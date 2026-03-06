@@ -133,7 +133,7 @@ Return ONLY valid JSON in this exact format:
 
     const result = await llm.generate(prompt, {
       temperature: 0.3,
-      max_tokens: 300,
+      maxTokens: 300,
     });
 
     if (!result) {
@@ -293,7 +293,7 @@ Include all ${neighbors.length} neighbors in your response.`;
 
     const result = await llm.generate(prompt, {
       temperature: 0.3,
-      max_tokens: 500,
+      maxTokens: 500,
     });
 
     if (!result) {
@@ -474,7 +474,7 @@ If no evolution is needed:
 
     const result = await llm.generate(prompt, {
       temperature: 0.4,
-      max_tokens: 400,
+      maxTokens: 400,
     });
 
     if (!result) {
@@ -722,7 +722,7 @@ Only include relationships with confidence >= 0.6. Return empty array [] if no c
 
     const result = await llm.generate(prompt, {
       temperature: 0.3,
-      max_tokens: 600,
+      maxTokens: 600,
     });
 
     if (!result) {
@@ -768,23 +768,23 @@ Only include relationships with confidence >= 0.6. Return empty array [] if no c
         continue;
       }
 
-      // Get document IDs
-      const sourceDocId = factMap[link.source_fact_idx].docId;
-      const targetDocId = factMap[link.target_fact_idx].docId;
+      // Get document IDs (bounds already validated above)
+      const sourceEntry = factMap[link.source_fact_idx]!;
+      const targetEntry = factMap[link.target_fact_idx]!;
 
       // Skip self-links (same document)
-      if (sourceDocId === targetDocId) {
+      if (sourceEntry.docId === targetEntry.docId) {
         continue;
       }
 
       // Insert causal relation
       const metadata = JSON.stringify({
         reasoning: link.reasoning,
-        source_fact: factMap[link.source_fact_idx].fact,
-        target_fact: factMap[link.target_fact_idx].fact,
+        source_fact: sourceEntry.fact,
+        target_fact: targetEntry.fact,
       });
 
-      insertStmt.run(sourceDocId, targetDocId, link.confidence, metadata, timestamp);
+      insertStmt.run(sourceEntry.docId, targetEntry.docId, link.confidence, metadata, timestamp);
       linksCreated++;
     }
 

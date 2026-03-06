@@ -43,13 +43,13 @@ const TEMPORAL_RELATIVE: [RegExp, TemporalExtractor][] = [
     return { start: s.toISOString().slice(0, 10), end: s.toISOString().slice(0, 10) };
   }],
   [/\b(\d+)\s*days?\s*ago\b/i, (now: Date, m?: RegExpMatchArray) => {
-    const s = new Date(now); s.setDate(s.getDate() - parseInt(m![1]));
+    const s = new Date(now); s.setDate(s.getDate() - parseInt(m?.[1] ?? "1"));
     return { start: s.toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) };
   }],
   [/\bin\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*(\d{4})?\b/i, (_now: Date, m?: RegExpMatchArray) => {
     const months: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
-    const mo = months[m![1].slice(0, 3).toLowerCase()] ?? 0;
-    const yr = m![2] ? parseInt(m![2]) : new Date().getFullYear();
+    const mo = months[(m?.[1] ?? "jan").slice(0, 3).toLowerCase()] ?? 0;
+    const yr = m?.[2] ? parseInt(m[2]) : new Date().getFullYear();
     const s = new Date(yr, mo, 1);
     const e = new Date(yr, mo + 1, 0);
     return { start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10) };
@@ -93,7 +93,7 @@ function classifyIntentHeuristic(query: string): IntentResult {
   }
 
   const intent = (Object.entries(scores) as [IntentType, number][])
-    .sort((a, b) => b[1] - a[1])[0][0];
+    .sort((a, b) => b[1] - a[1])[0]![0];
   const confidence = Math.min(0.95, 0.6 + maxScore * 0.1);
 
   return { intent, confidence, temporal_start, temporal_end };

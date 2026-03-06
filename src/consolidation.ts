@@ -83,7 +83,7 @@ async function tick(store: Store, llm: LlamaCpp): Promise<void> {
   try {
     // Find documents missing A-MEM keywords (primary indicator of unenriched docs)
     const docs = store.db
-      .prepare<DocumentToEnrich[], []>(
+      .prepare<DocumentToEnrich, []>(
         `SELECT id, hash, title
          FROM documents
          WHERE amem_keywords IS NULL AND active = 1

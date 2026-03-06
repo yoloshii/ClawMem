@@ -180,7 +180,7 @@ export async function indexCollection(
   const allEntries: string[] = [];
   for (const p of patterns) {
     const glob = new Glob(p);
-    for (const f of glob.scanSync({ cwd: collectionPath, followSymlinks: true, absolute: false })) {
+    for (const f of glob.scanSync({ cwd: collectionPath, followSymlinks: false, absolute: false })) {
       if (!seen.has(f)) {
         seen.add(f);
         allEntries.push(f);

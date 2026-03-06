@@ -831,7 +831,7 @@ Final Output:`;
     const ranked = await context.rankAndSort(query, texts);
 
     // Map back to our result format using the text-to-doc map
-    const results: RerankDocumentResult[] = ranked.map((item) => {
+    const results: RerankDocumentResult[] = ranked.map((item: { document: string; score: number }) => {
       const docInfo = textToDoc.get(item.document)!;
       return {
         file: docInfo.file,
