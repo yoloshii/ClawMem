@@ -209,11 +209,20 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `memory_snooze(query, until?)` — temporarily hide a memory from context surfacing until a date, or unsnooze.
 - `beads_sync(project_path?)` — import `.beads/beads.jsonl` into memory. Bridges deps into `memory_relations`, runs A-MEM enrichment on new docs. Usually automatic via watcher.
 
+### Memory Lifecycle
+
+- **Pin** high-value memories that should always surface (architecture decisions, critical patterns). Pinned docs get +0.3 composite boost.
+- **Snooze** noisy or temporarily irrelevant memories instead of forgetting them. They auto-return on the snooze date.
+- **Forget** only when a memory is genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
+- **Contradictions auto-resolve:** When `decision-extractor` detects a new decision contradicting an old one, the old decision's confidence is lowered automatically. No manual intervention needed for superseded decisions.
+
 ### Anti-Patterns
 
 - Do NOT call `query` or `intent_search` every turn — three rules above are the only gates.
 - Do NOT re-search what's already in `<vault-context>`.
 - Do NOT run `status` routinely. Only when retrieval feels broken or after large ingestion.
+- Do NOT pin everything — pin is for persistent high-priority items, not temporary boosting.
+- Do NOT forget memories to "clean up" — use `lifecycle_sweep` or let confidence decay handle it.
 
 ## Tool Selection (one-liner)
 
