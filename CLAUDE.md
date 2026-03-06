@@ -222,7 +222,7 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - Do NOT re-search what's already in `<vault-context>`.
 - Do NOT run `status` routinely. Only when retrieval feels broken or after large ingestion.
 - Do NOT pin everything — pin is for persistent high-priority items, not temporary boosting.
-- Do NOT forget memories to "clean up" — use `lifecycle_sweep` or let confidence decay handle it.
+- Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it naturally.
 
 ## Tool Selection (one-liner)
 
