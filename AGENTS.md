@@ -211,9 +211,15 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 
 ### Memory Lifecycle
 
-- **Pin** high-value memories that should always surface (architecture decisions, critical patterns). Pinned docs get +0.3 composite boost.
-- **Snooze** noisy or temporarily irrelevant memories instead of forgetting them. They auto-return on the snooze date.
-- **Forget** only when a memory is genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
+Pin, snooze, and forget are **manual MCP tools** — not automated. The agent should proactively use them when appropriate:
+
+- **Pin** (`memory_pin`) — +0.3 composite boost, ensures persistent surfacing.
+  - **Proactive triggers:** User says "remember this" / "don't forget" / "this is important". Architecture or critical design decision just made. User-stated preference or constraint that should persist across sessions.
+  - **Do NOT pin:** routine decisions, session-specific context, or observations that will naturally surface via recency.
+- **Snooze** (`memory_snooze`) — temporarily hides from context surfacing until a date.
+  - **Proactive triggers:** A memory keeps surfacing but isn't relevant to current work. User says "not now" / "later" / "ignore this for now". Seasonal or time-boxed content (e.g., "revisit after launch").
+- **Forget** (`memory_forget`) — permanently deactivates. Use sparingly.
+  - Only when a memory is genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
 - **Contradictions auto-resolve:** When `decision-extractor` detects a new decision contradicting an old one, the old decision's confidence is lowered automatically. No manual intervention needed for superseded decisions.
 
 ### Anti-Patterns
