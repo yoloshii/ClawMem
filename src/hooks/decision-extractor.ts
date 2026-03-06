@@ -22,6 +22,8 @@ import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
+import { extractJsonFromLLM } from "../amem.ts";
+import { DEFAULT_EMBED_MODEL, extractSnippet, type SearchResult } from "../store.ts";
 
 // =============================================================================
 // Decision Patterns
@@ -38,6 +40,106 @@ const DECISION_PATTERNS = [
   /\b(?:selected|picking|choosing)\s/i,
   /\binstead\s+of\b.*\bwe(?:'ll)?\s/i,
 ];
+
+// =============================================================================
+// Contradiction Detection
+// =============================================================================
+
+async function detectContradictions(
+  store: Store,
+  newObservations: Observation[],
+  sessionId: string
+): Promise<number> {
+  const decisions = newObservations.filter(o => o.type === "decision");
+  if (decisions.length === 0) return 0;
+
+  let contradictionCount = 0;
+  const llm = await getDefaultLlamaCpp();
+  if (!llm) return 0;
+
+  // Batch all new decision facts
+  const newFacts = decisions.flatMap(d => d.facts);
+  if (newFacts.length === 0) return 0;
+
+  // Vector search for existing decisions on overlapping topics
+  const queryText = newFacts.join(". ");
+  let existingDocs: SearchResult[];
+  try {
+    existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5);
+  } catch {
+    existingDocs = store.searchFTS(queryText, 5);
+  }
+
+  // Filter to decision/observation docs, exclude same session
+  const sessionPrefix = sessionId.slice(0, 8);
+  const candidates = existingDocs.filter(d =>
+    (d.displayPath.includes("decisions/") || d.displayPath.includes("observations/")) &&
+    !d.displayPath.includes(sessionPrefix)
+  );
+
+  if (candidates.length === 0) return 0;
+
+  // Build classification prompt
+  const existingFacts = candidates
+    .map((c, i) => `[OLD-${i}] ${c.displayPath}\n${extractSnippet(c.body || "", queryText, 300).snippet}`)
+    .join("\n\n");
+
+  const prompt = `You are analyzing decisions for contradictions.
+
+NEW DECISIONS (this session):
+${newFacts.map((f, i) => `[NEW-${i}] ${f}`).join("\n")}
+
+EXISTING DECISIONS (prior sessions):
+${existingFacts}
+
+For each NEW decision, check against EXISTING decisions. Classify each relationship:
+- "same": Identical decision, no action needed
+- "update": New decision supersedes/refines old one
+- "contradiction": New decision directly conflicts with old one
+
+Return JSON array:
+[{"new_idx": 0, "old_idx": 0, "relation": "update|contradiction|same", "confidence": 0.0-1.0, "reasoning": "..."}]
+
+Only include pairs with confidence >= 0.7. Return [] if no relationships found. /no_think`;
+
+  try {
+    const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 400 });
+    if (!result) return 0;
+    const parsed = extractJsonFromLLM(result.text);
+    if (!Array.isArray(parsed)) return 0;
+
+    for (const rel of parsed) {
+      if (rel.confidence < 0.7) continue;
+      const oldDoc = candidates[rel.old_idx];
+      if (!oldDoc) continue;
+
+      const existingDoc = store.findActiveDocument(oldDoc.collectionName, oldDoc.filepath);
+      if (!existingDoc) continue;
+
+      if (rel.relation === "contradiction") {
+        // Lower old doc confidence by 0.25 (floor 0.2)
+        const currentConfidence = existingDoc.confidence ?? 0.5;
+        store.updateDocumentMeta(existingDoc.id, {
+          confidence: Math.max(0.2, currentConfidence - 0.25),
+        });
+        contradictionCount++;
+        console.error(
+          `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
+        );
+      } else if (rel.relation === "update") {
+        // Lower old doc confidence by 0.15 (floor 0.3)
+        const currentConfidence = existingDoc.confidence ?? 0.5;
+        store.updateDocumentMeta(existingDoc.id, {
+          confidence: Math.max(0.3, currentConfidence - 0.15),
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`[decision-extractor] Contradiction classification failed:`, err);
+  }
+
+  return contradictionCount;
+}
 
 // =============================================================================
 // Handler
@@ -62,18 +164,9 @@ export async function decisionExtractor(
   const observations = await extractObservations(messages);
   const observedDecisions = observations.filter(o => o.type === "decision");
 
-  let decisionBody: string;
-  let decisionCount: number;
-
-  if (observedDecisions.length > 0) {
-    // Use rich observer output
-    decisionBody = formatObservedDecisions(observedDecisions, dateStr, sessionId);
-    decisionCount = observedDecisions.length;
-
-    // Collect observations with document IDs for causal inference
-    const observationsWithDocs: ObservationWithDoc[] = [];
-
-    // Persist all observations with structured metadata
+  // Persist ALL observations unconditionally (C2 fix: not gated on decisions existing)
+  const observationsWithDocs: ObservationWithDoc[] = [];
+  if (observations.length > 0) {
     for (const obs of observations) {
       const obsPath = `observations/${dateStr}-${sessionId.slice(0, 8)}-${obs.type}.md`;
       const obsBody = formatObservation(obs, dateStr, sessionId);
@@ -97,7 +190,6 @@ export async function decisionExtractor(
             files_modified: JSON.stringify(obs.filesModified),
           });
 
-          // Collect for causal inference if has facts
           if (obs.facts.length > 0) {
             observationsWithDocs.push({
               docId: doc.id,
@@ -119,16 +211,39 @@ export async function decisionExtractor(
         }
       } catch (err) {
         console.log(`[decision-extractor] Error in causal inference:`, err);
-        // Non-fatal: continue with decision extraction
       }
+    }
+  }
+
+  // Extract decisions (observer-first, regex fallback)
+  let decisionBody: string;
+  let decisionCount: number;
+
+  if (observedDecisions.length > 0) {
+    decisionBody = formatObservedDecisions(observedDecisions, dateStr, sessionId);
+    decisionCount = observedDecisions.length;
+
+    // Detect contradictions with existing decisions
+    try {
+      const contradictions = await detectContradictions(store, observedDecisions, sessionId);
+      if (contradictions > 0) {
+        console.error(`[decision-extractor] Found ${contradictions} contradiction(s) with prior decisions`);
+      }
+    } catch (err) {
+      console.error(`[decision-extractor] Error in contradiction detection:`, err);
     }
   } else {
     // Fallback to regex extraction
     const decisions = extractDecisions(messages);
-    if (decisions.length === 0) return makeEmptyOutput("decision-extractor");
+    if (decisions.length === 0 && observations.length === 0) return makeEmptyOutput("decision-extractor");
 
-    decisionBody = formatDecisionLog(decisions, dateStr, sessionId);
-    decisionCount = decisions.length;
+    if (decisions.length === 0) {
+      decisionBody = `# Session Observations ${dateStr}\n\nNo decisions extracted. ${observations.length} observation(s) persisted separately.\n`;
+      decisionCount = 0;
+    } else {
+      decisionBody = formatDecisionLog(decisions, dateStr, sessionId);
+      decisionCount = decisions.length;
+    }
   }
 
   const decisionHash = hashContent(decisionBody);

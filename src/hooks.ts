@@ -225,8 +225,13 @@ export function readTranscript(
             ? msg.content
             : Array.isArray(msg.content)
               ? msg.content
-                  .filter((b: any) => b.type === "text")
-                  .map((b: any) => b.text)
+                  .map((b: any) => {
+                    if (b.type === "text") return b.text;
+                    if (b.type === "tool_use") return `[tool_use name="${b.name}" id="${b.id}"] ${JSON.stringify(b.input ?? {})}`;
+                    if (b.type === "tool_result") return `[tool_result id="${b.tool_use_id}"] ${typeof b.content === "string" ? b.content.slice(0, 500) : ""}`;
+                    return "";
+                  })
+                  .filter((s: string) => s)
                   .join("\n")
               : JSON.stringify(msg.content);
 

@@ -650,6 +650,81 @@ async function cmdHook(args: string[]) {
   writeHookOutput(output);
 }
 
+// =============================================================================
+// IO6: Surface command (pre-prompt context injection for daemon mode)
+// =============================================================================
+
+async function readStdinRaw(): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of Bun.stdin.stream()) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf-8").trim();
+}
+
+async function cmdSurface(args: string[]) {
+  const isBootstrap = args.includes("--bootstrap");
+  const isContext = args.includes("--context");
+  const useStdin = args.includes("--stdin");
+
+  if (!isBootstrap && !isContext) {
+    die("Usage: clawmem surface --context --stdin  OR  clawmem surface --bootstrap --stdin");
+  }
+
+  const input = useStdin ? await readStdinRaw() : args.find(a => !a.startsWith("--")) || "";
+  if (!input) process.exit(0);
+
+  // Open store: writable for both (context-surfacing writes dedupe data)
+  const s = createStore(undefined, { busyTimeout: 500 });
+
+  try {
+    if (isBootstrap) {
+      // IO6b: session-bootstrap + staleness-check
+      const sessionId = input.trim() || `io6-${Date.now()}`;
+
+      const bootstrapResult = await sessionBootstrap(s, {
+        prompt: "",
+        hookEventName: "io6-bootstrap",
+        sessionId,
+        transcriptPath: undefined,
+      });
+
+      const stalenessResult = await stalenessCheck(s, {
+        prompt: "",
+        hookEventName: "io6-staleness",
+        sessionId,
+        transcriptPath: undefined,
+      });
+
+      // Output both if present (bootstrap first, staleness appended)
+      const output = [
+        bootstrapResult.hookSpecificOutput?.additionalContext,
+        stalenessResult.hookSpecificOutput?.additionalContext,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      if (output) process.stdout.write(output);
+    } else {
+      // IO6a: context-surfacing
+      if (input.length < 20) process.exit(0);
+
+      const result = await contextSurfacing(s, {
+        prompt: input,
+        hookEventName: "io6-context",
+        sessionId: undefined,
+        transcriptPath: undefined,
+      });
+
+      const ctx = result.hookSpecificOutput?.additionalContext;
+      if (ctx) process.stdout.write(ctx);
+    }
+  } finally {
+    s.close();
+  }
+  process.exit(0);
+}
+
 async function cmdBudget(args: string[]) {
   const { values } = parseArgs({
     args,
@@ -1315,6 +1390,9 @@ async function main() {
       case "update-context":
         await cmdUpdateContext();
         break;
+      case "surface":
+        await cmdSurface(subArgs);
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -1363,6 +1441,8 @@ ${c.bold}Memory:${c.reset}
 
 ${c.bold}Hooks:${c.reset}
   clawmem hook <name>                  Run hook (stdin JSON)
+  clawmem surface --context --stdin    IO6a: pre-prompt context injection
+  clawmem surface --bootstrap --stdin  IO6b: per-session bootstrap injection
 
 ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server

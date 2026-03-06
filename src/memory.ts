@@ -103,7 +103,7 @@ const RECENCY_PATTERNS = [
   /\brecent(ly)?\b/i,
   /\blast\s+(session|time|week|month|few\s+days)\b/i,
   /\bleft\s+off\b/i,
-  /\bwhere\s+(was|were)\s+[wi]\b/i,
+  /\bwhere\s+(was|were)\s+(we|i)\b/i,
   /\bpick\s+up\b/i,
   /\bcontinue\b/i,
   /\byesterday\b/i,
@@ -143,6 +143,8 @@ export type EnrichedResult = {
   modifiedAt: string;
   accessCount: number;
   confidence: number;
+  qualityScore: number;
+  pinned: boolean;
   context: string | null;
   hash: string;
   docid: string;
@@ -170,7 +172,18 @@ export function applyCompositeScoring(
     const recency = recencyScore(r.modifiedAt, r.contentType, now);
     const conf = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now);
     const composite = compositeScore(r.score, recency, conf, weights);
-    return { ...r, compositeScore: composite, recencyScore: recency };
+
+    // Quality multiplier: 0.5 default → 1.0x (no effect)
+    // Range: 0.0 → 0.7x penalty, 1.0 → 1.3x boost
+    const qualityMultiplier = 0.7 + 0.6 * (r.qualityScore ?? 0.5);
+    let adjusted = composite * qualityMultiplier;
+
+    // Pin boost: +0.3 additive, capped at 1.0
+    if (r.pinned) {
+      adjusted = Math.min(1.0, adjusted + 0.3);
+    }
+
+    return { ...r, compositeScore: adjusted, recencyScore: recency };
   });
 
   // Sort by composite score descending

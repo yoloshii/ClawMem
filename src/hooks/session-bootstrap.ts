@@ -13,7 +13,6 @@
 import type { Store } from "../store.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
-  makeContextOutput,
   makeEmptyOutput,
   smartTruncate,
   estimateTokens,
@@ -106,10 +105,17 @@ export async function sessionBootstrap(
   // Log the injection
   logInjection(store, sessionId, "session-bootstrap", paths, totalTokens);
 
-  return makeContextOutput(
-    "session-bootstrap",
-    `<vault-session>\n${sections.join("\n\n---\n\n")}\n</vault-session>`
-  );
+  // C4b fix: makeContextOutput drops content for SessionStart hooks (null in HOOK_EVENT_MAP).
+  // Return direct output with io6-bootstrap event name to ensure content reaches cmdSurface.
+  const sessionContext = `<vault-session>\n${sections.join("\n\n---\n\n")}\n</vault-session>`;
+  return {
+    continue: true,
+    suppressOutput: false,
+    hookSpecificOutput: {
+      hookEventName: "io6-bootstrap",
+      additionalContext: sessionContext,
+    },
+  };
 }
 
 // =============================================================================
