@@ -151,9 +151,9 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
 | `session-bootstrap` | SessionStart | 2000 tokens | profile + latest handoff + recent decisions + stale notes |
-| `context-surfacing` | UserPromptSubmit | 800 tokens | hybrid search → `<vault-context>` injection |
+| `context-surfacing` | UserPromptSubmit | 800 tokens | hybrid search (900ms vector timeout) → snooze filter → `<vault-context>` injection |
 | `staleness-check` | SessionStart | 250 tokens | flags notes not modified in 30+ days |
-| `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/observations/`, infers causal links |
+| `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/observations/`, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/handoffs/` |
 | `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence |
 
@@ -205,6 +205,8 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `session_log` — recent sessions with handoff summaries.
 - `profile` — user profile (static facts + dynamic context).
 - `memory_forget(query)` — deactivate a memory by closest match.
+- `memory_pin(query, unpin?)` — pin a memory for +0.3 composite boost in context surfacing, or unpin it.
+- `memory_snooze(query, until?)` — temporarily hide a memory from context surfacing until a date, or unsnooze.
 - `beads_sync(project_path?)` — import `.beads/beads.jsonl` into memory. Bridges deps into `memory_relations`, runs A-MEM enrichment on new docs. Usually automatic via watcher.
 
 ### Anti-Patterns
@@ -222,12 +224,15 @@ ClawMem escalation: query(compact=true) | intent_search(why/when/entity) → mul
 ## Composite Scoring (automatic, applied to all search tools)
 
 ```
-compositeScore = 0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenceScore
+compositeScore = (0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenceScore) × qualityMultiplier
 ```
+
+Where `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
+Pinned documents get +0.3 additive boost (capped at 1.0).
 
 Recency intent detected ("latest", "recent", "last session"):
 ```
-compositeScore = 0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenceScore
+compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenceScore) × qualityMultiplier
 ```
 
 | Content Type | Half-Life | Effect |
@@ -258,6 +263,8 @@ compositeScore = 0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidence
 **Infrastructure (Tier 1, no agent action needed):**
 - **`clawmem-watcher`** — keeps index + A-MEM fresh (continuous, on `.md` change). Also watches `.jsonl` — routes `.beads/beads.jsonl` changes to `syncBeadsIssues()` (auto-bridges deps into `memory_relations`). Does NOT embed.
 - **`clawmem-embed` timer** — keeps embeddings fresh (daily). Idempotent, skips already-embedded fragments.
+
+**Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision keywords, correction keywords, and frontmatter richness. Applied as a multiplier in composite scoring.
 
 **Impact of missing embeddings:** `vsearch`, `query` (vector component), `context-surfacing` (vector component), and `generateMemoryLinks()` (neighbor discovery) all depend on embeddings. If embeddings are missing, these degrade silently — BM25 still works, but vector recall and inter-doc link quality suffer.
 
@@ -397,6 +404,15 @@ Symptom: CLI reindex/update falls back to node-llama-cpp Vulkan (not GPU server)
 ## CLI Reference
 
 Run `clawmem --help` for full command listing. Use this before guessing at commands or parameters.
+
+**IO6 surface commands** (for daemon/`--print` mode integration):
+```bash
+# IO6a: per-prompt context injection (pipe prompt on stdin)
+echo "user query" | clawmem surface --context --stdin
+
+# IO6b: per-session bootstrap injection (pipe session ID on stdin)
+echo "session-id" | clawmem surface --bootstrap --stdin
+```
 
 ## Integration Notes
 
