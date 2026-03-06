@@ -18,6 +18,9 @@ ClawMem turns your markdown notes, project docs, and research dumps into an inte
 - **Traverses multi-graphs** (semantic, temporal, causal) via adaptive beam search
 - **Evolves memory metadata** as new documents create or refine connections
 - **Infers causal relationships** between facts extracted from session observations
+- **Detects contradictions** between new and prior decisions, auto-decaying superseded ones
+- **Scores document quality** using structure, keywords, and metadata richness signals
+- **Supports pin/snooze lifecycle** for persistent boosts and temporary suppression
 - **Syncs project issues** from Beads issue trackers into searchable memory
 
 All context injection runs through Claude Code's hook system — no API keys needed, no cloud services, fully local.
@@ -52,9 +55,10 @@ Claude Code Session
                             │
 ┌───────────────────────────▼─────────────────────────────┐
 │  SAME Composite Scoring Layer                            │
-│  compositeScore = w.search × searchScore                 │
+│  compositeScore = (w.search × searchScore                │
 │                 + w.recency × recencyDecay               │
-│                 + w.confidence × confidence               │
+│                 + w.confidence × confidence)              │
+│                 × qualityMultiplier + pinBoost            │
 └───────────────────────────┬─────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────┐
@@ -272,7 +276,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 18 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
+ClawMem exposes 20 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
 
 **Claude Code (automatic):**
 
@@ -297,7 +301,7 @@ Add to your MCP config (e.g. `~/.claude.json`, `claude_desktop_config.json`, or 
 
 The server runs via stdio — no network port needed. The `bin/clawmem` wrapper sets the GPU endpoint env vars automatically.
 
-**Verify:** After registering, your client should see 18 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
+**Verify:** After registering, your client should see 20 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
 
 ### Verify Installation
 
@@ -332,6 +336,8 @@ clawmem update-context                          Regenerate per-folder CLAUDE.md
 clawmem budget [--session ID]                   Token utilization
 clawmem log [--last N]                          Session history
 clawmem hook <name>                             Manual hook trigger
+clawmem surface --context --stdin               IO6: pre-prompt context injection
+clawmem surface --bootstrap --stdin             IO6: per-session bootstrap injection
 
 clawmem install-service [--enable] [--remove]   Systemd watcher service
 clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
@@ -341,7 +347,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (18)
+## MCP Tools (20)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
@@ -382,11 +388,13 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `beads_sync` | Sync `.beads/beads.jsonl` into memory: creates docs, bridges deps to `memory_relations`, runs A-MEM enrichment |
 
-### Memory Management
+### Memory Management & Lifecycle
 
 | Tool | Description |
 |---|---|
 | `memory_forget` | Search → deactivate closest match (with audit trail) |
+| `memory_pin` | Pin/unpin a memory for +0.3 composite boost in context surfacing |
+| `memory_snooze` | Temporarily hide a memory from context surfacing until a given date |
 | `status` | Index health with content type distribution |
 | `reindex` | Trigger vault re-scan |
 | `index_stats` | Detailed stats: types, staleness, access counts, sessions |
@@ -403,10 +411,10 @@ Six hooks auto-installed by `clawmem setup hooks`:
 
 | Hook | Event | What It Does |
 |---|---|---|
-| `context-surfacing` | UserPromptSubmit | Searches vault, scores, sanitizes, injects relevant notes (800 token budget) |
+| `context-surfacing` | UserPromptSubmit | Hybrid search (900ms vector timeout) → snooze filter → file-aware supplemental search → sanitize → inject (800 token budget) |
 | `session-bootstrap` | SessionStart | Injects profile + handoff + decisions + stale notes (2000 token budget) |
 | `staleness-check` | SessionStart | Flags documents needing review |
-| `decision-extractor` | Stop | GGUF observer extracts structured decisions + infers causal links between facts |
+| `decision-extractor` | Stop | GGUF observer extracts structured decisions, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones |
 
@@ -418,7 +426,7 @@ User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
   → Intent-Weighted RRF (boost BM25 for WHEN, boost vector for WHY)
   → Graph Expansion (WHY/ENTITY: adaptive beam search over multi-graph)
   → Cross-Encoder Reranking (0.6B GGUF)
-  → SAME Composite Scoring (search × 0.5 + recency × 0.25 + confidence × 0.25)
+  → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier + pinBoost)
   → Ranked Results
 ```
 
@@ -452,6 +460,14 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 | `note` | 60 days | 0.50 | Default |
 
 Content types are inferred from frontmatter or file path patterns.
+
+**Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision/correction keywords, and frontmatter richness. Applied as `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
+
+**Pin boost:** Pinned documents get +0.3 additive boost (capped at 1.0). Use `memory_pin` to pin critical memories.
+
+**Snooze:** Snoozed documents are filtered out of context surfacing until their snooze date. Use `memory_snooze` for temporary suppression.
+
+**Contradiction detection:** When `decision-extractor` identifies a new decision that contradicts a prior one, the old decision's confidence is automatically lowered (−0.25 for contradictions, −0.15 for updates). Superseded decisions naturally fade from context surfacing without manual intervention.
 
 ## Features
 
