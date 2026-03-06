@@ -208,7 +208,7 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `memory_pin(query, unpin?)` — pin a memory for +0.3 composite boost in context surfacing, or unpin it.
 - `memory_snooze(query, until?)` — temporarily hide a memory from context surfacing until a date, or unsnooze.
 - `build_graphs(temporal?, semantic?)` — build temporal backbone + semantic graph after bulk ingestion. Not needed after routine indexing (A-MEM handles per-doc links).
-- `beads_sync(project_path?)` — import `.beads/beads.jsonl` into memory. Usually automatic via watcher.
+- `beads_sync(project_path?)` — sync Beads issues from Dolt backend (via `bd` CLI) into memory. Usually automatic via watcher.
 
 ### Memory Lifecycle
 
@@ -278,7 +278,7 @@ compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenc
 ### Indexing vs Embedding (important distinction)
 
 **Infrastructure (Tier 1, no agent action needed):**
-- **`clawmem-watcher`** — keeps index + A-MEM fresh (continuous, on `.md` change). Also watches `.jsonl` — routes `.beads/beads.jsonl` changes to `syncBeadsIssues()` (auto-bridges deps into `memory_relations`). Does NOT embed.
+- **`clawmem-watcher`** — keeps index + A-MEM fresh (continuous, on `.md` change). Also watches `.beads/` — routes changes to `syncBeadsIssues()` which queries `bd` CLI for live Dolt data (auto-bridges deps into `memory_relations`). Does NOT embed.
 - **`clawmem-embed` timer** — keeps embeddings fresh (daily). Idempotent, skips already-embedded fragments.
 
 **Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision keywords, correction keywords, and frontmatter richness. Applied as a multiplier in composite scoring.
@@ -297,7 +297,7 @@ The `memory_relations` table is populated by multiple independent sources:
 |--------|-----------|---------|-------|
 | A-MEM `generateMemoryLinks()` | semantic, supporting, contradicts | Indexing (new docs only) | LLM-assessed confidence + reasoning. Requires embeddings for neighbor discovery. |
 | A-MEM `inferCausalLinks()` | causal | Post-response (IO3 decision-extractor) | Links between `_clawmem/observations/` docs, not arbitrary workspace docs. |
-| Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP tool or watcher (.jsonl change) | Maps beads deps: blocks→causal, discovered-from→supporting, relates-to→semantic. Metadata: `{origin: "beads"}`. |
+| Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP tool or watcher (.beads/ change) | Queries `bd` CLI (Dolt backend). Maps beads deps: blocks→causal, discovered-from→supporting, relates-to→semantic, plus conditional-blocks→causal, caused-by→causal, supersedes→supporting. Metadata: `{origin: "beads"}`. |
 | `buildTemporalBackbone()` | temporal | `build_graphs` MCP tool (manual) | Creation-order edges between all active docs. |
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP tool (manual) | Pure cosine similarity. PK collision: `INSERT OR IGNORE` means A-MEM semantic edges take precedence if they exist first. |
 
@@ -438,4 +438,4 @@ echo "session-id" | clawmem surface --bootstrap --stdin
 - Three `llama-server` instances (embedding, LLM, reranker) on local or remote GPU. Wrapper defaults to `localhost:8088/8089/8090`.
 - `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process LLM/reranker fallback via `node-llama-cpp`. Set `true` for remote-only setups to fail fast on unreachable endpoints.
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs with A-MEM notes + links. Only runs if the MCP process stays alive long enough to tick (every 5min).
-- Beads integration: `syncBeadsIssues()` creates markdown docs in `beads` collection, maps dependency edges (`blocks`→causal, `discovered-from`→supporting, `relates-to`→semantic) into `memory_relations`, and triggers A-MEM enrichment for new docs. Watcher auto-triggers on `.beads/beads.jsonl` changes; `beads_sync` MCP tool for manual sync.
+- Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+) for live issue data, creates markdown docs in `beads` collection, maps all dependency edge types into `memory_relations`, and triggers A-MEM enrichment for new docs. Watcher auto-triggers on `.beads/` directory changes; `beads_sync` MCP tool for manual sync. Requires `bd` binary on PATH or at `~/go/bin/bd`.

@@ -38,7 +38,7 @@ import {
   type NamedCollection,
 } from "./collections.ts";
 import {
-  parseBeadsJsonl,
+  queryBeadsList,
   formatBeadsIssueAsMarkdown,
   detectBeadsProject,
   type BeadsIssue,
@@ -725,7 +725,7 @@ export type Store = {
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
   // Beads integration
-  syncBeadsIssues: (beadsJsonlPath: string) => Promise<{ synced: number; created: number; newDocIds: number[] }>;
+  syncBeadsIssues: (projectDir: string) => Promise<{ synced: number; created: number; newDocIds: number[] }>;
   detectBeadsProject: (cwd: string) => string | null;
 
   // MAGMA graph building
@@ -863,7 +863,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
 
     // Beads integration
-    syncBeadsIssues: (beadsJsonlPath: string) => syncBeadsIssues(db, beadsJsonlPath),
+    syncBeadsIssues: (projectDir: string) => syncBeadsIssues(db, projectDir),
     detectBeadsProject,
 
     // MAGMA graph building
@@ -2984,31 +2984,32 @@ function getStaleDocumentsFn(db: Database, beforeDate: string): DocumentRow[] {
  */
 export async function syncBeadsIssues(
   db: Database,
-  beadsJsonlPath: string
+  projectDir: string
 ): Promise<{ synced: number; created: number; newDocIds: number[] }> {
-  const issues = parseBeadsJsonl(beadsJsonlPath);
+  const issues = queryBeadsList(projectDir);
+  if (issues.length === 0) {
+    console.warn(`[beads] No issues returned from bd list in ${projectDir}`);
+    return { synced: 0, created: 0, newDocIds: [] };
+  }
+
   let synced = 0;
   let created = 0;
   const newDocIds: number[] = [];
 
   for (const issue of issues) {
-    // Create markdown document for issue
     const docPath = `_clawmem/beads/${issue.id}.md`;
     const docBody = formatBeadsIssueAsMarkdown(issue);
     const hash = await hashContent(docBody);
 
-    // Check if document exists
     const existingDoc = findActiveDocument(db, 'beads', docPath);
 
     if (existingDoc) {
-      // Update document content if it changed
       if (existingDoc.hash !== hash) {
         insertContent(db, hash, docBody, new Date().toISOString());
         db.prepare(`UPDATE documents SET hash = ?, modified_at = ? WHERE id = ?`)
           .run(hash, new Date().toISOString(), existingDoc.id);
       }
 
-      // Update beads_issues table metadata
       db.prepare(`
         UPDATE beads_issues
         SET status = ?, priority = ?, assignee = ?, last_synced_at = ?
@@ -3022,28 +3023,15 @@ export async function syncBeadsIssues(
       );
       synced++;
     } else {
-      // Insert content first
       insertContent(db, hash, docBody, issue.created_at);
+      insertDocument(db, 'beads', docPath, issue.title, hash, issue.created_at, issue.created_at);
 
-      // Insert document
-      insertDocument(
-        db,
-        'beads',
-        docPath,
-        issue.title,
-        hash,
-        issue.created_at,
-        issue.created_at
-      );
-
-      // Get the newly inserted document ID
       const newDoc = findActiveDocument(db, 'beads', docPath);
       if (!newDoc) {
         console.warn(`[beads] Failed to insert document for ${issue.id}`);
         continue;
       }
 
-      // Insert beads metadata
       db.prepare(`
         INSERT INTO beads_issues (
           beads_id, doc_id, issue_type, status, priority, tags,
@@ -3052,10 +3040,10 @@ export async function syncBeadsIssues(
       `).run(
         issue.id,
         newDoc.id,
-        issue.type,
+        issue.type || issue.issue_type || "task",
         issue.status,
         issue.priority,
-        JSON.stringify(issue.tags || []),
+        JSON.stringify(issue.labels || issue.tags || []),
         issue.assignee || null,
         issue.parent || null,
         issue.created_at,
@@ -3068,25 +3056,29 @@ export async function syncBeadsIssues(
     }
   }
 
-  // Second pass: insert dependencies after all issues exist (avoids FK violations for forward references)
+  // Second pass: insert all dependencies from Dolt (richer than legacy blocks-only)
   for (const issue of issues) {
-    if (issue.blocks && issue.blocks.length > 0) {
-      for (const blockedId of issue.blocks) {
-        db.prepare(`
-          INSERT OR IGNORE INTO beads_dependencies (source_id, target_id, dep_type, created_at)
-          VALUES (?, ?, 'blocks', ?)
-        `).run(blockedId, issue.id, new Date().toISOString());
-      }
+    if (!issue.dependencies || issue.dependencies.length === 0) continue;
+    for (const dep of issue.dependencies) {
+      db.prepare(`
+        INSERT OR IGNORE INTO beads_dependencies (source_id, target_id, dep_type, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(dep.issue_id, dep.depends_on_id, dep.type, dep.created_at || new Date().toISOString());
     }
   }
 
   // Third pass: bridge beads_dependencies → memory_relations for MAGMA graph traversal
-  // Mapping: blocks→causal, discovered-from→supporting, relates-to→semantic
   const depTypeMap: Record<string, string> = {
     'blocks': 'causal',
-    'discovered-from': 'supporting',
-    'relates-to': 'semantic',
+    'conditional-blocks': 'causal',
     'waits-for': 'causal',
+    'caused-by': 'causal',
+    'discovered-from': 'supporting',
+    'supersedes': 'supporting',
+    'duplicates': 'supporting',
+    'relates-to': 'semantic',
+    'related': 'semantic',
+    'parent-child': 'semantic',
   };
 
   const allDeps = db.prepare(`SELECT source_id, target_id, dep_type FROM beads_dependencies`).all() as {
@@ -3096,7 +3088,6 @@ export async function syncBeadsIssues(
   for (const dep of allDeps) {
     const relationType = depTypeMap[dep.dep_type] || 'semantic';
 
-    // Resolve beads_id → doc_id via beads_issues table
     const sourceRow = db.prepare(`SELECT doc_id FROM beads_issues WHERE beads_id = ?`).get(dep.source_id) as { doc_id: number } | undefined;
     const targetRow = db.prepare(`SELECT doc_id FROM beads_issues WHERE beads_id = ?`).get(dep.target_id) as { doc_id: number } | undefined;
 

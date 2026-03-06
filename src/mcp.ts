@@ -830,23 +830,23 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "beads_sync",
     {
       title: "Sync Beads Issues",
-      description: "Import Beads issues from .beads/beads.jsonl into ClawMem search index. Syncs task dependency graph for searchability.",
+      description: "Sync Beads issues from Dolt backend (bd CLI) into ClawMem search index. Queries live Dolt database — no stale JSONL dependency.",
       inputSchema: {
         project_path: z.string().optional().describe("Path to project with .beads/ directory (default: cwd)"),
       },
     },
     async ({ project_path }) => {
       const cwd = project_path || process.cwd();
-      const beadsPath = store.detectBeadsProject(cwd);
+      const projectDir = store.detectBeadsProject(cwd);
 
-      if (!beadsPath) {
+      if (!projectDir) {
         return {
-          content: [{ type: "text", text: "No Beads project found. Expected .beads/beads.jsonl in project directory." }],
+          content: [{ type: "text", text: "No Beads project found. Expected .beads/ directory in project path." }],
         };
       }
 
       try {
-        const result = await store.syncBeadsIssues(beadsPath);
+        const result = await store.syncBeadsIssues(projectDir);
 
         // A-MEM enrichment for newly created docs (generates semantic/entity edges)
         if (result.newDocIds.length > 0) {
@@ -865,7 +865,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
             type: "text",
             text: `Beads sync complete:\n  - ${result.created} new issues indexed\n  - ${result.synced} existing issues updated\n  - ${result.newDocIds.length} docs enriched with A-MEM\n  - Total: ${result.created + result.synced} issues`,
           }],
-          structuredContent: { ...result, beads_path: beadsPath },
+          structuredContent: { ...result, project_dir: projectDir },
         };
       } catch (err) {
         return {

@@ -386,7 +386,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 | Tool | Description |
 |---|---|
-| `beads_sync` | Sync `.beads/beads.jsonl` into memory: creates docs, bridges deps to `memory_relations`, runs A-MEM enrichment |
+| `beads_sync` | Sync Beads issues from Dolt backend (`bd` CLI) into memory: creates docs, bridges all dep types to `memory_relations`, runs A-MEM enrichment |
 
 ### Memory Management & Lifecycle
 
@@ -486,12 +486,13 @@ The decision-extractor hook analyzes Observer facts for causal relationships. Wh
 
 ### Beads Integration
 
-Projects using [Beads](https://github.com/steveyegge/beads) (v0.49+) issue tracking are fully integrated into the MAGMA memory graph:
+Projects using [Beads](https://github.com/steveyegge/beads) (v0.58.0+, Dolt backend) issue tracking are fully integrated into the MAGMA memory graph:
 
-- **Auto-sync**: Watcher detects `.beads/beads.jsonl` changes → `syncBeadsIssues()` creates markdown docs in `beads` collection
-- **Dependency bridging**: Beads deps map to `memory_relations` edges — `blocks`→causal, `discovered-from`→supporting, `relates-to`→semantic, `waits-for`→causal. Tagged `{origin: "beads"}` for traceability.
+- **Auto-sync**: Watcher detects `.beads/` directory changes → `syncBeadsIssues()` queries `bd` CLI for live Dolt data → creates markdown docs in `beads` collection
+- **Dependency bridging**: All Beads dependency types map to `memory_relations` edges — `blocks`/`conditional-blocks`/`waits-for`/`caused-by`→causal, `discovered-from`/`supersedes`/`duplicates`→supporting, `relates-to`/`related`/`parent-child`→semantic. Tagged `{origin: "beads"}` for traceability.
 - **A-MEM enrichment**: New beads docs get full `postIndexEnrich()` — memory note construction, semantic/entity link generation, memory evolution
 - **Graph traversal**: `intent_search` and `find_causal_links` traverse beads dependency edges alongside observation-inferred causal chains
+- **Requirement**: `bd` binary on PATH or at `~/go/bin/bd`
 
 `beads_sync` MCP tool for manual sync; watcher handles routine operations automatically.
 
@@ -594,8 +595,8 @@ For agent systems using ClawMem as their memory backend, this 5-layer structure 
 └── ...                              # Behavioral docs, configs, etc.
 
 ~/Projects/<project>/               ← Collection: "<project>"
-├── .beads/                          # Beads issue tracker (auto-synced to memory graph)
-│   └── beads.jsonl
+├── .beads/                          # Beads issue tracker (Dolt backend, auto-synced to memory graph)
+│   └── dolt/                        # Dolt SQL database (source of truth)
 ├── MEMORY.md                        # Layer 3: Project long-term (human-curated)
 ├── memory/                          # Layer 4: Project daily (session logs)
 │   └── 2026-02-06.md
@@ -669,7 +670,7 @@ Built on the shoulders of:
 - [claude-mem](https://github.com/thedotmack/claude-mem) — Claude Code memory integration reference
 - [A-MEM](https://arxiv.org/abs/2510.02178) — self-evolving memory architecture
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
-- [Beads](https://github.com/steveyegge/beads) — git-backed issue tracker for AI agents
+- [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
 
 ## License
 

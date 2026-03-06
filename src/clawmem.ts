@@ -960,11 +960,12 @@ async function cmdWatch() {
       const relativePath = fullPath.slice(col.path.length + 1);
       console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
 
-      // Beads JSONL: trigger sync instead of regular index
-      if (fullPath.endsWith(".jsonl") && fullPath.includes(".beads/")) {
-        const beadsPath = detectBeadsProject(fullPath.replace(/\/\.beads\/.*$/, ""));
-        if (beadsPath) {
-          const result = await s.syncBeadsIssues(beadsPath);
+      // Beads: trigger sync on any change within .beads/ directory
+      // Dolt backend writes to .beads/dolt/ — watch for any file change there
+      if (fullPath.includes(".beads/")) {
+        const projectDir = detectBeadsProject(fullPath.replace(/\/\.beads\/.*$/, ""));
+        if (projectDir) {
+          const result = await s.syncBeadsIssues(projectDir);
           console.log(`  beads: +${result.created} ~${result.synced}`);
         }
         return;
