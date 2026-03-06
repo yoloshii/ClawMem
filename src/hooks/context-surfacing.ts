@@ -68,12 +68,16 @@ export async function contextSurfacing(
   const isRecency = hasRecencyIntent(prompt);
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : MIN_COMPOSITE_SCORE;
 
-  // Search: try vector first, fall back to BM25
+  // Search: try vector first with 900ms sub-timeout (IO6 safety), fall back to BM25
   let results: SearchResult[] = [];
   try {
-    results = await store.searchVec(prompt, DEFAULT_EMBED_MODEL, MAX_RESULTS);
+    const vectorPromise = store.searchVec(prompt, DEFAULT_EMBED_MODEL, MAX_RESULTS);
+    const timeoutPromise = new Promise<SearchResult[]>((_, reject) =>
+      setTimeout(() => reject(new Error("vector timeout")), 900)
+    );
+    results = await Promise.race([vectorPromise, timeoutPromise]);
   } catch {
-    // Vector search unavailable (no embeddings), fall back to BM25
+    // Vector search unavailable, timed out, or errored — fall back to BM25
   }
 
   if (results.length === 0) {
@@ -86,6 +90,17 @@ export async function contextSurfacing(
   results = results.filter(r =>
     !FILTERED_PATHS.some(p => r.displayPath.includes(p))
   );
+
+  if (results.length === 0) return makeEmptyOutput("context-surfacing");
+
+  // Filter out snoozed documents
+  const now = new Date();
+  results = results.filter(r => {
+    const doc = store.findActiveDocument(r.collectionName, r.filepath);
+    if (!doc) return true;
+    if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
+    return true;
+  });
 
   if (results.length === 0) return makeEmptyOutput("context-surfacing");
 

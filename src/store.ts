@@ -343,6 +343,9 @@ function initializeDatabase(db: Database): void {
     ["confidence", "ALTER TABLE documents ADD COLUMN confidence REAL NOT NULL DEFAULT 0.5"],
     ["access_count", "ALTER TABLE documents ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"],
     ["content_hash", "ALTER TABLE documents ADD COLUMN content_hash TEXT"],
+    ["quality_score", "ALTER TABLE documents ADD COLUMN quality_score REAL NOT NULL DEFAULT 0.5"],
+    ["pinned", "ALTER TABLE documents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"],
+    ["snoozed_until", "ALTER TABLE documents ADD COLUMN snoozed_until TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -685,7 +688,7 @@ export type Store = {
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
+  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
   reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
@@ -714,10 +717,12 @@ export type Store = {
   markUsageReferenced: (id: number) => void;
 
   // SAME: Document metadata operations
-  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number }) => void;
+  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }) => void;
   incrementAccessCount: (paths: string[]) => void;
   getDocumentsByType: (contentType: string, limit?: number) => DocumentRow[];
   getStaleDocuments: (beforeDate: string) => DocumentRow[];
+  pinDocument: (collection: string, path: string, pinned: boolean) => void;
+  snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
   // Beads integration
   syncBeadsIssues: (beadsJsonlPath: string) => Promise<{ synced: number; created: number; newDocIds: number[] }>;
@@ -745,10 +750,22 @@ export type Store = {
  * @param dbPath - Path to the SQLite database file
  * @returns Store instance with all methods bound to the database
  */
-export function createStore(dbPath?: string): Store {
+export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTimeout?: number }): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
-  const db = new Database(resolvedPath);
-  initializeDatabase(db);
+  const db = opts?.readonly
+    ? new Database(resolvedPath, { readonly: true })
+    : new Database(resolvedPath);
+  if (!opts?.readonly) {
+    initializeDatabase(db);
+  } else {
+    // Readonly: load sqlite-vec extension and set WAL mode pragma only
+    sqliteVec.load(db);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA query_only = ON");
+  }
+  if (opts?.busyTimeout !== undefined) {
+    db.exec(`PRAGMA busy_timeout = ${opts.busyTimeout}`);
+  }
 
   return {
     db,
@@ -842,6 +859,8 @@ export function createStore(dbPath?: string): Store {
     incrementAccessCount: (paths: string[]) => incrementAccessCountFn(db, paths),
     getDocumentsByType: (contentType: string, limit?: number) => getDocumentsByTypeFn(db, contentType, limit),
     getStaleDocuments: (beforeDate: string) => getStaleDocumentsFn(db, beforeDate),
+    pinDocument: (collection: string, path: string, pinned: boolean) => pinDocumentFn(db, collection, path, pinned),
+    snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
 
     // Beads integration
     syncBeadsIssues: (beadsJsonlPath: string) => syncBeadsIssues(db, beadsJsonlPath),
@@ -1269,11 +1288,11 @@ export function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
-): { id: number; hash: string; title: string } | null {
+): { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null {
   return db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, pinned, snoozed_until, confidence FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | null;
+  `).get(collectionName, path) as { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
 }
 
 /**
@@ -2873,7 +2892,7 @@ function markUsageReferencedFn(db: Database, id: number): void {
 // SAME: Document Metadata Operations
 // =============================================================================
 
-function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number }): void {
+function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }): void {
   const sets: string[] = [];
   const vals: (string | number | null)[] = [];
   if (meta.domain !== undefined) { sets.push("domain = ?"); vals.push(meta.domain); }
@@ -2882,9 +2901,22 @@ function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: stri
   if (meta.content_type !== undefined) { sets.push("content_type = ?"); vals.push(meta.content_type); }
   if (meta.review_by !== undefined) { sets.push("review_by = ?"); vals.push(meta.review_by); }
   if (meta.confidence !== undefined) { sets.push("confidence = ?"); vals.push(meta.confidence); }
+  if (meta.quality_score !== undefined) { sets.push("quality_score = ?"); vals.push(meta.quality_score); }
   if (sets.length === 0) return;
   vals.push(docId);
   db.prepare(`UPDATE documents SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+}
+
+function pinDocumentFn(db: Database, collection: string, path: string, pinned: boolean): void {
+  db.prepare(
+    "UPDATE documents SET pinned = ? WHERE collection = ? AND path = ? AND active = 1"
+  ).run(pinned ? 1 : 0, collection, path);
+}
+
+function snoozeDocumentFn(db: Database, collection: string, path: string, until: string | null): void {
+  db.prepare(
+    "UPDATE documents SET snoozed_until = ? WHERE collection = ? AND path = ? AND active = 1"
+  ).run(until, collection, path);
 }
 
 function incrementAccessCountFn(db: Database, paths: string[]): void {

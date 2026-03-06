@@ -27,7 +27,7 @@ const EMPTY_NOTE: MemoryNote = {
  * - Leading/trailing prose around JSON
  * - Truncated JSON from token limits (repairs arrays/objects)
  */
-function extractJsonFromLLM(raw: string): any | null {
+export function extractJsonFromLLM(raw: string): any | null {
   let text = raw.trim();
 
   // Strip markdown code blocks

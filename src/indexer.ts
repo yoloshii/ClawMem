@@ -112,6 +112,44 @@ export function parseDocument(content: string, relativePath: string): { body: st
 }
 
 // =============================================================================
+// Quality Scoring
+// =============================================================================
+
+export function computeQualityScore(body: string, meta: DocumentMeta): number {
+  let score = 0.3; // Base
+
+  // Length signals
+  if (body.length > 200) score += 0.1;
+  if (body.length > 500) score += 0.1;
+
+  // Structure signals
+  if (/^##\s+/m.test(body)) score += 0.1;
+  if (/^[-*]\s+/m.test(body)) score += 0.05;
+
+  // Decision/commitment keywords
+  if (/\b(decided?\s+to|chose|will\s+use|switching\s+to|going\s+with|selected|adopted)\b/i.test(body)) {
+    score += 0.15;
+  }
+
+  // Correction keywords
+  if (/\b(fix(ed)?|bug|resolved|corrected|patched|root\s+cause)\b/i.test(body)) {
+    score += 0.1;
+  }
+
+  // Frontmatter richness: +0.05 per populated field, max +0.15
+  let metaBonus = 0;
+  if (meta.tags && meta.tags.length > 0) metaBonus += 0.05;
+  if (meta.domain) metaBonus += 0.05;
+  if (meta.workstream) metaBonus += 0.05;
+  score += Math.min(0.15, metaBonus);
+
+  // Penalty for trivial stubs
+  if (body.length < 50) score -= 0.1;
+
+  return Math.max(0, Math.min(1.0, score));
+}
+
+// =============================================================================
 // Collection Indexing
 // =============================================================================
 
@@ -199,6 +237,7 @@ export async function indexCollection(
         content_type: contentType,
         review_by: meta.review_by,
         confidence: confidenceScore(contentType, mtime, 0),
+        quality_score: computeQualityScore(body, meta),
       });
 
       // Update content_hash for next incremental check
@@ -232,6 +271,7 @@ export async function indexCollection(
           content_type: contentType,
           review_by: meta.review_by,
           confidence: confidenceScore(contentType, mtime, 0),
+          quality_score: computeQualityScore(body, meta),
         });
         await store.postIndexEnrich(llm, inactive.id, false);
       } else {
@@ -246,6 +286,7 @@ export async function indexCollection(
             content_type: contentType,
             review_by: meta.review_by,
             confidence: confidenceScore(contentType, mtime, 0),
+            quality_score: computeQualityScore(body, meta),
           });
           store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, newDoc.id);
           await store.postIndexEnrich(llm, newDoc.id, true);

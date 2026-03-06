@@ -1223,6 +1223,68 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: memory_pin
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "memory_pin",
+    {
+      title: "Pin/Unpin Memory",
+      description: "Pin a memory so it's always prioritized in context surfacing, or unpin it. Pinned docs get a +0.3 composite score boost.",
+      inputSchema: {
+        query: z.string().describe("Search query to find the memory to pin/unpin"),
+        unpin: z.boolean().optional().default(false).describe("Set true to unpin"),
+      },
+    },
+    async ({ query, unpin }) => {
+      const results = store.searchFTS(query, 3);
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
+      }
+      const r = results[0]!;
+      const doc = store.findActiveDocument(r.collectionName, r.filepath);
+      if (!doc) {
+        return { content: [{ type: "text", text: "Document not found." }], isError: true };
+      }
+      store.pinDocument(r.collectionName, r.filepath, !unpin);
+      const action = unpin ? "Unpinned" : "Pinned";
+      return { content: [{ type: "text", text: `${action}: ${r.displayPath} (${r.title})` }] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: memory_snooze
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "memory_snooze",
+    {
+      title: "Snooze Memory",
+      description: "Temporarily hide a memory from context surfacing until a given date, or unsnooze it.",
+      inputSchema: {
+        query: z.string().describe("Search query to find the memory to snooze"),
+        until: z.string().optional().describe("ISO date to snooze until (e.g. 2026-03-01). Omit to unsnooze."),
+      },
+    },
+    async ({ query, until }) => {
+      const results = store.searchFTS(query, 3);
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
+      }
+      const r = results[0]!;
+      const doc = store.findActiveDocument(r.collectionName, r.filepath);
+      if (!doc) {
+        return { content: [{ type: "text", text: "Document not found." }], isError: true };
+      }
+      store.snoozeDocument(r.collectionName, r.filepath, until || null);
+      const msg = until
+        ? `Snoozed until ${until}: ${r.displayPath}`
+        : `Unsnoozed: ${r.displayPath}`;
+      return { content: [{ type: "text", text: msg }] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Connect
   // ---------------------------------------------------------------------------
 
