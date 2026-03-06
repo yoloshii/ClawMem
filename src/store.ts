@@ -165,9 +165,12 @@ export function normalizeVirtualPath(input: string): string {
   // Handle clawmem:// with extra slashes: clawmem:////collection/path -> clawmem://collection/path
   if (path.startsWith('clawmem:')) {
     // Remove clawmem: prefix and normalize slashes
-    path = path.slice(4);
+    // "clawmem:".length === 8
+    path = path.slice(8);
     // Remove leading slashes and re-add exactly two
     path = path.replace(/^\/+/, '');
+    // Collapse any internal multiple slashes to single
+    path = path.replace(/\/\/+/g, '/');
     return `clawmem://${path}`;
   }
 
@@ -2029,6 +2032,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
+      d.modified_at,
       bm25(documents_fts, 10.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
@@ -2049,7 +2053,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; modified_at: string; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (lower is better) into a stable (0..1] score where higher is better.
@@ -2062,7 +2066,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       hash: row.hash,
       docid: getDocid(row.hash),
       collectionName,
-      modifiedAt: "",  // Not available in FTS query
+      modifiedAt: row.modified_at || "",
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
@@ -2113,6 +2117,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'clawmem://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
+      d.modified_at,
       content.doc as body
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
@@ -2128,7 +2133,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; body: string; modified_at: string;
     fragment_type: string | null; fragment_label: string | null;
   }[];
 
@@ -2154,7 +2159,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         hash: row.hash,
         docid: getDocid(row.hash),
         collectionName,
-        modifiedAt: "",  // Not available in vec query
+        modifiedAt: row.modified_at || "",
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
