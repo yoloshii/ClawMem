@@ -207,7 +207,8 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `memory_forget(query)` — deactivate a memory by closest match.
 - `memory_pin(query, unpin?)` — pin a memory for +0.3 composite boost in context surfacing, or unpin it.
 - `memory_snooze(query, until?)` — temporarily hide a memory from context surfacing until a date, or unsnooze.
-- `beads_sync(project_path?)` — import `.beads/beads.jsonl` into memory. Bridges deps into `memory_relations`, runs A-MEM enrichment on new docs. Usually automatic via watcher.
+- `build_graphs(temporal?, semantic?)` — build temporal backbone + semantic graph after bulk ingestion. Not needed after routine indexing (A-MEM handles per-doc links).
+- `beads_sync(project_path?)` — import `.beads/beads.jsonl` into memory. Usually automatic via watcher.
 
 ### Memory Lifecycle
 
@@ -229,6 +230,7 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 - Do NOT run `status` routinely. Only when retrieval feels broken or after large ingestion.
 - Do NOT pin everything — pin is for persistent high-priority items, not temporary boosting.
 - Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it naturally.
+- Do NOT run `build_graphs` after every reindex — A-MEM creates per-doc links automatically. Only after bulk ingestion or when `intent_search` returns weak graph results.
 
 ## Tool Selection (one-liner)
 
