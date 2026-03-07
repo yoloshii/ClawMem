@@ -39,6 +39,9 @@ export function startWatcher(
           }
         }, debounceMs));
       });
+      watcher.on("error", (err) => {
+        onError?.(err instanceof Error ? err : new Error(String(err)));
+      });
       watchers.push(watcher);
     } catch (err) {
       onError?.(err instanceof Error ? err : new Error(`Failed to watch ${dir}: ${err}`));
