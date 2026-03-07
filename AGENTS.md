@@ -151,7 +151,7 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
 | `session-bootstrap` | SessionStart | 2000 tokens | profile + latest handoff + recent decisions + stale notes |
-| `context-surfacing` | UserPromptSubmit | 800 tokens | hybrid search (900ms vector timeout) → snooze filter → `<vault-context>` injection |
+| `context-surfacing` | UserPromptSubmit | 800 tokens | retrieval gate → hybrid search (vector + FTS supplement, 900ms timeout) → snooze filter → noise filter → `<vault-context>` injection |
 | `staleness-check` | SessionStart | 250 tokens | flags notes not modified in 30+ days |
 | `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/observations/`, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/handoffs/` |
@@ -245,6 +245,7 @@ compositeScore = (0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenc
 ```
 
 Where `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
+Length normalization: `1/(1 + 0.5 × log2(max(bodyLength/500, 1)))` — penalizes verbose entries, floor at 30%.
 Pinned documents get +0.3 additive boost (capped at 1.0).
 
 Recency intent detected ("latest", "recent", "last session"):
@@ -260,6 +261,9 @@ compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenc
 | note | 60 days | Default |
 | progress | 45 days | Faster decay |
 | handoff | 30 days | Fast — recent matters most |
+
+Half-lives extend up to 3× for frequently-accessed memories (access reinforcement decays over 90 days).
+Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research are exempt.
 
 ## Indexing & Graph Building
 
@@ -330,6 +334,7 @@ User Query → Intent Classification (heuristic, LLM fallback if confidence < 0.
   → Cross-Encoder Reranking (4000 char context per doc)
   → Position-Aware Blending (α=0.75 top3, 0.60 mid, 0.40 tail)
   → SAME Composite Scoring
+  → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted, not removed)
 ```
 
 ### `intent_search` (specialist for causal chains)
@@ -351,6 +356,7 @@ User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
 | Query expansion | Yes | No |
 | Rerank context | 4000 chars/doc | 200 chars/doc |
 | Graph traversal | No | Yes (WHY/ENTITY, multi-hop) |
+| MMR diversity | Yes (`diverse=true` default) | No |
 | `compact` param | Yes | No |
 | `collection` filter | Yes | No |
 | Best for | Most queries, progressive disclosure | Causal chains spanning multiple docs |

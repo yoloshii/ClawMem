@@ -58,7 +58,8 @@ Claude Code Session
 │  compositeScore = (w.search × searchScore                │
 │                 + w.recency × recencyDecay               │
 │                 + w.confidence × confidence)              │
-│                 × qualityMultiplier + pinBoost            │
+│                 × qualityMultiplier × lengthNorm          │
+│                 + pinBoost                                │
 └───────────────────────────┬─────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────┐
@@ -361,7 +362,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `search` | BM25 keyword search with composite scoring + compact mode |
 | `vsearch` | Vector semantic search with composite scoring + compact mode |
-| `query` | Full hybrid pipeline with composite scoring + compact mode |
+| `query` | Full hybrid pipeline with composite scoring + MMR diversity + compact mode |
 | `get` | Retrieve single document by path or docid |
 | `multi_get` | Retrieve multiple docs by glob or comma-separated list |
 | `find_similar` | Find notes similar to a reference document |
@@ -426,7 +427,8 @@ User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
   → Intent-Weighted RRF (boost BM25 for WHEN, boost vector for WHY)
   → Graph Expansion (WHY/ENTITY: adaptive beam search over multi-graph)
   → Cross-Encoder Reranking (0.6B GGUF)
-  → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier + pinBoost)
+  → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier × lengthNorm + pinBoost)
+  → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted)
   → Ranked Results
 ```
 
@@ -459,9 +461,11 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 | `progress` | 45 days | 0.50 | |
 | `note` | 60 days | 0.50 | Default |
 
-Content types are inferred from frontmatter or file path patterns.
+Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, note, project) lose 5% confidence per week without access (attention decay). Decision/hub/research are exempt.
 
 **Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision/correction keywords, and frontmatter richness. Applied as `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
+
+**Length normalization:** `1/(1 + 0.5 × log2(max(bodyLength/500, 1)))` — penalizes verbose entries that dominate via keyword density. Floor at 30% of original score.
 
 **Pin boost:** Pinned documents get +0.3 additive boost (capped at 1.0). Use `memory_pin` to pin critical memories.
 
