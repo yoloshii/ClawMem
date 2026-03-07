@@ -675,6 +675,7 @@ Built on the shoulders of:
 - [A-MEM](https://arxiv.org/abs/2510.02178) — self-evolving memory architecture
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
+- [memory-lancedb-pro](https://github.com/cyanheads/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
 
 ## License
 
