@@ -91,6 +91,67 @@ ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 ./bin/clawmem status    # Quick index status
 ```
 
+### Background Services (systemd user units)
+
+The watcher and embed timer keep the vault fresh automatically. Create these after setup:
+
+```bash
+# Create systemd user directory
+mkdir -p ~/.config/systemd/user
+
+# clawmem-watcher.service — auto-indexes on .md changes
+cat > ~/.config/systemd/user/clawmem-watcher.service << 'EOF'
+[Unit]
+Description=ClawMem file watcher — auto-indexes on .md changes
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/clawmem/bin/clawmem watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+# clawmem-embed.service — oneshot embedding sweep
+cat > ~/.config/systemd/user/clawmem-embed.service << 'EOF'
+[Unit]
+Description=ClawMem embedding sweep
+
+[Service]
+Type=oneshot
+ExecStart=%h/clawmem/bin/clawmem embed
+EOF
+
+# clawmem-embed.timer — daily at 04:00
+cat > ~/.config/systemd/user/clawmem-embed.timer << 'EOF'
+[Unit]
+Description=ClawMem daily embedding sweep
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now clawmem-watcher.service clawmem-embed.timer
+
+# Persist across reboots (start without login)
+loginctl enable-linger $(whoami)
+
+# Verify
+systemctl --user status clawmem-watcher.service clawmem-embed.timer
+```
+
+**Note:** The service files use `%h` (home directory specifier). If clawmem is installed elsewhere, update `ExecStart` paths. For remote GPU setups, add `Environment=CLAWMEM_EMBED_URL=http://host:8088` etc. to both service files (the `bin/clawmem` wrapper sets defaults).
+
 ---
 
 ## OpenClaw Integration: Memory System Configuration
