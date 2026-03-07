@@ -26,6 +26,7 @@ import {
 } from "../memory.ts";
 import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
+import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
 
 // =============================================================================
@@ -59,6 +60,9 @@ export async function contextSurfacing(
   // Skip slash commands
   if (prompt.startsWith("/")) return makeEmptyOutput("context-surfacing");
 
+  // Adaptive retrieval gate: skip greetings, shell commands, affirmations, etc.
+  if (shouldSkipRetrieval(prompt)) return makeEmptyOutput("context-surfacing");
+
   // Heartbeat / duplicate suppression (IO4)
   if (isHeartbeatPrompt(prompt)) return makeEmptyOutput("context-surfacing");
   if (wasPromptSeenRecently(store, "context-surfacing", prompt)) {
@@ -69,6 +73,7 @@ export async function contextSurfacing(
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : MIN_COMPOSITE_SCORE;
 
   // Search: try vector first with 900ms sub-timeout (IO6 safety), fall back to BM25
+  // When vector succeeds, also supplement with FTS for keyword-exact recall
   let results: SearchResult[] = [];
   try {
     const vectorPromise = store.searchVec(prompt, DEFAULT_EMBED_MODEL, MAX_RESULTS);
@@ -82,6 +87,16 @@ export async function contextSurfacing(
 
   if (results.length === 0) {
     results = store.searchFTS(prompt, MAX_RESULTS);
+  } else {
+    // Supplement vector results with FTS for keyword-exact matches (<10ms)
+    const seen = new Set(results.map(r => r.filepath));
+    const ftsSupplemental = store.searchFTS(prompt, 5);
+    for (const r of ftsSupplemental) {
+      if (!seen.has(r.filepath)) {
+        seen.add(r.filepath);
+        results.push(r);
+      }
+    }
   }
 
   if (results.length === 0) return makeEmptyOutput("context-surfacing");
@@ -96,7 +111,10 @@ export async function contextSurfacing(
   // Filter out snoozed documents
   const now = new Date();
   results = results.filter(r => {
-    const doc = store.findActiveDocument(r.collectionName, r.filepath);
+    // filepath is a virtual path (clawmem://collection/path) but findActiveDocument
+    // expects the collection-relative path, not the full virtual path
+    const parsed = r.filepath.startsWith('clawmem://') ? r.filepath.replace(/^clawmem:\/\/[^/]+\/?/, '') : r.filepath;
+    const doc = store.findActiveDocument(r.collectionName, parsed);
     if (!doc) return true;
     if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
     return true;
@@ -113,6 +131,9 @@ export async function contextSurfacing(
     }
   }
   results = [...deduped.values()];
+
+  // Filter out noise results (agent denials, too-short snippets) before enrichment
+  results = results.filter(r => !r.body || !isRetrievedNoise(r.body));
 
   // Enrich with SAME metadata
   const enriched = enrichResults(store, results, prompt);

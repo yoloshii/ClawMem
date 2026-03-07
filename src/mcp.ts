@@ -27,6 +27,7 @@ import {
   type EnrichedResult,
 } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from "./search-utils.ts";
+import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
 import { classifyIntent, type IntentType } from "./intent.ts";
@@ -309,9 +310,10 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         minScore: z.number().optional().default(0),
         collection: z.string().optional().describe("Filter to collection"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        diverse: z.boolean().optional().default(true).describe("Apply MMR diversity filter to reduce near-duplicate results"),
       },
     },
-    async ({ query, limit, minScore, collection, compact }) => {
+    async ({ query, limit, minScore, collection, compact, diverse }) => {
       const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
       const rankedLists: RankedResult[][] = [];
       const docidMap = new Map<string, string>();
@@ -367,9 +369,10 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         .filter((r): r is SearchResult => r !== null);
 
       const enriched = enrichResults(store, searchResults, query);
-      const scored = applyCompositeScoring(enriched, query)
-        .filter(r => r.compositeScore >= (minScore || 0))
-        .slice(0, limit || 10);
+      let scored = applyCompositeScoring(enriched, query)
+        .filter(r => r.compositeScore >= (minScore || 0));
+      if (diverse !== false) scored = applyMMRDiversity(scored);
+      scored = scored.slice(0, limit || 10);
 
       if (compact) {
         const items = scored.map(r => ({
@@ -996,7 +999,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         }
       }
 
-      // Step 5: Rerank top 30
+      // Step 5: Rerank top 30 and blend scores (same pattern as query tool)
       const toRerank = expanded.slice(0, 30);
       const rerankDocs = toRerank.map(r => ({
         file: r.filepath,
@@ -1005,11 +1008,18 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
 
       const reranked = await store.rerank(query, rerankDocs);
 
+      // Blend original + rerank scores (position-aware like query tool)
+      const blendedResults = toRerank.map((r, i) => {
+        const rerankScore = reranked[i]?.score || 0;
+        const rank = i + 1;
+        const origWeight = rank <= 3 ? 0.75 : rank <= 10 ? 0.60 : 0.40;
+        const blended = origWeight * r.score + (1 - origWeight) * rerankScore;
+        return { ...r, score: blended };
+      });
+      blendedResults.sort((a, b) => b.score - a.score);
+
       // Step 6: Composite scoring
-      const enriched = enrichResults(store, toRerank.map((r, i) => ({
-        ...r,
-        rerankScore: reranked[i]?.score || 0,
-      })), query);
+      const enriched = enrichResults(store, blendedResults, query);
 
       const scored = applyCompositeScoring(enriched, query);
 

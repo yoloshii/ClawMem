@@ -493,6 +493,9 @@ function initializeDatabase(db: Database): void {
     ["concepts", "ALTER TABLE documents ADD COLUMN concepts TEXT"],
     ["files_read", "ALTER TABLE documents ADD COLUMN files_read TEXT"],
     ["files_modified", "ALTER TABLE documents ADD COLUMN files_modified TEXT"],
+    ["skill_name", "ALTER TABLE documents ADD COLUMN skill_name TEXT"],
+    ["obs_quality_score", "ALTER TABLE documents ADD COLUMN obs_quality_score REAL"],
+    ["failure_reason", "ALTER TABLE documents ADD COLUMN failure_reason TEXT"],
   ];
   for (const [col, sql] of obsMigrations) {
     if (!colNames.has(col)) {
@@ -2346,55 +2349,6 @@ export async function rerank(query: string, documents: { file: string; text: str
 }
 
 // =============================================================================
-// Reciprocal Rank Fusion
-// =============================================================================
-
-export function reciprocalRankFusion(
-  resultLists: RankedResult[][],
-  weights: number[] = [],
-  k: number = 60
-): RankedResult[] {
-  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number }>();
-
-  for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
-    const list = resultLists[listIdx];
-    if (!list) continue;
-    const weight = weights[listIdx] ?? 1.0;
-
-    for (let rank = 0; rank < list.length; rank++) {
-      const result = list[rank];
-      if (!result) continue;
-      const rrfContribution = weight / (k + rank + 1);
-      const existing = scores.get(result.file);
-
-      if (existing) {
-        existing.rrfScore += rrfContribution;
-        existing.topRank = Math.min(existing.topRank, rank);
-      } else {
-        scores.set(result.file, {
-          result,
-          rrfScore: rrfContribution,
-          topRank: rank,
-        });
-      }
-    }
-  }
-
-  // Top-rank bonus
-  for (const entry of scores.values()) {
-    if (entry.topRank === 0) {
-      entry.rrfScore += 0.05;
-    } else if (entry.topRank <= 2) {
-      entry.rrfScore += 0.02;
-    }
-  }
-
-  return Array.from(scores.values())
-    .sort((a, b) => b.rrfScore - a.rrfScore)
-    .map(e => ({ ...e.result, score: e.rrfScore }));
-}
-
-// =============================================================================
 // Document retrieval
 // =============================================================================
 
@@ -2951,7 +2905,7 @@ function updateObservationFieldsFn(
   db: Database,
   docPath: string,
   collectionName: string,
-  fields: { observation_type?: string; facts?: string; narrative?: string; concepts?: string; files_read?: string; files_modified?: string }
+  fields: { observation_type?: string; facts?: string; narrative?: string; concepts?: string; files_read?: string; files_modified?: string; skill_name?: string; quality_score?: string; failure_reason?: string }
 ): void {
   const sets: string[] = [];
   const vals: (string | null)[] = [];
@@ -2961,6 +2915,9 @@ function updateObservationFieldsFn(
   if (fields.concepts !== undefined) { sets.push("concepts = ?"); vals.push(fields.concepts); }
   if (fields.files_read !== undefined) { sets.push("files_read = ?"); vals.push(fields.files_read); }
   if (fields.files_modified !== undefined) { sets.push("files_modified = ?"); vals.push(fields.files_modified); }
+  if (fields.skill_name !== undefined) { sets.push("skill_name = ?"); vals.push(fields.skill_name); }
+  if (fields.quality_score !== undefined) { sets.push("obs_quality_score = ?"); vals.push(fields.quality_score); }
+  if (fields.failure_reason !== undefined) { sets.push("failure_reason = ?"); vals.push(fields.failure_reason); }
   if (sets.length === 0) return;
   vals.push(collectionName, docPath);
   db.prepare(`UPDATE documents SET ${sets.join(", ")} WHERE collection = ? AND path = ? AND active = 1`).run(...vals);

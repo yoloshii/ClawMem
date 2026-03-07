@@ -56,12 +56,45 @@ export function inferContentType(path: string, explicitType?: string): ContentTy
 // Recency Score
 // =============================================================================
 
-export function recencyScore(modifiedAt: Date | string, contentType: string, now: Date = new Date()): number {
-  const halfLife = HALF_LIVES[contentType] ?? 60;
-  if (!isFinite(halfLife)) return 1.0;
+/**
+ * Compute effective half-life adjusted by access frequency.
+ * Frequently accessed memories decay slower (up to 3x base half-life).
+ */
+function effectiveHalfLife(
+  baseHalfLife: number,
+  accessCount: number,
+  lastAccessedAt?: Date | string | null,
+  now: Date = new Date()
+): number {
+  if (!isFinite(baseHalfLife) || accessCount <= 0) return baseHalfLife;
+
+  let freshness = 1.0;
+  if (lastAccessedAt) {
+    const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;
+    if (!isNaN(lastAccess.getTime())) {
+      const daysSinceAccess = (now.getTime() - lastAccess.getTime()) / (1000 * 60 * 60 * 24);
+      freshness = Math.max(0, 1 - daysSinceAccess / 90);
+    }
+  }
+
+  const extension = baseHalfLife * 0.3 * Math.log1p(accessCount * freshness);
+  return Math.min(baseHalfLife * 3, baseHalfLife + extension);
+}
+
+export function recencyScore(
+  modifiedAt: Date | string,
+  contentType: string,
+  now: Date = new Date(),
+  accessCount: number = 0,
+  lastAccessedAt?: Date | string | null
+): number {
+  const baseHalfLife = HALF_LIVES[contentType] ?? 60;
+  if (!isFinite(baseHalfLife)) return 1.0;
+
+  const halfLife = effectiveHalfLife(baseHalfLife, accessCount, lastAccessedAt, now);
 
   const modified = typeof modifiedAt === "string" ? new Date(modifiedAt) : modifiedAt;
-  if (isNaN(modified.getTime())) return 0.5; // Invalid date → neutral score
+  if (isNaN(modified.getTime())) return 0.5;
   const daysSince = (now.getTime() - modified.getTime()) / (1000 * 60 * 60 * 24);
   if (daysSince <= 0) return 1.0;
   const result = Math.pow(0.5, daysSince / halfLife);
@@ -76,13 +109,35 @@ export function confidenceScore(
   contentType: string,
   modifiedAt: Date | string,
   accessCount: number,
-  now: Date = new Date()
+  now: Date = new Date(),
+  lastAccessedAt?: Date | string | null
 ): number {
   const baseline = TYPE_BASELINES[contentType] ?? 0.5;
   const recency = recencyScore(modifiedAt, contentType, now);
   const safeAccess = Number.isFinite(accessCount) && accessCount >= 0 ? accessCount : 0;
   const accessBoost = Math.min(1.5, 1 + Math.log2(1 + safeAccess) * 0.1);
-  const result = Math.min(1.0, baseline * recency * accessBoost);
+
+  // Attention decay: reduce confidence if not accessed recently (5% per week)
+  // Only apply to episodic/progress content — skip for durable types (decision, hub, research)
+  // Also skip if last_accessed_at was backfilled from modified_at (no real access yet)
+  const DECAY_EXEMPT_TYPES = new Set(["decision", "hub", "research"]);
+  let attentionDecay = 1.0;
+  if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
+    const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;
+    const modified = typeof modifiedAt === "string" ? new Date(modifiedAt) : modifiedAt;
+    if (!isNaN(lastAccess.getTime())) {
+      // Skip decay if last_accessed_at == modified_at (backfilled, no real access)
+      const isBackfilled = Math.abs(lastAccess.getTime() - modified.getTime()) < 1000;
+      if (!isBackfilled) {
+        const daysSinceAccess = (now.getTime() - lastAccess.getTime()) / (1000 * 60 * 60 * 24);
+        if (daysSinceAccess > 0) {
+          attentionDecay = Math.max(0.5, Math.pow(0.95, daysSinceAccess / 7));
+        }
+      }
+    }
+  }
+
+  const result = Math.min(1.0, baseline * recency * accessBoost * attentionDecay);
   return Number.isFinite(result) ? result : 0;
 }
 
@@ -154,6 +209,7 @@ export type EnrichedResult = {
   chunkPos?: number;
   fragmentType?: string;
   fragmentLabel?: string;
+  lastAccessedAt?: string | null;
 };
 
 export type ScoredResult = EnrichedResult & {
@@ -169,14 +225,20 @@ export function applyCompositeScoring(
   const now = new Date();
 
   const scored = results.map(r => {
-    const recency = recencyScore(r.modifiedAt, r.contentType, now);
-    const conf = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now);
+    const recency = recencyScore(r.modifiedAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
+    const conf = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now, r.lastAccessedAt);
     const composite = compositeScore(r.score, recency, conf, weights);
 
     // Quality multiplier: 0.5 default → 1.0x (no effect)
     // Range: 0.0 → 0.7x penalty, 1.0 → 1.3x boost
     const qualityMultiplier = 0.7 + 0.6 * (r.qualityScore ?? 0.5);
     let adjusted = composite * qualityMultiplier;
+
+    // Length normalization: penalize verbose entries that dominate via keyword density
+    // anchor=500 chars. At anchor → 1.0x, 1000 → 0.75x, 2000 → 0.57x. Never boosts short docs.
+    const lenRatio = Math.log2(Math.max((r.bodyLength || 500) / 500, 1));
+    const lenFactor = 1 / (1 + 0.5 * lenRatio);
+    adjusted = Math.max(adjusted * 0.3, adjusted * lenFactor);
 
     // Pin boost: +0.3 additive, capped at 1.0
     if (r.pinned) {
