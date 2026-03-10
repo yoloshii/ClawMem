@@ -368,10 +368,10 @@ Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
 - Do NOT pin everything — pin is for persistent high-priority items
 - Do NOT forget memories to "clean up" — let confidence decay handle it
 
-For detailed reference → clawmem skill
+For setup, indexing, query optimization, pipeline details, troubleshooting → invoke `Skill tool with skill="clawmem"`
 ```
 
-This gives your agent the escalation logic and tool routing needed for correct ClawMem usage, with the full skill available on demand for detailed reference.
+This gives your agent the escalation logic and tool routing, with an explicit skill invocation for detailed reference on demand.
 
 ---
 

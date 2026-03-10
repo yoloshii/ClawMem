@@ -1,7 +1,7 @@
 ---
 name: clawmem
 description: |
-  On-device hybrid memory system for AI agents. Provides automatic context injection via hooks (90% of retrieval) and explicit recall via MCP tools (10%). Covers retrieval pipeline, query crafting, tool selection, composite scoring, memory lifecycle, indexing, graph traversal, and troubleshooting. Reference skill — not triggered, always available for detailed ClawMem operations guidance.
+  ClawMem agent reference — detailed operational guidance for the on-device hybrid memory system. Use when: setting up collections/indexing/embedding, troubleshooting retrieval, tuning query optimization (4 levers), understanding pipeline behavior, managing memory lifecycle (pin/snooze/forget), building graphs, or any ClawMem operation beyond basic tool routing.
 allowed-tools: "mcp__clawmem__*"
 metadata:
   author: yoloshii
