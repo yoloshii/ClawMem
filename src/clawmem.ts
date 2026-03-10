@@ -853,7 +853,8 @@ async function cmdSetupHooks(args: string[]) {
     // Install clawmem hooks
     const hookConfig: Record<string, string[]> = {
       UserPromptSubmit: ["context-surfacing"],
-      SessionStart: ["session-bootstrap", "staleness-check"],
+      SessionStart: ["session-bootstrap", "staleness-check", "postcompact-inject"],
+      PreCompact: ["precompact-extract"],
       Stop: ["decision-extractor", "handoff-generator", "feedback-loop"],
     };
 

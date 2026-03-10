@@ -67,7 +67,7 @@ curl http://host:8090/v1/models
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
 
-**Note:** The `bin/clawmem` wrapper sets all endpoint defaults (`CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` pointing to VM 200) and `CLAWMEM_NO_LOCAL_MODELS=true`. Always use the wrapper — never `bun run src/clawmem.ts` directly. The systemd watcher service has the same env vars via its `10-gpu-env.conf` drop-in.
+**Note:** The `bin/clawmem` wrapper sets all endpoint defaults and `CLAWMEM_NO_LOCAL_MODELS=true`. Always use the wrapper — never `bun run src/clawmem.ts` directly. For remote GPU setups, add the same env vars to the watcher service via a systemd drop-in.
 
 ## Quick Setup
 
@@ -303,6 +303,42 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 ClawMem escalation: query(compact=true) | intent_search(why/when/entity) → multi_get → search/vsearch (spot checks)
 ```
 
+## Query Optimization
+
+The pipeline autonomously generates lex/vec/hyde variants, fuses BM25 + vector via RRF, and reranks with a cross-encoder. Agents do NOT choose search types — the pipeline handles fusion internally. The optimization levers are: **tool selection**, **query string quality**, **intent**, and **candidateLimit**.
+
+### Tool Selection (highest impact)
+
+Pick the lightest tool that satisfies the need:
+
+| Tool | Cost | When |
+|------|------|------|
+| `search(q, compact=true)` | BM25 only, 0 GPU | Know exact terms, spot-check, fast keyword lookup |
+| `vsearch(q, compact=true)` | Vector only, 1 GPU call | Conceptual/fuzzy, don't know vocabulary |
+| `query(q, compact=true)` | Full hybrid, 3+ GPU calls | General recall, unsure which signal matters |
+| `intent_search(q)` | Hybrid + graph | Why/entity chains (graph traversal), when queries (BM25-biased) |
+
+Use `search` for quick keyword spot-checks. Use `query` for general recall (default Tier 3 workhorse). Use `intent_search` directly (not as fallback) when the question is causal or relational.
+
+### Query String Quality
+
+The query string feeds BM25 directly (probes first, can short-circuit the pipeline) and anchors the 2×-weighted original signal in RRF.
+
+**For keyword recall (BM25):** 2-5 precise terms, no filler. Code identifiers work. BM25 AND's all terms as prefix matches (`perf` matches "performance") — no phrase search or negation syntax. A strong hit (≥ 0.85 with gap ≥ 0.15) skips expansion — faster results.
+
+**For semantic recall (vector):** Full natural language question, be specific. `"in the payment service, how are refunds processed"` > `"refunds"`.
+
+**Do NOT write hypothetical-answer-style queries.** The expansion LLM already generates hyde variants internally. A long hypothetical dilutes BM25 scoring and duplicates what the pipeline does autonomously.
+
+### Intent Parameter
+
+Steers 5 autonomous stages: expansion, reranking, chunk selection, snippet extraction, and strong-signal bypass (disabled when intent is provided).
+
+Use when: query term has multiple meanings in the vault, domain is known but query alone is ambiguous.
+Do NOT use when: query is already specific, single-domain vault, using `search`/`vsearch` (intent only affects `query`).
+
+Note: intent disables BM25 strong-signal bypass, forcing full expansion+reranking. Correct behavior — intent means the query is ambiguous, so keyword confidence alone is insufficient.
+
 ## Composite Scoring (automatic, applied to all search tools)
 
 ```
@@ -393,8 +429,9 @@ The `memory_relations` table is populated by multiple independent sources:
 ```
 User Query + optional intent hint
   → BM25 Probe → Strong Signal Check (skip expansion if top hit ≥ 0.85 with gap ≥ 0.15; disabled when intent provided)
-  → Query Expansion (LLM generates hyde/lex/vec variants; intent steers expansion prompt)
-  → Parallel: BM25(original, 2×) + Vector(original, 2×) + BM25(expanded, 1×) + Vector(expanded, 1×)
+  → Query Expansion (LLM generates text variants; intent steers expansion prompt)
+  → Parallel: BM25(original) + Vector(original) + BM25(each expanded) + Vector(each expanded)
+  → Original query lists get positional 2× weight in RRF; expanded get 1×
   → Reciprocal Rank Fusion (k=60, top candidateLimit)
   → Intent-Aware Chunk Selection (intent terms at 0.5× weight alongside query terms at 1.0×)
   → Cross-Encoder Reranking (4000 char context; intent prepended to rerank query; chunk dedup; batch cap=4)
@@ -408,11 +445,12 @@ User Query + optional intent hint
 ```
 User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
   → BM25 + Vector (intent-weighted RRF: boost BM25 for WHEN, vector for WHY)
-  → Graph Traversal (multi-hop beam search over memory_relations)
+  → Graph Traversal (WHY/ENTITY only; multi-hop beam search over memory_relations)
       Outbound: all edge types (semantic, supporting, contradicts, causal, temporal)
       Inbound: semantic and entity only
-  → Cross-Encoder Reranking (200 char context per doc)
-  → SAME Composite Scoring
+      Scores normalized to [0,1] before merge with search results
+  → Cross-Encoder Reranking (200 char context per doc; file-keyed score join)
+  → SAME Composite Scoring (uses stored confidence from contradiction detection + feedback)
 ```
 
 ### Key Differences

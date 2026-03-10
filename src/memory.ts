@@ -226,7 +226,11 @@ export function applyCompositeScoring(
 
   const scored = results.map(r => {
     const recency = recencyScore(r.modifiedAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
-    const conf = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now, r.lastAccessedAt);
+    const computed = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now, r.lastAccessedAt);
+    // Blend stored confidence (from contradiction lowering, feedback boosts) with computed.
+    // Default stored=0.5 → 100% computed. Stored deviations shift the result proportionally.
+    const storedConf = r.confidence ?? 0.5;
+    const conf = storedConf === 0.5 ? computed : Math.min(1.0, computed * (storedConf / 0.5) * 0.5 + computed * 0.5);
     const composite = compositeScore(r.score, recency, conf, weights);
 
     // Quality multiplier: 0.5 default → 1.0x (no effect)

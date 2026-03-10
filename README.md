@@ -277,7 +277,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 20 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
+ClawMem exposes 22 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
 
 **Claude Code (automatic):**
 
@@ -302,7 +302,7 @@ Add to your MCP config (e.g. `~/.claude.json`, `claude_desktop_config.json`, or 
 
 The server runs via stdio — no network port needed. The `bin/clawmem` wrapper sets the GPU endpoint env vars automatically.
 
-**Verify:** After registering, your client should see 20 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
+**Verify:** After registering, your client should see 22 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
 
 ### Verify Installation
 
@@ -311,6 +311,69 @@ The server runs via stdio — no network port needed. The `bin/clawmem` wrapper 
 ./bin/clawmem status   # Quick index status
 bun test               # Run test suite (103 tests)
 ```
+
+## Agent Instructions
+
+ClawMem ships three instruction files that give AI agents the operational context to use it correctly:
+
+| File | Loaded | Purpose |
+|------|--------|---------|
+| `CLAUDE.md` | Automatically (Claude Code, when working in this repo) | Complete operational reference — hooks, tools, query optimization, scoring, pipeline details, troubleshooting |
+| `AGENTS.md` | Framework-dependent | Identical to CLAUDE.md — cross-framework compatibility (Cursor, Windsurf, Codex, etc.) |
+| `SKILL.md` | On-demand via Claude Code skill system | Same reference as CLAUDE.md, available across all projects |
+
+**Working in the ClawMem repo:** No action needed — `CLAUDE.md` loads automatically.
+
+**Using ClawMem from other projects:** Your agent needs instructions on how to use ClawMem's hooks and MCP tools. Two options:
+
+### Option A: Copy instructions into your project
+
+Copy the contents of `CLAUDE.md` (or the relevant sections) into your project's own `CLAUDE.md` or `AGENTS.md`. Simple but requires manual updates when ClawMem changes.
+
+### Option B: Install as a skill (recommended)
+
+Symlink ClawMem into Claude Code's skill directory for on-demand reference across all projects:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -sf ~/clawmem ~/.claude/skills/clawmem
+```
+
+Then add this minimal trigger block to your global `~/.claude/CLAUDE.md`:
+
+```markdown
+## ClawMem
+
+Architecture: hooks (automatic, ~90%) + MCP tools (explicit, ~10%).
+
+Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
+
+### Escalation Gate (3 rules — ONLY escalate to MCP tools when one fires)
+
+1. **Low-specificity injection** — `<vault-context>` is empty or lacks the specific fact needed
+2. **Cross-session question** — "why did we decide X", "what changed since last time"
+3. **Pre-irreversible check** — before destructive or hard-to-reverse changes
+
+### Tool Routing (once escalated)
+
+- General recall → `query(query, compact=true)`
+- Why/entity/when → `intent_search(query)`
+- Spot check → `search(query, compact=true)` or `vsearch(query, compact=true)`
+- Full content → `multi_get("path1,path2")`
+
+### Anti-Patterns
+
+- Do NOT call query/intent_search every turn — 3 rules above are the only gates
+- Do NOT re-search what's already in `<vault-context>`
+- Do NOT pin everything — pin is for persistent high-priority items
+- Do NOT forget memories to "clean up" — let confidence decay handle it
+
+For detailed reference → clawmem skill
+```
+
+This gives your agent the escalation logic and tool routing needed for correct ClawMem usage, with the full skill available on demand for detailed reference.
+
+---
 
 ## CLI Reference
 
@@ -348,7 +411,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (20)
+## MCP Tools (22)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
@@ -401,6 +464,9 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `index_stats` | Detailed stats: types, staleness, access counts, sessions |
 | `session_log` | Recent sessions with handoff info |
 | `profile` | Current static + dynamic user profile |
+| `lifecycle_status` | Show stale and archived content |
+| `lifecycle_sweep` | Archive stale content past retention threshold |
+| `lifecycle_restore` | Restore previously archived content |
 
 ### Compact Mode
 
@@ -419,6 +485,8 @@ Six hooks auto-installed by `clawmem setup hooks`:
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones |
 
+Hooks handle ~90% of retrieval automatically. For agent escalation logic (when to use MCP tools vs rely on hooks), see `CLAUDE.md`.
+
 ## Search Pipeline
 
 ```
@@ -434,6 +502,8 @@ User Query + optional intent hint
   → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted)
   → Ranked Results
 ```
+
+For agent-facing query optimization (tool selection, query string quality, intent parameter, candidateLimit), see `CLAUDE.md`.
 
 ### Multi-Graph Traversal
 

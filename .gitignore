@@ -3,11 +3,12 @@ node_modules/
 *.sqlite-wal
 *.sqlite-shm
 
-# All documentation except README.md and CLAUDE.md
+# All documentation except shipped .md files
 *.md
 !README.md
 !CLAUDE.md
 !AGENTS.md
+!SKILL.md
 
 # Internal dev artifacts
 .ralph/

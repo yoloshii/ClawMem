@@ -217,19 +217,26 @@ export function mergeTraversalResults(
     merged.set(r.hash, r.score);
   }
 
+  // Normalize traversal scores to [0, 1] before merging (traversal uses exp() which is unbounded)
+  const maxTraversalScore = traversedNodes.length > 0
+    ? Math.max(...traversedNodes.map(n => n.score))
+    : 1;
+  const normalizer = maxTraversalScore > 0 ? 1 / maxTraversalScore : 1;
+
   // Merge traversed nodes (boost scores slightly for multi-hop discoveries)
   for (const node of traversedNodes) {
     // Get hash from doc ID
     const doc = db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(node.docId) as { hash: string } | undefined;
     if (!doc) continue;
 
+    const normalizedScore = node.score * normalizer;
     const existing = merged.get(doc.hash);
     if (existing !== undefined) {
       // Document found via both direct search and traversal - boost it
-      merged.set(doc.hash, Math.max(existing, node.score * 1.1));
+      merged.set(doc.hash, Math.max(existing, normalizedScore * 1.1));
     } else {
       // New document discovered via traversal
-      merged.set(doc.hash, node.score * 0.8); // Slight penalty for indirect hits
+      merged.set(doc.hash, normalizedScore * 0.8); // Slight penalty for indirect hits
     }
   }
 

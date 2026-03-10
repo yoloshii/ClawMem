@@ -1035,12 +1035,34 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
             traversed
           );
 
-          // Convert back to SearchResult format
+          // Convert back to SearchResult format — hydrate graph-discovered nodes from DB
           expanded = merged.map(m => {
             const original = fused.find(f => f.hash === m.hash);
-            return original
-              ? { ...original, score: m.score }
-              : { ...fused[0]!, hash: m.hash, score: m.score };
+            if (original) return { ...original, score: m.score };
+            // Graph-discovered node not in original fused results — hydrate from DB
+            const doc = store.db.prepare(`
+              SELECT d.collection, d.path, d.title, d.hash, c.body,
+                     col.name as collection_name, d.modified_at
+              FROM documents d
+              LEFT JOIN content c ON c.hash = d.hash
+              LEFT JOIN collections col ON col.id = d.collection
+              WHERE d.hash = ? AND d.active = 1 LIMIT 1
+            `).get(m.hash) as { collection: number; path: string; title: string; hash: string; body: string | null; collection_name: string; modified_at: string } | undefined;
+            if (!doc) return null;
+            return {
+              filepath: doc.path,
+              displayPath: doc.path,
+              title: doc.title || doc.path.split("/").pop() || "",
+              context: null,
+              hash: doc.hash,
+              docid: doc.hash.slice(0, 6),
+              collectionName: doc.collection_name || "",
+              modifiedAt: doc.modified_at || "",
+              bodyLength: doc.body?.length || 0,
+              body: doc.body || "",
+              score: m.score,
+              source: "vec" as const,
+            } satisfies SearchResult;
           }).filter((r): r is SearchResult => r !== null);
         }
       }
@@ -1054,10 +1076,12 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
 
       const reranked = await store.rerank(query, rerankDocs);
 
-      // Blend original + rerank scores (position-aware like query tool)
-      const blendedResults = toRerank.map((r, i) => {
-        const rerankScore = reranked[i]?.score || 0;
-        const rank = i + 1;
+      // Blend original + rerank scores using file-keyed join (matching query tool pattern)
+      const rerankMap = new Map(reranked.map(r => [r.file, r.score]));
+      const rankMap = new Map(toRerank.map((r, i) => [r.filepath, i + 1]));
+      const blendedResults = toRerank.map(r => {
+        const rerankScore = rerankMap.get(r.filepath) || 0;
+        const rank = rankMap.get(r.filepath) || toRerank.length;
         const origWeight = rank <= 3 ? 0.75 : rank <= 10 ? 0.60 : 0.40;
         const blended = origWeight * r.score + (1 - origWeight) * rerankScore;
         return { ...r, score: blended };
