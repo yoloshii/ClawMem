@@ -13,6 +13,8 @@ import { z } from "zod";
 import {
   createStore,
   extractSnippet,
+  extractIntentTerms,
+  INTENT_CHUNK_WEIGHT,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -69,6 +71,16 @@ type StatusResult = {
 
 function encodeClawmemPath(path: string): string {
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
+/** Split text into overlapping windows for intent-aware chunk selection */
+function splitIntoWindows(text: string, windowSize: number, overlap = 200): string[] {
+  const windows: string[] = [];
+  for (let i = 0; i < text.length; i += windowSize - overlap) {
+    windows.push(text.slice(i, i + windowSize));
+    if (i + windowSize >= text.length) break;
+  }
+  return windows.length > 0 ? windows : [text];
 }
 
 function formatSearchSummary(results: SearchResultItem[], query: string): string {
@@ -303,7 +315,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "query",
     {
       title: "Hybrid Query (Best Quality)",
-      description: "Highest quality: BM25 + vector + query expansion + reranking + SAME composite scoring.",
+      description: "Highest quality: BM25 + vector + query expansion + reranking + SAME composite scoring. Provide intent to disambiguate overloaded queries (e.g. 'performance' could mean web perf, team health, or fitness).",
       inputSchema: {
         query: z.string().describe("Natural language query"),
         limit: z.number().optional().default(10),
@@ -311,16 +323,32 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         collection: z.string().optional().describe("Filter to collection"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
         diverse: z.boolean().optional().default(true).describe("Apply MMR diversity filter to reduce near-duplicate results"),
+        intent: z.string().optional().describe("Domain intent hint for disambiguation — steers expansion, reranking, chunk selection, and snippet extraction"),
+        candidateLimit: z.number().optional().default(30).describe("Max candidates reaching the reranker (default 30)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, diverse }) => {
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
+    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit }) => {
+      const candLimit = candidateLimit || 30;
       const rankedLists: RankedResult[][] = [];
       const docidMap = new Map<string, string>();
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
+      // Step 1: BM25 probe — skip expensive LLM expansion if strong signal
+      const initialFts = store.searchFTS(query, 20).filter(r => !collection || r.collectionName === collection);
+      const topScore = initialFts.length > 0 ? Math.abs(initialFts[0]!.score) : 0;
+      const secondScore = initialFts.length > 1 ? Math.abs(initialFts[1]!.score) : 0;
+      // When intent is provided, disable strong-signal bypass — the obvious BM25
+      // match may not be what the caller wants (e.g. "performance" with intent "web page load times")
+      const hasStrongSignal = !intent && initialFts.length > 0
+        && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+
+      // Step 2: Query expansion (skipped if strong signal)
+      const queries = hasStrongSignal
+        ? [query]
+        : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent);
+
       for (const q of queries) {
-        const ftsResults = store.searchFTS(q, 20).filter(r => !collection || r.collectionName === collection);
+        const ftsResults = q === query ? initialFts : store.searchFTS(q, 20).filter(r => !collection || r.collectionName === collection);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -337,18 +365,36 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
 
       const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
       const fused = reciprocalRankFusion(rankedLists, weights);
-      const candidates = fused.slice(0, 30);
+      const candidates = fused.slice(0, candLimit);
 
-      const reranked = await store.rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body.slice(0, 4000) })),
-        DEFAULT_RERANK_MODEL
-      );
+      // Step 3: Intent-aware chunk selection for reranking
+      const intentTerms = intent ? extractIntentTerms(intent) : [];
+      const chunksToRerank = candidates.map(c => {
+        let text = c.body.slice(0, 4000);
+        // When intent is provided, select the chunk with highest intent+query relevance
+        if (intentTerms.length > 0 && c.body.length > 4000) {
+          const chunks = splitIntoWindows(c.body, 4000);
+          let bestChunk = chunks[0]!;
+          let bestScore = -1;
+          const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+          for (const chunk of chunks) {
+            const lower = chunk.toLowerCase();
+            let score = 0;
+            for (const term of queryTerms) { if (lower.includes(term)) score += 1.0; }
+            for (const term of intentTerms) { if (lower.includes(term)) score += INTENT_CHUNK_WEIGHT; }
+            if (score > bestScore) { bestScore = score; bestChunk = chunk; }
+          }
+          text = bestChunk;
+        }
+        return { file: c.file, text };
+      });
+
+      const reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
 
       const candidateMap = new Map(candidates.map(c => [c.file, c]));
       const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-      // Blend RRF + reranker scores
+      // Blend RRF + reranker scores (position-aware)
       const blended = reranked.map(r => {
         const rrfRank = rrfRankMap.get(r.file) || candidates.length;
         const rrfWeight = rrfRank <= 3 ? 0.75 : rrfRank <= 10 ? 0.60 : 0.40;
@@ -385,7 +431,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
       }
 
       const items: SearchResultItem[] = scored.map(r => {
-        const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
+        const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos, intent);
         return {
           docid: `#${docidMap.get(r.filepath) || r.docid}`,
           file: r.displayPath,

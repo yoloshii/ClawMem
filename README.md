@@ -362,7 +362,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `search` | BM25 keyword search with composite scoring + compact mode |
 | `vsearch` | Vector semantic search with composite scoring + compact mode |
-| `query` | Full hybrid pipeline with composite scoring + MMR diversity + compact mode |
+| `query` | Full hybrid pipeline with intent hint, strong-signal bypass, intent-aware chunk selection, chunk dedup, configurable candidateLimit, composite scoring + MMR diversity + compact mode |
 | `get` | Retrieve single document by path or docid |
 | `multi_get` | Retrieve multiple docs by glob or comma-separated list |
 | `find_similar` | Find notes similar to a reference document |
@@ -422,11 +422,14 @@ Six hooks auto-installed by `clawmem setup hooks`:
 ## Search Pipeline
 
 ```
-User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
-  → BM25 + Vector Search (parallel)
-  → Intent-Weighted RRF (boost BM25 for WHEN, boost vector for WHY)
-  → Graph Expansion (WHY/ENTITY: adaptive beam search over multi-graph)
-  → Cross-Encoder Reranking (0.6B GGUF)
+User Query + optional intent hint
+  → BM25 Probe → Strong Signal Check (skip expansion if top hit ≥ 0.85 with gap ≥ 0.15; disabled when intent provided)
+  → Query Expansion (intent steers LLM prompt when provided)
+  → BM25 + Vector Search (parallel, original query 2× weight)
+  → Reciprocal Rank Fusion → slice to candidateLimit (default 30)
+  → Intent-Aware Chunk Selection (intent terms at 0.5× weight alongside query terms at 1.0×)
+  → Cross-Encoder Reranking (4000 char context; intent prepended; chunk dedup; batch cap=4)
+  → Position-Aware Blending (α=0.75 top3, 0.60 mid, 0.40 tail)
   → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier × lengthNorm + pinBoost)
   → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted)
   → Ranked Results

@@ -188,7 +188,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -649,13 +649,13 @@ export class LlamaCpp implements LLM {
     }
   }
 
-  private async expandQueryRemote(query: string, includeLexical: boolean, context?: string): Promise<Queryable[]> {
+  private async expandQueryRemote(query: string, includeLexical: boolean, context?: string, intent?: string): Promise<Queryable[]> {
     const prompt = `Rewrite this search query for better retrieval. Output lines in format "type: text" where type is lex, vec, or hyde.
 - lex: keyword search terms (1-3 lines)
 - vec: semantic search queries (1-3 lines)
 - hyde: hypothetical document passage that answers the query (1 line)
 
-Query: ${query}${context ? `\nContext: ${context}` : ""}
+Query: ${query}${intent ? `\nQuery intent: ${intent}` : ""}${context ? `\nContext: ${context}` : ""}
 
 Output:`;
 
@@ -708,13 +708,14 @@ Output:`;
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
+    const intent = options.intent;
 
     // Remote LLM path — no grammar constraint, parse output instead
     if (this.remoteLlmUrl) {
-      return this.expandQueryRemote(query, includeLexical, context);
+      return this.expandQueryRemote(query, includeLexical, context, intent);
     }
 
     const llama = await this.ensureLlama();
@@ -732,7 +733,7 @@ Output:`;
     const prompt = `You are a search query optimization expert. Your task is to improve retrieval by rewriting queries and generating hypothetical documents.
 
 Original Query: ${query}
-
+${intent ? `\nQuery intent: ${intent}` : ""}
 ${context ? `Additional Context, ONLY USE IF RELEVANT:\n\n<context>${context}</context>` : ""}
 
 ## Step 1: Query Analysis

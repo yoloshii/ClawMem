@@ -678,8 +678,8 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionId?: number) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<string[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
+  expandQuery: (query: string, model?: string, intent?: string) => Promise<string[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -816,8 +816,8 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     searchVec: (query: string, model: string, limit?: number, collectionId?: number) => searchVec(db, query, model, limit, collectionId),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2255,9 +2255,9 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
-  // Check cache first
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<string[]> {
+  // Check cache first (include intent in cache key)
+  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     const lines = cached.split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -2266,7 +2266,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  // Pass intent to steer expansion when provided
+  const results = await llm.expandQuery(query, { intent });
   const queryTexts = results.map(r => r.text);
 
   // Cache the expanded queries (excluding original)
@@ -2282,22 +2283,41 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
+  // Prepend intent to rerank query so the reranker scores with domain context
+  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+
+  // Deduplicate identical chunk texts — same content from different files shares a single score
+  const textToFiles = new Map<string, string[]>();
+  const uniqueDocs: RerankDocument[] = [];
+  for (const doc of documents) {
+    const existing = textToFiles.get(doc.text);
+    if (existing) {
+      existing.push(doc.file);
+    } else {
+      textToFiles.set(doc.text, [doc.file]);
+      uniqueDocs.push(doc);
+    }
+  }
+
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
-  // Check cache for each document
-  for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model });
+  // Check cache for each unique document
+  for (const doc of uniqueDocs) {
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
     const cached = getCachedResult(db, cacheKey);
     if (cached !== null) {
-      cachedResults.set(doc.file, parseFloat(cached));
+      const score = parseFloat(cached);
+      // Apply score to all files sharing this text
+      for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, score);
     } else {
       uncachedDocs.push({ file: doc.file, text: doc.text });
     }
   }
 
   // Rerank uncached documents (remote GPU preferred, local node-llama-cpp fallback)
+  // Cap parallelism at 4 to prevent VRAM exhaustion
   if (uncachedDocs.length > 0) {
     const rerankUrl = Bun.env.CLAWMEM_RERANK_URL;
     let scored = false;
@@ -2307,24 +2327,31 @@ export async function rerank(query: string, documents: { file: string; text: str
     // (query + document must fit in one pair; ~2 chars/token for mixed content)
     if (rerankUrl) {
       try {
-        const resp = await fetch(`${rerankUrl}/v1/rerank`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query,
-            documents: uncachedDocs.map(d => d.text.slice(0, 400)),
-          }),
-        });
-        if (resp.ok) {
-          const data = await resp.json() as { results: { index: number; relevance_score: number }[] };
-          for (const r of data.results) {
-            const doc = uncachedDocs[r.index]!;
-            const cacheKey = getCacheKey("rerank", { query, file: doc.file, model });
-            setCachedResult(db, cacheKey, r.relevance_score.toString());
-            cachedResults.set(doc.file, r.relevance_score);
+        // Process in batches of 4 to prevent VRAM exhaustion
+        for (let i = 0; i < uncachedDocs.length; i += 4) {
+          const batch = uncachedDocs.slice(i, i + 4);
+          const resp = await fetch(`${rerankUrl}/v1/rerank`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: rerankQuery,
+              documents: batch.map(d => d.text.slice(0, 400)),
+            }),
+          });
+          if (resp.ok) {
+            const data = await resp.json() as { results: { index: number; relevance_score: number }[] };
+            for (const r of data.results) {
+              const doc = batch[r.index]!;
+              const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
+              setCachedResult(db, cacheKey, r.relevance_score.toString());
+              // Apply score to all files sharing this text
+              for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
+            }
+          } else {
+            break; // Remote failed mid-batch, fall through to local
           }
-          scored = true;
         }
+        scored = cachedResults.size > 0;
       } catch {
         // Remote failed, fall through to local
       }
@@ -2332,12 +2359,21 @@ export async function rerank(query: string, documents: { file: string; text: str
 
     // Fallback to local node-llama-cpp
     if (!scored) {
-      const llm = getDefaultLlamaCpp();
-      const rerankResult = await llm.rerank(query, uncachedDocs, { model });
-      for (const result of rerankResult.results) {
-        const cacheKey = getCacheKey("rerank", { query, file: result.file, model });
-        setCachedResult(db, cacheKey, result.score.toString());
-        cachedResults.set(result.file, result.score);
+      const remaining = uncachedDocs.filter(d => !cachedResults.has(d.file));
+      if (remaining.length > 0) {
+        const llm = getDefaultLlamaCpp();
+        const rerankResult = await llm.rerank(rerankQuery, remaining, { model });
+        for (const result of rerankResult.results) {
+          const doc = remaining.find(d => d.file === result.file);
+          const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model });
+          setCachedResult(db, cacheKey, result.score.toString());
+          // Apply score to all files sharing this text
+          if (doc) {
+            for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, result.score);
+          } else {
+            cachedResults.set(result.file, result.score);
+          }
+        }
       }
     }
   }
@@ -2712,7 +2748,33 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number): SnippetResult {
+// Stop words filtered from intent strings before tokenization
+const INTENT_STOP_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+  "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+  "being", "have", "has", "had", "do", "does", "did", "will", "would",
+  "could", "should", "may", "might", "shall", "can", "about", "how",
+  "what", "when", "where", "which", "who", "whom", "why", "this", "that",
+  "these", "those", "it", "its", "not", "no", "so", "if", "then", "than",
+]);
+
+/** Weight for intent terms relative to query terms (1.0) in snippet scoring */
+const INTENT_SNIPPET_WEIGHT = 0.3;
+
+/** Weight for intent terms relative to query terms (1.0) in chunk selection */
+export const INTENT_CHUNK_WEIGHT = 0.5;
+
+/**
+ * Extract meaningful terms from an intent string, filtering stop words and punctuation.
+ */
+export function extractIntentTerms(intent: string): string[] {
+  return intent.toLowerCase().split(/\s+/)
+    .filter(w => w.length > 1 && !INTENT_STOP_WORDS.has(w))
+    .map(w => w.replace(/[^a-z0-9-]/g, ""))
+    .filter(w => w.length > 1);
+}
+
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, intent?: string): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
@@ -2728,6 +2790,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 
   const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
@@ -2735,6 +2798,10 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
     let score = 0;
     for (const term of queryTerms) {
       if (lineLower.includes(term)) score++;
+    }
+    // Intent terms nudge snippet selection toward intent-relevant lines
+    for (const term of intentTerms) {
+      if (lineLower.includes(term)) score += INTENT_SNIPPET_WEIGHT;
     }
     if (score > bestScore) {
       bestScore = score;
@@ -2750,7 +2817,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
   // fall back to a full-document snippet so we always show something useful.
   if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
-    return extractSnippet(body, query, maxLen, undefined);
+    return extractSnippet(body, query, maxLen, undefined, intent);
   }
 
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";

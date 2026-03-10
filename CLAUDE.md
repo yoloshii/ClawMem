@@ -236,7 +236,11 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 ```
 1a. General recall → query(query, compact=true, limit=20)
     Full hybrid: BM25 + vector + query expansion + deep reranking (4000 char).
-    Supports compact and collection filter. Default for most Tier 3 needs.
+    Supports compact, collection filter, intent, and candidateLimit.
+    Default for most Tier 3 needs.
+    Optional: intent="domain hint" for ambiguous queries (steers expansion, reranking, chunk selection, snippets).
+    Optional: candidateLimit=N to tune precision/speed (default 30).
+    BM25 strong-signal bypass: skips expansion when top BM25 hit ≥ 0.85 with gap ≥ 0.15 (disabled when intent is provided).
 
 1b. Causal/why/when/entity → intent_search(query, enable_graph_traversal=true)
     MAGMA intent classification + intent-weighted RRF + multi-hop graph traversal.
@@ -387,12 +391,13 @@ The `memory_relations` table is populated by multiple independent sources:
 ### `query` (default Tier 3 workhorse)
 
 ```
-User Query → Intent Classification (heuristic, LLM fallback if confidence < 0.8)
-  → BM25 Strong Signal Check (skip expansion if top hit ≥ 0.85 with gap ≥ 0.15)
-  → Query Expansion (LLM generates hyde/lex/vec variants)
+User Query + optional intent hint
+  → BM25 Probe → Strong Signal Check (skip expansion if top hit ≥ 0.85 with gap ≥ 0.15; disabled when intent provided)
+  → Query Expansion (LLM generates hyde/lex/vec variants; intent steers expansion prompt)
   → Parallel: BM25(original, 2×) + Vector(original, 2×) + BM25(expanded, 1×) + Vector(expanded, 1×)
-  → Reciprocal Rank Fusion (k=60, top 30)
-  → Cross-Encoder Reranking (4000 char context per doc)
+  → Reciprocal Rank Fusion (k=60, top candidateLimit)
+  → Intent-Aware Chunk Selection (intent terms at 0.5× weight alongside query terms at 1.0×)
+  → Cross-Encoder Reranking (4000 char context; intent prepended to rerank query; chunk dedup; batch cap=4)
   → Position-Aware Blending (α=0.75 top3, 0.60 mid, 0.40 tail)
   → SAME Composite Scoring
   → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted, not removed)
@@ -414,12 +419,15 @@ User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
 
 | Aspect | `query` | `intent_search` |
 |--------|---------|-----------------|
-| Query expansion | Yes | No |
-| Rerank context | 4000 chars/doc | 200 chars/doc |
+| Query expansion | Yes (skipped on strong BM25 signal) | No |
+| Intent hint | Yes (`intent` param steers 5 stages) | Auto-detected (WHY/WHEN/ENTITY/WHAT) |
+| Rerank context | 4000 chars/doc (intent-aware chunk selection) | 200 chars/doc |
+| Chunk dedup | Yes (identical texts share single rerank call) | No |
 | Graph traversal | No | Yes (WHY/ENTITY, multi-hop) |
 | MMR diversity | Yes (`diverse=true` default) | No |
 | `compact` param | Yes | No |
 | `collection` filter | Yes | No |
+| `candidateLimit` | Yes (default 30) | No |
 | Best for | Most queries, progressive disclosure | Causal chains spanning multiple docs |
 
 ## Operational Issue Tracking
