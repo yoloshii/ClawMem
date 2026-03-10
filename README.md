@@ -368,10 +368,15 @@ Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
 - Do NOT pin everything — pin is for persistent high-priority items
 - Do NOT forget memories to "clean up" — let confidence decay handle it
 
-For setup, indexing, query optimization, pipeline details, troubleshooting → invoke `Skill tool with skill="clawmem"`
+Invoke `Skill tool with skill="clawmem"` when:
+- Retrieval quality is poor or results miss expected content (query optimization, troubleshooting)
+- Adding new content directories or indexing something (collection setup, embedding workflow)
+- After bulk document creation or ingestion (graph building, embedding)
+- Need to decide pin vs snooze vs forget (lifecycle management)
+- Any operation beyond the basic tool routing above
 ```
 
-This gives your agent the escalation logic and tool routing, with an explicit skill invocation for detailed reference on demand.
+This gives your agent the 3-rule gate and tool routing always loaded, with situation-triggered skill invocation for the 10% manual operations.
 
 ---
 
