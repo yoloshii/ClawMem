@@ -366,25 +366,34 @@ Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
 - **Preferred** → `memory_retrieve(query)` (auto-routes to optimal backend)
 - General recall → `query(query, compact=true)`
 - Why/entity/when → `intent_search(query)`
+- Multi-topic/complex → `query_plan(query, compact=true)`
 - Spot check → `search(query, compact=true)` or `vsearch(query, compact=true)`
 - Full content → `multi_get("path1,path2")`
+- Lifecycle health → `lifecycle_status()` | Stale sweep → `lifecycle_sweep(dry_run=true)` | Restore → `lifecycle_restore(query)`
+
+### Proactive Use (no escalation gate needed)
+
+- User says "remember this" / critical decision made → `memory_pin(query)` immediately
+- User corrects a misconception → `memory_pin(query)` the correction
+- `<vault-context>` surfaces irrelevant/noisy content → `memory_snooze(query, until)` for 30 days
 
 ### Anti-Patterns
 
 - Do NOT call query/intent_search every turn — 3 rules above are the only gates
 - Do NOT re-search what's already in `<vault-context>`
-- Do NOT pin everything — pin is for persistent high-priority items
+- Do NOT pin everything — pin is for persistent high-priority items, not routine decisions
 - Do NOT forget memories to "clean up" — let confidence decay handle it
+- Do NOT wait for curator to pin decisions — pin immediately when critical
 
 Invoke `Skill tool with skill="clawmem"` when:
 - Retrieval quality is poor or results miss expected content (query optimization, troubleshooting)
 - Adding new content directories or indexing something (collection setup, embedding workflow)
 - After bulk document creation or ingestion (graph building, embedding)
-- Need to decide pin vs snooze vs forget (lifecycle management)
+- Need lifecycle triage beyond basic status/sweep (run curator: "curate memory")
 - Any operation beyond the basic tool routing above
 ```
 
-This gives your agent the 3-rule gate and tool routing always loaded, with situation-triggered skill invocation for the 10% manual operations.
+This gives your agent the 3-rule gate, tool routing, and proactive behaviors always loaded, with situation-triggered skill invocation for the ~10% manual operations.
 
 ---
 
