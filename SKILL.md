@@ -168,9 +168,12 @@ Hooks handle ~90% of retrieval. Zero agent effort.
 | `session-bootstrap` | SessionStart | 2000 tokens | profile + latest handoff + recent decisions + stale notes |
 | `context-surfacing` | UserPromptSubmit | 800 tokens | retrieval gate -> hybrid search (vector + FTS, 900ms timeout) -> snooze filter -> noise filter -> `<vault-context>` |
 | `staleness-check` | SessionStart | 250 tokens | flags notes not modified in 30+ days |
-| `decision-extractor` | Stop | — | LLM extracts observations -> `_clawmem/observations/`, infers causal links, detects contradictions |
-| `handoff-generator` | Stop | — | LLM summarizes session -> `_clawmem/handoffs/` |
+| `decision-extractor` | Stop | — | LLM extracts observations -> `_clawmem/agent/observations/`, infers causal links, detects contradictions |
+| `handoff-generator` | Stop | — | LLM summarizes session -> `_clawmem/agent/handoffs/` |
 | `feedback-loop` | Stop | — | tracks referenced notes -> boosts confidence |
+| `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
+| `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
+| `pretool-inject` | PreToolUse | 200 tokens | searches vault for file-specific context before Read/Edit/Write. Surfaces via `reason` field. Disabled by default. |
 
 **Default behavior:** Read injected `<vault-context>` first. If sufficient, answer immediately.
 
@@ -211,11 +214,17 @@ Once escalated, route by query type:
 
     Choose 1a or 1b based on query type. Parallel options, not sequential.
 
+1c. Multi-topic/complex -> query_plan(query, compact=true)
+    Decomposes query into 2-4 typed clauses (bm25/vector/graph), executes in parallel, merges via RRF.
+    Use when query spans multiple topics or needs both keyword and semantic recall simultaneously.
+    Falls back to single-query behavior for simple queries.
+
 2. Progressive disclosure -> multi_get("path1,path2") for full content of top hits
 
 3. Spot checks -> search(query) (BM25, 0 GPU) or vsearch(query) (vector, 1 GPU)
 
 4. Chain tracing -> find_causal_links(docid, direction="both", depth=5)
+   Traverses causal edges between _clawmem/agent/observations/ docs.
 
 5. Memory debugging -> memory_evolution_status(docid)
 ```
@@ -226,6 +235,7 @@ Once escalated, route by query type:
 |------|---------|
 | `query` | Full hybrid search (BM25 + vector + expansion + rerank). Default Tier 3 workhorse. |
 | `intent_search` | MAGMA intent classification + graph traversal. For why/when/entity chains. |
+| `query_plan` | Multi-topic query decomposition into parallel typed clauses. Complex queries spanning multiple topics. |
 | `search` | BM25 keyword search only. Fast, 0 GPU. |
 | `vsearch` | Vector similarity only. ~100ms, 1 GPU call. |
 | `get` | Retrieve single doc by path or `#docid`. |
@@ -265,6 +275,7 @@ Pick the lightest tool that satisfies the need. Heavier tools are slower and con
 | `vsearch(q, compact=true)` | Vector only, 1 GPU call | Conceptual/fuzzy, don't know vocabulary |
 | `query(q, compact=true)` | Full hybrid, 3+ GPU calls | General recall, unsure which signal matters, need best results |
 | `intent_search(q)` | Hybrid + graph traversal | Why/entity chains (graph traversal), when queries (BM25-biased) |
+| `query_plan(q, compact=true)` | Hybrid + decomposition | Complex multi-topic queries needing parallel typed retrieval |
 
 Use `search` for quick keyword spot-checks. Use `query` for general recall (default Tier 3 workhorse). Use `intent_search` directly (not as fallback) when the question is causal or relational.
 
@@ -383,10 +394,11 @@ User Query -> Intent Classification (WHY/WHEN/ENTITY/WHAT)
 Applied automatically to all search tool results.
 
 ```
-compositeScore = (0.50 x searchScore + 0.25 x recencyScore + 0.25 x confidenceScore) x qualityMultiplier
+compositeScore = (0.50 x searchScore + 0.25 x recencyScore + 0.25 x confidenceScore) x qualityMultiplier x coActivationBoost
 ```
 
 Where `qualityMultiplier = 0.7 + 0.6 x qualityScore` (range: 0.7x penalty to 1.3x boost).
+`coActivationBoost = 1 + min(coCount/10, 0.15)` — documents frequently surfaced together get up to 15% boost.
 
 Length normalization: `1/(1 + 0.5 x log2(max(bodyLength/500, 1)))` — penalizes verbose entries, floor at 30%.
 
@@ -395,7 +407,7 @@ Pinned documents get +0.3 additive boost (capped at 1.0).
 ### Recency Intent Detected ("latest", "recent", "last session")
 
 ```
-compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceScore) x qualityMultiplier
+compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceScore) x qualityMultiplier x coActivationBoost
 ```
 
 ### Content Type Half-Lives
@@ -403,6 +415,7 @@ compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceSc
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
 | decision, hub | infinity | Never decay |
+| antipattern | infinity | Never decay — accumulated negative patterns persist |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
 | note | 60 days | Default |
@@ -411,7 +424,7 @@ compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceSc
 
 Half-lives extend up to 3x for frequently-accessed memories (access reinforcement decays over 90 days).
 
-Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research are exempt.
+Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research/antipattern are exempt.
 
 ---
 
@@ -467,7 +480,7 @@ mcp__clawmem__vsearch(query, collection="name", compact=true)   # vector
 | Source | Edge Types | Trigger | Notes |
 |--------|-----------|---------|-------|
 | A-MEM `generateMemoryLinks()` | semantic, supporting, contradicts | Indexing (new docs) | LLM-assessed confidence. Requires embeddings. |
-| A-MEM `inferCausalLinks()` | causal | Post-response (decision-extractor) | Links `_clawmem/observations/` docs only. |
+| A-MEM `inferCausalLinks()` | causal | Post-response (decision-extractor) | Links `_clawmem/agent/observations/` docs only. |
 | Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP or watcher | Queries `bd` CLI (Dolt backend). |
 | `buildTemporalBackbone()` | temporal | `build_graphs` MCP (manual) | Creation-order edges. |
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP (manual) | Pure cosine similarity. A-MEM edges take precedence (first-writer wins). |
@@ -608,6 +621,15 @@ echo "user query" | clawmem surface --context --stdin
 echo "session-id" | clawmem surface --bootstrap --stdin
 ```
 
+### Analysis Commands
+
+```bash
+clawmem reflect [N]             # Cross-session reflection (last N days, default 14)
+                                # Recurring themes, antipatterns, co-activation clusters
+clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
+                                # Jaccard similarity within same collection
+```
+
 ---
 
 ## Operational Issue Tracking
@@ -646,5 +668,5 @@ Write to `docs/issues/YYYY-MM-DD-<slug>.md`:
 ## Tool Selection (one-liner)
 
 ```
-ClawMem escalation: query(compact=true) | intent_search(why/when/entity) -> multi_get -> search/vsearch (spot checks)
+ClawMem escalation: query(compact=true) | intent_search(why/when/entity) | query_plan(multi-topic) -> multi_get -> search/vsearch (spot checks)
 ```
