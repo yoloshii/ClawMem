@@ -6,7 +6,7 @@ TypeScript on Bun. ~15,500 lines across 35 source files. 139 tests.
 
 ## What It Does
 
-ClawMem turns your markdown notes, project docs, and research dumps into an intelligent memory layer for Claude Code. It automatically:
+ClawMem turns your markdown notes, project docs, and research dumps into an intelligent memory layer for AI coding agents. It automatically:
 
 - **Surfaces relevant context** on every prompt (context-surfacing hook)
 - **Bootstraps sessions** with your profile, latest handoff, recent decisions, and stale notes
@@ -25,9 +25,11 @@ ClawMem turns your markdown notes, project docs, and research dumps into an inte
 - **Cleans stale embeddings** automatically before embed runs, removing orphans from deleted/changed documents
 - **Transaction-safe indexing** — crash mid-index leaves zero partial state (atomic commit with rollback)
 - **Supports pin/snooze lifecycle** for persistent boosts and temporary suppression
+- **Manages document lifecycle** — policy-driven archival sweeps with restore capability
+- **Auto-routes queries** via `memory_retrieve` — classifies intent and dispatches to the optimal search backend
 - **Syncs project issues** from Beads issue trackers into searchable memory
 
-All context injection runs through Claude Code's hook system — no API keys needed, no cloud services, fully local.
+Runs fully local — no API keys, no cloud services. Integrates via Claude Code hooks (automatic context injection) and MCP tools (agent-initiated retrieval). Works with any MCP-compatible client.
 
 ## Architecture
 
@@ -484,9 +486,9 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `index_stats` | Detailed stats: types, staleness, access counts, sessions |
 | `session_log` | Recent sessions with handoff info |
 | `profile` | Current static + dynamic user profile |
-| `lifecycle_status` | Show stale and archived content |
-| `lifecycle_sweep` | Archive stale content past retention threshold |
-| `lifecycle_restore` | Restore previously archived content |
+| `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary |
+| `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold, optionally purge old archives. Defaults to dry_run (preview only) |
+| `lifecycle_restore` | Restore documents that were auto-archived by lifecycle policies. Filter by query, collection, or restore all |
 
 ### Compact Mode
 
@@ -806,7 +808,7 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 
 Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Best with three `llama-server` instances (embedding, LLM, reranker) on a local or remote GPU. See GPU Services section above for setup.
 
-Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), Claude Code hooks (6 hooks for context injection + extraction).
+Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 9 Claude Code hooks (context injection, session bootstrap, decision extraction, handoffs, feedback, compaction support).
 
 ## Acknowledgments
 
