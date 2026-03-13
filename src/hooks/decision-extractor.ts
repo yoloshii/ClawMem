@@ -26,10 +26,96 @@ import { extractJsonFromLLM } from "../amem.ts";
 import { DEFAULT_EMBED_MODEL, extractSnippet, type SearchResult } from "../store.ts";
 
 // =============================================================================
+// Facet-Based Merge Policy
+// =============================================================================
+
+export type MergePolicy = 'always_new' | 'merge_recent' | 'update_existing' | 'dedup_check';
+
+/**
+ * Content-type-specific merge policy. Controls how new extracted content
+ * interacts with existing entries to prevent memory bloat.
+ *
+ * - always_new: Every entry is unique (handoffs, observations)
+ * - merge_recent: Merge with recent same-topic entry if within 7 days
+ * - update_existing: Overwrite older entry on same topic
+ * - dedup_check: Check embedding similarity before inserting
+ */
+export function getMergePolicy(contentType: string): MergePolicy {
+  switch (contentType) {
+    case 'decision': return 'dedup_check';
+    case 'antipattern': return 'merge_recent';
+    case 'preference': return 'update_existing';
+    case 'handoff': return 'always_new';
+    default: return 'always_new';
+  }
+}
+
+const DEDUP_SIMILARITY_THRESHOLD = 0.92;
+const MERGE_RECENT_DAYS = 7;
+
+/**
+ * Check if a new document should be merged/skipped based on merge policy.
+ * Returns the existing doc ID to merge with, or null to insert new.
+ */
+export async function checkMergePolicy(
+  store: Store,
+  contentType: string,
+  body: string,
+  collection: string,
+): Promise<{ action: 'insert' | 'skip' | 'merge'; existingId?: number }> {
+  const policy = getMergePolicy(contentType);
+
+  if (policy === 'always_new') return { action: 'insert' };
+
+  // Get recent entries of same content type
+  const recentDocs = store.getDocumentsByType(contentType, 5);
+  if (recentDocs.length === 0) return { action: 'insert' };
+
+  if (policy === 'dedup_check') {
+    // Vector similarity check against recent entries
+    try {
+      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3);
+      const sameType = results.filter(r =>
+        r.collectionName === collection &&
+        r.score >= DEDUP_SIMILARITY_THRESHOLD
+      );
+      if (sameType.length > 0) {
+        return { action: 'skip' };
+      }
+    } catch {
+      // Vector search unavailable — fall through to insert
+    }
+    return { action: 'insert' };
+  }
+
+  if (policy === 'merge_recent') {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - MERGE_RECENT_DAYS);
+    const recent = recentDocs.find(d =>
+      d.modifiedAt && new Date(d.modifiedAt) >= cutoff
+    );
+    if (recent) {
+      return { action: 'merge', existingId: recent.id };
+    }
+    return { action: 'insert' };
+  }
+
+  if (policy === 'update_existing') {
+    // Find most recent entry of same type
+    if (recentDocs.length > 0 && recentDocs[0]) {
+      return { action: 'merge', existingId: recentDocs[0].id };
+    }
+    return { action: 'insert' };
+  }
+
+  return { action: 'insert' };
+}
+
+// =============================================================================
 // Decision Patterns
 // =============================================================================
 
-const DECISION_PATTERNS = [
+export const DECISION_PATTERNS = [
   /\b(?:we(?:'ll|'ve)?\s+)?decided?\s+(?:to|that|on)\b/i,
   /\b(?:the\s+)?decision\s+(?:is|was)\s+to\b/i,
   /\b(?:we(?:'re)?|i(?:'m)?)\s+going\s+(?:to|with)\b/i,
@@ -40,6 +126,55 @@ const DECISION_PATTERNS = [
   /\b(?:selected|picking|choosing)\s/i,
   /\binstead\s+of\b.*\bwe(?:'ll)?\s/i,
 ];
+
+// =============================================================================
+// Antipattern / Failure Patterns
+// =============================================================================
+
+export const FAILURE_PATTERNS = [
+  /\b(?:this\s+)?(?:doesn't|didn't|won't)\s+work\b/i,
+  /\b(?:bug|error|issue|problem|failure)\s+(?:is|was|caused\s+by)\b/i,
+  /\b(?:reverted?|rolled?\s+back|undid|undo)\b/i,
+  /\b(?:wrong\s+approach|bad\s+idea|mistake)\b/i,
+  /\bdon't\s+(?:use|do|try)\b/i,
+  /\b(?:avoid|never|stop)\s+(?:using|doing)\b/i,
+];
+
+/**
+ * Extract antipatterns (failures, mistakes, things to avoid) from transcript messages.
+ * Same extraction structure as extractDecisions but with failure-oriented patterns.
+ */
+export function extractAntipatterns(
+  messages: { role: string; content: string }[]
+): { text: string; context: string }[] {
+  const antipatterns: { text: string; context: string }[] = [];
+  const seen = new Set<string>();
+
+  for (const msg of messages) {
+    if (msg.role !== "assistant") continue;
+    const sentences = msg.content.split(/[.!]\s+/);
+
+    for (const sentence of sentences) {
+      if (sentence.length < 15 || sentence.length > 500) continue;
+
+      for (const pattern of FAILURE_PATTERNS) {
+        if (pattern.test(sentence)) {
+          const key = sentence.slice(0, 80).toLowerCase();
+          if (!seen.has(key)) {
+            seen.add(key);
+            // Get surrounding context (previous sentence)
+            const idx = sentences.indexOf(sentence);
+            const context = idx > 0 ? sentences[idx - 1]!.trim() : "";
+            antipatterns.push({ text: sentence.trim(), context });
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return antipatterns.slice(0, 10);
+}
 
 // =============================================================================
 // Contradiction Detection
@@ -299,12 +434,12 @@ export async function decisionExtractor(
 // Extraction
 // =============================================================================
 
-type Decision = {
+export type Decision = {
   text: string;
   context: string;
 };
 
-function extractDecisions(messages: { role: string; content: string }[]): Decision[] {
+export function extractDecisions(messages: { role: string; content: string }[]): Decision[] {
   const decisions: Decision[] = [];
   const seen = new Set<string>();
 

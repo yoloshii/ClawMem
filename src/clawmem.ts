@@ -52,6 +52,9 @@ import { decisionExtractor } from "./hooks/decision-extractor.ts";
 import { handoffGenerator } from "./hooks/handoff-generator.ts";
 import { feedbackLoop } from "./hooks/feedback-loop.ts";
 import { stalenessCheck } from "./hooks/staleness-check.ts";
+import { precompactExtract } from "./hooks/precompact-extract.ts";
+import { postcompactInject } from "./hooks/postcompact-inject.ts";
+import { pretoolInject } from "./hooks/pretool-inject.ts";
 
 enableProductionMode();
 
@@ -645,8 +648,17 @@ async function cmdHook(args: string[]) {
       case "staleness-check":
         output = await stalenessCheck(s, input);
         break;
+      case "precompact-extract":
+        output = await precompactExtract(s, input);
+        break;
+      case "postcompact-inject":
+        output = await postcompactInject(s, input);
+        break;
+      case "pretool-inject":
+        output = await pretoolInject(s, input);
+        break;
       default:
-        die(`Unknown hook: ${hookName}. Available: context-surfacing, session-bootstrap, decision-extractor, handoff-generator, feedback-loop, staleness-check`);
+        die(`Unknown hook: ${hookName}. Available: context-surfacing, session-bootstrap, decision-extractor, handoff-generator, feedback-loop, staleness-check, precompact-extract, postcompact-inject, pretool-inject`);
         output = makeEmptyOutput(); // unreachable, satisfies TS
     }
   } catch (err) {
@@ -1403,6 +1415,12 @@ async function main() {
       case "surface":
         await cmdSurface(subArgs);
         break;
+      case "reflect":
+        await cmdReflect(subArgs);
+        break;
+      case "consolidate":
+        await cmdConsolidate(subArgs);
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -1415,6 +1433,166 @@ async function main() {
   } finally {
     closeStore();
   }
+}
+
+// =============================================================================
+// Cross-Session Reflection
+// =============================================================================
+
+async function cmdReflect(args: string[]) {
+  const s = getStore();
+  const days = parseInt(args[0] || "14");
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+
+  const recentDocs = s.getDocumentsByType("decision", 50)
+    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+
+  if (recentDocs.length === 0) {
+    console.log(`No decisions found in the last ${days} days.`);
+    return;
+  }
+
+  console.log(`${c.bold}Reflection Report${c.reset} (last ${days} days, ${recentDocs.length} decisions)\n`);
+
+  // Noun-phrase clustering: find recurring 2-3 word phrases across decisions
+  const phrases = new Map<string, number>();
+  const stopWords = new Set(["the", "that", "this", "with", "from", "have", "will", "been", "were", "they", "their", "what", "when", "which", "about", "into", "more", "some", "than", "them", "then", "very", "also", "just", "should", "would", "could", "does", "make", "like", "using", "used"]);
+
+  for (const d of recentDocs) {
+    const doc = s.findDocument(d.path);
+    if ("error" in doc) continue;
+    const body = s.getDocumentBody(doc) || "";
+    const words = body.toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, " ")
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !stopWords.has(w));
+
+    // Ordered bigrams (preserve phrase direction)
+    for (let i = 0; i < words.length - 1; i++) {
+      const pair = `${words[i]!} ${words[i + 1]!}`;
+      phrases.set(pair, (phrases.get(pair) || 0) + 1);
+    }
+    // Trigrams for better phrase capture
+    for (let i = 0; i < words.length - 2; i++) {
+      const triple = `${words[i]!} ${words[i + 1]!} ${words[i + 2]!}`;
+      phrases.set(triple, (phrases.get(triple) || 0) + 1);
+    }
+  }
+
+  // Report patterns appearing 3+ times (prefer longer phrases)
+  const patterns = [...phrases.entries()]
+    .filter(([, count]) => count >= 3)
+    .sort((a, b) => {
+      const lenDiff = b[0].split(" ").length - a[0].split(" ").length;
+      return b[1] - a[1] || lenDiff;
+    })
+    .slice(0, 20);
+
+  if (patterns.length > 0) {
+    console.log(`${c.bold}Recurring Themes:${c.reset}`);
+    for (const [pair, count] of patterns) {
+      console.log(`  ${c.green}[${count}x]${c.reset} ${pair}`);
+    }
+  } else {
+    console.log("No recurring patterns found (threshold: 3+ occurrences).");
+  }
+
+  // Also report antipatterns
+  const antiDocs = s.getDocumentsByType("antipattern", 10)
+    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+
+  if (antiDocs.length > 0) {
+    console.log(`\n${c.bold}Recent Antipatterns (${antiDocs.length}):${c.reset}`);
+    for (const d of antiDocs) {
+      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.modifiedAt?.slice(0, 10)})`);
+    }
+  }
+
+  // Co-activation clusters
+  const coActs = s.db.prepare(`
+    SELECT doc_a, doc_b, count FROM co_activations
+    WHERE count >= 3
+    ORDER BY count DESC
+    LIMIT 10
+  `).all() as { doc_a: string; doc_b: string; count: number }[];
+
+  if (coActs.length > 0) {
+    console.log(`\n${c.bold}Strong Co-Activations (accessed together 3+ times):${c.reset}`);
+    for (const ca of coActs) {
+      console.log(`  ${c.cyan}[${ca.count}x]${c.reset} ${ca.doc_a} ↔ ${ca.doc_b}`);
+    }
+  }
+}
+
+// =============================================================================
+// Memory Consolidation (E12)
+// =============================================================================
+
+async function cmdConsolidate(args: string[]) {
+  const s = getStore();
+  const dryRun = args.includes("--dry-run");
+  const maxDocs = parseInt(args.find(a => /^\d+$/.test(a)) || "50");
+
+  // Find low-confidence documents that might be duplicates
+  const candidates = s.db.prepare(`
+    SELECT id, collection, path, title, hash, confidence, modified_at
+    FROM documents
+    WHERE active = 1 AND confidence < 0.4
+    ORDER BY confidence ASC
+    LIMIT ?
+  `).all(maxDocs) as { id: number; collection: string; path: string; title: string; hash: string; confidence: number; modified_at: string }[];
+
+  if (candidates.length === 0) {
+    console.log("No low-confidence documents to consolidate.");
+    return;
+  }
+
+  console.log(`${c.bold}Consolidation Analysis${c.reset} (${candidates.length} candidates, confidence < 0.4)${dryRun ? " [DRY RUN]" : ""}\n`);
+
+  let mergeCount = 0;
+
+  for (const candidate of candidates) {
+    // BM25 search with title as query to find similar docs
+    const similar = s.searchFTS(candidate.title, 5);
+    const candidateBody = s.getDocumentBody({ hash: candidate.hash } as any) || "";
+
+    const matches = similar.filter(r => {
+      if (r.filepath === `${candidate.collection}/${candidate.path}`) return false;
+      if (r.score < 0.7) return false;
+
+      // Require same collection
+      const rCollection = r.filepath.split("/")[0];
+      if (rCollection !== candidate.collection) return false;
+
+      // Require body similarity (Jaccard on word sets)
+      const matchBody = r.body || "";
+      if (matchBody.length === 0 || candidateBody.length === 0) return false;
+      const wordsA = new Set(candidateBody.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+      const wordsB = new Set(matchBody.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+      if (wordsA.size === 0 || wordsB.size === 0) return false;
+      let intersection = 0;
+      for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+      const jaccard = intersection / (wordsA.size + wordsB.size - intersection);
+      if (jaccard < 0.4) return false;
+
+      return true;
+    });
+
+    if (matches.length === 0) continue;
+
+    const bestMatch = matches[0]!;
+    console.log(`  ${c.yellow}Duplicate:${c.reset} ${candidate.collection}/${candidate.path} (conf: ${candidate.confidence.toFixed(2)})`);
+    console.log(`  ${c.green}Keep:${c.reset}      ${bestMatch.displayPath} (score: ${bestMatch.score.toFixed(3)})`);
+
+    if (!dryRun) {
+      s.archiveDocuments([candidate.id]);
+      mergeCount++;
+    }
+    console.log();
+  }
+
+  console.log(`${dryRun ? "Would consolidate" : "Consolidated"}: ${mergeCount} document(s)`);
 }
 
 function printHelp() {
@@ -1453,6 +1631,10 @@ ${c.bold}Hooks:${c.reset}
   clawmem hook <name>                  Run hook (stdin JSON)
   clawmem surface --context --stdin    IO6a: pre-prompt context injection
   clawmem surface --bootstrap --stdin  IO6b: per-session bootstrap injection
+
+${c.bold}Analysis:${c.reset}
+  clawmem reflect [N]                  Cross-session reflection (last N days, default 14)
+  clawmem consolidate [--dry-run] [N]  Find and archive duplicate low-confidence docs
 
 ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server

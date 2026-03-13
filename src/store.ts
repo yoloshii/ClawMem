@@ -767,6 +767,9 @@ export type Store = {
 
   // Usage relation tracking
   insertRelation: (fromDoc: number, toDoc: number, relType: string, weight?: number) => void;
+
+  // Document archival
+  archiveDocuments: (ids: number[]) => number;
 };
 
 /**
@@ -947,6 +950,18 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           weight = weight + excluded.weight,
           created_at = excluded.created_at
       `).run(fromDoc, toDoc, relType, weight, new Date().toISOString());
+    },
+
+    // Document archival — deactivates documents by ID
+    archiveDocuments: (ids: number[]) => {
+      if (ids.length === 0) return 0;
+      const now = new Date().toISOString();
+      const placeholders = ids.map(() => "?").join(",");
+      const result = db.prepare(`
+        UPDATE documents SET active = 0, archived_at = ?
+        WHERE id IN (${placeholders}) AND active = 1
+      `).run(now, ...ids);
+      return result.changes;
     },
   };
 }

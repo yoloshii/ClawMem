@@ -27,12 +27,13 @@ import {
   applyCompositeScoring,
   hasRecencyIntent,
   type EnrichedResult,
+  type CoActivationFn,
 } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from "./search-utils.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
-import { classifyIntent, type IntentType } from "./intent.ts";
+import { classifyIntent, decomposeQuery, type IntentType } from "./intent.ts";
 import { adaptiveTraversal, mergeTraversalResults } from "./graph-traversal.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
@@ -1122,6 +1123,141 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
           confidence: intent.confidence,
           results,
         },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: query_plan (Multi-Query Decomposition)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "query_plan",
+    {
+      title: "Query Plan (Multi-Query Decomposition)",
+      description: "Decomposes complex or multi-topic queries into parallel typed retrieval clauses. Best for queries spanning multiple topics or requiring both keyword and semantic search. Falls back to single-query behavior for simple queries.",
+      inputSchema: {
+        query: z.string().describe("Complex or multi-topic query"),
+        limit: z.number().optional().default(10),
+        compact: z.boolean().optional().default(true).describe("Return compact results"),
+      },
+    },
+    async ({ query, limit, compact }) => {
+      const llm = getDefaultLlamaCpp();
+
+      // Decompose query into typed clauses
+      const clauses = await decomposeQuery(query, llm, store.db);
+
+      // Sort by priority and execute each clause
+      const sortedClauses = [...clauses].sort((a, b) => a.priority - b.priority);
+      const allResults: SearchResult[] = [];
+      const clauseDetails: { type: string; query: string; priority: number; resultCount: number }[] = [];
+
+      for (const clause of sortedClauses) {
+        let results: SearchResult[] = [];
+        if (clause.type === 'bm25') {
+          results = store.searchFTS(clause.query, 20, undefined, clause.collections);
+        } else if (clause.type === 'vector') {
+          results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections);
+        } else if (clause.type === 'graph') {
+          // Graph clause: run intent_search-style retrieval
+          const intent = await classifyIntent(clause.query, llm, store.db);
+          const bm25 = store.searchFTS(clause.query, 15, undefined, clause.collections);
+          const vec = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 15, undefined, clause.collections);
+          const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
+          const searchMap = new Map([...bm25, ...vec].map(r => [r.filepath, r]));
+          results = fused
+            .map(fr => searchMap.get(fr.file))
+            .filter((r): r is SearchResult => r !== null);
+
+          // Graph expansion for WHY/ENTITY
+          if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
+            const anchorEmb = await llm.embed(clause.query);
+            if (anchorEmb) {
+              const traversed = adaptiveTraversal(store.db, results.slice(0, 5).map(r => ({ hash: r.hash, score: r.score })), {
+                maxDepth: 2, beamWidth: 3, budget: 15, intent: intent.intent, queryEmbedding: anchorEmb.embedding,
+              });
+              const merged = mergeTraversalResults(store.db, results.map(r => ({ hash: r.hash, score: r.score })), traversed);
+              const expandedMap = new Map(results.map(r => [r.hash, r]));
+              results = merged.map(m => {
+                const existing = expandedMap.get(m.hash);
+                if (existing) return { ...existing, score: m.score };
+                // Graph-discovered node — hydrate from DB
+                const doc = store.db.prepare(`
+                  SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
+                  FROM documents d
+                  LEFT JOIN content c ON c.hash = d.hash
+                  WHERE d.hash = ? AND d.active = 1 LIMIT 1
+                `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
+                if (!doc) return null;
+                return {
+                  filepath: `clawmem://${doc.collection}/${doc.path}`,
+                  displayPath: `${doc.collection}/${doc.path}`,
+                  title: doc.title || doc.path.split("/").pop() || "",
+                  context: null,
+                  hash: doc.hash,
+                  docid: doc.hash.slice(0, 6),
+                  collectionName: doc.collection,
+                  modifiedAt: doc.modified_at || "",
+                  bodyLength: doc.body?.length || 0,
+                  body: doc.body || "",
+                  score: m.score,
+                  source: "vec" as const,
+                } satisfies SearchResult;
+              }).filter((r): r is SearchResult => r !== null);
+            }
+          }
+        }
+        clauseDetails.push({ type: clause.type, query: clause.query, priority: clause.priority, resultCount: results.length });
+        allResults.push(...results);
+      }
+
+      // Deduplicate by filepath, keeping highest score
+      const deduped = new Map<string, SearchResult>();
+      for (const r of allResults) {
+        const existing = deduped.get(r.filepath);
+        if (!existing || r.score > existing.score) deduped.set(r.filepath, r);
+      }
+
+      // RRF merge across clauses for final ranking
+      const clauseLists = sortedClauses.map((clause, idx) => {
+        const start = sortedClauses.slice(0, idx).reduce((sum, c, i) => sum + clauseDetails[i]!.resultCount, 0);
+        const end = start + clauseDetails[idx]!.resultCount;
+        return allResults.slice(start, end).map(toRanked);
+      });
+      const finalRanked = reciprocalRankFusion(clauseLists, sortedClauses.map(c => 6 - c.priority));
+
+      // Map back to SearchResults
+      const resultMap = new Map([...deduped.values()].map(r => [r.filepath, r]));
+      const finalResults = finalRanked
+        .map(fr => { const r = resultMap.get(fr.file); return r ? { ...r, score: fr.score } : null; })
+        .filter((r): r is SearchResult => r !== null);
+
+      const enriched = enrichResults(store, finalResults, query);
+      const coFn: CoActivationFn = (path) => store.getCoActivated(path);
+      const scored = applyCompositeScoring(enriched, query, coFn).slice(0, limit || 10);
+
+      const planSummary = clauseDetails.map(c => `  ${c.type}(p${c.priority}): "${c.query}" → ${c.resultCount} results`).join("\n");
+
+      if (compact) {
+        const items = scored.map(r => ({
+          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+          score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
+          snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+        }));
+        return {
+          content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
+          structuredContent: { plan: clauseDetails, results: items },
+        };
+      }
+
+      const items = scored.map(r => ({
+        docid: r.docid, file: r.filepath, title: r.title, score: r.score,
+        compositeScore: r.compositeScore, context: r.context, snippet: r.body?.slice(0, 300) || '', contentType: r.contentType,
+      }));
+      return {
+        content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items, query)}` }],
+        structuredContent: { plan: clauseDetails, results: items },
       };
     }
   );

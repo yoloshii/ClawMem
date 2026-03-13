@@ -53,6 +53,27 @@ export function inferContentType(path: string, explicitType?: string): ContentTy
 }
 
 // =============================================================================
+// Memory Type Classification (E10)
+// =============================================================================
+
+export type MemoryType = "episodic" | "semantic" | "procedural";
+
+/**
+ * Infer memory type from content metadata.
+ * - episodic: session events, handoffs, progress (time-bound)
+ * - semantic: facts, decisions, knowledge (declarative)
+ * - procedural: how-to, patterns, workflows (actionable)
+ */
+export function inferMemoryType(path: string, contentType: string, body?: string): MemoryType {
+  if (["handoff", "progress"].includes(contentType)) return "episodic";
+  if (["decision", "hub", "research"].includes(contentType)) return "semantic";
+  if (body && /\b(step\s+\d|workflow|recipe|how\s+to|procedure|runbook|playbook)\b/i.test(body)) return "procedural";
+  if (path.includes("sop") || path.includes("runbook") || path.includes("playbook")) return "procedural";
+  if (contentType === "antipattern") return "semantic";
+  return "semantic";
+}
+
+// =============================================================================
 // Recency Score
 // =============================================================================
 
