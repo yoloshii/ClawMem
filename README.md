@@ -679,12 +679,16 @@ review_by: "2026-03-01"
 ---
 ```
 
-## Suggested Memory Filesystem (OpenClaw)
+## Suggested Memory Filesystem
 
-For agent systems using ClawMem as their memory backend, this structure separates human-curated content from auto-generated memories, and within auto-generated content, separates **user memories** (persist across agents, owned by the human) from **agent memories** (operational, generated from sessions). Static knowledge lives in `resources/` with no recency decay, distinct from ephemeral session logs.
+This structure separates human-curated content from auto-generated memories, and within auto-generated content, separates **user memories** (persist across agents, owned by the human) from **agent memories** (operational, generated from sessions). Static knowledge lives in `resources/` with no recency decay, distinct from ephemeral session logs. The layout works with any MCP-compatible client (Claude Code, OpenClaw, custom agents).
+
+### Workspace Collection
+
+The primary workspace where the agent operates. Path varies by client (e.g., `~/workspace/`, `~/.openclaw/workspace/`, or any directory you choose).
 
 ```
-~/.openclaw/workspace/              ← Collection: "workspace"
+<workspace>/                         ← Collection: "workspace"
 ├── MEMORY.md                        # Human-curated long-term memory
 ├── memory/                          # Session logs (daily entries)
 │   ├── 2026-02-05.md
@@ -704,7 +708,13 @@ For agent systems using ClawMem as their memory backend, this structure separate
 │   │   └── antipatterns/            #     Accumulated negative patterns (∞ half-life)
 │   └── precompact-state.md          #   Pre-compaction snapshot (transient)
 └── ...
+```
 
+### Project Collections
+
+Each project gets its own collection. Same structure, with optional Beads integration.
+
+```
 ~/Projects/<project>/               ← Collection: "<project>"
 ├── .beads/                          # Beads issue tracker (Dolt backend, auto-synced)
 │   └── dolt/                        #   Dolt SQL database (source of truth)
@@ -758,11 +768,11 @@ For agent systems using ClawMem as their memory backend, this structure separate
 
 Manual layers benefit from periodic re-indexing — a cron job running `clawmem update --embed` keeps the index fresh for content edited outside of watched directories.
 
-### Setup for OpenClaw
+### Setup
 
 ```bash
-# Bootstrap workspace collection
-./bin/clawmem bootstrap ~/.openclaw/workspace --name workspace
+# Bootstrap workspace collection (use your agent's workspace path)
+./bin/clawmem bootstrap ~/workspace --name workspace
 
 # Bootstrap each project
 ./bin/clawmem bootstrap ~/Projects/my-project --name my-project
@@ -772,6 +782,13 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 
 # Install watcher as systemd service
 ./bin/clawmem install-service --enable
+```
+
+#### OpenClaw-Specific
+
+```bash
+# OpenClaw uses ~/.openclaw/workspace/ as its workspace root
+./bin/clawmem bootstrap ~/.openclaw/workspace --name workspace
 ```
 
 ## Dependencies
