@@ -217,6 +217,9 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 | `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/observations/`, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/handoffs/` |
 | `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence |
+| `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. Reindexes auto-memory collection. |
+| `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + recent decisions (400) + antipatterns (150) + vault context (200) → `<vault-postcompact>` |
+| `pretool-inject` | PreToolUse | 200 tokens | searches vault for file-specific context before Read/Edit/Write. Surfaces via `reason` field. Disabled in HOOK_EVENT_MAP (cannot inject additionalContext). |
 
 **Default behavior:** Read injected `<vault-context>` first. If sufficient, answer immediately.
 
@@ -255,6 +258,11 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 
     Choose 1a or 1b based on query type. They are parallel options, not sequential.
 
+1c. Multi-topic/complex → query_plan(query, compact=true)
+    Decomposes query into 2-4 typed clauses (bm25/vector/graph), executes in parallel, merges via RRF.
+    Use when query spans multiple topics or needs both keyword and semantic recall simultaneously.
+    Falls back to single-query behavior for simple queries (planner returns 1 clause).
+
 2. Progressive disclosure → multi_get("path1,path2") for full content of top hits
 
 3. Spot checks → search(query) (BM25, 0 GPU) or vsearch(query) (vector, 1 GPU)
@@ -274,6 +282,7 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `memory_snooze(query, until?)` — temporarily hide a memory from context surfacing until a date, or unsnooze.
 - `build_graphs(temporal?, semantic?)` — build temporal backbone + semantic graph after bulk ingestion. Not needed after routine indexing (A-MEM handles per-doc links).
 - `beads_sync(project_path?)` — sync Beads issues from Dolt backend (via `bd` CLI) into memory. Usually automatic via watcher.
+- `query_plan(query, compact=true)` — multi-topic query decomposition into parallel typed clauses. Use for complex queries spanning multiple topics.
 
 ### Memory Lifecycle
 
@@ -300,7 +309,7 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 ## Tool Selection (one-liner)
 
 ```
-ClawMem escalation: query(compact=true) | intent_search(why/when/entity) → multi_get → search/vsearch (spot checks)
+ClawMem escalation: query(compact=true) | intent_search(why/when/entity) | query_plan(multi-topic) → multi_get → search/vsearch (spot checks)
 ```
 
 ## Query Optimization
@@ -317,6 +326,7 @@ Pick the lightest tool that satisfies the need:
 | `vsearch(q, compact=true)` | Vector only, 1 GPU call | Conceptual/fuzzy, don't know vocabulary |
 | `query(q, compact=true)` | Full hybrid, 3+ GPU calls | General recall, unsure which signal matters |
 | `intent_search(q)` | Hybrid + graph | Why/entity chains (graph traversal), when queries (BM25-biased) |
+| `query_plan(q)` | Hybrid + decomposition | Complex multi-topic queries needing parallel typed retrieval |
 
 Use `search` for quick keyword spot-checks. Use `query` for general recall (default Tier 3 workhorse). Use `intent_search` directly (not as fallback) when the question is causal or relational.
 
@@ -544,6 +554,14 @@ echo "user query" | clawmem surface --context --stdin
 
 # IO6b: per-session bootstrap injection (pipe session ID on stdin)
 echo "session-id" | clawmem surface --bootstrap --stdin
+```
+
+**Analysis commands:**
+```bash
+clawmem reflect [N]             # Cross-session reflection (last N days, default 14)
+                                # Shows recurring themes, antipatterns, co-activation clusters
+clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
+                                # Uses Jaccard similarity within same collection
 ```
 
 ## Integration Notes

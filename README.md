@@ -2,7 +2,7 @@
 
 Hybrid agent memory system built on [QMD](https://github.com/tobi/qmd)'s retrieval substrate (BM25 + vectors + RRF + query expansion + cross-encoder reranking), layered with [SAME](https://github.com/sgx-labs/statelessagent)-derived composite scoring (recency decay, confidence, content-type half-lives), [MAGMA](https://arxiv.org/abs/2501.13956)-inspired intent classification and multi-graph traversal (semantic, temporal, causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes with automatic keyword/tag/context enrichment and inter-document link generation. Designed for [OpenClaw](https://github.com/openclaw/openclaw) and Claude Code.
 
-TypeScript on Bun. ~14,400 lines across 32 source files. 110 tests.
+TypeScript on Bun. ~15,500 lines across 35 source files. 139 tests.
 
 ## What It Does
 
@@ -306,14 +306,14 @@ Add to your MCP config (e.g. `~/.claude.json`, `claude_desktop_config.json`, or 
 
 The server runs via stdio — no network port needed. The `bin/clawmem` wrapper sets the GPU endpoint env vars automatically.
 
-**Verify:** After registering, your client should see 20 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
+**Verify:** After registering, your client should see 21 tools including `search`, `vsearch`, `query`, `query_plan`, `intent_search`, etc.
 
 ### Verify Installation
 
 ```bash
 ./bin/clawmem doctor   # Full health check
 ./bin/clawmem status   # Quick index status
-bun test               # Run test suite (110 tests)
+bun test               # Run test suite (139 tests)
 ```
 
 ## Agent Instructions
@@ -412,6 +412,9 @@ clawmem hook <name>                             Manual hook trigger
 clawmem surface --context --stdin               IO6: pre-prompt context injection
 clawmem surface --bootstrap --stdin             IO6: per-session bootstrap injection
 
+clawmem reflect [N]                             Cross-session reflection (last N days, default 14)
+clawmem consolidate [--dry-run] [N]             Find and archive duplicate low-confidence docs
+
 clawmem install-service [--enable] [--remove]   Systemd watcher service
 clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
 clawmem setup mcp [--remove]                    Register/remove MCP server
@@ -420,7 +423,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (20)
+## MCP Tools (21)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
@@ -444,8 +447,11 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | Tool | Description |
 |---|---|
 | `intent_search` | Intent-classified search with graph expansion and reranking |
+| `query_plan` | Decomposes complex multi-topic queries into parallel typed clauses (bm25/vector/graph), executes each, merges via RRF, applies composite scoring |
 
-**Pipeline:** Query → Intent Classification → BM25 + Vector → Intent-Weighted RRF → Graph Expansion (WHY/ENTITY intents) → Cross-Encoder Reranking → Composite Scoring
+**`intent_search` pipeline:** Query → Intent Classification → BM25 + Vector → Intent-Weighted RRF → Graph Expansion (WHY/ENTITY intents) → Cross-Encoder Reranking → Composite Scoring
+
+**`query_plan` pipeline:** Query → LLM decomposition into 2-4 typed clauses → Parallel execution (BM25/vector/graph per clause) → RRF merge across clauses → Composite scoring. Falls back to single-query for simple inputs.
 
 ### Multi-Graph & Causal
 
@@ -483,7 +489,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 ## Hooks (Claude Code Integration)
 
-Six hooks auto-installed by `clawmem setup hooks`:
+Nine hooks auto-installed by `clawmem setup hooks`:
 
 | Hook | Event | What It Does |
 |---|---|---|
@@ -493,6 +499,9 @@ Six hooks auto-installed by `clawmem setup hooks`:
 | `decision-extractor` | Stop | GGUF observer extracts structured decisions, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation for documents surfaced together |
+| `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. |
+| `postcompact-inject` | SessionStart (compact) | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
+| `pretool-inject` | PreToolUse | Searches vault for file-specific context before Read/Edit/Write. Surfaces via `reason` field (200 token budget). Disabled in HOOK_EVENT_MAP. |
 
 Hooks handle ~90% of retrieval automatically. For agent escalation logic (when to use MCP tools vs rely on hooks), see `CLAUDE.md`.
 
