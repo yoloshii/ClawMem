@@ -84,6 +84,32 @@ function splitIntoWindows(text: string, windowSize: number, overlap = 200): stri
   return windows.length > 0 ? windows : [text];
 }
 
+/** Classify query into retrieval mode based on signal patterns */
+function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "discovery" | "complex" | "hybrid" {
+  const q = query.toLowerCase();
+
+  // Timeline (highest precision signals — check first)
+  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do|cross.session|earlier today|this morning|what we discussed|when we last)\b/i.test(q)) return "timeline";
+
+  // Causal
+  if (/\b(why did|why was|why were|what caused|what led to|reason for|decided to|decision about|trade.?off|instead of|chose to|because we)\b/i.test(q)) return "causal";
+  if (/^why\b/i.test(q)) return "causal";
+
+  // Discovery
+  if (/\b(similar to|related to|what else|what other|reminds? me of|like this|comparable|neighbors)\b/i.test(q)) return "discovery";
+
+  // Complex multi-topic
+  if (/\band\s+(?:also|what|how|why)\b/i.test(q) || /\?.*\?/.test(q) || /\b(?:additionally|as well as|along with)\b/i.test(q) || /\bboth\s+.+\s+and\s+/i.test(q)) return "complex";
+
+  // Keyword: short + contains specific identifiers/codes/paths
+  if (q.length < 50 && (/[A-Z][A-Z0-9_]{2,}/.test(query) || /[\w-]+\.\w{2,4}\b/.test(q.trim()) || /\b(config|setting|error|path|file|port|url)\b/i.test(q))) return "keyword";
+
+  // Semantic: conceptual/explanatory
+  if (/\b(how does|explain|concept|overview|understand|meaning of|what is the purpose)\b/i.test(q)) return "semantic";
+
+  return "hybrid";
+}
+
 function formatSearchSummary(results: SearchResultItem[], query: string): string {
   if (results.length === 0) return `No results found for "${query}"`;
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
@@ -127,14 +153,198 @@ export async function startMcpServer(): Promise<void> {
     },
     async () => ({
       content: [{ type: "text" as const, text: `## ClawMem Search Workflow
-1a. General recall → query(query, compact=true) — hybrid + expansion + deep rerank (4000 char)
-1b. Causal/why/when/entity → intent_search(query, enable_graph_traversal=true) — graph traversal
-    Choose 1a or 1b by query type. They are parallel options, not sequential fallback.
-2. Progressive disclosure → multi_get("path1,path2") for full content of top hits
-3. Spot checks → search(query) or vsearch(query) — fast, narrow
-4. Before irreversible actions → check memory for prior decisions on the topic.
-Only escalate when injected <vault-context> is insufficient. Do not re-search what hooks already surfaced.` }]
+
+PREFERRED: Use memory_retrieve(query) — auto-routes to the right backend.
+
+If calling tools directly, match query type to tool:
+
+  "why did we decide X"         → intent_search(query)     NOT query()
+  "what happened last session"  → session_log()             NOT query()
+  "what else relates to X"      → find_similar(file)        NOT query()
+  complex multi-topic           → query_plan(query)         NOT query()
+  general recall                → query(query, compact=true)
+  keyword spot check            → search(query, compact=true)
+  conceptual/fuzzy              → vsearch(query, compact=true)
+
+WRONG: query("why did we choose PostgreSQL", compact=true)
+RIGHT: intent_search("why did we choose PostgreSQL")
+RIGHT: memory_retrieve("why did we choose PostgreSQL")
+
+WRONG: query("what happened last session", compact=true)
+RIGHT: session_log(limit=5)
+RIGHT: memory_retrieve("what happened last session")
+
+After search: multi_get("path1,path2") for full content of top hits.
+Only escalate when injected <vault-context> is insufficient.` }]
     })
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: memory_retrieve (Meta-tool — auto-routing single entry point)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "memory_retrieve",
+    {
+      title: "Smart Memory Retrieve (Auto-Routing)",
+      description: `Unified memory retrieval — classifies your query and routes to the optimal search backend automatically. Use this instead of choosing between search/vsearch/query/intent_search.
+
+Auto-routing:
+- "why did we decide X" → causal graph traversal
+- "what happened last session" → session history
+- "what else relates to X" → vector neighbors
+- Complex multi-topic → parallel decomposition
+- General recall → full hybrid search
+
+This is the recommended entry point for ALL memory queries.`,
+      inputSchema: {
+        query: z.string().describe("Your question or search query"),
+        mode: z.enum(["auto", "keyword", "semantic", "causal", "timeline", "discovery", "complex", "hybrid"]).optional().default("auto").describe("Override auto-detection: keyword=BM25, semantic=vector, causal=graph traversal, timeline=session history, discovery=similar docs, complex=multi-topic, hybrid=full pipeline"),
+        limit: z.number().optional().default(10),
+        compact: z.boolean().optional().default(true),
+      },
+    },
+    async ({ query, mode, limit, compact }) => {
+      const effectiveMode = mode === "auto" ? classifyRetrievalMode(query) : mode;
+      const lim = limit || 10;
+
+      // --- Timeline mode → session log ---
+      if (effectiveMode === "timeline") {
+        const sessions = store.getRecentSessions(lim);
+        if (sessions.length === 0) {
+          return { content: [{ type: "text", text: `[routed: timeline] No sessions tracked yet.` }] };
+        }
+        const lines = [`[routed: timeline] Recent sessions:\n`];
+        for (const sess of sessions) {
+          const duration = sess.endedAt
+            ? `${Math.round((new Date(sess.endedAt).getTime() - new Date(sess.startedAt).getTime()) / 60000)}min`
+            : "active";
+          lines.push(`${sess.sessionId.slice(0, 8)} ${sess.startedAt} (${duration})`);
+          if (sess.handoffPath) lines.push(`  Handoff: ${sess.handoffPath}`);
+          if (sess.summary) lines.push(`  ${sess.summary.slice(0, 100)}`);
+          if (sess.filesChanged.length > 0) lines.push(`  Files: ${sess.filesChanged.slice(0, 5).join(", ")}`);
+        }
+        return { content: [{ type: "text", text: lines.join('\n') }], structuredContent: { mode: effectiveMode, sessions } };
+      }
+
+      // --- Causal mode → intent classification + graph traversal ---
+      if (effectiveMode === "causal") {
+        const llm = getDefaultLlamaCpp();
+        const intent = await classifyIntent(query, llm, store.db);
+        const bm25Results = store.searchFTS(query, 30);
+        let vecResults: SearchResult[] = [];
+        try { vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch { /* no vectors */ }
+        const rrfWeights = intent.intent === 'WHY' ? [1.0, 1.5] : intent.intent === 'WHEN' ? [1.5, 1.0] : [1.0, 1.0];
+        const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
+        const allSearch = [...bm25Results, ...vecResults];
+        let fused: SearchResult[] = fusedRanked.map(fr => {
+          const orig = allSearch.find(r => r.filepath === fr.file);
+          return orig ? { ...orig, score: fr.score } : null;
+        }).filter((r): r is SearchResult => r !== null);
+
+        if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
+          try {
+            const anchorEmb = await llm.embed(query);
+            if (anchorEmb) {
+              const traversed = adaptiveTraversal(store.db, fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })), {
+                maxDepth: 2, beamWidth: 5, budget: 30,
+                intent: intent.intent, queryEmbedding: anchorEmb.embedding,
+              });
+              fused = mergeTraversalResults(fused, traversed, store.db);
+            }
+          } catch { /* graph traversal failed — continue with base results */ }
+        }
+
+        const enriched = enrichResults(store, fused, query);
+        const scored = applyCompositeScoring(enriched, query).slice(0, lim);
+        const items = scored.map(r => ({
+          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+          score: Math.round(r.compositeScore * 100) / 100,
+          snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
+        }));
+        return {
+          content: [{ type: "text", text: `[routed: causal, intent: ${intent.intent}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
+          structuredContent: { mode: effectiveMode, intent, results: items },
+        };
+      }
+
+      // --- Complex mode → query decomposition ---
+      if (effectiveMode === "complex") {
+        const llm = getDefaultLlamaCpp();
+        const clauses = await decomposeQuery(query, llm, store.db);
+        const allResults: SearchResult[] = [];
+        for (const clause of clauses.sort((a, b) => a.priority - b.priority)) {
+          let results: SearchResult[] = [];
+          if (clause.type === 'bm25') results = store.searchFTS(clause.query, 20, undefined, clause.collections);
+          else if (clause.type === 'vector') { try { results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections); } catch { /* */ } }
+          else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections); }
+          allResults.push(...results);
+        }
+        const seen = new Set<string>();
+        const deduped = allResults.filter(r => { if (seen.has(r.filepath)) return false; seen.add(r.filepath); return true; });
+        const enriched = enrichResults(store, deduped, query);
+        const scored = applyCompositeScoring(enriched, query).slice(0, lim);
+        const items = scored.map(r => ({
+          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+          score: Math.round(r.compositeScore * 100) / 100,
+          snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
+        }));
+        return {
+          content: [{ type: "text", text: `[routed: complex, ${clauses.length} clauses] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
+          structuredContent: { mode: effectiveMode, clauses: clauses.length, results: items },
+        };
+      }
+
+      // --- Keyword / Semantic / Discovery / Hybrid modes ---
+      let results: SearchResult[] = [];
+      if (effectiveMode === "keyword") {
+        results = store.searchFTS(query, lim);
+      } else if (effectiveMode === "semantic" || effectiveMode === "discovery") {
+        try { results = await store.searchVec(query, DEFAULT_EMBED_MODEL, lim); } catch { results = store.searchFTS(query, lim); }
+      } else {
+        // Hybrid: BM25 + vector + RRF
+        const bm25 = store.searchFTS(query, 30);
+        let vec: SearchResult[] = [];
+        try { vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch { /* */ }
+        if (vec.length > 0) {
+          const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
+          const allSearch = [...bm25, ...vec];
+          results = fusedRanked.map(fr => {
+            const orig = allSearch.find(r => r.filepath === fr.file);
+            return orig ? { ...orig, score: fr.score } : null;
+          }).filter((r): r is SearchResult => r !== null);
+        } else {
+          results = bm25;
+        }
+      }
+
+      const enriched = enrichResults(store, results, query);
+      const scored = applyCompositeScoring(enriched, query).slice(0, lim);
+      if (compact) {
+        const items = scored.map(r => ({
+          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+          score: Math.round(r.compositeScore * 100) / 100,
+          snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
+        }));
+        return {
+          content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
+          structuredContent: { mode: effectiveMode, results: items },
+        };
+      }
+      const items: SearchResultItem[] = scored.map(r => {
+        const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
+        return {
+          docid: `#${r.docid}`, file: r.displayPath, title: r.title,
+          score: r.score, compositeScore: Math.round(r.compositeScore * 100) / 100,
+          contentType: r.contentType, context: store.getContextForFile(r.filepath),
+          snippet: addLineNumbers(snippet, line),
+        };
+      });
+      return {
+        content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items, query)}` }],
+        structuredContent: { mode: effectiveMode, results: items },
+      };
+    }
   );
 
   // ---------------------------------------------------------------------------
@@ -199,12 +409,12 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "search",
     {
       title: "Search (BM25 + Memory)",
-      description: "Keyword search with SAME composite scoring. Results ranked by relevance + recency + confidence.",
+      description: "Keyword (BM25) search for exact term lookup. Use for config names, error codes, specific filenames. DO NOT use for 'why' questions (use intent_search) or cross-session queries (use session_log). Prefer memory_retrieve for auto-routing.",
       inputSchema: {
         query: z.string().describe("Search query"),
         limit: z.number().optional().default(10),
         minScore: z.number().optional().default(0),
-        collection: z.string().optional().describe("Filter to collection"),
+        collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
       },
     },
@@ -258,12 +468,12 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "vsearch",
     {
       title: "Vector Search (Semantic + Memory)",
-      description: "Semantic similarity search with SAME composite scoring.",
+      description: "Vector similarity search for conceptual/fuzzy matching. Use when exact keywords are unknown. DO NOT use for causal 'why' questions (use intent_search) or session history (use session_log). Prefer memory_retrieve for auto-routing.",
       inputSchema: {
         query: z.string().describe("Natural language query"),
         limit: z.number().optional().default(10),
         minScore: z.number().optional().default(0.3),
-        collection: z.string().optional().describe("Filter to collection"),
+        collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
       },
     },
@@ -322,12 +532,12 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "query",
     {
       title: "Hybrid Query (Best Quality)",
-      description: "Highest quality: BM25 + vector + query expansion + reranking + SAME composite scoring. Provide intent to disambiguate overloaded queries (e.g. 'performance' could mean web perf, team health, or fitness).",
+      description: "Full hybrid search (BM25 + vector + rerank). General-purpose — use when query type is unclear. WRONG: query('why did we decide X') — use intent_search instead. WRONG: query('what happened last session') — use session_log instead. Prefer memory_retrieve for auto-routing.",
       inputSchema: {
         query: z.string().describe("Natural language query"),
         limit: z.number().optional().default(10),
         minScore: z.number().optional().default(0),
-        collection: z.string().optional().describe("Filter to collection"),
+        collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
         diverse: z.boolean().optional().default(true).describe("Apply MMR diversity filter to reduce near-duplicate results"),
         intent: z.string().optional().describe("Domain intent hint for disambiguation — steers expansion, reranking, chunk selection, and snippet extraction"),
@@ -710,7 +920,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "find_similar",
     {
       title: "Find Similar Notes",
-      description: "Find notes similar to a reference document using vector proximity.",
+      description: "USE THIS for 'what else relates to X', 'show me similar docs'. Finds k-NN vector neighbors of a reference document — discovers connections beyond keyword overlap that search/query cannot find.",
       inputSchema: {
         file: z.string().describe("Path of reference document"),
         limit: z.number().optional().default(5),
@@ -852,7 +1062,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "session_log",
     {
       title: "Session Log",
-      description: "View recent agent sessions with handoff info and file changes.",
+      description: "USE THIS when user references prior sessions: 'last time', 'yesterday', 'what happened', 'what did we do'. Returns session history with handoffs and file changes. DO NOT use query() for cross-session questions — this tool has session-specific data that search cannot find.",
       inputSchema: {
         limit: z.number().optional().default(10),
       },
@@ -989,7 +1199,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "intent_search",
     {
       title: "Intent-Aware Search",
-      description: "Search with automatic intent detection and graph-enhanced retrieval (MAGMA). Uses WHY/WHEN/ENTITY/WHAT classification to route queries.",
+      description: "USE THIS for 'why did we decide X', 'what caused Y', 'who worked on Z'. Classifies intent (WHY/WHEN/ENTITY) and traverses causal + semantic graph edges. Returns decision chains that query() CANNOT find. If asking about reasons, causes, decisions, or entities — this tool, not query().",
       inputSchema: {
         query: z.string().describe("Search query"),
         limit: z.number().optional().default(10),
@@ -1135,7 +1345,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "query_plan",
     {
       title: "Query Plan (Multi-Query Decomposition)",
-      description: "Decomposes complex or multi-topic queries into parallel typed retrieval clauses. Best for queries spanning multiple topics or requiring both keyword and semantic search. Falls back to single-query behavior for simple queries.",
+      description: "USE THIS for complex multi-topic queries ('tell me about X and also Y', 'compare A with B in the context of C'). Decomposes into parallel typed retrieval clauses. DO NOT use query() for multi-topic — it searches as one blob. This tool splits topics and routes each optimally.",
       inputSchema: {
         query: z.string().describe("Complex or multi-topic query"),
         limit: z.number().optional().default(10),
@@ -1270,7 +1480,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "find_causal_links",
     {
       title: "Find Causal Links",
-      description: "Traverse the causal graph to find documents causally related to a given document. Returns causal chains with reasoning.",
+      description: "USE THIS to trace decision chains: 'what led to X', 'trace how we got from A to B'. Follow up intent_search with this tool on a top result to walk the full causal chain. Returns depth-annotated links with reasoning.",
       inputSchema: {
         docid: z.string().describe("Document ID (e.g., '#123' or path)"),
         direction: z.enum(['causes', 'caused_by', 'both']).optional().default('both').describe("Direction: 'causes' (outbound), 'caused_by' (inbound), or 'both'"),
@@ -1453,7 +1663,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "memory_pin",
     {
       title: "Pin/Unpin Memory",
-      description: "Pin a memory so it's always prioritized in context surfacing, or unpin it. Pinned docs get a +0.3 composite score boost.",
+      description: "Pin a memory for permanent prioritization (+0.3 boost). USE PROACTIVELY when: user states a persistent constraint, makes an architecture decision, or corrects a misconception. Don't wait for curator — pin critical decisions immediately.",
       inputSchema: {
         query: z.string().describe("Search query to find the memory to pin/unpin"),
         unpin: z.boolean().optional().default(false).describe("Set true to unpin"),
@@ -1486,7 +1696,7 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
     "memory_snooze",
     {
       title: "Snooze Memory",
-      description: "Temporarily hide a memory from context surfacing until a given date, or unsnooze it.",
+      description: "Temporarily hide a memory from context surfacing. USE PROACTIVELY when vault-context repeatedly surfaces irrelevant content — snooze it for 30 days instead of ignoring it. Reduces noise for future sessions.",
       inputSchema: {
         query: z.string().describe("Search query to find the memory to snooze"),
         until: z.string().optional().describe("ISO date to snooze until (e.g. 2026-03-01). Omit to unsnooze."),

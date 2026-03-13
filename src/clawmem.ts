@@ -840,7 +840,8 @@ async function cmdSetup(args: string[]) {
   switch (subCmd) {
     case "hooks": await cmdSetupHooks(args.slice(1)); break;
     case "mcp": await cmdSetupMcp(args.slice(1)); break;
-    default: die("Usage: clawmem setup <hooks|mcp> [--remove]");
+    case "curator": await cmdSetupCurator(args.slice(1)); break;
+    default: die("Usage: clawmem setup <hooks|mcp|curator> [--remove]");
   }
 }
 
@@ -934,6 +935,39 @@ async function cmdSetupMcp(args: string[]) {
 
   const { writeFileSync: wfs } = await import("fs");
   wfs(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
+}
+
+async function cmdSetupCurator(args: string[]) {
+  const remove = args.includes("--remove");
+  const agentsDir = pathResolve(process.env.HOME || "~", ".claude", "agents");
+  const targetPath = pathResolve(agentsDir, "clawmem-curator.md");
+  const sourcePath = pathResolve(import.meta.dir, "..", "agents", "clawmem-curator.md");
+
+  if (remove) {
+    if (existsSync(targetPath)) {
+      const { unlinkSync } = await import("fs");
+      unlinkSync(targetPath);
+      console.log(`${c.green}Removed curator agent from ${targetPath}${c.reset}`);
+    } else {
+      console.log(`${c.dim}Curator agent not installed at ${targetPath}${c.reset}`);
+    }
+    return;
+  }
+
+  if (!existsSync(sourcePath)) {
+    die(`Curator agent definition not found at ${sourcePath}`);
+  }
+
+  if (!existsSync(agentsDir)) mkdirSync(agentsDir, { recursive: true });
+
+  const { copyFileSync } = await import("fs");
+  copyFileSync(sourcePath, targetPath);
+  console.log(`${c.green}Installed curator agent to ${targetPath}${c.reset}`);
+  console.log(`  Trigger: "curate memory", "run curator", or "memory maintenance"`);
+}
+
+function cmdPath() {
+  console.log(getDefaultDbPath());
 }
 
 function findClawmemBinary(): string {
@@ -1418,6 +1452,9 @@ async function main() {
       case "reflect":
         await cmdReflect(subArgs);
         break;
+      case "path":
+        cmdPath();
+        break;
       case "consolidate":
         await cmdConsolidate(subArgs);
         break;
@@ -1607,6 +1644,7 @@ ${c.bold}Setup:${c.reset}
   clawmem collection remove <name>
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
+  clawmem setup curator [--remove]     Install/remove curator agent to ~/.claude/agents/
   clawmem install-service [--enable]   Install systemd watcher service
 
 ${c.bold}Indexing:${c.reset}
@@ -1640,6 +1678,7 @@ ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
+  clawmem path                         Print database path
 
 ${c.bold}Options:${c.reset}
   -n, --num <N>        Number of results

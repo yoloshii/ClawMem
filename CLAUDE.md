@@ -236,6 +236,8 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 
 **Once escalated, route by query type:**
 
+**PREFERRED:** `memory_retrieve(query)` — auto-classifies and routes to the optimal backend (query, intent_search, session_log, find_similar, or query_plan). Use this instead of manually choosing a tool below.
+
 ```
 1a. General recall → query(query, compact=true, limit=20)
     Full hybrid: BM25 + vector + query expansion + deep reranking (4000 char).
@@ -299,7 +301,8 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 
 ### Anti-Patterns
 
-- Do NOT call `query` or `intent_search` every turn — three rules above are the only gates.
+- Do NOT manually pick query/intent_search/search when `memory_retrieve` can auto-route.
+- Do NOT call MCP tools every turn — three rules above are the only gates.
 - Do NOT re-search what's already in `<vault-context>`.
 - Do NOT run `status` routinely. Only when retrieval feels broken or after large ingestion.
 - Do NOT pin everything — pin is for persistent high-priority items, not temporary boosting.
@@ -309,8 +312,24 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 ## Tool Selection (one-liner)
 
 ```
-ClawMem escalation: query(compact=true) | intent_search(why/when/entity) | query_plan(multi-topic) → multi_get → search/vsearch (spot checks)
+ClawMem escalation: memory_retrieve(query) | query(compact=true) | intent_search(why/when/entity) | query_plan(multi-topic) → multi_get → search/vsearch (spot checks)
 ```
+
+## Curator Agent
+
+Maintenance agent for Tier 3 operations the main agent typically neglects. Install with `clawmem setup curator`.
+
+**Invoke:** "curate memory", "run curator", or "memory maintenance"
+
+**6 phases:**
+1. Health snapshot — status, index_stats, lifecycle_status, doctor
+2. Lifecycle triage — pin high-value unpinned memories, snooze stale content, propose forget candidates (never auto-confirms)
+3. Retrieval health check — 5 probes (BM25, vector, hybrid, intent/graph, lifecycle)
+4. Maintenance — reflect (cross-session patterns), consolidate --dry-run (dedup candidates)
+5. Graph rebuild — conditional on probe results and embedding state
+6. Collection hygiene — orphan detection, content type distribution
+
+**Safety rails:** Never auto-confirms forget. Never runs embed (timer's job). Never modifies config.yaml. All destructive proposals require user approval.
 
 ## Query Optimization
 

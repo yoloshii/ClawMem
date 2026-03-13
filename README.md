@@ -306,7 +306,7 @@ Add to your MCP config (e.g. `~/.claude.json`, `claude_desktop_config.json`, or 
 
 The server runs via stdio — no network port needed. The `bin/clawmem` wrapper sets the GPU endpoint env vars automatically.
 
-**Verify:** After registering, your client should see 21 tools including `search`, `vsearch`, `query`, `query_plan`, `intent_search`, etc.
+**Verify:** After registering, your client should see tools including `memory_retrieve`, `search`, `vsearch`, `query`, `query_plan`, `intent_search`, etc.
 
 ### Verify Installation
 
@@ -318,13 +318,14 @@ bun test               # Run test suite (139 tests)
 
 ## Agent Instructions
 
-ClawMem ships three instruction files that give AI agents the operational context to use it correctly:
+ClawMem ships three instruction files and an optional maintenance agent:
 
 | File | Loaded | Purpose |
 |------|--------|---------|
 | `CLAUDE.md` | Automatically (Claude Code, when working in this repo) | Complete operational reference — hooks, tools, query optimization, scoring, pipeline details, troubleshooting |
 | `AGENTS.md` | Framework-dependent | Identical to CLAUDE.md — cross-framework compatibility (Cursor, Windsurf, Codex, etc.) |
 | `SKILL.md` | On-demand via Claude Code skill system | Same reference as CLAUDE.md, available across all projects |
+| `agents/clawmem-curator.md` | On-demand via `clawmem setup curator` | Maintenance agent — lifecycle triage, retrieval health checks, dedup sweeps, graph rebuilds |
 
 **Working in the ClawMem repo:** No action needed — `CLAUDE.md` loads automatically.
 
@@ -360,6 +361,7 @@ Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
 
 ### Tool Routing (once escalated)
 
+- **Preferred** → `memory_retrieve(query)` (auto-routes to optimal backend)
 - General recall → `query(query, compact=true)`
 - Why/entity/when → `intent_search(query)`
 - Spot check → `search(query, compact=true)` or `vsearch(query, compact=true)`
@@ -418,7 +420,9 @@ clawmem consolidate [--dry-run] [N]             Find and archive duplicate low-c
 clawmem install-service [--enable] [--remove]   Systemd watcher service
 clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
 clawmem setup mcp [--remove]                    Register/remove MCP server
+clawmem setup curator [--remove]                Install/remove curator maintenance agent
 clawmem mcp                                     Start stdio MCP server
+clawmem path                                    Print database path
 clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
@@ -435,6 +439,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 | Tool | Description |
 |---|---|
+| `memory_retrieve` | **Preferred entry point.** Auto-classifies query and routes to optimal backend (query, intent_search, session_log, find_similar, or query_plan). Use instead of manually choosing a search tool. |
 | `search` | BM25 keyword search with composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. |
 | `vsearch` | Vector semantic search with composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. |
 | `query` | Full hybrid pipeline with intent hint, strong-signal bypass, intent-aware chunk selection, chunk dedup, configurable candidateLimit, composite scoring + co-activation boost + MMR diversity + compact mode. Collection filter supports comma-separated values. |
