@@ -363,22 +363,36 @@ Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
 
 ### Tool Routing (once escalated)
 
-- **Preferred** → `memory_retrieve(query)` (auto-routes to optimal backend)
-- General recall → `query(query, compact=true)`
-- Why/entity/when → `intent_search(query)`
-- Multi-topic/complex → `query_plan(query, compact=true)`
-- Spot check → `search(query, compact=true)` or `vsearch(query, compact=true)`
-- Full content → `multi_get("path1,path2")`
-- Lifecycle health → `lifecycle_status()` | Stale sweep → `lifecycle_sweep(dry_run=true)` | Restore → `lifecycle_restore(query)`
+**Preferred:** `memory_retrieve(query)` — auto-classifies and routes to the optimal backend.
+
+**Direct routing** (when calling specific tools):
+```
+"why did we decide X"         → intent_search(query)          NOT query()
+"what happened last session"  → session_log()                 NOT query()
+"what else relates to X"      → find_similar(file)            NOT query()
+Complex multi-topic           → query_plan(query)             NOT query()
+General recall                → query(query, compact=true)
+Keyword spot check            → search(query, compact=true)
+Conceptual/fuzzy              → vsearch(query, compact=true)
+Full content                  → multi_get("path1,path2")
+Lifecycle health              → lifecycle_status()
+Stale sweep                   → lifecycle_sweep(dry_run=true)
+Restore archived              → lifecycle_restore(query)
+```
+
+ALWAYS `compact=true` first → review → `multi_get` for full content.
 
 ### Proactive Use (no escalation gate needed)
 
 - User says "remember this" / critical decision made → `memory_pin(query)` immediately
 - User corrects a misconception → `memory_pin(query)` the correction
 - `<vault-context>` surfaces irrelevant/noisy content → `memory_snooze(query, until)` for 30 days
+- Need to correct a memory → `memory_forget(query)`
+- After bulk ingestion → `build_graphs`
 
 ### Anti-Patterns
 
+- Do NOT use `query()` for everything — match query type to tool, or use `memory_retrieve`
 - Do NOT call query/intent_search every turn — 3 rules above are the only gates
 - Do NOT re-search what's already in `<vault-context>`
 - Do NOT pin everything — pin is for persistent high-priority items, not routine decisions
