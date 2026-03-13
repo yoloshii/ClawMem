@@ -9,6 +9,7 @@ node_modules/
 !CLAUDE.md
 !AGENTS.md
 !SKILL.md
+!agents/*.md
 
 # Internal dev artifacts
 .ralph/
