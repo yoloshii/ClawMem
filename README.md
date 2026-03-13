@@ -676,50 +676,80 @@ review_by: "2026-03-01"
 
 ## Suggested Memory Filesystem (OpenClaw)
 
-For agent systems using ClawMem as their memory backend, this 5-layer structure maps cleanly to ClawMem collections:
+For agent systems using ClawMem as their memory backend, this structure separates human-curated content from auto-generated memories, and within auto-generated content, separates **user memories** (persist across agents, owned by the human) from **agent memories** (operational, generated from sessions). Static knowledge lives in `resources/` with no recency decay, distinct from ephemeral session logs.
 
 ```
 ~/.openclaw/workspace/              ← Collection: "workspace"
-├── MEMORY.md                        # Layer 1: Workspace long-term (human-curated)
-├── memory/                          # Layer 2: Workspace daily (session logs)
+├── MEMORY.md                        # Human-curated long-term memory
+├── memory/                          # Session logs (daily entries)
 │   ├── 2026-02-05.md
 │   └── 2026-02-06.md
+├── resources/                       # Static knowledge — use content_type: hub (∞ half-life)
+│   ├── runbooks/
+│   │   └── deploy-checklist.md
+│   └── onboarding.md
 ├── _clawmem/                        # Auto-generated — DO NOT EDIT
-│   ├── decisions/                   #   Structured decisions from session transcripts
-│   ├── handoffs/                    #   Session handoffs (summary, next steps, files)
-│   └── profile.md                   #   Auto-curated user profile (static + dynamic)
-└── ...                              # Behavioral docs, configs, etc.
+│   ├── user/                        #   User memories (persist across agents/sessions)
+│   │   ├── profile.md               #     Static facts + dynamic context
+│   │   ├── preferences/             #     Extracted preferences (update_existing merge policy)
+│   │   └── entities/                #     Named entities (people, services, repos)
+│   ├── agent/                       #   Agent memories (operational, session-derived)
+│   │   ├── observations/            #     Decisions + observations from transcripts
+│   │   ├── handoffs/                #     Session summaries with next steps
+│   │   └── antipatterns/            #     Accumulated negative patterns (∞ half-life)
+│   └── precompact-state.md          #   Pre-compaction snapshot (transient)
+└── ...
 
 ~/Projects/<project>/               ← Collection: "<project>"
-├── .beads/                          # Beads issue tracker (Dolt backend, auto-synced to memory graph)
-│   └── dolt/                        # Dolt SQL database (source of truth)
-├── MEMORY.md                        # Layer 3: Project long-term (human-curated)
-├── memory/                          # Layer 4: Project daily (session logs)
+├── .beads/                          # Beads issue tracker (Dolt backend, auto-synced)
+│   └── dolt/                        #   Dolt SQL database (source of truth)
+├── MEMORY.md                        # Human-curated project memory
+├── memory/                          # Project session logs
 │   └── 2026-02-06.md
-├── _clawmem/                        # Auto-generated per-project
-│   ├── beads/                       #   Beads issues as searchable markdown
-│   ├── decisions/
-│   ├── handoffs/
-│   └── profile.md
-├── research/                        # Layer 5: Research dumps (fragment-embedded)
+├── resources/                       # Static project knowledge (∞ half-life)
+│   ├── architecture.md
+│   └── api-reference.md
+├── research/                        # Research dumps (fragment-embedded, 90-day decay)
 │   └── 2026-02-06-topic-slug.md
-├── CLAUDE.md                        # May include auto-generated ClawMem context section
+├── _clawmem/                        # Auto-generated per-project
+│   ├── user/
+│   │   └── preferences/
+│   ├── agent/
+│   │   ├── observations/
+│   │   ├── handoffs/
+│   │   ├── antipatterns/
+│   │   └── beads/                   #   Beads issues as searchable markdown
+│   └── precompact-state.md
+├── CLAUDE.md
 ├── src/
 └── README.md
 ```
 
+### Design Principles
+
+| Principle | Rationale | ClawMem Mechanism |
+|---|---|---|
+| **User/agent separation** | User memories (preferences, entities, profile) are owned by the human and persist indefinitely. Agent memories (observations, handoffs) are operational artifacts with lifecycle management. | `_clawmem/user/` vs `_clawmem/agent/` — different merge policies and decay rules per content type |
+| **Resources are first-class** | Static knowledge (runbooks, architecture docs, API refs) should never lose relevance due to recency decay. | `resources/` indexed with `content_type: hub` → ∞ half-life in composite scoring |
+| **Progressive disclosure** | Hook injection (2000 token budget) benefits from tiered loading: compact snippets first, full content on demand. | `compact=true` (L1) → `multi_get` (L2) at query time. Pre-computed abstracts not yet implemented — candidate for future L0 tier. |
+| **Beads as memory edges** | Issue tracker data bridges into the knowledge graph via typed relations, not just as flat documents. | `syncBeadsIssues()` maps deps → `memory_relations`: blocks→causal, discovered-from→supporting, relates-to→semantic |
+| **Merge policies per facet** | Different memory types need different deduplication strategies to prevent bloat. | `getMergePolicy()`: decision→dedup_check (cosine>0.92), antipattern→merge_recent (7d), preference→update_existing, handoff→always_new |
+
 ### Layer Mapping
 
-| Layer | Path | Manual/Auto | ClawMem Role |
-|---|---|---|---|
-| 1. Workspace Long-Term | `MEMORY.md` | Manual | Indexed, searched, profile supplements |
-| 2. Workspace Daily | `memory/*.md` | Manual | Indexed, searched, handoff auto-generated |
-| 3. Project Long-Term | `Projects/X/MEMORY.md` | Manual | Indexed per-collection, decisions auto-captured |
-| 4. Project Daily | `Projects/X/memory/*.md` | Manual | Indexed, searched |
-| 5. Research Dumps | `Projects/X/research/*.md` | Manual | Fragment-embedded for granular retrieval |
-| Auto: Decisions | `_clawmem/decisions/*.md` | Auto | Observer-extracted from transcripts |
-| Auto: Handoffs | `_clawmem/handoffs/*.md` | Auto | Session summaries with next steps |
-| Auto: Profile | `_clawmem/profile.md` | Auto | Static facts + dynamic context |
+| Layer | Path | Owner | Decay | ClawMem Role |
+|---|---|---|---|---|
+| Long-Term Memory | `MEMORY.md` | Human | ∞ | Indexed, profile supplements, human-curated anchor |
+| Session Logs | `memory/*.md` | Human | 60 days | Indexed, daily entries, handoff auto-generated |
+| Static Resources | `resources/**/*.md` | Human | ∞ (hub) | Fragment-embedded, no recency penalty |
+| Research | `research/*.md` | Human | 90 days | Fragment-embedded for granular retrieval |
+| User Profile | `_clawmem/user/profile.md` | Auto | ∞ | Static facts + dynamic context |
+| User Preferences | `_clawmem/user/preferences/*.md` | Auto | ∞ | Extracted preferences (update_existing merge) |
+| User Entities | `_clawmem/user/entities/*.md` | Auto | ∞ | Named entities across sessions |
+| Observations | `_clawmem/agent/observations/*.md` | Auto | ∞ (decision) | Decisions + observations from transcripts |
+| Handoffs | `_clawmem/agent/handoffs/*.md` | Auto | 30 days | Session summaries with next steps |
+| Antipatterns | `_clawmem/agent/antipatterns/*.md` | Auto | ∞ | Accumulated negative patterns |
+| Beads | `_clawmem/agent/beads/*.md` | Auto | ∞ | Beads issues synced from Dolt, relations in memory graph |
 
 Manual layers benefit from periodic re-indexing — a cron job running `clawmem update --embed` keeps the index fresh for content edited outside of watched directories.
 
@@ -767,8 +797,8 @@ Built on the shoulders of:
 - [A-MEM](https://arxiv.org/abs/2510.02178) — self-evolving memory architecture
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
-- [memory-lancedb-pro](https://github.com/cyanheads/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
-- [OpenViking](https://github.com/nicepkg/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
+- [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
+- [OpenViking](https://github.com/volcengine/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
 
 ## License
 

@@ -214,8 +214,8 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 | `session-bootstrap` | SessionStart | 2000 tokens | profile + latest handoff + recent decisions + stale notes |
 | `context-surfacing` | UserPromptSubmit | 800 tokens | retrieval gate → hybrid search (vector + FTS supplement, 900ms timeout) → snooze filter → noise filter → `<vault-context>` injection |
 | `staleness-check` | SessionStart | 250 tokens | flags notes not modified in 30+ days |
-| `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/observations/`, infers causal links, detects contradictions with prior decisions |
-| `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/handoffs/` |
+| `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/agent/observations/`, infers causal links, detects contradictions with prior decisions |
+| `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/agent/handoffs/` |
 | `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. Reindexes auto-memory collection. |
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + recent decisions (400) + antipatterns (150) + vault context (200) → `<vault-postcompact>` |
@@ -268,7 +268,7 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 3. Spot checks → search(query) (BM25, 0 GPU) or vsearch(query) (vector, 1 GPU)
 
 4. Chain tracing → find_causal_links(docid, direction="both", depth=5)
-   Traverses causal edges between _clawmem/observations/ docs (from decision-extractor).
+   Traverses causal edges between _clawmem/agent/observations/ docs (from decision-extractor).
 
 5. Memory debugging → memory_evolution_status(docid)
 ```
@@ -413,7 +413,7 @@ The `memory_relations` table is populated by multiple independent sources:
 | Source | Edge Types | Trigger | Notes |
 |--------|-----------|---------|-------|
 | A-MEM `generateMemoryLinks()` | semantic, supporting, contradicts | Indexing (new docs only) | LLM-assessed confidence + reasoning. Requires embeddings for neighbor discovery. |
-| A-MEM `inferCausalLinks()` | causal | Post-response (IO3 decision-extractor) | Links between `_clawmem/observations/` docs, not arbitrary workspace docs. |
+| A-MEM `inferCausalLinks()` | causal | Post-response (IO3 decision-extractor) | Links between `_clawmem/agent/observations/` docs, not arbitrary workspace docs. |
 | Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP tool or watcher (.beads/ change) | Queries `bd` CLI (Dolt backend). Maps beads deps: blocks→causal, discovered-from→supporting, relates-to→semantic, plus conditional-blocks→causal, caused-by→causal, supersedes→supporting. Metadata: `{origin: "beads"}`. |
 | `buildTemporalBackbone()` | temporal | `build_graphs` MCP tool (manual) | Creation-order edges between all active docs. |
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP tool (manual) | Pure cosine similarity. PK collision: `INSERT OR IGNORE` means A-MEM semantic edges take precedence if they exist first. |
