@@ -236,7 +236,7 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 ```
 1a. General recall → query(query, compact=true, limit=20)
     Full hybrid: BM25 + vector + query expansion + deep reranking (4000 char).
-    Supports compact, collection filter, intent, and candidateLimit.
+    Supports compact, collection filter (comma-separated for multi-collection: `"col1,col2"`), intent, and candidateLimit.
     Default for most Tier 3 needs.
     Optional: intent="domain hint" for ambiguous queries (steers expansion, reranking, chunk selection, snippets).
     Optional: candidateLimit=N to tune precision/speed (default 30).
@@ -342,21 +342,23 @@ Note: intent disables BM25 strong-signal bypass, forcing full expansion+rerankin
 ## Composite Scoring (automatic, applied to all search tools)
 
 ```
-compositeScore = (0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenceScore) × qualityMultiplier
+compositeScore = (0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
 Where `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
+`coActivationBoost = 1 + min(coCount/10, 0.15)` — documents frequently surfaced together get up to 15% boost.
 Length normalization: `1/(1 + 0.5 × log2(max(bodyLength/500, 1)))` — penalizes verbose entries, floor at 30%.
 Pinned documents get +0.3 additive boost (capped at 1.0).
 
 Recency intent detected ("latest", "recent", "last session"):
 ```
-compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenceScore) × qualityMultiplier
+compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
 | decision, hub | ∞ | Never decay |
+| antipattern | ∞ | Never decay — accumulated negative patterns persist |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
 | note | 60 days | Default |
@@ -364,7 +366,7 @@ compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenc
 | handoff | 30 days | Fast — recent matters most |
 
 Half-lives extend up to 3× for frequently-accessed memories (access reinforcement decays over 90 days).
-Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research are exempt.
+Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research/antipattern are exempt.
 
 ## Indexing & Graph Building
 

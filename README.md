@@ -2,7 +2,7 @@
 
 Hybrid agent memory system built on [QMD](https://github.com/tobi/qmd)'s retrieval substrate (BM25 + vectors + RRF + query expansion + cross-encoder reranking), layered with [SAME](https://github.com/sgx-labs/statelessagent)-derived composite scoring (recency decay, confidence, content-type half-lives), [MAGMA](https://arxiv.org/abs/2501.13956)-inspired intent classification and multi-graph traversal (semantic, temporal, causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes with automatic keyword/tag/context enrichment and inter-document link generation. Designed for [OpenClaw](https://github.com/openclaw/openclaw) and Claude Code.
 
-TypeScript on Bun. ~12,700 lines across 30 source files. 103 tests.
+TypeScript on Bun. ~14,400 lines across 32 source files. 110 tests.
 
 ## What It Does
 
@@ -20,6 +20,10 @@ ClawMem turns your markdown notes, project docs, and research dumps into an inte
 - **Infers causal relationships** between facts extracted from session observations
 - **Detects contradictions** between new and prior decisions, auto-decaying superseded ones
 - **Scores document quality** using structure, keywords, and metadata richness signals
+- **Boosts co-accessed documents** — notes frequently surfaced together get retrieval reinforcement
+- **Decomposes complex queries** into typed retrieval clauses (BM25/vector/graph) for multi-topic questions
+- **Cleans stale embeddings** automatically before embed runs, removing orphans from deleted/changed documents
+- **Transaction-safe indexing** — crash mid-index leaves zero partial state (atomic commit with rollback)
 - **Supports pin/snooze lifecycle** for persistent boosts and temporary suppression
 - **Syncs project issues** from Beads issue trackers into searchable memory
 
@@ -59,7 +63,7 @@ Claude Code Session
 │                 + w.recency × recencyDecay               │
 │                 + w.confidence × confidence)              │
 │                 × qualityMultiplier × lengthNorm          │
-│                 + pinBoost                                │
+│                 × coActivationBoost + pinBoost            │
 └───────────────────────────┬─────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────┐
@@ -302,14 +306,14 @@ Add to your MCP config (e.g. `~/.claude.json`, `claude_desktop_config.json`, or 
 
 The server runs via stdio — no network port needed. The `bin/clawmem` wrapper sets the GPU endpoint env vars automatically.
 
-**Verify:** After registering, your client should see 22 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
+**Verify:** After registering, your client should see 20 tools including `search`, `vsearch`, `query`, `intent_search`, etc.
 
 ### Verify Installation
 
 ```bash
 ./bin/clawmem doctor   # Full health check
 ./bin/clawmem status   # Quick index status
-bun test               # Run test suite (103 tests)
+bun test               # Run test suite (110 tests)
 ```
 
 ## Agent Instructions
@@ -416,7 +420,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (22)
+## MCP Tools (20)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
@@ -428,9 +432,9 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 | Tool | Description |
 |---|---|
-| `search` | BM25 keyword search with composite scoring + compact mode |
-| `vsearch` | Vector semantic search with composite scoring + compact mode |
-| `query` | Full hybrid pipeline with intent hint, strong-signal bypass, intent-aware chunk selection, chunk dedup, configurable candidateLimit, composite scoring + MMR diversity + compact mode |
+| `search` | BM25 keyword search with composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. |
+| `vsearch` | Vector semantic search with composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. |
+| `query` | Full hybrid pipeline with intent hint, strong-signal bypass, intent-aware chunk selection, chunk dedup, configurable candidateLimit, composite scoring + co-activation boost + MMR diversity + compact mode. Collection filter supports comma-separated values. |
 | `get` | Retrieve single document by path or docid |
 | `multi_get` | Retrieve multiple docs by glob or comma-separated list |
 | `find_similar` | Find notes similar to a reference document |
@@ -488,7 +492,7 @@ Six hooks auto-installed by `clawmem setup hooks`:
 | `staleness-check` | SessionStart | Flags documents needing review |
 | `decision-extractor` | Stop | GGUF observer extracts structured decisions, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
-| `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones |
+| `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation for documents surfaced together |
 
 Hooks handle ~90% of retrieval automatically. For agent escalation logic (when to use MCP tools vs rely on hooks), see `CLAUDE.md`.
 
@@ -503,7 +507,7 @@ User Query + optional intent hint
   → Intent-Aware Chunk Selection (intent terms at 0.5× weight alongside query terms at 1.0×)
   → Cross-Encoder Reranking (4000 char context; intent prepended; chunk dedup; batch cap=4)
   → Position-Aware Blending (α=0.75 top3, 0.60 mid, 0.40 tail)
-  → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier × lengthNorm + pinBoost)
+  → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier × lengthNorm × coActivationBoost + pinBoost)
   → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted)
   → Ranked Results
 ```
@@ -538,8 +542,9 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 | `handoff` | 30 days | 0.60 | Fast decay — most recent matters |
 | `progress` | 45 days | 0.50 | |
 | `note` | 60 days | 0.50 | Default |
+| `antipattern` | ∞ | 0.75 | Never decays — accumulated negative patterns persist |
 
-Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, note, project) lose 5% confidence per week without access (attention decay). Decision/hub/research are exempt.
+Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, note, project) lose 5% confidence per week without access (attention decay). Decision/hub/research/antipattern are exempt.
 
 **Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision/correction keywords, and frontmatter richness. Applied as `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
 
@@ -754,6 +759,7 @@ Built on the shoulders of:
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
 - [memory-lancedb-pro](https://github.com/cyanheads/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
+- [OpenViking](https://github.com/nicepkg/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
 
 ## License
 

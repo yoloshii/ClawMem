@@ -472,12 +472,24 @@ function initializeDatabase(db: Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_hook_dedupe_last_seen ON hook_dedupe(last_seen_at)`);
 
+  // Co-activation tracking: documents accessed together in the same injection
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS co_activations (
+      doc_a TEXT NOT NULL,
+      doc_b TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 1,
+      last_seen TEXT NOT NULL,
+      PRIMARY KEY (doc_a, doc_b)
+    )
+  `);
+
   // Migration: add fragment columns to content_vectors
   const cvCols = db.prepare("PRAGMA table_info(content_vectors)").all() as { name: string }[];
   const cvColNames = new Set(cvCols.map(c => c.name));
   const cvMigrations: [string, string][] = [
     ["fragment_type", "ALTER TABLE content_vectors ADD COLUMN fragment_type TEXT"],
     ["fragment_label", "ALTER TABLE content_vectors ADD COLUMN fragment_label TEXT"],
+    ["canonical_id", "ALTER TABLE content_vectors ADD COLUMN canonical_id TEXT"],
   ];
   for (const [col, sql] of cvMigrations) {
     if (!cvColNames.has(col)) {
@@ -674,8 +686,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<string[]>;
@@ -704,9 +716,10 @@ export type Store = {
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
-  getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string }[];
+  getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => void;
+  cleanStaleEmbeddings: () => number;
 
   // SAME: Observation metadata
   updateObservationFields: (docPath: string, collectionName: string, fields: { observation_type?: string; facts?: string; narrative?: string; concepts?: string; files_read?: string; files_modified?: string }) => void;
@@ -747,6 +760,13 @@ export type Store = {
   inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => Promise<number>;
   findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalLink[];
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
+
+  // Co-activation tracking
+  recordCoActivation: (paths: string[]) => void;
+  getCoActivated: (path: string, limit?: number) => { path: string; count: number }[];
+
+  // Usage relation tracking
+  insertRelation: (fromDoc: number, toDoc: number, relType: string, weight?: number) => void;
 };
 
 /**
@@ -812,8 +832,8 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number) => searchVec(db, query, model, limit, collectionId),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[]) => searchFTS(db, query, limit, collectionId, collections),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[]) => searchVec(db, query, model, limit, collectionId, collections),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
@@ -844,7 +864,8 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     getHashesNeedingFragments: () => getHashesNeedingFragments(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId),
+    cleanStaleEmbeddings: () => cleanStaleEmbeddings(db),
 
     // SAME: Observation metadata
     updateObservationFields: (docPath: string, collectionName: string, fields) => updateObservationFieldsFn(db, docPath, collectionName, fields),
@@ -885,6 +906,48 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => inferCausalLinks({ db, dbPath: resolvedPath } as Store, llm, observations),
     findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => findCausalLinks(db, docId, direction, maxDepth),
     getEvolutionTimeline: (docId: number, limit?: number) => getEvolutionTimeline(db, docId, limit),
+
+    // Co-activation tracking
+    recordCoActivation: (paths: string[]) => {
+      if (paths.length < 2) return;
+      const now = new Date().toISOString();
+      const stmt = db.prepare(`
+        INSERT INTO co_activations (doc_a, doc_b, count, last_seen)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(doc_a, doc_b) DO UPDATE SET
+          count = count + 1,
+          last_seen = excluded.last_seen
+      `);
+      // Record all pairs (order-independent: always store sorted)
+      for (let i = 0; i < paths.length; i++) {
+        for (let j = i + 1; j < paths.length; j++) {
+          const sorted = [paths[i]!, paths[j]!].sort();
+          stmt.run(sorted[0]!, sorted[1]!, now);
+        }
+      }
+    },
+    getCoActivated: (path: string, limit: number = 5) => {
+      return db.prepare(`
+        SELECT
+          CASE WHEN doc_a = ? THEN doc_b ELSE doc_a END as path,
+          count
+        FROM co_activations
+        WHERE doc_a = ? OR doc_b = ?
+        ORDER BY count DESC
+        LIMIT ?
+      `).all(path, path, path, limit) as { path: string; count: number }[];
+    },
+
+    // Usage relation tracking — records relations between documents
+    insertRelation: (fromDoc: number, toDoc: number, relType: string, weight: number = 1.0) => {
+      db.prepare(`
+        INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
+          weight = weight + excluded.weight,
+          created_at = excluded.created_at
+      `).run(fromDoc, toDoc, relType, weight, new Date().toISOString());
+    },
   };
 }
 
@@ -1231,6 +1294,56 @@ export function cleanupOrphanedVectors(db: Database): number {
  */
 export function vacuumDatabase(db: Database): void {
   db.exec(`VACUUM`);
+}
+
+// =============================================================================
+// Canonical Document Identity
+// =============================================================================
+
+/**
+ * Deterministic document identity hash: hash(collection + "/" + path).
+ * Stable across content changes — tracks document identity, not content.
+ */
+export function canonicalDocId(collection: string, path: string): string {
+  const h = new Bun.CryptoHasher("sha256");
+  h.update(collection + "/" + path);
+  return h.digest("hex").slice(0, 16);
+}
+
+/**
+ * Remove stale embeddings: content_vectors rows whose hash no longer belongs
+ * to any active document. Also cleans the corresponding vectors_vec rows.
+ * Returns the number of stale embeddings removed.
+ */
+export function cleanStaleEmbeddings(db: Database): number {
+  // Find orphaned hashes in content_vectors that have no active document
+  const staleRows = db.prepare(`
+    SELECT DISTINCT cv.hash
+    FROM content_vectors cv
+    LEFT JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    WHERE d.id IS NULL
+  `).all() as { hash: string }[];
+
+  if (staleRows.length === 0) return 0;
+
+  const staleHashes = staleRows.map(r => r.hash);
+
+  // Get all hash_seq keys for stale rows to clean vectors_vec
+  const placeholders = staleHashes.map(() => '?').join(',');
+  const staleVecKeys = db.prepare(`
+    SELECT hash || '_' || seq as hash_seq FROM content_vectors WHERE hash IN (${placeholders})
+  `).all(...staleHashes) as { hash_seq: string }[];
+
+  // Delete from vectors_vec
+  if (staleVecKeys.length > 0) {
+    const vecPlaceholders = staleVecKeys.map(() => '?').join(',');
+    db.prepare(`DELETE FROM vectors_vec WHERE hash_seq IN (${vecPlaceholders})`).run(...staleVecKeys.map(r => r.hash_seq));
+  }
+
+  // Delete from content_vectors
+  db.prepare(`DELETE FROM content_vectors WHERE hash IN (${placeholders})`).run(...staleHashes);
+
+  return staleVecKeys.length;
 }
 
 // =============================================================================
@@ -2024,7 +2137,7 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -2044,10 +2157,13 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
-    // This code path is likely unused as collection filtering should be done at CLI level.
+  if (collections && collections.length > 0) {
+    // SQL-level collection filtering — avoids full-table scan + post-filter
+    const placeholders = collections.map(() => '?').join(',');
+    sql += ` AND d.collection IN (${placeholders})`;
+    params.push(...collections);
+  } else if (collectionId) {
+    // Legacy parameter — kept for backward compatibility
     sql += ` AND d.collection = ?`;
     params.push(String(collectionId));
   }
@@ -2083,7 +2199,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2129,7 +2245,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionId) {
+  if (collections && collections.length > 0) {
+    const colPlaceholders = collections.map(() => '?').join(',');
+    docSql += ` AND d.collection IN (${colPlaceholders})`;
+    params.push(...collections);
+  } else if (collectionId) {
     docSql += ` AND d.collection = ?`;
     params.push(String(collectionId));
   }
@@ -2206,15 +2326,15 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Get all unique content hashes that need fragment-level embeddings.
  * Returns hashes that have no content_vectors row with fragment_type set.
  */
-export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string }[] {
+export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string }[] {
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title
+    SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.fragment_type IS NOT NULL
     WHERE d.active = 1 AND v.hash IS NULL
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string; title: string }[];
+  `).all() as { hash: string; body: string; path: string; title: string; collection: string }[];
 }
 
 /**
@@ -2239,16 +2359,17 @@ export function insertEmbedding(
   model: string,
   embeddedAt: string,
   fragmentType?: string,
-  fragmentLabel?: string
+  fragmentLabel?: string,
+  canonicalId?: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
   const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
   const insertContentVectorStmt = db.prepare(
-    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   insertVecStmt.run(hashSeq, embedding);
-  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null);
+  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
 }
 
 // =============================================================================
@@ -2947,11 +3068,12 @@ function snoozeDocumentFn(db: Database, collection: string, path: string, until:
 
 function incrementAccessCountFn(db: Database, paths: string[]): void {
   if (paths.length === 0) return;
+  const now = new Date().toISOString();
   const placeholders = paths.map(() => "?").join(",");
   db.prepare(`
-    UPDATE documents SET access_count = access_count + 1
+    UPDATE documents SET access_count = access_count + 1, last_accessed_at = ?
     WHERE active = 1 AND (collection || '/' || path) IN (${placeholders})
-  `).run(...paths);
+  `).run(now, ...paths);
 }
 
 function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10): DocumentRow[] {

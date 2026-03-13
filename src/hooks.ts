@@ -17,6 +17,7 @@ export type HookInput = {
   prompt?: string;
   transcriptPath?: string;
   hookEventName?: string;
+  toolInput?: Record<string, unknown>;
 };
 
 export type HookOutput = {
@@ -27,7 +28,7 @@ export type HookOutput = {
   reason?: string;
   systemMessage?: string;
   permissionDecision?: "allow" | "deny" | "ask";
-  hookSpecificOutput: {
+  hookSpecificOutput?: {
     hookEventName?: string;
     additionalContext?: string;
   };
@@ -55,6 +56,7 @@ export async function readHookInput(): Promise<HookInput> {
       prompt: parsed.prompt,
       transcriptPath: parsed.transcript_path ?? parsed.transcriptPath,
       hookEventName: parsed.hook_event_name ?? parsed.hookEventName,
+      toolInput: parsed.tool_input ?? parsed.toolInput,
     };
   } catch {
     return {};
@@ -69,17 +71,39 @@ export function writeHookOutput(output: HookOutput): void {
 }
 
 /**
+ * Map internal hook names → Claude Code event names for hookSpecificOutput.
+ * Only UserPromptSubmit and PostToolUse support additionalContext.
+ * Stop/SessionStart hooks must NOT include hookSpecificOutput.
+ */
+const HOOK_EVENT_MAP: Record<string, string | null> = {
+  "context-surfacing": "UserPromptSubmit",
+  "session-bootstrap": null,       // SessionStart — no hookSpecificOutput
+  "staleness-check": null,         // SessionStart — no hookSpecificOutput
+  "decision-extractor": null,      // Stop — no hookSpecificOutput
+  "handoff-generator": null,       // Stop — no hookSpecificOutput
+  "feedback-loop": null,           // Stop — no hookSpecificOutput
+  "precompact-extract": null,      // PreCompact — side-effect only, no context injection
+  "postcompact-inject": "SessionStart", // SessionStart(compact) — injects additionalContext
+  "pretool-inject": null,          // PreToolUse — disabled (cannot inject additionalContext; E13 folded into context-surfacing)
+};
+
+/**
  * Create a successful output with additional context injected into Claude's prompt.
  */
 export function makeContextOutput(
-  hookEventName: string,
+  hookName: string,
   context: string
 ): HookOutput {
+  const eventName = HOOK_EVENT_MAP[hookName];
+  if (!eventName) {
+    // Stop/SessionStart hooks don't support hookSpecificOutput
+    return { continue: true, suppressOutput: false };
+  }
   return {
     continue: true,
     suppressOutput: false,
     hookSpecificOutput: {
-      hookEventName,
+      hookEventName: eventName,
       additionalContext: context,
     },
   };
@@ -88,13 +112,21 @@ export function makeContextOutput(
 /**
  * Create an empty output (no context to inject).
  */
-export function makeEmptyOutput(hookEventName?: string): HookOutput {
+export function makeEmptyOutput(hookName?: string): HookOutput {
+  const eventName = hookName ? HOOK_EVENT_MAP[hookName] : undefined;
+  if (hookName && !eventName) {
+    // Stop/SessionStart hooks don't support hookSpecificOutput
+    return { continue: true, suppressOutput: false };
+  }
   return {
     continue: true,
     suppressOutput: false,
-    hookSpecificOutput: {
-      ...(hookEventName && { hookEventName }),
-    },
+    ...(eventName && {
+      hookSpecificOutput: {
+        hookEventName: eventName,
+        additionalContext: "",
+      },
+    }),
   };
 }
 
@@ -324,6 +356,11 @@ export function logInjection(
       estimatedTokens,
       wasReferenced: 0,
     });
+
+    // Record co-activation for all injected paths (E3)
+    if (injectedPaths.length >= 2) {
+      store.recordCoActivation(injectedPaths);
+    }
   } catch {
     // Non-fatal: don't crash hook if usage logging fails
   }

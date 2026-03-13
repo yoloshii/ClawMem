@@ -208,11 +208,14 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
       },
     },
     async ({ query, limit, minScore, collection, compact }) => {
-      const results = store.searchFTS(query, limit || 10)
-        .filter(r => !collection || r.collectionName === collection);
+      const collections = collection
+        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        : undefined;
+      const results = store.searchFTS(query, limit || 10, undefined, collections);
 
+      const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query)
+      const scored = applyCompositeScoring(enriched, query, coFn)
         .filter(r => r.compositeScore >= (minScore || 0));
 
       if (compact) {
@@ -269,11 +272,14 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         return { content: [{ type: "text", text: "Vector index not found. Run 'clawmem embed' first." }], isError: true };
       }
 
-      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit || 10);
-      const filtered = results.filter(r => !collection || r.collectionName === collection);
+      const collections = collection
+        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        : undefined;
+      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit || 10, undefined, collections);
 
-      const enriched = enrichResults(store, filtered, query);
-      const scored = applyCompositeScoring(enriched, query)
+      const coFn = (path: string) => store.getCoActivated(path);
+      const enriched = enrichResults(store, results, query);
+      const scored = applyCompositeScoring(enriched, query, coFn)
         .filter(r => r.compositeScore >= (minScore || 0.3));
 
       if (compact) {
@@ -334,7 +340,10 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
       // Step 1: BM25 probe — skip expensive LLM expansion if strong signal
-      const initialFts = store.searchFTS(query, 20).filter(r => !collection || r.collectionName === collection);
+      const collections = collection
+        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        : undefined;
+      const initialFts = store.searchFTS(query, 20, undefined, collections);
       const topScore = initialFts.length > 0 ? Math.abs(initialFts[0]!.score) : 0;
       const secondScore = initialFts.length > 1 ? Math.abs(initialFts[1]!.score) : 0;
       // When intent is provided, disable strong-signal bypass — the obvious BM25
@@ -348,17 +357,16 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent);
 
       for (const q of queries) {
-        const ftsResults = q === query ? initialFts : store.searchFTS(q, 20).filter(r => !collection || r.collectionName === collection);
+        const ftsResults = q === query ? initialFts : store.searchFTS(q, 20, undefined, collections);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
         if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20);
-          const filteredVec = vecResults.filter(r => !collection || r.collectionName === collection);
-          if (filteredVec.length > 0) {
-            for (const r of filteredVec) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(filteredVec.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20, undefined, collections);
+          if (vecResults.length > 0) {
+            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         }
       }
@@ -414,8 +422,9 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         })
         .filter((r): r is SearchResult => r !== null);
 
+      const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, searchResults, query);
-      let scored = applyCompositeScoring(enriched, query)
+      let scored = applyCompositeScoring(enriched, query, coFn)
         .filter(r => r.compositeScore >= (minScore || 0));
       if (diverse !== false) scored = applyMMRDiversity(scored);
       scored = scored.slice(0, limit || 10);
@@ -1041,22 +1050,20 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
             if (original) return { ...original, score: m.score };
             // Graph-discovered node not in original fused results — hydrate from DB
             const doc = store.db.prepare(`
-              SELECT d.collection, d.path, d.title, d.hash, c.body,
-                     col.name as collection_name, d.modified_at
+              SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
               FROM documents d
               LEFT JOIN content c ON c.hash = d.hash
-              LEFT JOIN collections col ON col.id = d.collection
               WHERE d.hash = ? AND d.active = 1 LIMIT 1
-            `).get(m.hash) as { collection: number; path: string; title: string; hash: string; body: string | null; collection_name: string; modified_at: string } | undefined;
+            `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
             if (!doc) return null;
             return {
-              filepath: doc.path,
-              displayPath: doc.path,
+              filepath: `clawmem://${doc.collection}/${doc.path}`,
+              displayPath: `${doc.collection}/${doc.path}`,
               title: doc.title || doc.path.split("/").pop() || "",
               context: null,
               hash: doc.hash,
               docid: doc.hash.slice(0, 6),
-              collectionName: doc.collection_name || "",
+              collectionName: doc.collection,
               modifiedAt: doc.modified_at || "",
               bodyLength: doc.body?.length || 0,
               body: doc.body || "",

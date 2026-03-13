@@ -120,7 +120,7 @@ export function confidenceScore(
   // Attention decay: reduce confidence if not accessed recently (5% per week)
   // Only apply to episodic/progress content — skip for durable types (decision, hub, research)
   // Also skip if last_accessed_at was backfilled from modified_at (no real access yet)
-  const DECAY_EXEMPT_TYPES = new Set(["decision", "hub", "research"]);
+  const DECAY_EXEMPT_TYPES = new Set(["decision", "hub", "research", "antipattern"]);
   let attentionDecay = 1.0;
   if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
     const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;
@@ -217,9 +217,12 @@ export type ScoredResult = EnrichedResult & {
   recencyScore: number;
 };
 
+export type CoActivationFn = (path: string) => { path: string; count: number }[];
+
 export function applyCompositeScoring(
   results: EnrichedResult[],
-  query: string
+  query: string,
+  coActivationFn?: CoActivationFn
 ): ScoredResult[] {
   const weights = hasRecencyIntent(query) ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS;
   const now = new Date();
@@ -251,6 +254,36 @@ export function applyCompositeScoring(
 
     return { ...r, compositeScore: adjusted, recencyScore: recency };
   });
+
+  // Co-activation boost: docs frequently accessed alongside top results get a boost
+  if (coActivationFn && scored.length > 1) {
+    const topQuartile = Math.max(1, Math.floor(scored.length * 0.25));
+    // Co-activations are recorded using displayPath format (collection/path),
+    // but scored results use filepath format (clawmem://collection/path).
+    // Normalize: strip clawmem:// prefix for lookup, match back via both formats.
+    const stripPrefix = (p: string) => p.startsWith("clawmem://") ? p.slice(10) : p;
+    const topDisplayPaths = new Set(scored.slice(0, topQuartile).map(r => stripPrefix(r.filepath)));
+    const coActivatedCounts = new Map<string, number>();
+
+    for (const topPath of topDisplayPaths) {
+      const partners = coActivationFn(topPath);
+      for (const p of partners) {
+        if (!topDisplayPaths.has(p.path)) {
+          coActivatedCounts.set(p.path, (coActivatedCounts.get(p.path) || 0) + p.count);
+        }
+      }
+    }
+
+    if (coActivatedCounts.size > 0) {
+      for (const r of scored) {
+        const coCount = coActivatedCounts.get(stripPrefix(r.filepath));
+        if (coCount) {
+          // Boost capped at 15% to prevent runaway amplification
+          r.compositeScore *= 1 + Math.min(coCount / 10, 0.15);
+        }
+      }
+    }
+  }
 
   // Sort by composite score descending
   scored.sort((a, b) => b.compositeScore - a.compositeScore);

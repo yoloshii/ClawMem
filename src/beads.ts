@@ -179,6 +179,7 @@ function normalizeBeadsIssue(raw: any): BeadsIssue {
  * Returns the project directory path if found, null otherwise.
  *
  * Checks for .beads/ directory (Dolt backend).
+ * Falls back to checking .beads/beads.jsonl for legacy installations.
  */
 export function detectBeadsProject(cwd: string): string | null {
   const beadsDir = join(cwd, ".beads");
@@ -232,4 +233,31 @@ export function formatBeadsIssueAsMarkdown(issue: BeadsIssue): string {
   }
 
   return lines.join("\n");
+}
+
+// =============================================================================
+// Legacy Compat (parseBeadsJsonl — kept for migration, not active use)
+// =============================================================================
+
+/**
+ * @deprecated Use queryBeadsList() instead. Beads v0.58.0+ uses Dolt backend.
+ * Kept only for one-time migration of pre-Dolt installations.
+ */
+export function parseBeadsJsonl(path: string): BeadsIssue[] {
+  console.warn("[beads] parseBeadsJsonl is deprecated — Beads v0.58.0+ uses Dolt backend. Use queryBeadsList() instead.");
+  const { readFileSync } = require("node:fs");
+  const content = readFileSync(path, "utf-8");
+  const lines = content.trim().split("\n");
+
+  return lines
+    .filter((line: string) => line.trim())
+    .map((line: string) => {
+      try {
+        const raw = JSON.parse(line);
+        return normalizeBeadsIssue(raw);
+      } catch {
+        return null;
+      }
+    })
+    .filter((issue: BeadsIssue | null): issue is BeadsIssue => issue !== null);
 }

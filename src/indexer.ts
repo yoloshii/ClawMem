@@ -188,83 +188,55 @@ export async function indexCollection(
     }
   }
 
-  for (const relativePath of allEntries) {
-    if (shouldExclude(relativePath)) continue;
+  // Collect doc IDs that need post-index enrichment (deferred until after commit)
+  const enrichQueue: { docId: number; isNew: boolean }[] = [];
 
-    activePaths.add(relativePath);
-    const absolutePath = `${collectionPath}/${relativePath}`;
+  // Wrap all DB writes in a transaction for atomicity
+  store.db.exec("BEGIN");
+  try {
+    for (const relativePath of allEntries) {
+      if (shouldExclude(relativePath)) continue;
 
-    let content: string;
-    let mtime: Date;
-    try {
-      content = readFileSync(absolutePath, "utf-8");
-      mtime = statSync(absolutePath).mtime;
-    } catch {
-      continue; // File may have been deleted between scan and read
-    }
+      activePaths.add(relativePath);
+      const absolutePath = `${collectionPath}/${relativePath}`;
 
-    const contentHash = hashContent(content);
-    const now = new Date().toISOString();
-
-    // Check if document already exists
-    const existing = store.findActiveDocument(collectionName, relativePath);
-
-    if (existing) {
-      // Check if content changed via content hash
-      const existingRow = store.db.prepare(
-        "SELECT content_hash FROM documents WHERE id = ?"
-      ).get(existing.id) as { content_hash: string | null } | null;
-
-      if (existingRow?.content_hash === contentHash) {
-        stats.unchanged++;
-        continue;
+      let content: string;
+      let mtime: Date;
+      try {
+        content = readFileSync(absolutePath, "utf-8");
+        mtime = statSync(absolutePath).mtime;
+      } catch {
+        continue; // File may have been deleted between scan and read
       }
 
-      // Content changed — update
-      const { body, meta } = parseDocument(content, relativePath);
-      const title = meta.title || extractTitle(body, relativePath);
-      const docHash = hashContent(body);
+      const contentHash = hashContent(content);
+      const now = new Date().toISOString();
 
-      store.insertContent(docHash, body, now);
-      store.updateDocument(existing.id, title, docHash, mtime.toISOString());
+      // Check if document already exists
+      const existing = store.findActiveDocument(collectionName, relativePath);
 
-      // Update SAME metadata
-      const contentType = meta.content_type || inferContentType(relativePath);
-      store.updateDocumentMeta(existing.id, {
-        domain: meta.domain,
-        workstream: meta.workstream,
-        tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
-        content_type: contentType,
-        review_by: meta.review_by,
-        confidence: confidenceScore(contentType, mtime, 0),
-        quality_score: computeQualityScore(body, meta),
-      });
+      if (existing) {
+        // Check if content changed via content hash
+        const existingRow = store.db.prepare(
+          "SELECT content_hash FROM documents WHERE id = ?"
+        ).get(existing.id) as { content_hash: string | null } | null;
 
-      // Update content_hash for next incremental check
-      store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, existing.id);
+        if (existingRow?.content_hash === contentHash) {
+          stats.unchanged++;
+          continue;
+        }
 
-      // A-MEM: Refresh memory note for updated documents (skip links/evolution to avoid churn)
-      await store.postIndexEnrich(llm, existing.id, false);
+        // Content changed — update
+        const { body, meta } = parseDocument(content, relativePath);
+        const title = meta.title || extractTitle(body, relativePath);
+        const docHash = hashContent(body);
 
-      stats.updated++;
-    } else {
-      // Check for inactive (previously removed) doc at same path — reactivate instead of inserting
-      const inactive = store.db.prepare(
-        "SELECT id, hash FROM documents WHERE collection = ? AND path = ? AND active = 0"
-      ).get(collectionName, relativePath) as { id: number; hash: string } | null;
+        store.insertContent(docHash, body, now);
+        store.updateDocument(existing.id, title, docHash, mtime.toISOString());
 
-      const { body, meta } = parseDocument(content, relativePath);
-      const title = meta.title || extractTitle(body, relativePath);
-      const docHash = hashContent(body);
-      const contentType = meta.content_type || inferContentType(relativePath);
-
-      store.insertContent(docHash, body, now);
-
-      if (inactive) {
-        // Reactivate existing row
-        store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ? WHERE id = ?")
-          .run(docHash, title, mtime.toISOString(), contentHash, inactive.id);
-        store.updateDocumentMeta(inactive.id, {
+        // Update SAME metadata
+        const contentType = meta.content_type || inferContentType(relativePath);
+        store.updateDocumentMeta(existing.id, {
           domain: meta.domain,
           workstream: meta.workstream,
           tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
@@ -273,13 +245,32 @@ export async function indexCollection(
           confidence: confidenceScore(contentType, mtime, 0),
           quality_score: computeQualityScore(body, meta),
         });
-        await store.postIndexEnrich(llm, inactive.id, false);
+
+        // Update content_hash for next incremental check
+        store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, existing.id);
+
+        // Defer A-MEM enrichment until after commit
+        enrichQueue.push({ docId: existing.id, isNew: false });
+
+        stats.updated++;
       } else {
-        // Truly new document
-        store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString());
-        const newDoc = store.findActiveDocument(collectionName, relativePath);
-        if (newDoc) {
-          store.updateDocumentMeta(newDoc.id, {
+        // Check for inactive (previously removed) doc at same path — reactivate instead of inserting
+        const inactive = store.db.prepare(
+          "SELECT id, hash FROM documents WHERE collection = ? AND path = ? AND active = 0"
+        ).get(collectionName, relativePath) as { id: number; hash: string } | null;
+
+        const { body, meta } = parseDocument(content, relativePath);
+        const title = meta.title || extractTitle(body, relativePath);
+        const docHash = hashContent(body);
+        const contentType = meta.content_type || inferContentType(relativePath);
+
+        store.insertContent(docHash, body, now);
+
+        if (inactive) {
+          // Reactivate existing row
+          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ? WHERE id = ?")
+            .run(docHash, title, mtime.toISOString(), contentHash, inactive.id);
+          store.updateDocumentMeta(inactive.id, {
             domain: meta.domain,
             workstream: meta.workstream,
             tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
@@ -288,22 +279,48 @@ export async function indexCollection(
             confidence: confidenceScore(contentType, mtime, 0),
             quality_score: computeQualityScore(body, meta),
           });
-          store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, newDoc.id);
-          await store.postIndexEnrich(llm, newDoc.id, true);
+          enrichQueue.push({ docId: inactive.id, isNew: false });
+        } else {
+          // Truly new document
+          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString());
+          const newDoc = store.findActiveDocument(collectionName, relativePath);
+          if (newDoc) {
+            store.updateDocumentMeta(newDoc.id, {
+              domain: meta.domain,
+              workstream: meta.workstream,
+              tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
+              content_type: contentType,
+              review_by: meta.review_by,
+              confidence: confidenceScore(contentType, mtime, 0),
+              quality_score: computeQualityScore(body, meta),
+            });
+            store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, newDoc.id);
+            enrichQueue.push({ docId: newDoc.id, isNew: true });
+          }
         }
-      }
 
-      stats.added++;
+        stats.added++;
+      }
     }
+
+    // Deactivate documents that no longer exist on disk
+    const storedPaths = store.getActiveDocumentPaths(collectionName);
+    for (const storedPath of storedPaths) {
+      if (!activePaths.has(storedPath)) {
+        store.deactivateDocument(collectionName, storedPath);
+        stats.removed++;
+      }
+    }
+
+    store.db.exec("COMMIT");
+  } catch (err) {
+    store.db.exec("ROLLBACK");
+    throw err;
   }
 
-  // Deactivate documents that no longer exist on disk
-  const storedPaths = store.getActiveDocumentPaths(collectionName);
-  for (const storedPath of storedPaths) {
-    if (!activePaths.has(storedPath)) {
-      store.deactivateDocument(collectionName, storedPath);
-      stats.removed++;
-    }
+  // A-MEM enrichment runs after successful commit (LLM calls should not block transaction)
+  for (const { docId, isNew } of enrichQueue) {
+    await store.postIndexEnrich(llm, docId, isNew);
   }
 
   return stats;

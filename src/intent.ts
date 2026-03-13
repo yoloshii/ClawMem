@@ -176,6 +176,102 @@ function cacheIntent(db: Database, queryHash: string, query: string, result: Int
   );
 }
 
+// =============================================================================
+// Query Decomposition (OpenViking-inspired QueryPlan)
+// =============================================================================
+
+export type QueryClause = {
+  type: 'bm25' | 'vector' | 'graph';
+  query: string;
+  collections?: string[];
+  priority: 1 | 2 | 3 | 4 | 5;
+};
+
+/**
+ * Decompose a complex query into multiple typed retrieval clauses.
+ * Uses heuristics first, LLM only for genuinely ambiguous multi-topic queries.
+ * Graph-first, planner-second design (per GPT 5.4 validation).
+ */
+export async function decomposeQuery(
+  query: string,
+  llm: LlamaCpp,
+  db: Database,
+  sessionContext?: string
+): Promise<QueryClause[]> {
+  // Short queries still need intent classification — "why did this fail?" is 4 words but needs graph
+  const words = query.split(/\s+/).filter(w => w.length > 2);
+  if (words.length <= 5) {
+    const intent = await classifyIntent(query, llm, db);
+    const type = intent.intent === 'WHY' || intent.intent === 'ENTITY' ? 'graph' : 'bm25';
+    return [
+      { type, query, priority: 1 },
+      { type: 'vector', query, priority: 3 },
+    ];
+  }
+
+  // Heuristic: detect multi-topic queries (conjunctions, "and also", multiple questions)
+  const multiTopicSignals = [
+    /\band\s+(?:also|what|how|why)\b/i,
+    /\bboth\s+.+\s+and\s+/i,
+    /\?.*\?/,
+    /\b(?:plus|additionally|as well as|along with)\b/i,
+  ];
+  const isMultiTopic = multiTopicSignals.some(p => p.test(query));
+
+  if (!isMultiTopic) {
+    // Single-topic: classify intent and route appropriately
+    const intent = await classifyIntent(query, llm, db);
+    const type = intent.intent === 'WHY' || intent.intent === 'ENTITY' ? 'graph' : 'bm25';
+    return [
+      { type, query, priority: 1 },
+      { type: 'vector', query, priority: 3 },
+    ];
+  }
+
+  // Multi-topic: use LLM to decompose
+  const contextBlock = sessionContext ? `\nSession context: ${sessionContext.slice(0, 300)}` : '';
+  const prompt = `Decompose this query into 2-4 retrieval sub-queries. Each should target one specific topic.
+${contextBlock}
+Query: "${query}"
+
+Return JSON array: [{"query": "sub-query text", "type": "bm25|vector|graph", "priority": 1-5}]
+Rules:
+- type "graph" for causal/entity questions (why, who, relationships)
+- type "bm25" for keyword-specific factual lookups
+- type "vector" for conceptual/fuzzy similarity
+- priority 1 = most important, 5 = least
+Return ONLY the JSON array. /no_think`;
+
+  try {
+    const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 300 });
+    if (result) {
+      const text = result.text.trim();
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]) as QueryClause[];
+        if (Array.isArray(parsed) && parsed.length >= 1 && parsed.length <= 4) {
+          return parsed
+            .filter(c => c.query && c.type && c.priority)
+            .map(c => ({
+              type: ['bm25', 'vector', 'graph'].includes(c.type) ? c.type : 'bm25',
+              query: c.query,
+              collections: c.collections,
+              priority: Math.min(5, Math.max(1, c.priority)) as 1 | 2 | 3 | 4 | 5,
+            }));
+        }
+      }
+    }
+  } catch {
+    // LLM failed — fallback to dual-mode
+  }
+
+  // Fallback: dual-mode search on original query
+  return [
+    { type: 'bm25', query, priority: 1 },
+    { type: 'vector', query, priority: 2 },
+  ];
+}
+
 /**
  * Get intent-specific weights for graph traversal.
  */

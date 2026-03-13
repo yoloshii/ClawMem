@@ -10,6 +10,7 @@ import {
   createStore,
   enableProductionMode,
   getDefaultDbPath,
+  canonicalDocId,
   type Store,
   type SearchResult,
   DEFAULT_EMBED_MODEL,
@@ -244,6 +245,12 @@ async function cmdEmbed(args: string[]) {
     s.clearAllEmbeddings();
   }
 
+  // Clean stale embeddings (orphaned hashes from updated/deleted documents)
+  const cleaned = s.cleanStaleEmbeddings();
+  if (cleaned > 0) {
+    console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
+  }
+
   // Use fragment-based pipeline: split documents into semantic fragments and embed each
   const hashes = s.getHashesNeedingFragments();
   if (hashes.length === 0) {
@@ -280,8 +287,9 @@ async function cmdEmbed(args: string[]) {
   const batchStart = Date.now();
 
   for (let docIdx = 0; docIdx < hashes.length; docIdx++) {
-    const { hash, body, path, title: docTitle } = hashes[docIdx]!;
+    const { hash, body, path, title: docTitle, collection } = hashes[docIdx]!;
     const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
+    const canId = canonicalDocId(collection, path);
 
     // Parse frontmatter for fragment splitting
     let frontmatter: Record<string, any> | undefined;
@@ -309,7 +317,7 @@ async function cmdEmbed(args: string[]) {
           s.ensureVecTable(result.embedding.length);
           s.insertEmbedding(
             hash, seq, frag.startLine, new Float32Array(result.embedding),
-            result.model, new Date().toISOString(), frag.type, frag.label ?? undefined
+            result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
           );
           totalFragments++;
           if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
