@@ -236,29 +236,29 @@ Once escalated, route by query type:
 | Tool | Purpose |
 |------|---------|
 | `memory_retrieve` | **Preferred.** Auto-classifies query and routes to optimal backend. Use instead of choosing manually. |
-| `query` | Full hybrid search (BM25 + vector + expansion + rerank). Default Tier 3 workhorse. |
-| `intent_search` | MAGMA intent classification + graph traversal. For why/when/entity chains. |
-| `query_plan` | Multi-topic query decomposition into parallel typed clauses. Complex queries spanning multiple topics. |
-| `search` | BM25 keyword search only. Fast, 0 GPU. |
-| `vsearch` | Vector similarity only. ~100ms, 1 GPU call. |
+| `query` | Full hybrid (BM25 + vector + rerank). General-purpose when type unclear. WRONG for "why" (use `intent_search`) or cross-session (use `session_log`). Prefer `memory_retrieve`. |
+| `intent_search` | USE THIS for "why did we decide X", "what caused Y", "who worked on Z". Classifies intent, traverses graph edges. Returns decision chains `query()` cannot find. |
+| `query_plan` | USE THIS for multi-topic queries ("X and also Y", "compare A with B"). `query()` searches as one blob — this splits and routes each optimally. |
+| `search` | BM25 keyword — for exact terms, config names, error codes. Fast, 0 GPU. Prefer `memory_retrieve`. |
+| `vsearch` | Vector semantic — for conceptual/fuzzy when keywords unknown. ~100ms, 1 GPU. Prefer `memory_retrieve`. |
 | `get` | Retrieve single doc by path or `#docid`. |
 | `multi_get` | Retrieve multiple docs by glob or comma-separated list. |
-| `find_similar` | Related documents from a known anchor. |
-| `find_causal_links` | Traverse causal edges between observation docs. |
-| `session_log` | Recent sessions with handoff summaries. |
+| `find_similar` | USE THIS for "what else relates to X". k-NN vector neighbors — discovers connections beyond keyword overlap. |
+| `find_causal_links` | Trace decision chains: "what led to X". Follow up `intent_search` on a top result to walk the full causal chain. |
+| `session_log` | USE THIS for "last time", "yesterday", "what did we do". DO NOT use `query()` for cross-session questions. |
 | `profile` | User profile (static facts + dynamic context). |
 | `memory_forget` | Deactivate a memory by closest match. |
-| `memory_pin` | Pin for +0.3 composite boost, or unpin. |
-| `memory_snooze` | Temporarily hide from surfacing until a date, or unsnooze. |
+| `memory_pin` | +0.3 composite boost. USE PROACTIVELY for constraints, architecture decisions, corrections. Don't wait for curator. |
+| `memory_snooze` | USE PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days instead of ignoring. |
 | `build_graphs` | Build temporal backbone + semantic graph after bulk ingestion. |
 | `beads_sync` | Sync Beads issues from Dolt backend into memory. |
 | `index_stats` | Doc counts, embedding coverage, content type distribution. |
 | `status` | Quick index health. |
 | `reindex` | Force re-index (BM25 only, does NOT embed). |
-| `memory_evolution_status` | Track how a doc's confidence/links changed over time. |
-| `lifecycle_status` | Show stale/archived content. |
-| `lifecycle_sweep` | Archive stale content. |
-| `lifecycle_restore` | Restore archived content. |
+| `memory_evolution_status` | Track how a doc's A-MEM metadata evolved over time. |
+| `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |
+| `lifecycle_sweep` | Run lifecycle policies: archive stale docs. Defaults to dry_run (preview only). |
+| `lifecycle_restore` | Restore auto-archived documents. Filter by query, collection, or all. Does NOT restore manually forgotten docs. |
 
 **Progressive disclosure:** ALWAYS `compact=true` first -> review snippets/scores -> `get(docid)` or `multi_get(pattern)` for full content.
 

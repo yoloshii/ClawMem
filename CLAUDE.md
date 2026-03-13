@@ -276,15 +276,15 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 ```
 
 **Other tools:**
-- `find_similar(docid)` — related documents from a known anchor.
-- `session_log` — recent sessions with handoff summaries.
+- `find_similar(docid)` — "what else relates to X". k-NN vector neighbors — discovers connections beyond keyword overlap.
+- `session_log` — USE THIS for "last time", "yesterday", "what did we do". DO NOT use `query()` for cross-session questions.
 - `profile` — user profile (static facts + dynamic context).
 - `memory_forget(query)` — deactivate a memory by closest match.
-- `memory_pin(query, unpin?)` — pin a memory for +0.3 composite boost in context surfacing, or unpin it.
-- `memory_snooze(query, until?)` — temporarily hide a memory from context surfacing until a date, or unsnooze.
+- `memory_pin(query, unpin?)` — +0.3 composite boost. USE PROACTIVELY for constraints, architecture decisions, corrections.
+- `memory_snooze(query, until?)` — USE PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days.
 - `build_graphs(temporal?, semantic?)` — build temporal backbone + semantic graph after bulk ingestion. Not needed after routine indexing (A-MEM handles per-doc links).
 - `beads_sync(project_path?)` — sync Beads issues from Dolt backend (via `bd` CLI) into memory. Usually automatic via watcher.
-- `query_plan(query, compact=true)` — multi-topic query decomposition into parallel typed clauses. Use for complex queries spanning multiple topics.
+- `query_plan(query, compact=true)` — USE THIS for multi-topic queries. `query()` searches as one blob — this splits topics and routes each optimally.
 
 ### Memory Lifecycle
 
