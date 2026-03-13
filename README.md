@@ -366,19 +366,18 @@ Vault: `~/.cache/clawmem/index.sqlite` | Config: `~/.config/clawmem/config.yaml`
 **Preferred:** `memory_retrieve(query)` — auto-classifies and routes to the optimal backend.
 
 **Direct routing** (when calling specific tools):
-```
-"why did we decide X"         → intent_search(query)          NOT query()
-"what happened last session"  → session_log()                 NOT query()
-"what else relates to X"      → find_similar(file)            NOT query()
-Complex multi-topic           → query_plan(query)             NOT query()
-General recall                → query(query, compact=true)
-Keyword spot check            → search(query, compact=true)
-Conceptual/fuzzy              → vsearch(query, compact=true)
-Full content                  → multi_get("path1,path2")
-Lifecycle health              → lifecycle_status()
-Stale sweep                   → lifecycle_sweep(dry_run=true)
-Restore archived              → lifecycle_restore(query)
-```
+
+    "why did we decide X"         → intent_search(query)          NOT query()
+    "what happened last session"  → session_log()                 NOT query()
+    "what else relates to X"      → find_similar(file)            NOT query()
+    Complex multi-topic           → query_plan(query)             NOT query()
+    General recall                → query(query, compact=true)
+    Keyword spot check            → search(query, compact=true)
+    Conceptual/fuzzy              → vsearch(query, compact=true)
+    Full content                  → multi_get("path1,path2")
+    Lifecycle health              → lifecycle_status()
+    Stale sweep                   → lifecycle_sweep(dry_run=true)
+    Restore archived              → lifecycle_restore(query)
 
 ALWAYS `compact=true` first → review → `multi_get` for full content.
 
