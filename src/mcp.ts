@@ -1724,6 +1724,121 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: lifecycle_status
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "lifecycle_status",
+    {
+      title: "Lifecycle Status",
+      description: "Show document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary.",
+      inputSchema: {},
+    },
+    async () => {
+      const stats = store.getLifecycleStats();
+      const { loadConfig } = await import("./collections.ts");
+      const config = loadConfig();
+      const policy = config.lifecycle;
+
+      const lines = [
+        `Active: ${stats.active}`,
+        `Archived (auto): ${stats.archived}`,
+        `Forgotten (manual): ${stats.forgotten}`,
+        `Pinned: ${stats.pinned}`,
+        `Snoozed: ${stats.snoozed}`,
+        `Never accessed: ${stats.neverAccessed}`,
+        `Oldest access: ${stats.oldestAccess?.slice(0, 10) || "n/a"}`,
+        "",
+        `Policy: ${policy ? `archive after ${policy.archive_after_days}d, purge after ${policy.purge_after_days ?? "never"}, dry_run=${policy.dry_run}` : "none configured"}`,
+      ];
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: lifecycle_sweep
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "lifecycle_sweep",
+    {
+      title: "Lifecycle Sweep",
+      description: "Run lifecycle policies: archive stale docs, optionally purge old archives. Defaults to dry_run (preview only).",
+      inputSchema: {
+        dry_run: z.boolean().optional().default(true).describe("Preview what would be archived/purged without acting"),
+      },
+    },
+    async ({ dry_run }) => {
+      const { loadConfig } = await import("./collections.ts");
+      const config = loadConfig();
+      const policy = config.lifecycle;
+      if (!policy) {
+        return { content: [{ type: "text", text: "No lifecycle policy configured in config.yaml" }] };
+      }
+
+      const candidates = store.getArchiveCandidates(policy);
+
+      if (dry_run) {
+        const lines = candidates.map(c =>
+          `- ${c.collection}/${c.path} (${c.content_type}, modified ${c.modified_at.slice(0, 10)}, accessed ${c.last_accessed_at?.slice(0, 10) || "never"})`
+        );
+        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s):\n${lines.join("\n") || "(none)"}` }] };
+      }
+
+      const archived = store.archiveDocuments(candidates.map(c => c.id));
+      let purged = 0;
+      if (policy.purge_after_days) {
+        purged = store.purgeArchivedDocuments(policy.purge_after_days);
+      }
+
+      return { content: [{ type: "text", text: `Lifecycle sweep: archived ${archived}, purged ${purged}` }] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: lifecycle_restore
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "lifecycle_restore",
+    {
+      title: "Restore Archived Documents",
+      description: "Restore documents that were auto-archived by lifecycle policies. Does NOT restore manually forgotten documents.",
+      inputSchema: {
+        query: z.string().optional().describe("Search archived docs by keyword to find what to restore"),
+        collection: z.string().optional().describe("Restore all archived docs from a specific collection"),
+        all: z.boolean().optional().default(false).describe("Restore ALL archived documents"),
+      },
+    },
+    async ({ query, collection, all }) => {
+      if (query) {
+        const results = store.searchArchived(query, 20);
+
+        if (results.length === 0) {
+          return { content: [{ type: "text", text: "No archived documents match that query." }] };
+        }
+
+        const restored = store.restoreArchivedDocuments({ ids: results.map(r => r.id) });
+        const lines = results.map(r => `- [${r.score.toFixed(3)}] ${r.collection}/${r.path} (archived ${r.archived_at?.slice(0, 10)})`);
+        return { content: [{ type: "text", text: `Restored ${restored}:\n${lines.join("\n")}` }] };
+      }
+
+      if (collection) {
+        const restored = store.restoreArchivedDocuments({ collection });
+        return { content: [{ type: "text", text: `Restored ${restored} documents from collection "${collection}"` }] };
+      }
+
+      if (all) {
+        const restored = store.restoreArchivedDocuments({});
+        return { content: [{ type: "text", text: `Restored ${restored} archived documents` }] };
+      }
+
+      return { content: [{ type: "text", text: "Specify query, collection, or all=true" }], isError: true };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Connect
   // ---------------------------------------------------------------------------
 

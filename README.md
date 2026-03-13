@@ -281,7 +281,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 22 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
+ClawMem exposes 25 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
 
 **Claude Code (automatic):**
 
@@ -427,7 +427,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (21)
+## MCP Tools (25)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 

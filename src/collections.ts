@@ -34,10 +34,19 @@ export interface Collection {
 /**
  * The complete configuration file structure
  */
+export interface LifecyclePolicy {
+  archive_after_days: number;
+  type_overrides: Record<string, number | null>;
+  purge_after_days: number | null;
+  exempt_collections: string[];
+  dry_run: boolean;
+}
+
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
   directoryContext?: boolean;                 // Opt-in: auto-generate CLAUDE.md in directories
+  lifecycle?: LifecyclePolicy;                // Lifecycle management policy
 }
 
 /**
@@ -97,6 +106,19 @@ export function loadConfig(): CollectionConfig {
     // Ensure collections object exists
     if (!config.collections) {
       config.collections = {};
+    }
+
+    // Parse lifecycle policy if present
+    const raw = YAML.parse(content);
+    if (raw?.lifecycle && typeof raw.lifecycle === "object") {
+      const lc = raw.lifecycle;
+      config.lifecycle = {
+        archive_after_days: typeof lc.archive_after_days === "number" ? lc.archive_after_days : 90,
+        type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides : {},
+        purge_after_days: typeof lc.purge_after_days === "number" ? lc.purge_after_days : null,
+        exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
+        dry_run: lc.dry_run !== false,
+      };
     }
 
     return config;

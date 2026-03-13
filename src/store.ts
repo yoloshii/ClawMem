@@ -768,8 +768,13 @@ export type Store = {
   // Usage relation tracking
   insertRelation: (fromDoc: number, toDoc: number, relType: string, weight?: number) => void;
 
-  // Document archival
+  // Document archival & lifecycle
   archiveDocuments: (ids: number[]) => number;
+  getArchiveCandidates: (policy: import("./collections.ts").LifecyclePolicy) => { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[];
+  restoreArchivedDocuments: (filter: { ids?: number[]; collection?: string; sinceDate?: string }) => number;
+  purgeArchivedDocuments: (olderThanDays: number) => number;
+  getLifecycleStats: () => { active: number; archived: number; forgotten: number; pinned: number; snoozed: number; neverAccessed: number; oldestAccess: string | null };
+  searchArchived: (query: string, limit?: number) => { id: number; collection: string; path: string; title: string; archived_at: string; score: number }[];
 };
 
 /**
@@ -963,6 +968,13 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       `).run(now, ...ids);
       return result.changes;
     },
+
+    // Lifecycle management
+    getArchiveCandidates: (policy) => getArchiveCandidatesFn(db, policy),
+    restoreArchivedDocuments: (filter) => restoreArchivedDocumentsFn(db, filter),
+    purgeArchivedDocuments: (olderThanDays) => purgeArchivedDocumentsFn(db, olderThanDays),
+    getLifecycleStats: () => getLifecycleStatsFn(db),
+    searchArchived: (query, limit?) => searchArchivedFn(db, query, limit),
   };
 }
 
@@ -3553,4 +3565,127 @@ export function getEvolutionTimeline(
       createdAt: row.created_at,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle management functions
+// ---------------------------------------------------------------------------
+
+function getArchiveCandidatesFn(
+  db: Database,
+  policy: import("./collections.ts").LifecyclePolicy
+): { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[] {
+  const now = new Date();
+  const defaultDays = policy.archive_after_days;
+
+  const rows = db.prepare(`
+    SELECT id, collection, path, title, modified_at, last_accessed_at, content_type
+    FROM documents
+    WHERE active = 1 AND pinned = 0
+      AND (snoozed_until IS NULL OR snoozed_until = '' OR snoozed_until <= ?)
+  `).all(now.toISOString()) as any[];
+
+  const candidates: any[] = [];
+  for (const row of rows) {
+    if (policy.exempt_collections.includes(row.collection)) continue;
+
+    const typeOverride = policy.type_overrides[row.content_type];
+    if (typeOverride === null) continue;
+    const thresholdDays = typeOverride ?? defaultDays;
+
+    const cutoff = new Date(now);
+    cutoff.setDate(cutoff.getDate() - thresholdDays);
+    const cutoffStr = cutoff.toISOString();
+
+    const modifiedStale = row.modified_at <= cutoffStr;
+    const accessedStale = !row.last_accessed_at || row.last_accessed_at <= cutoffStr;
+
+    if (modifiedStale && accessedStale) {
+      candidates.push(row);
+    }
+  }
+
+  return candidates;
+}
+
+function restoreArchivedDocumentsFn(
+  db: Database,
+  filter: { ids?: number[]; collection?: string; sinceDate?: string }
+): number {
+  let sql = "UPDATE documents SET active = 1, archived_at = NULL WHERE active = 0 AND archived_at IS NOT NULL";
+  const params: any[] = [];
+
+  if (filter.ids?.length) {
+    const placeholders = filter.ids.map(() => "?").join(",");
+    sql += ` AND id IN (${placeholders})`;
+    params.push(...filter.ids);
+  }
+  if (filter.collection) {
+    sql += " AND collection = ?";
+    params.push(filter.collection);
+  }
+  if (filter.sinceDate) {
+    sql += " AND archived_at >= ?";
+    params.push(filter.sinceDate);
+  }
+
+  return db.prepare(sql).run(...params).changes;
+}
+
+function purgeArchivedDocumentsFn(db: Database, olderThanDays: number): number {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - olderThanDays);
+  const result = db.prepare(`
+    DELETE FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND archived_at <= ?
+  `).run(cutoff.toISOString());
+  return result.changes;
+}
+
+function getLifecycleStatsFn(db: Database): {
+  active: number; archived: number; forgotten: number;
+  pinned: number; snoozed: number;
+  neverAccessed: number; oldestAccess: string | null;
+} {
+  const row = db.prepare(`
+    SELECT
+      SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) as active,
+      SUM(CASE WHEN active = 0 AND archived_at IS NOT NULL THEN 1 ELSE 0 END) as archived,
+      SUM(CASE WHEN active = 0 AND archived_at IS NULL THEN 1 ELSE 0 END) as forgotten,
+      SUM(CASE WHEN active = 1 AND pinned = 1 THEN 1 ELSE 0 END) as pinned,
+      SUM(CASE WHEN active = 1 AND snoozed_until IS NOT NULL AND snoozed_until > datetime('now') THEN 1 ELSE 0 END) as snoozed,
+      SUM(CASE WHEN active = 1 AND last_accessed_at IS NULL THEN 1 ELSE 0 END) as neverAccessed,
+      MIN(CASE WHEN active = 1 AND last_accessed_at IS NOT NULL THEN last_accessed_at END) as oldestAccess
+    FROM documents
+  `).get() as any;
+
+  return {
+    active: row?.active ?? 0,
+    archived: row?.archived ?? 0,
+    forgotten: row?.forgotten ?? 0,
+    pinned: row?.pinned ?? 0,
+    snoozed: row?.snoozed ?? 0,
+    neverAccessed: row?.neverAccessed ?? 0,
+    oldestAccess: row?.oldestAccess ?? null,
+  };
+}
+
+function searchArchivedFn(
+  db: Database,
+  query: string,
+  limit: number = 20
+): { id: number; collection: string; path: string; title: string; archived_at: string; score: number }[] {
+  const likePattern = `%${query}%`;
+  const rows = db.prepare(`
+    SELECT d.id, d.collection, d.path, d.title, d.archived_at
+    FROM documents d
+    LEFT JOIN content c ON c.hash = d.hash
+    WHERE d.active = 0 AND d.archived_at IS NOT NULL
+      AND (d.title LIKE ? OR d.path LIKE ? OR d.collection LIKE ? OR c.doc LIKE ?)
+    LIMIT ?
+  `).all(likePattern, likePattern, likePattern, likePattern, limit) as any[];
+
+  return rows.map((r: any) => ({
+    id: r.id, collection: r.collection, path: r.path, title: r.title,
+    archived_at: r.archived_at, score: 1.0,
+  }));
 }
