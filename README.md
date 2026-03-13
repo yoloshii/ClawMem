@@ -457,26 +457,26 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 | Tool | Description |
 |---|---|
-| `__IMPORTANT` | Workflow guide: search compact → review → multi_get |
+| `__IMPORTANT` | Workflow guide: prefer `memory_retrieve` → match query type to tool → `multi_get` for full content |
 
 ### Core Search & Retrieval
 
 | Tool | Description |
 |---|---|
 | `memory_retrieve` | **Preferred entry point.** Auto-classifies query and routes to optimal backend (query, intent_search, session_log, find_similar, or query_plan). Use instead of manually choosing a search tool. |
-| `search` | BM25 keyword search with composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. |
-| `vsearch` | Vector semantic search with composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. |
-| `query` | Full hybrid pipeline with intent hint, strong-signal bypass, intent-aware chunk selection, chunk dedup, configurable candidateLimit, composite scoring + co-activation boost + MMR diversity + compact mode. Collection filter supports comma-separated values. |
+| `search` | BM25 keyword search — for exact terms, config names, error codes, filenames. Composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
+| `vsearch` | Vector semantic search — for conceptual/fuzzy matching when exact keywords are unknown. Composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
+| `query` | Full hybrid pipeline (BM25 + vector + rerank) — general-purpose when query type is unclear. WRONG for "why" questions (use `intent_search`) or cross-session queries (use `session_log`). Prefer `memory_retrieve` for auto-routing. Intent hint, strong-signal bypass, chunk dedup, candidateLimit, MMR diversity, compact mode. |
 | `get` | Retrieve single document by path or docid |
 | `multi_get` | Retrieve multiple docs by glob or comma-separated list |
-| `find_similar` | Find notes similar to a reference document |
+| `find_similar` | USE THIS for "what else relates to X", "show me similar docs". Finds k-NN vector neighbors — discovers connections beyond keyword overlap that search/query cannot find. |
 
 ### Intent-Aware Search
 
 | Tool | Description |
 |---|---|
-| `intent_search` | Intent-classified search with graph expansion and reranking |
-| `query_plan` | Decomposes complex multi-topic queries into parallel typed clauses (bm25/vector/graph), executes each, merges via RRF, applies composite scoring |
+| `intent_search` | USE THIS for "why did we decide X", "what caused Y", "who worked on Z". Classifies intent (WHY/WHEN/ENTITY/WHAT), traverses causal + semantic graph edges. Returns decision chains that `query()` cannot find. |
+| `query_plan` | USE THIS for complex multi-topic queries ("tell me about X and also Y", "compare A with B"). Decomposes into parallel typed clauses (bm25/vector/graph), executes each, merges via RRF. `query()` searches as one blob — this tool splits topics and routes each optimally. |
 
 **`intent_search` pipeline:** Query → Intent Classification → BM25 + Vector → Intent-Weighted RRF → Graph Expansion (WHY/ENTITY intents) → Cross-Encoder Reranking → Composite Scoring
 
@@ -487,7 +487,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | Tool | Description |
 |---|---|
 | `build_graphs` | Build temporal and/or semantic graphs from document corpus |
-| `find_causal_links` | Traverse causal chains (causes / caused_by / both) up to N hops |
+| `find_causal_links` | Trace decision chains: "what led to X", "how we got from A to B". Follow up `intent_search` with this tool on a top result to walk the full causal chain. Traverses causes / caused_by / both up to N hops with depth-annotated reasoning. |
 | `memory_evolution_status` | Show how a document's A-MEM metadata evolved over time |
 
 ### Beads Integration
@@ -501,12 +501,12 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | Tool | Description |
 |---|---|
 | `memory_forget` | Search → deactivate closest match (with audit trail) |
-| `memory_pin` | Pin/unpin a memory for +0.3 composite boost in context surfacing |
-| `memory_snooze` | Temporarily hide a memory from context surfacing until a given date |
+| `memory_pin` | Pin a memory for +0.3 composite boost. USE PROACTIVELY when: user states a persistent constraint, makes an architecture decision, or corrects a misconception. Don't wait for curator — pin critical decisions immediately. |
+| `memory_snooze` | Temporarily hide a memory from context surfacing until a date. USE PROACTIVELY when `<vault-context>` repeatedly surfaces irrelevant content — snooze for 30 days instead of ignoring it. |
 | `status` | Index health with content type distribution |
 | `reindex` | Trigger vault re-scan |
 | `index_stats` | Detailed stats: types, staleness, access counts, sessions |
-| `session_log` | Recent sessions with handoff info |
+| `session_log` | USE THIS for "last time", "yesterday", "what happened", "what did we do". Returns session history with handoffs and file changes. DO NOT use `query()` for cross-session questions — this tool has session-specific data that search cannot find. |
 | `profile` | Current static + dynamic user profile |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary |
 | `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold, optionally purge old archives. Defaults to dry_run (preview only) |
