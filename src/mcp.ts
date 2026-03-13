@@ -1465,11 +1465,14 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
       }
       const r = results[0]!;
-      const doc = store.findActiveDocument(r.collectionName, r.filepath);
+      const parts = r.displayPath.split("/");
+      const collection = parts[0]!;
+      const path = parts.slice(1).join("/");
+      const doc = store.findActiveDocument(collection, path);
       if (!doc) {
         return { content: [{ type: "text", text: "Document not found." }], isError: true };
       }
-      store.pinDocument(r.collectionName, r.filepath, !unpin);
+      store.pinDocument(collection, path, !unpin);
       const action = unpin ? "Unpinned" : "Pinned";
       return { content: [{ type: "text", text: `${action}: ${r.displayPath} (${r.title})` }] };
     }
@@ -1495,11 +1498,14 @@ Only escalate when injected <vault-context> is insufficient. Do not re-search wh
         return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
       }
       const r = results[0]!;
-      const doc = store.findActiveDocument(r.collectionName, r.filepath);
+      const parts = r.displayPath.split("/");
+      const collection = parts[0]!;
+      const path = parts.slice(1).join("/");
+      const doc = store.findActiveDocument(collection, path);
       if (!doc) {
         return { content: [{ type: "text", text: "Document not found." }], isError: true };
       }
-      store.snoozeDocument(r.collectionName, r.filepath, until || null);
+      store.snoozeDocument(collection, path, until || null);
       const msg = until
         ? `Snoozed until ${until}: ${r.displayPath}`
         : `Unsnoozed: ${r.displayPath}`;

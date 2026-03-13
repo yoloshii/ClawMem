@@ -1555,14 +1555,14 @@ async function cmdConsolidate(args: string[]) {
   for (const candidate of candidates) {
     // BM25 search with title as query to find similar docs
     const similar = s.searchFTS(candidate.title, 5);
-    const candidateBody = s.getDocumentBody({ hash: candidate.hash } as any) || "";
+    const candidateBody = s.getDocumentBody({ filepath: `clawmem://${candidate.collection}/${candidate.path}` } as any) || "";
 
     const matches = similar.filter(r => {
-      if (r.filepath === `${candidate.collection}/${candidate.path}`) return false;
+      if (r.filepath === `clawmem://${candidate.collection}/${candidate.path}`) return false;
       if (r.score < 0.7) return false;
 
       // Require same collection
-      const rCollection = r.filepath.split("/")[0];
+      const rCollection = r.collectionName;
       if (rCollection !== candidate.collection) return false;
 
       // Require body similarity (Jaccard on word sets)

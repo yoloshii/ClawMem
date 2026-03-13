@@ -1970,20 +1970,6 @@ export function renameCollection(db: Database, oldName: string, newName: string)
 // =============================================================================
 
 /**
- * Insert or update a context for a specific collection and path prefix.
- */
-export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
-  // Get collection name from ID
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-  if (!coll) {
-    throw new Error(`Collection with id ${collectionId} not found`);
-  }
-
-  // Use collections.ts to add context
-  collectionsAddContext(coll.name, pathPrefix, context);
-}
-
-/**
  * Delete a context for a specific collection and path prefix.
  * Returns the number of contexts deleted.
  */
