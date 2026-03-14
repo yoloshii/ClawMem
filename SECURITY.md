@@ -6,7 +6,7 @@
 |---------|--------------------|
 | 0.1.x   | :white_check_mark: |
 
-Only the latest release receives security fixes.
+Only the latest release on `main` receives security fixes.
 
 ## Architecture Context
 
