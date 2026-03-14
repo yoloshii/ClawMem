@@ -286,7 +286,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 26 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
+ClawMem exposes 26 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
 
 **Claude Code (automatic):**
 
@@ -311,7 +311,50 @@ Add to your MCP config (e.g. `~/.claude.json`, `claude_desktop_config.json`, or 
 
 The server runs via stdio — no network port needed. The `bin/clawmem` wrapper sets the GPU endpoint env vars automatically.
 
-**Verify:** After registering, your client should see tools including `memory_retrieve`, `search`, `vsearch`, `query`, `query_plan`, `intent_search`, etc.
+**Verify:** After registering, your client should see tools including `memory_retrieve`, `search`, `vsearch`, `query`, `query_plan`, `intent_search`, `timeline`, etc.
+
+### HTTP REST API (optional)
+
+For web dashboards, non-MCP agents, cross-machine access, or programmatic use:
+
+```bash
+./bin/clawmem serve                          # localhost:7438, no auth
+./bin/clawmem serve --port 8080              # custom port
+CLAWMEM_API_TOKEN=secret ./bin/clawmem serve # with bearer token auth
+```
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Liveness probe + version + doc count |
+| GET | `/stats` | Full index statistics |
+| POST | `/search` | Unified search (`mode`: auto/keyword/semantic/hybrid) |
+| GET | `/documents/:docid` | Single document by 6-char hash prefix |
+| GET | `/documents?pattern=...` | Multi-get by glob pattern |
+| GET | `/timeline/:docid` | Temporal neighborhood (before/after) |
+| GET | `/sessions` | Recent session history |
+| GET | `/collections` | List all collections |
+| GET | `/lifecycle/status` | Active/archived/pinned/snoozed counts |
+| POST | `/documents/:docid/pin` | Pin/unpin |
+| POST | `/documents/:docid/snooze` | Snooze until date |
+| POST | `/documents/:docid/forget` | Deactivate |
+| POST | `/lifecycle/sweep` | Archive stale docs (dry_run default) |
+| GET | `/graph/causal/:docid` | Causal chain traversal |
+| GET | `/graph/similar/:docid` | k-NN neighbors |
+| GET | `/export` | Full vault export as JSON |
+| POST | `/reindex` | Trigger re-scan |
+| POST | `/graphs/build` | Rebuild temporal + semantic graphs |
+
+**Auth:** Set `CLAWMEM_API_TOKEN` env var to require `Authorization: Bearer <token>` on all requests. If unset, access is open (localhost-only by default). See `.env.example`.
+
+**Search example:**
+
+```bash
+curl -X POST http://localhost:7438/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "authentication decisions", "mode": "hybrid", "compact": true}'
+```
 
 ### Verify Installation
 
@@ -449,6 +492,7 @@ clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
 clawmem setup mcp [--remove]                    Register/remove MCP server
 clawmem setup curator [--remove]                Install/remove curator maintenance agent
 clawmem mcp                                     Start stdio MCP server
+clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
 clawmem path                                    Print database path
 clawmem doctor                                  Full health check
 clawmem status                                  Quick index status

@@ -11,6 +11,9 @@ node_modules/
 !SKILL.md
 !agents/*.md
 
+# Secrets
+.env
+
 # Internal dev artifacts
 .ralph/
 ralph.yml

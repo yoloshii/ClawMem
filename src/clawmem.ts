@@ -817,6 +817,18 @@ async function cmdMcp() {
   await startMcpServer();
 }
 
+async function cmdServe(args: string[]) {
+  const port = parseInt(args.find((_, i, a) => a[i - 1] === "--port") || "7438", 10);
+  const host = args.find((_, i, a) => a[i - 1] === "--host") || "127.0.0.1";
+  const s = getStore();
+  const { startServer } = await import("./server.ts");
+  const server = startServer(s, port, host);
+  console.log(`ClawMem HTTP server listening on http://${host}:${port}`);
+  console.log(`Token auth: ${process.env.CLAWMEM_API_TOKEN ? "enabled" : "disabled (set CLAWMEM_API_TOKEN)"}`);
+  console.log(`Press Ctrl+C to stop.`);
+  await new Promise(() => {});
+}
+
 // In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
 // Any accidental console.log/info/debug/warn output will corrupt the protocol stream.
 function enableMcpStdioMode(): void {
@@ -1422,6 +1434,9 @@ async function main() {
       case "mcp":
         await cmdMcp();
         break;
+      case "serve":
+        await cmdServe(subArgs);
+        break;
       case "setup":
         await cmdSetup(subArgs);
         break;
@@ -1676,6 +1691,7 @@ ${c.bold}Analysis:${c.reset}
 
 ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server
+  clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
   clawmem path                         Print database path
