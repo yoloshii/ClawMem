@@ -885,11 +885,24 @@ async function cmdSetupHooks(args: string[]) {
     console.log(`${c.green}Removed ClawMem hooks from ${settingsPath}${c.reset}`);
   } else {
     // Install clawmem hooks
+    // Production-validated hook set:
+    // - session-bootstrap/staleness-check omitted: context-surfacing on first prompt
+    //   handles retrieval more precisely, and postcompact-inject covers post-compaction.
+    //   session-bootstrap adds ~2000 tokens before the user types anything.
+    // - timeout wrappers prevent hooks from blocking the session on GPU timeouts.
     const hookConfig: Record<string, string[]> = {
       UserPromptSubmit: ["context-surfacing"],
-      SessionStart: ["session-bootstrap", "staleness-check", "postcompact-inject"],
+      SessionStart: ["postcompact-inject"],
       PreCompact: ["precompact-extract"],
       Stop: ["decision-extractor", "handoff-generator", "feedback-loop"],
+    };
+
+    // Timeout per event type (seconds)
+    const timeouts: Record<string, number> = {
+      UserPromptSubmit: 5,
+      SessionStart: 5,
+      PreCompact: 5,
+      Stop: 10,
     };
 
     for (const [event, hooks] of Object.entries(hookConfig)) {
@@ -900,12 +913,14 @@ async function cmdSetupHooks(args: string[]) {
         !entry.hooks?.some((h: any) => h.command?.includes("clawmem"))
       );
 
-      // Add new entries
+      const timeout = timeouts[event] || 5;
+
+      // Add new entries with timeout wrappers
       settings.hooks[event].push({
         matcher: "",
         hooks: hooks.map(name => ({
           type: "command",
-          command: `${binPath} hook ${name}`,
+          command: `timeout ${timeout} ${binPath} hook ${name}`,
         })),
       });
     }
