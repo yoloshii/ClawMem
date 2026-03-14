@@ -55,6 +55,7 @@ import { stalenessCheck } from "./hooks/staleness-check.ts";
 import { precompactExtract } from "./hooks/precompact-extract.ts";
 import { postcompactInject } from "./hooks/postcompact-inject.ts";
 import { pretoolInject } from "./hooks/pretool-inject.ts";
+import { curatorNudge } from "./hooks/curator-nudge.ts";
 
 enableProductionMode();
 
@@ -657,8 +658,11 @@ async function cmdHook(args: string[]) {
       case "pretool-inject":
         output = await pretoolInject(s, input);
         break;
+      case "curator-nudge":
+        output = await curatorNudge(s, input);
+        break;
       default:
-        die(`Unknown hook: ${hookName}. Available: context-surfacing, session-bootstrap, decision-extractor, handoff-generator, feedback-loop, staleness-check, precompact-extract, postcompact-inject, pretool-inject`);
+        die(`Unknown hook: ${hookName}. Available: context-surfacing, session-bootstrap, decision-extractor, handoff-generator, feedback-loop, staleness-check, precompact-extract, postcompact-inject, pretool-inject, curator-nudge`);
         output = makeEmptyOutput(); // unreachable, satisfies TS
     }
   } catch (err) {
@@ -892,7 +896,7 @@ async function cmdSetupHooks(args: string[]) {
     // - timeout wrappers prevent hooks from blocking the session on GPU timeouts.
     const hookConfig: Record<string, string[]> = {
       UserPromptSubmit: ["context-surfacing"],
-      SessionStart: ["postcompact-inject"],
+      SessionStart: ["postcompact-inject", "curator-nudge"],
       PreCompact: ["precompact-extract"],
       Stop: ["decision-extractor", "handoff-generator", "feedback-loop"],
     };
