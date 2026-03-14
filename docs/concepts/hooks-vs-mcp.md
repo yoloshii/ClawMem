@@ -26,6 +26,18 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 6. Build context within token budget
 7. Inject as `<vault-context>` XML in the prompt
 
+### Tuning context-surfacing with profiles
+
+Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's resource budget:
+
+| Profile | Token budget | Max results | Vector | Timeout | Min score |
+|---------|-------------|-------------|--------|---------|-----------|
+| `speed` | 400 | 5 | Off | — | 0.55 |
+| `balanced` (default) | 800 | 10 | On | 900ms | 0.45 |
+| `deep` | 1200 | 15 | On | 2000ms | 0.35 |
+
+Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
+
 ### Hook blind spots
 
 Hooks filter aggressively — they enforce score thresholds, cap token budgets, and exclude system artifacts. If a memory exists but wasn't surfaced in `<vault-context>`, it doesn't mean it's missing from the vault. It means it didn't make the top-k cut for this prompt.
