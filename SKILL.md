@@ -165,15 +165,13 @@ Hooks handle ~90% of retrieval. Zero agent effort.
 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
-| `session-bootstrap` | SessionStart | 2000 tokens | profile + latest handoff + recent decisions + stale notes |
 | `context-surfacing` | UserPromptSubmit | 800 tokens | retrieval gate -> hybrid search (vector + FTS, 900ms timeout) -> snooze filter -> noise filter -> `<vault-context>` |
-| `staleness-check` | SessionStart | 250 tokens | flags notes not modified in 30+ days |
+| `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
+| `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
+| `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
 | `decision-extractor` | Stop | — | LLM extracts observations -> `_clawmem/agent/observations/`, infers causal links, detects contradictions |
 | `handoff-generator` | Stop | — | LLM summarizes session -> `_clawmem/agent/handoffs/` |
 | `feedback-loop` | Stop | — | tracks referenced notes -> boosts confidence |
-| `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
-| `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
-| `pretool-inject` | PreToolUse | 200 tokens | searches vault for file-specific context before Read/Edit/Write. Surfaces via `reason` field. Disabled by default. |
 
 **Default behavior:** Read injected `<vault-context>` first. If sufficient, answer immediately.
 

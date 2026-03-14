@@ -50,8 +50,8 @@ Claude Code Session
     ├─ UserPromptSubmit ──→ context-surfacing hook
     │                       search vault → composite score → sanitize → inject
     │
-    ├─ SessionStart ──────→ session-bootstrap hook
-    │                       profile + handoff + decisions + stale → inject
+    ├─ SessionStart ──────→ postcompact-inject + curator-nudge hooks
+    │                       re-inject state after compaction + surface curator actions
     │
     └─ Stop ──────────────→ decision-extractor + handoff-generator + feedback-loop
     │                       + causal inference from Observer facts
@@ -140,7 +140,7 @@ clawmem setup hooks    # Install lifecycle hooks (SessionStart, UserPromptSubmit
 clawmem setup mcp      # Register MCP server in ~/.claude.json (20+ agent tools)
 ```
 
-**Automatic (90%):** `session-bootstrap` surfaces profile + handoff + decisions on session start. `context-surfacing` injects relevant memory on every prompt. `decision-extractor`, `handoff-generator`, `feedback-loop` capture session state on stop.
+**Automatic (90%):** `context-surfacing` injects relevant memory on every prompt. `postcompact-inject` re-injects state after compaction. `decision-extractor`, `handoff-generator`, `feedback-loop` capture session state on stop.
 
 **Agent-initiated (10%):** MCP tools (`query`, `intent_search`, `find_causal_links`, `timeline`, etc.) for targeted retrieval when hooks don't surface what's needed.
 
@@ -593,19 +593,25 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 ## Hooks (Claude Code Integration)
 
-Nine hooks auto-installed by `clawmem setup hooks`:
+Hooks installed by `clawmem setup hooks`:
 
 | Hook | Event | What It Does |
 |---|---|---|
 | `context-surfacing` | UserPromptSubmit | Hybrid search (900ms vector timeout) → snooze filter → file-aware supplemental search → sanitize → inject (800 token budget) |
-| `session-bootstrap` | SessionStart | Injects profile + handoff + decisions + stale notes (2000 token budget) |
-| `staleness-check` | SessionStart | Flags documents needing review |
+| `postcompact-inject` | SessionStart | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
+| `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
+| `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory |
 | `decision-extractor` | Stop | GGUF observer extracts structured decisions, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation for documents surfaced together |
-| `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. |
-| `postcompact-inject` | SessionStart (compact) | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
-| `pretool-inject` | PreToolUse | Searches vault for file-specific context before Read/Edit/Write. Surfaces via `reason` field (200 token budget). Disabled in HOOK_EVENT_MAP. |
+
+Additional hooks available but not installed by default:
+
+| Hook | Event | Why Not Default |
+|---|---|---|
+| `session-bootstrap` | SessionStart | Injects ~2000 tokens before user types anything. `context-surfacing` on first prompt is more precise. |
+| `staleness-check` | SessionStart | Redundant without `session-bootstrap` (stale notes are part of its output). |
+| `pretool-inject` | PreToolUse | Disabled in HOOK_EVENT_MAP (cannot inject additionalContext via PreToolUse). |
 
 Hooks handle ~90% of retrieval automatically. For agent escalation logic (when to use MCP tools vs rely on hooks), see `CLAUDE.md`.
 
