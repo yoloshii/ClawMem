@@ -7,10 +7,9 @@ import { unlinkSync } from "fs";
 import { createStore, type Store } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { startServer } from "../../src/server.ts";
-import type { Server } from "bun";
 
 let store: Store;
-let server: Server;
+let server: ReturnType<typeof startServer>;
 let authDocHash: string;
 let handoffDocHash: string;
 const TEST_DB = "/tmp/clawmem-server-test.sqlite";
@@ -59,7 +58,7 @@ describe("GET /health", () => {
   test("returns ok status", async () => {
     const res = await fetch(`${BASE}/health`);
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.status).toBe("ok");
     expect(data.service).toBe("clawmem");
     expect(data.documents).toBe(3);
@@ -70,7 +69,7 @@ describe("GET /stats", () => {
   test("returns document stats", async () => {
     const res = await fetch(`${BASE}/stats`);
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.totalDocuments).toBe(3);
   });
 });
@@ -83,7 +82,7 @@ describe("POST /search", () => {
       body: JSON.stringify({ query: "authentication", mode: "keyword" }),
     });
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.results.length).toBeGreaterThan(0);
     expect(data.results[0].title).toContain("Auth");
   });
@@ -103,7 +102,7 @@ describe("POST /search", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query: "JWT", compact: true }),
     });
-    const data = await res.json();
+    const data = await res.json() as any;
     if (data.results.length > 0) {
       expect(data.results[0]).toHaveProperty("snippet");
       expect(data.results[0]).not.toHaveProperty("body");
@@ -132,7 +131,7 @@ describe("GET /timeline/:docid", () => {
     const docid = handoffDocHash.slice(0, 6);
     const res = await fetch(`${BASE}/timeline/${docid}`);
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.focus).toBeDefined();
     expect(data.before).toBeInstanceOf(Array);
     expect(data.after).toBeInstanceOf(Array);
@@ -143,7 +142,7 @@ describe("GET /collections", () => {
   test("returns collection list", async () => {
     const res = await fetch(`${BASE}/collections`);
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.count).toBeGreaterThanOrEqual(0);
   });
 });
@@ -152,7 +151,7 @@ describe("GET /lifecycle/status", () => {
   test("returns lifecycle stats", async () => {
     const res = await fetch(`${BASE}/lifecycle/status`);
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.active).toBe(3);
   });
 });
@@ -166,7 +165,7 @@ describe("POST /documents/:docid/pin", () => {
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.pinned).toBe(true);
   });
 });
@@ -193,7 +192,7 @@ describe("GET /export", () => {
   test("exports all documents", async () => {
     const res = await fetch(`${BASE}/export`);
     expect(res.status).toBe(200);
-    const data = await res.json();
+    const data = await res.json() as any;
     expect(data.version).toBe("1.0.0");
     expect(data.count).toBe(3);
     expect(data.documents.length).toBe(3);

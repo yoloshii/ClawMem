@@ -215,7 +215,7 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
-| `context-surfacing` | UserPromptSubmit | 800 tokens | retrieval gate → hybrid search (vector + FTS supplement, 900ms timeout) → snooze filter → noise filter → `<vault-context>` injection |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate → profile-driven hybrid search (vector if `useVector`, timeout from profile) → FTS supplement → snooze filter → noise filter → `<vault-context>` injection. Budget, max results, vector timeout, and min score all driven by `CLAWMEM_PROFILE`. |
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + recent decisions (400) + antipatterns (150) + vault context (200) → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. Reindexes auto-memory collection. |
@@ -293,11 +293,11 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `query_plan(query, compact=true)` — USE THIS for multi-topic queries. `query()` searches as one blob — this splits topics and routes each optimally.
 - `timeline(docid, before=5, after=5, same_collection=false)` — temporal neighborhood around a document. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation.
 - `list_vaults()` — show configured vault names and paths. Empty in single-vault mode (default).
-- `vault_sync(vault, content_root, pattern?, collection_name?)` — index markdown from a directory into a named vault.
+- `vault_sync(vault, content_root, pattern?, collection_name?)` — index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories (`/etc/`, `/root/`, `.ssh`, `.env`, `credentials`, etc.).
 
 ### Multi-Vault
 
-All retrieval tools accept an optional `vault` parameter. Omit it for the default vault (single-vault mode). Named vaults are configured in `~/.config/clawmem/config.yaml` under `vaults:` or via `CLAWMEM_VAULTS` env var.
+All tools accept an optional `vault` parameter — retrieval (query, search, vsearch, intent_search, memory_retrieve, query_plan), document access (get, multi_get, find_similar, find_causal_links, timeline, memory_evolution_status, session_log), mutations (memory_pin, memory_snooze, memory_forget), lifecycle (lifecycle_status, lifecycle_sweep, lifecycle_restore), and maintenance (status, reindex, index_stats, build_graphs). Omit `vault` for the default vault (single-vault mode). Named vaults are configured in `~/.config/clawmem/config.yaml` under `vaults:` or via `CLAWMEM_VAULTS` env var. Vault paths support `~` expansion.
 
 ### Memory Lifecycle
 
@@ -605,5 +605,5 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 - `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process LLM/reranker fallback via `node-llama-cpp`. Set `true` for remote-only setups to fail fast on unreachable endpoints.
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs with A-MEM notes + links. Only runs if the MCP process stays alive long enough to tick (every 5min).
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+) for live issue data, creates markdown docs in `beads` collection, maps all dependency edge types into `memory_relations`, and triggers A-MEM enrichment for new docs. Watcher auto-triggers on `.beads/` directory changes; `beads_sync` MCP tool for manual sync. Requires `bd` binary on PATH or at `~/go/bin/bd`.
-- HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Same search/retrieval/lifecycle as MCP tools. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
+- HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
 - OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers ClawMem as a native OpenClaw context engine. Uses `before_prompt_build` for retrieval (prompt-aware), `afterTurn()` for extraction, `compact()` for pre-compaction. Shares same vault as Claude Code hooks (dual-mode). SQLite busy_timeout=5000ms for concurrent access safety.

@@ -138,10 +138,24 @@ function addLineNumbers(text: string, startLine: number = 1): string {
 export async function startMcpServer(): Promise<void> {
   const store = createStore(undefined, { busyTimeout: 5000 });
 
-  // Vault-aware store resolution: returns named vault store or default
+  // Vault store cache: prevents connection churn, closed on shutdown
+  const vaultStoreCache = new Map<string, Store>();
+
   function getStore(vault?: string): Store {
     if (!vault) return store;
-    return resolveStore(vault, { busyTimeout: 5000 });
+    const cached = vaultStoreCache.get(vault);
+    if (cached) return cached;
+    const s = resolveStore(vault, { busyTimeout: 5000 });
+    vaultStoreCache.set(vault, s);
+    return s;
+  }
+
+  function closeAllStores(): void {
+    for (const [, s] of vaultStoreCache) {
+      try { s.close(); } catch {}
+    }
+    vaultStoreCache.clear();
+    try { store.close(); } catch {}
   }
 
   const server = new McpServer({
@@ -261,7 +275,35 @@ This is the recommended entry point for ALL memory queries.`,
                 maxDepth: 2, beamWidth: 5, budget: 30,
                 intent: intent.intent, queryEmbedding: anchorEmb.embedding,
               });
-              fused = mergeTraversalResults(fused, traversed, store.db);
+              const merged = mergeTraversalResults(store.db, fused.map(r => ({ hash: r.hash, score: r.score })), traversed);
+              // Hydrate merged results back to SearchResult format
+              const fusedMap = new Map(fused.map(r => [r.hash, r]));
+              fused = merged.map(m => {
+                const orig = fusedMap.get(m.hash);
+                if (orig) return { ...orig, score: m.score };
+                // Graph-discovered node — hydrate from DB
+                const doc = store.db.prepare(`
+                  SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
+                  FROM documents d
+                  LEFT JOIN content c ON c.hash = d.hash
+                  WHERE d.hash = ? AND d.active = 1 LIMIT 1
+                `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
+                if (!doc) return null;
+                return {
+                  filepath: `clawmem://${doc.collection}/${doc.path}`,
+                  displayPath: `${doc.collection}/${doc.path}`,
+                  title: doc.title || doc.path.split("/").pop() || "",
+                  context: null,
+                  hash: doc.hash,
+                  docid: doc.hash.slice(0, 6),
+                  collectionName: doc.collection,
+                  modifiedAt: doc.modified_at || "",
+                  bodyLength: doc.body?.length || 0,
+                  body: doc.body || "",
+                  score: m.score,
+                  source: "vec" as const,
+                } satisfies SearchResult;
+              }).filter((r): r is SearchResult => r !== null);
             }
           } catch { /* graph traversal failed — continue with base results */ }
         }
@@ -700,9 +742,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("What to forget — searches for the closest match"),
         confirm: z.boolean().optional().default(true).describe("If true, deactivates the best match. If false, just shows what would be forgotten."),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, confirm }) => {
+    async ({ query, confirm, vault }) => {
+      const store = getStore(vault);
       const results = store.searchFTS(query, 5);
       if (results.length === 0) {
         return { content: [{ type: "text", text: `No matching memory found for "${query}"` }] };
@@ -792,9 +836,11 @@ This is the recommended entry point for ALL memory queries.`,
         fromLine: z.number().optional(),
         maxLines: z.number().optional(),
         lineNumbers: z.boolean().optional().default(false),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ file, fromLine, maxLines, lineNumbers }) => {
+    async ({ file, fromLine, maxLines, lineNumbers, vault }) => {
+      const store = getStore(vault);
       let parsedFromLine = fromLine;
       let lookup = file;
       const colonMatch = lookup.match(/:(\d+)$/);
@@ -846,9 +892,11 @@ This is the recommended entry point for ALL memory queries.`,
         maxLines: z.number().optional(),
         maxBytes: z.number().optional().default(10240),
         lineNumbers: z.boolean().optional().default(false),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
+    async ({ pattern, maxLines, maxBytes, lineNumbers, vault }) => {
+      const store = getStore(vault);
       const { docs, errors } = store.findDocuments(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
       if (docs.length === 0 && errors.length === 0) {
         return { content: [{ type: "text", text: `No files matched: ${pattern}` }], isError: true };
@@ -895,9 +943,12 @@ This is the recommended entry point for ALL memory queries.`,
     {
       title: "Index Status",
       description: "Show ClawMem index status with content type distribution.",
-      inputSchema: {},
+      inputSchema: {
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
     },
-    async () => {
+    async ({ vault }) => {
+      const store = getStore(vault);
       const status: StatusResult = store.getStatus();
 
       // Add content type distribution
@@ -941,9 +992,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         file: z.string().describe("Path of reference document"),
         limit: z.number().optional().default(5),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ file, limit }) => {
+    async ({ file, limit, vault }) => {
+      const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
         return { content: [{ type: "text", text: "Vector index not found. Run 'clawmem embed' first." }], isError: true };
@@ -995,9 +1048,12 @@ This is the recommended entry point for ALL memory queries.`,
     {
       title: "Re-index Collections",
       description: "Trigger a re-scan of all collections. Detects new, changed, and deleted documents.",
-      inputSchema: {},
+      inputSchema: {
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
     },
-    async () => {
+    async ({ vault }) => {
+      const store = getStore(vault);
       const collections = listCollections();
       const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
 
@@ -1026,9 +1082,12 @@ This is the recommended entry point for ALL memory queries.`,
     {
       title: "Index Statistics",
       description: "Detailed index statistics with content type distribution, staleness info, and memory health.",
-      inputSchema: {},
+      inputSchema: {
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
     },
-    async () => {
+    async ({ vault }) => {
+      const store = getStore(vault);
       const status = store.getStatus();
       const typeCounts = store.db.prepare(
         `SELECT content_type, COUNT(*) as count FROM documents WHERE active = 1 GROUP BY content_type ORDER BY count DESC`
@@ -1082,9 +1141,11 @@ This is the recommended entry point for ALL memory queries.`,
       description: "USE THIS when user references prior sessions: 'last time', 'yesterday', 'what happened', 'what did we do'. Returns session history with handoffs and file changes. DO NOT use query() for cross-session questions — this tool has session-specific data that search cannot find.",
       inputSchema: {
         limit: z.number().optional().default(10),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ limit }) => {
+    async ({ limit, vault }) => {
+      const store = getStore(vault);
       const sessions = store.getRecentSessions(limit || 10);
       if (sessions.length === 0) {
         return { content: [{ type: "text", text: "No sessions tracked yet." }] };
@@ -1177,9 +1238,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         graph_types: z.array(z.enum(['temporal', 'semantic', 'all'])).optional().default(['all']),
         semantic_threshold: z.number().optional().default(0.7).describe("Similarity threshold for semantic edges (0.0-1.0)"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ graph_types, semantic_threshold }) => {
+    async ({ graph_types, semantic_threshold, vault }) => {
+      const store = getStore(vault);
       const types = graph_types || ['all'];
       const shouldBuildTemporal = types.includes('temporal') || types.includes('all');
       const shouldBuildSemantic = types.includes('semantic') || types.includes('all');
@@ -1369,9 +1432,11 @@ This is the recommended entry point for ALL memory queries.`,
         query: z.string().describe("Complex or multi-topic query"),
         limit: z.number().optional().default(10),
         compact: z.boolean().optional().default(true).describe("Return compact results"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, compact }) => {
+    async ({ query, limit, compact, vault }) => {
+      const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
       // Decompose query into typed clauses
@@ -1504,9 +1569,11 @@ This is the recommended entry point for ALL memory queries.`,
         docid: z.string().describe("Document ID (e.g., '#123' or path)"),
         direction: z.enum(['causes', 'caused_by', 'both']).optional().default('both').describe("Direction: 'causes' (outbound), 'caused_by' (inbound), or 'both'"),
         depth: z.number().optional().default(5).describe("Maximum traversal depth (1-10)"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ docid, direction, depth }) => {
+    async ({ docid, direction, depth, vault }) => {
+      const store = getStore(vault);
       // Resolve docid to document
       const resolved = store.findDocumentByDocid(docid);
       if (!resolved) {
@@ -1583,9 +1650,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         docid: z.string().describe("Document ID (e.g., '#123' or path)"),
         limit: z.number().optional().default(10).describe("Maximum number of evolution entries to return (1-100)"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ docid, limit }) => {
+    async ({ docid, limit, vault }) => {
+      const store = getStore(vault);
       // Resolve docid to document
       const resolved = store.findDocumentByDocid(docid);
       if (!resolved) {
@@ -1688,9 +1757,11 @@ This is the recommended entry point for ALL memory queries.`,
         before: z.number().optional().default(5).describe("Number of documents to show before the focus (1-20)"),
         after: z.number().optional().default(5).describe("Number of documents to show after the focus (1-20)"),
         same_collection: z.boolean().optional().default(false).describe("Constrain to same collection (like session scoping)"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ docid, before, after, same_collection }) => {
+    async ({ docid, before, after, same_collection, vault }) => {
+      const store = getStore(vault);
       // Resolve docid to numeric ID
       const resolved = store.findDocumentByDocid(docid);
       if (!resolved) {
@@ -1763,9 +1834,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Search query to find the memory to pin/unpin"),
         unpin: z.boolean().optional().default(false).describe("Set true to unpin"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, unpin }) => {
+    async ({ query, unpin, vault }) => {
+      const store = getStore(vault);
       const results = store.searchFTS(query, 3);
       if (results.length === 0) {
         return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
@@ -1796,9 +1869,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Search query to find the memory to snooze"),
         until: z.string().optional().describe("ISO date to snooze until (e.g. 2026-03-01). Omit to unsnooze."),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, until }) => {
+    async ({ query, until, vault }) => {
+      const store = getStore(vault);
       const results = store.searchFTS(query, 3);
       if (results.length === 0) {
         return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
@@ -1828,9 +1903,12 @@ This is the recommended entry point for ALL memory queries.`,
     {
       title: "Lifecycle Status",
       description: "Show document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary.",
-      inputSchema: {},
+      inputSchema: {
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
     },
-    async () => {
+    async ({ vault }) => {
+      const store = getStore(vault);
       const stats = store.getLifecycleStats();
       const { loadConfig } = await import("./collections.ts");
       const config = loadConfig();
@@ -1863,9 +1941,11 @@ This is the recommended entry point for ALL memory queries.`,
       description: "Run lifecycle policies: archive stale docs, optionally purge old archives. Defaults to dry_run (preview only).",
       inputSchema: {
         dry_run: z.boolean().optional().default(true).describe("Preview what would be archived/purged without acting"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ dry_run }) => {
+    async ({ dry_run, vault }) => {
+      const store = getStore(vault);
       const { loadConfig } = await import("./collections.ts");
       const config = loadConfig();
       const policy = config.lifecycle;
@@ -1905,9 +1985,11 @@ This is the recommended entry point for ALL memory queries.`,
         query: z.string().optional().describe("Search archived docs by keyword to find what to restore"),
         collection: z.string().optional().describe("Restore all archived docs from a specific collection"),
         all: z.boolean().optional().default(false).describe("Restore ALL archived documents"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, collection, all }) => {
+    async ({ query, collection, all, vault }) => {
+      const store = getStore(vault);
       if (query) {
         const results = store.searchArchived(query, 20);
 
@@ -1986,6 +2068,19 @@ This is the recommended entry point for ALL memory queries.`,
       const root = content_root.replace(/^~/, process.env.HOME || "/tmp");
       const collName = collection_name || vault;
 
+      // Validate content_root — reject sensitive paths
+      const { resolve: resolvePath } = await import("path");
+      const resolvedRoot = resolvePath(root);
+      const DENIED_PREFIXES = ["/etc/", "/root/", "/var/", "/proc/", "/sys/", "/dev/"];
+      const DENIED_PATTERNS = [".ssh", ".gnupg", ".env", "credentials", "secrets", ".aws", ".kube"];
+      if (DENIED_PREFIXES.some(p => resolvedRoot.startsWith(p)) ||
+          DENIED_PATTERNS.some(p => resolvedRoot.includes(p))) {
+        return {
+          content: [{ type: "text", text: `Vault sync denied: "${resolvedRoot}" is in a restricted path` }],
+          isError: true,
+        };
+      }
+
       try {
         const stats = await indexCollection(s, collName, root, pattern || "**/*.md");
         return {
@@ -2026,12 +2121,14 @@ This is the recommended entry point for ALL memory queries.`,
   process.on("SIGINT", () => {
     console.error("\n[mcp] Received SIGINT, shutting down...");
     stopConsolidationWorker();
+    closeAllStores();
     process.exit(0);
   });
 
   process.on("SIGTERM", () => {
     console.error("\n[mcp] Received SIGTERM, shutting down...");
     stopConsolidationWorker();
+    closeAllStores();
     process.exit(0);
   });
 }

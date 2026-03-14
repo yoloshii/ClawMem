@@ -12,8 +12,8 @@
 
 import type { Server } from "bun";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
-import { enrichResults } from "./search-utils.ts";
-import { applyCompositeScoring, type EnrichedResult } from "./memory.ts";
+import { enrichResults, reciprocalRankFusion, toRanked } from "./search-utils.ts";
+import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { listCollections } from "./collections.ts";
 import { classifyIntent, type IntentType } from "./intent.ts";
@@ -241,11 +241,12 @@ function handleGetDocuments(_req: Request, url: URL, store: Store): Response {
   const maxBytes = queryInt(url, "max_bytes", 10240);
   const { docs, errors } = store.findDocuments(pattern, { includeBody: true, maxBytes });
 
+  const resolved = docs.filter(d => !d.skipped).map(d => d.doc);
   return jsonResponse({
     pattern,
-    count: docs.length,
+    count: resolved.length,
     errors,
-    documents: docs.map(d => ({
+    documents: resolved.map(d => ({
       docid: d.docid,
       path: d.displayPath,
       title: d.title,
@@ -560,6 +561,116 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
   return jsonResponse({ temporal: temporalEdges, semantic: semanticEdges });
 }
 
+// --- Unified Retrieve (mirrors memory_retrieve from MCP) ---
+
+function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "hybrid" {
+  const q = query.toLowerCase();
+  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do)\b/i.test(q)) return "timeline";
+  if (/\b(why did|why was|what caused|what led to|reason for|decided to|decision about|trade.?off|chose to)\b/i.test(q) || /^why\b/i.test(q)) return "causal";
+  if (q.length < 50 && (/[A-Z][A-Z0-9_]{2,}/.test(query) || /[\w-]+\.\w{2,4}\b/.test(q.trim()))) return "keyword";
+  if (/\b(how does|explain|concept|overview|understand|what is the purpose)\b/i.test(q)) return "semantic";
+  return "hybrid";
+}
+
+async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Response> {
+  const body = await parseBody<{
+    query: string;
+    mode?: "auto" | "keyword" | "semantic" | "causal" | "timeline" | "hybrid";
+    collection?: string;
+    compact?: boolean;
+    limit?: number;
+  }>(req);
+
+  if (!body?.query) return jsonError("query is required");
+
+  const query = body.query;
+  const requestedMode = body.mode ?? "auto";
+  const mode = requestedMode === "auto" ? classifyRetrievalMode(query) : requestedMode;
+  const limit = Math.min(body.limit ?? 10, 50);
+  const compact = body.compact ?? true;
+  const collections = body.collection ? body.collection.split(",").map(c => c.trim()) : undefined;
+
+  let results: SearchResult[];
+
+  if (mode === "timeline") {
+    // Delegate to session log
+    const sessions = store.getRecentSessions(limit);
+    const lines = sessions.map(s => {
+      const dur = s.endedAt
+        ? `${Math.round((new Date(s.endedAt).getTime() - new Date(s.startedAt).getTime()) / 60000)}min`
+        : "active";
+      return `${s.sessionId.slice(0, 8)} ${s.startedAt} (${dur})${s.summary ? " — " + s.summary.slice(0, 100) : ""}`;
+    });
+    return jsonResponse({ query, mode: "timeline", count: sessions.length, results: lines });
+  }
+
+  if (mode === "causal") {
+    // Intent-aware RRF: boost vector for causal queries
+    const llm = getDefaultLlamaCpp();
+    const intent = await classifyIntent(query, llm, store.db);
+    const bm25 = store.searchFTS(query, limit * 2, undefined, collections);
+    let vec: SearchResult[] = [];
+    try {
+      vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
+    } catch { /* vector unavailable */ }
+    const weights = intent.intent === "WHEN" ? [1.5, 1.0] : [1.0, 1.5];
+    const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], weights);
+    const allResults = [...bm25, ...vec];
+    results = fused.map(fr => {
+      const orig = allResults.find(r => r.filepath === fr.file);
+      return orig ? { ...orig, score: fr.score } : null;
+    }).filter((r): r is SearchResult => r !== null);
+  } else if (mode === "keyword") {
+    results = store.searchFTS(query, limit * 2, undefined, collections);
+  } else if (mode === "semantic") {
+    try {
+      results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
+    } catch {
+      results = store.searchFTS(query, limit * 2, undefined, collections);
+    }
+  } else {
+    // hybrid
+    const fts = store.searchFTS(query, limit * 2, undefined, collections);
+    let vec: SearchResult[] = [];
+    try {
+      vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
+    } catch { /* vector unavailable */ }
+    const merged = new Map<string, SearchResult>();
+    for (const r of [...fts, ...vec]) {
+      const existing = merged.get(r.filepath);
+      if (!existing || r.score > existing.score) merged.set(r.filepath, r);
+    }
+    results = Array.from(merged.values());
+  }
+
+  const enriched = enrichResults(store, results, query);
+  const scored = applyCompositeScoring(enriched, query, (path) => store.getCoActivated(path));
+  const diverse = applyMMRDiversity(scored);
+  const final = diverse.slice(0, limit);
+
+  if (compact) {
+    return jsonResponse({
+      query, mode, count: final.length,
+      results: final.map(r => ({
+        docid: r.docid, path: r.displayPath, title: r.title,
+        score: Math.round(r.compositeScore * 1000) / 1000,
+        contentType: r.contentType,
+        snippet: extractSnippet(r.body || "", query, 200).snippet,
+      })),
+    });
+  }
+
+  return jsonResponse({
+    query, mode, count: final.length,
+    results: final.map(r => ({
+      docid: r.docid, path: r.displayPath, title: r.title,
+      score: Math.round(r.compositeScore * 1000) / 1000,
+      contentType: r.contentType, modifiedAt: r.modifiedAt,
+      confidence: r.confidence, body: r.body,
+    })),
+  });
+}
+
 // =============================================================================
 // Router
 // =============================================================================
@@ -575,8 +686,9 @@ const routes: Route[] = [
   { method: "GET",  pattern: /^\/health$/,                 handler: handleHealth },
   { method: "GET",  pattern: /^\/stats$/,                  handler: handleStats },
 
-  // Search
+  // Search & Retrieve
   { method: "POST", pattern: /^\/search$/,                 handler: handleSearch },
+  { method: "POST", pattern: /^\/retrieve$/,               handler: handleRetrieve },
 
   // Documents
   { method: "GET",  pattern: /^\/documents$/,              handler: handleGetDocuments },
@@ -630,7 +742,7 @@ function matchRoute(method: string, pathname: string): RouteHandler | null {
 // Server
 // =============================================================================
 
-export function startServer(store: Store, port: number = 7438, host: string = "127.0.0.1"): Server {
+export function startServer(store: Store, port: number = 7438, host: string = "127.0.0.1") {
   return Bun.serve({
     port,
     hostname: host,

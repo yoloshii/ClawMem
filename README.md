@@ -396,6 +396,7 @@ CLAWMEM_API_TOKEN=secret ./bin/clawmem serve # with bearer token auth
 | GET | `/health` | Liveness probe + version + doc count |
 | GET | `/stats` | Full index statistics |
 | POST | `/search` | Unified search (`mode`: auto/keyword/semantic/hybrid) |
+| POST | `/retrieve` | Smart retrieve with auto-routing (`mode`: auto/keyword/semantic/causal/timeline/hybrid) |
 | GET | `/documents/:docid` | Single document by 6-char hash prefix |
 | GET | `/documents?pattern=...` | Multi-get by glob pattern |
 | GET | `/timeline/:docid` | Temporal neighborhood (before/after) |
@@ -427,7 +428,7 @@ curl -X POST http://localhost:7438/search \
 ```bash
 ./bin/clawmem doctor   # Full health check
 ./bin/clawmem status   # Quick index status
-bun test               # Run test suite (139 tests)
+bun test               # Run test suite (171 tests)
 ```
 
 ## Agent Instructions

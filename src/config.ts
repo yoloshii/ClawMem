@@ -27,6 +27,15 @@ import { homedir } from "os";
 import YAML from "yaml";
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Expand leading ~ to user home directory */
+function expandHome(p: string): string {
+  return p.startsWith("~/") || p === "~" ? join(homedir(), p.slice(1)) : p;
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -102,7 +111,7 @@ export function loadVaultConfig(): ClawMemConfig {
       if (parsedYaml?.vaults && typeof parsedYaml.vaults === "object") {
         for (const [name, path] of Object.entries(parsedYaml.vaults)) {
           if (typeof path === "string") {
-            vaults[name] = resolve(path);
+            vaults[name] = resolve(expandHome(path));
           }
         }
       }
@@ -118,7 +127,7 @@ export function loadVaultConfig(): ClawMemConfig {
       if (typeof envVaults === "object") {
         for (const [name, path] of Object.entries(envVaults)) {
           if (typeof path === "string") {
-            vaults[name] = resolve(path as string);
+            vaults[name] = resolve(expandHome(path as string));
           }
         }
       }

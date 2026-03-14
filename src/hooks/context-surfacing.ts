@@ -28,14 +28,12 @@ import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
 import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
+import { getActiveProfile } from "../config.ts";
 
 // =============================================================================
 // Config
 // =============================================================================
 
-const MAX_TOKEN_BUDGET = 800;
-const MAX_RESULTS = 10;
-const MIN_COMPOSITE_SCORE = 0.45;
 const MIN_COMPOSITE_SCORE_RECENCY = 0.35;
 const SNIPPET_MAX_CHARS = 300;
 const MIN_PROMPT_LENGTH = 20;
@@ -69,24 +67,31 @@ export async function contextSurfacing(
     return makeEmptyOutput("context-surfacing");
   }
 
-  const isRecency = hasRecencyIntent(prompt);
-  const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : MIN_COMPOSITE_SCORE;
+  // Load active performance profile
+  const profile = getActiveProfile();
+  const maxResults = profile.maxResults;
+  const tokenBudget = profile.tokenBudget;
 
-  // Search: try vector first with 900ms sub-timeout (IO6 safety), fall back to BM25
+  const isRecency = hasRecencyIntent(prompt);
+  const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : profile.minScore;
+
+  // Search: try vector first (if profile enables it), fall back to BM25
   // When vector succeeds, also supplement with FTS for keyword-exact recall
   let results: SearchResult[] = [];
-  try {
-    const vectorPromise = store.searchVec(prompt, DEFAULT_EMBED_MODEL, MAX_RESULTS);
-    const timeoutPromise = new Promise<SearchResult[]>((_, reject) =>
-      setTimeout(() => reject(new Error("vector timeout")), 900)
-    );
-    results = await Promise.race([vectorPromise, timeoutPromise]);
-  } catch {
-    // Vector search unavailable, timed out, or errored — fall back to BM25
+  if (profile.useVector) {
+    try {
+      const vectorPromise = store.searchVec(prompt, DEFAULT_EMBED_MODEL, maxResults);
+      const timeoutPromise = new Promise<SearchResult[]>((_, reject) =>
+        setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout)
+      );
+      results = await Promise.race([vectorPromise, timeoutPromise]);
+    } catch {
+      // Vector search unavailable, timed out, or errored — fall back to BM25
+    }
   }
 
   if (results.length === 0) {
-    results = store.searchFTS(prompt, MAX_RESULTS);
+    results = store.searchFTS(prompt, maxResults);
   } else {
     // Supplement vector results with FTS for keyword-exact matches (<10ms)
     const seen = new Set(results.map(r => r.filepath));
@@ -145,7 +150,7 @@ export async function contextSurfacing(
   if (scored.length === 0) return makeEmptyOutput("context-surfacing");
 
   // Build context within token budget
-  const { context, paths, tokens } = buildContext(scored, prompt);
+  const { context, paths, tokens } = buildContext(scored, prompt, tokenBudget);
 
   if (!context) return makeEmptyOutput("context-surfacing");
 
@@ -166,14 +171,15 @@ export async function contextSurfacing(
 
 function buildContext(
   scored: ScoredResult[],
-  query: string
+  query: string,
+  budget: number = 800
 ): { context: string; paths: string[]; tokens: number } {
   const lines: string[] = [];
   const paths: string[] = [];
   let totalTokens = 0;
 
   for (const r of scored) {
-    if (totalTokens >= MAX_TOKEN_BUDGET) break;
+    if (totalTokens >= budget) break;
 
     const bodyStr = r.body || "";
 
@@ -195,7 +201,7 @@ function buildContext(
     const entry = `**${safeTitle}**${typeTag}\n${safePath}\n${snippet}`;
 
     const entryTokens = estimateTokens(entry);
-    if (totalTokens + entryTokens > MAX_TOKEN_BUDGET && lines.length > 0) break;
+    if (totalTokens + entryTokens > budget && lines.length > 0) break;
 
     lines.push(entry);
     paths.push(r.displayPath);

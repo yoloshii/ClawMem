@@ -934,11 +934,29 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  *   Jina:     CLAWMEM_EMBED_URL=https://api.jina.ai     CLAWMEM_EMBED_MODEL=jina-embeddings-v3
  *   Cohere:   CLAWMEM_EMBED_URL=https://api.cohere.com   CLAWMEM_EMBED_MODEL=embed-v4.0
  */
+let _apiKeyLocalhostWarned = false;
+
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
+    const embedUrl = process.env.CLAWMEM_EMBED_URL || undefined;
+    const embedApiKey = process.env.CLAWMEM_EMBED_API_KEY || undefined;
+
+    // Warn once if API key is set but URL points to localhost
+    if (embedApiKey && embedUrl && !_apiKeyLocalhostWarned) {
+      const lower = embedUrl.toLowerCase();
+      if (lower.includes("localhost") || lower.includes("127.0.0.1")) {
+        console.warn(
+          "[clawmem] Warning: CLAWMEM_EMBED_API_KEY is set but CLAWMEM_EMBED_URL points to " +
+          `${embedUrl}. API key will be sent as Bearer token to local server. ` +
+          "If this is intentional (local gateway), ignore this warning."
+        );
+        _apiKeyLocalhostWarned = true;
+      }
+    }
+
     defaultLlamaCpp = new LlamaCpp({
-      remoteEmbedUrl: process.env.CLAWMEM_EMBED_URL || undefined,
-      remoteEmbedApiKey: process.env.CLAWMEM_EMBED_API_KEY || undefined,
+      remoteEmbedUrl: embedUrl,
+      remoteEmbedApiKey: embedApiKey,
       remoteEmbedModel: process.env.CLAWMEM_EMBED_MODEL || undefined,
       remoteLlmUrl: process.env.CLAWMEM_LLM_URL || undefined,
     });

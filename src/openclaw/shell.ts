@@ -5,7 +5,7 @@
  * All hook handlers accept JSON on stdin and return JSON on stdout.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -139,6 +139,38 @@ export function execCommand(
       }
     );
   });
+}
+
+/**
+ * Spawn a long-lived background process (e.g., `clawmem serve`).
+ * Returns the child process handle for lifecycle management.
+ * The child is detached from the parent's event loop via unref().
+ */
+export function spawnBackground(
+  cfg: ClawMemConfig,
+  args: string[],
+  logger?: { info: (...args: any[]) => void; warn: (...args: any[]) => void }
+): ChildProcess {
+  const child = spawn(cfg.clawmemBin, args, {
+    env: { ...process.env, ...cfg.env },
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+  });
+
+  child.stdout?.on("data", (data: Buffer) => {
+    logger?.info(`[clawmem-serve] ${data.toString().trim()}`);
+  });
+
+  child.stderr?.on("data", (data: Buffer) => {
+    logger?.warn(`[clawmem-serve] ${data.toString().trim()}`);
+  });
+
+  child.on("exit", (code, signal) => {
+    logger?.warn(`[clawmem-serve] exited (code=${code}, signal=${signal})`);
+  });
+
+  child.unref();
+  return child;
 }
 
 /**

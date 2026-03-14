@@ -198,19 +198,21 @@ const clawmemPlugin = {
     }
 
     // ----- Register Service (REST API) -----
+    let serveChild: import("node:child_process").ChildProcess | null = null;
+
     api.registerService({
       id: "clawmem-api",
       async start(svcCtx: { logger: typeof logger }) {
-        // Start clawmem serve in background
-        const { execCommand } = await import("./shell.js");
-        const result = await execCommand(cfg, ["serve", "--port", String(cfg.servePort)], 2000);
-        // serve runs as a long-lived process — if it exits quickly, it failed
-        if (result.exitCode !== 0 && !result.stderr.includes("EADDRINUSE")) {
-          svcCtx.logger.warn(`clawmem: REST API failed to start: ${result.stderr}`);
-        }
+        const { spawnBackground } = await import("./shell.js");
+        serveChild = spawnBackground(cfg, ["serve", "--port", String(cfg.servePort)], svcCtx.logger);
+        svcCtx.logger.info(`clawmem: REST API spawned (pid=${serveChild.pid})`);
       },
       stop() {
-        logger.info("clawmem: REST API service stopped");
+        if (serveChild && !serveChild.killed) {
+          serveChild.kill("SIGTERM");
+          logger.info("clawmem: REST API service stopped");
+        }
+        serveChild = null;
       },
     });
   },

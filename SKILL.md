@@ -165,7 +165,7 @@ Hooks handle ~90% of retrieval. Zero agent effort.
 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
-| `context-surfacing` | UserPromptSubmit | 800 tokens | retrieval gate -> hybrid search (vector + FTS, 900ms timeout) -> snooze filter -> noise filter -> `<vault-context>` |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate -> profile-driven hybrid search (vector if `useVector`, timeout from profile) -> FTS supplement -> snooze filter -> noise filter -> `<vault-context>`. Budget, max results, vector timeout, min score all driven by `CLAWMEM_PROFILE`. |
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
@@ -260,10 +260,12 @@ Once escalated, route by query type:
 | `memory_evolution_status` | Track how a doc's A-MEM metadata evolved over time. |
 | `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
 | `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
-| `vault_sync` | Index markdown from a directory into a named vault. |
+| `vault_sync` | Index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories. |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |
 | `lifecycle_sweep` | Run lifecycle policies: archive stale docs. Defaults to dry_run (preview only). |
 | `lifecycle_restore` | Restore auto-archived documents. Filter by query, collection, or all. Does NOT restore manually forgotten docs. |
+
+**Multi-vault:** All tools accept an optional `vault` parameter. Omit for the default vault (single-vault mode). Named vaults configured in `~/.config/clawmem/config.yaml` under `vaults:` or via `CLAWMEM_VAULTS` env var. Vault paths support `~` expansion.
 
 **Progressive disclosure:** ALWAYS `compact=true` first -> review snippets/scores -> `get(docid)` or `multi_get(pattern)` for full content.
 
@@ -675,7 +677,7 @@ Write to `docs/issues/YYYY-MM-DD-<slug>.md`:
 - `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process fallback. Set `true` for remote-only to fail fast.
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs. Only runs if MCP process stays alive long enough (every 5min).
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
-- HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Same search/retrieval/lifecycle as MCP tools. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
+- HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
 - OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction.
 
 ## Tool Selection (one-liner)
