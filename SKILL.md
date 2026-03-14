@@ -22,7 +22,7 @@ Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper d
 
 | Service | Port | Model | VRAM | Protocol |
 |---|---|---|---|---|
-| Embedding | 8088 | granite-embedding-278m-multilingual-Q6_K | ~400MB | `/v1/embeddings` |
+| Embedding | 8088 | embeddinggemma-300M-Q8_0 | ~400MB | `/v1/embeddings` |
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
@@ -36,7 +36,7 @@ Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper d
 
 | Role | Model | Source | Size | Notes |
 |---|---|---|---|---|
-| Embedding | granite-embedding-278m-multilingual-Q6_K | bartowski/granite-embedding-278m-multilingual-GGUF | 226MB | 768 dims, 512-token context (~1100 chars) |
+| Embedding | embeddinggemma-300M-Q8_0 | ggml-org/embeddinggemma-300M-GGUF | 314MB | 768 dims, 2048-token context. Default (matches QMD). |
 | LLM | qmd-query-expansion-1.7B-q4_k_m | tobil/qmd-query-expansion-1.7B-gguf | ~1.1GB | QMD Qwen3-1.7B finetune for query expansion |
 | Reranker | qwen3-reranker-0.6B-Q8_0 | ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF | ~600MB | Cross-encoder scoring |
 
@@ -46,7 +46,7 @@ Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper d
 
 ```bash
 # Embedding (--embeddings flag required)
-llama-server -m granite-embedding-278m-multilingual-Q6_K.gguf \
+llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 --no-mmap -ngl 99 -c 2048 --batch-size 2048
 
 # LLM
