@@ -874,7 +874,7 @@ async function cmdSetupHooks(args: string[]) {
 
   if (remove) {
     // Remove clawmem hooks
-    for (const event of ["UserPromptSubmit", "Stop", "SessionStart"]) {
+    for (const event of ["UserPromptSubmit", "Stop", "SessionStart", "PreCompact"]) {
       if (settings.hooks[event]) {
         settings.hooks[event] = settings.hooks[event].filter((entry: any) =>
           !entry.hooks?.some((h: any) => h.command?.includes("clawmem"))
