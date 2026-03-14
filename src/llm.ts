@@ -524,11 +524,12 @@ export class LlamaCpp implements LLM {
 
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
 
-  // granite-embedding-278m: 512 token context. With -c 2048 server context,
-  // the server can handle more tokens but quality degrades past model training length.
-  // Empirically: failures at ~1200+ chars; 1100 is safe across all content types.
-  // Cloud providers (OpenAI, Voyage, Jina, Cohere) handle their own truncation.
-  private static readonly MAX_REMOTE_EMBED_CHARS = 1100;
+  // Default: 8000 chars (~2048 tokens) for EmbeddingGemma-300M (2048-token context).
+  // Override via CLAWMEM_EMBED_MAX_CHARS for models with different context windows
+  // (e.g. 1100 for granite-278m which has only 512-token context).
+  // Cloud providers (API key set) skip truncation entirely.
+  private readonly maxRemoteEmbedChars: number =
+    parseInt(process.env.CLAWMEM_EMBED_MAX_CHARS || "8000", 10);
 
   private isCloudEmbedding(): boolean {
     return !!this.remoteEmbedApiKey;
@@ -545,8 +546,8 @@ export class LlamaCpp implements LLM {
   private truncateForEmbed(text: string): string {
     // Cloud providers handle their own context window limits
     if (this.isCloudEmbedding()) return text;
-    return text.length > LlamaCpp.MAX_REMOTE_EMBED_CHARS
-      ? text.slice(0, LlamaCpp.MAX_REMOTE_EMBED_CHARS) : text;
+    return text.length > this.maxRemoteEmbedChars
+      ? text.slice(0, this.maxRemoteEmbedChars) : text;
   }
 
   private async embedRemote(text: string): Promise<EmbeddingResult | null> {

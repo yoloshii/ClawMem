@@ -176,7 +176,7 @@ ClawMem uses three lightweight `llama-server` (llama.cpp) instances for neural i
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
-| Embedding | 8088 | granite-embedding-278m-multilingual-Q6_K | ~400MB | Vector search, indexing, context-surfacing |
+| Embedding | 8088 | embeddinggemma-300M-Q8_0 | ~400MB | Vector search, indexing, context-surfacing |
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | Intent classification, query expansion, A-MEM |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
@@ -212,20 +212,21 @@ ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint for all embedding 
 
 #### Option A: Local GPU (default)
 
-Use [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) via `llama-server --embeddings` on port 8088.
+Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) via `llama-server --embeddings` on port 8088. This is the same default model used by [QMD](https://github.com/tobi/qmd).
 
-- Size: 226MB, Dimensions: 768, VRAM: ~400MB
-- Performance: ~5ms per fragment, ~200 fragments/sec on RTX 3090
+- Size: 314MB, Dimensions: 768, VRAM: ~400MB, Context: 2048 tokens
 
 ```bash
 # Download model
-wget https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF/resolve/main/granite-embedding-278m-multilingual-Q6_K.gguf
+wget https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
 
 # Start llama-server in embedding mode
-llama-server -m granite-embedding-278m-multilingual-Q6_K.gguf \
+llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 \
   --no-mmap -ngl 99 -c 2048 --batch-size 2048
 ```
+
+Alternative: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) for multilingual corpora (set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
 
 #### Option B: Cloud Embedding API
 
@@ -244,7 +245,7 @@ export CLAWMEM_EMBED_MODEL=text-embedding-3-small     # Model name
 | Jina AI | `https://api.jina.ai` | `jina-embeddings-v3` | 1024 | 8K context, 1M free tokens |
 | Cohere | `https://api.cohere.ai/compatibility` | `embed-v4.0` | 1024 | 128K context, $0.12/1M tokens |
 
-**Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server uses 1100-char truncation (granite-278m has 512-token context).
+**Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server truncates at `CLAWMEM_EMBED_MAX_CHARS` (default: 8000 chars for EmbeddingGemma's 2048-token context). Set to `1100` if using granite-278m (512-token context).
 
 #### Verify and embed
 
