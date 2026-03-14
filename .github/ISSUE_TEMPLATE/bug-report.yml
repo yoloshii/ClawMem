@@ -1,0 +1,75 @@
+name: Bug Report
+description: Report a bug or unexpected behavior.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. Include what you expected to happen.
+      placeholder: |
+        When I run `clawmem query "test"`, I get...
+        I expected it to return...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the bug.
+      placeholder: |
+        1. Run `clawmem init`
+        2. Add a collection...
+        3. Run `clawmem query "..."`
+        4. See error
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output / logs
+      description: Paste any error messages or relevant log output.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your system details.
+      value: |
+        - OS:
+        - Bun version (`bun --version`):
+        - ClawMem version:
+        - GPU (if applicable):
+        - llama-server version (if applicable):
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of ClawMem is affected?
+      options:
+        - CLI
+        - MCP Server
+        - Indexing / Watcher
+        - Search / Retrieval
+        - Hooks (Claude Code)
+        - OpenClaw Plugin
+        - Embedding
+        - Graph / A-MEM
+        - REST API
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this hasn't been reported
+          required: true
+        - label: I ran `clawmem doctor` and included relevant output above
+          required: false

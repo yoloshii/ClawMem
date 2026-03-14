@@ -9,6 +9,10 @@ node_modules/
 !CLAUDE.md
 !AGENTS.md
 !SKILL.md
+!LICENSE
+!CODE_OF_CONDUCT.md
+!CONTRIBUTING.md
+!SECURITY.md
 !agents/*.md
 
 # Secrets
