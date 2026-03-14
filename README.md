@@ -959,16 +959,16 @@ Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawm
 
 Built on the shoulders of:
 
+- [A-MEM](https://arxiv.org/abs/2510.02178) — self-evolving memory architecture
+- [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
+- [claude-mem](https://github.com/thedotmack/claude-mem) — Claude Code memory integration reference
+- [Engram](https://github.com/Gentleman-Programming/engram) — observation dedup window, topic-key upsert pattern, temporal timeline navigation, duplicate metadata scoring signals
+- [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
+- [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
+- [OpenViking](https://github.com/volcengine/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
 - [QMD](https://github.com/tobi/qmd) — search backend (BM25 + vectors + RRF + reranking)
 - [SAME](https://github.com/sgx-labs/statelessagent) — agent memory concepts (recency decay, confidence scoring, session tracking)
 - [supermemory](https://github.com/supermemoryai/clawdbot-supermemory) — hook patterns and context surfacing ideas
-- [claude-mem](https://github.com/thedotmack/claude-mem) — Claude Code memory integration reference
-- [A-MEM](https://arxiv.org/abs/2510.02178) — self-evolving memory architecture
-- [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
-- [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
-- [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
-- [OpenViking](https://github.com/volcengine/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
-- [Engram](https://github.com/Gentleman-Programming/engram) — observation dedup window, topic-key upsert pattern, temporal timeline navigation, duplicate metadata scoring signals
 
 ## License
 
