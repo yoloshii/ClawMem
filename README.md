@@ -129,23 +129,27 @@ One command to set up a vault:
 ./bin/clawmem setup mcp
 ```
 
-### OpenClaw Integration: Memory System Configuration
+### Integration
 
-When using ClawMem with OpenClaw, choose one of three options:
+#### Claude Code
 
-#### Option 1: ContextEngine Plugin (Recommended)
-
-Register ClawMem as a native OpenClaw ContextEngine plugin for deep lifecycle integration. This is the recommended approach - ClawMem handles context assembly, post-turn extraction, and compaction orchestration natively through OpenClaw's plugin system.
+ClawMem integrates via hooks (`settings.json`) and an MCP stdio server. Hooks handle 90% of retrieval automatically - the agent never needs to call tools for routine context.
 
 ```bash
-# Install the plugin
-clawmem setup openclaw
+clawmem setup hooks    # Install lifecycle hooks (SessionStart, UserPromptSubmit, Stop, PreCompact)
+clawmem setup mcp      # Register MCP server in ~/.claude.json (20+ agent tools)
+```
 
-# Follow the printed steps:
-# 1. Symlink plugin into OpenClaw extensions
-# 2. Set ClawMem as active context engine
-# 3. Configure GPU endpoints
-# 4. Start REST API for tool calls
+**Automatic (90%):** `session-bootstrap` surfaces profile + handoff + decisions on session start. `context-surfacing` injects relevant memory on every prompt. `decision-extractor`, `handoff-generator`, `feedback-loop` capture session state on stop.
+
+**Agent-initiated (10%):** MCP tools (`query`, `intent_search`, `find_causal_links`, `timeline`, etc.) for targeted retrieval when hooks don't surface what's needed.
+
+#### OpenClaw
+
+ClawMem registers as a native ContextEngine plugin - OpenClaw's pluggable interface for context management. Same 90/10 automatic retrieval, delivered through OpenClaw's lifecycle system instead of Claude Code hooks.
+
+```bash
+clawmem setup openclaw   # Shows installation steps
 ```
 
 **What the plugin provides:**
@@ -155,43 +159,14 @@ clawmem setup openclaw
 - **5 agent tools** - `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
 - **Session lifecycle hooks** - `session_start`, `session_end`, `before_reset` safety net
 
-**Memory distribution (same 90/10 split as Claude Code):**
-- **Tier 2 (90%):** Automatic context injection on every prompt via `before_prompt_build` + extraction via `afterTurn()`
-- **Tier 3 (10%):** Agent-initiated tool calls (`clawmem_search`, `clawmem_get`, etc.)
-
-**Disable OpenClaw's native memory to avoid duplicate injection:**
+Disable OpenClaw's native memory and `memory-lancedb` auto-recall/capture to avoid duplicate injection:
 ```bash
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
-If `memory-lancedb` is installed, disable its auto-recall and auto-capture as well.
+#### Dual-Mode Operation
 
-#### Option 2: Hooks + MCP (Legacy)
-
-Use ClawMem hooks + MCP for 100% of memory operations. This was the original integration method before the ContextEngine plugin and still works, but the plugin approach is preferred for new setups.
-
-```bash
-clawmem setup hooks
-clawmem setup mcp
-
-# Disable native memory
-openclaw config set agents.defaults.memorySearch.extraPaths "[]"
-```
-
-#### Option 3: Hybrid (ClawMem + Native)
-
-Keep both ClawMem and OpenClaw's native memory active for redundancy or experimentation:
-
-```bash
-openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/notes"]'
-```
-
-**Tradeoffs:**
-- Redundant recall from two independent memory systems
-- 10-15% context window waste from duplicate facts injected
-- Two memory indices to maintain
-
-**Dual-mode operation:** The plugin shares the same SQLite vault as Claude Code hooks. Both runtimes can be active simultaneously — decisions captured in one are immediately visible in the other. WAL mode + busy_timeout handles concurrent access.
+Both integrations share the same SQLite vault. Claude Code and OpenClaw can run simultaneously - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms. WAL mode + busy_timeout handles concurrent access.
 
 ### GPU Services
 
