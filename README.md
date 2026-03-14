@@ -4,11 +4,11 @@
   <img src="docs/clawmem_hero.png" alt="ClawMem" width="100%">
 </p>
 
-**Local shared memory and context engine for AI agents.** Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenClaw](https://github.com/openclaw/openclaw) — runs entirely on-device with no API keys or cloud dependencies.
+**Local shared memory and context engine for AI agents.** Built for Claude Code and OpenClaw - runs entirely on-device with no API keys or cloud dependencies.
 
 ClawMem fuses state-of-the-art approaches from recent research into a single retrieval-augmented memory layer that agents actually use. The hybrid architecture combines [QMD](https://github.com/tobi/qmd)-derived multi-signal retrieval (BM25 + vector search + reciprocal rank fusion + query expansion + cross-encoder reranking), [SAME](https://github.com/sgx-labs/statelessagent)-inspired composite scoring (recency decay, confidence, content-type half-lives, co-activation reinforcement), [MAGMA](https://arxiv.org/abs/2501.13956)-style intent classification with multi-graph traversal (semantic, temporal, and causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes that automatically enrich documents with keywords, tags, and inter-document causal links. Pattern extraction from [Engram](https://github.com/Gentleman-Programming/engram) adds deduplication windows, frequency-based durability scoring, and temporal navigation.
 
-Dual-mode delivery: integrates as Claude Code hooks + MCP server, or as a native OpenClaw ContextEngine plugin. Both modes share the same local SQLite vault — decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms.
+Dual-mode delivery: integrates as Claude Code hooks + MCP server, or as a native OpenClaw ContextEngine plugin. Both modes share the same local SQLite vault - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms.
 
 TypeScript on Bun. ~15,500 lines across 35 source files. 157 tests.
 
