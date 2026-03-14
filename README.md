@@ -80,6 +80,15 @@ Claude Code Session
 
 ## Install
 
+### Platform Support
+
+| Platform | Status | Notes |
+|---|---|---|
+| **Linux** | Full support | Primary target. systemd services for watcher + embed timer. |
+| **macOS** | Full support | Homebrew SQLite handled automatically. GPU via Metal (llama.cpp). |
+| **Windows (WSL2)** | Full support | Recommended for Windows users. Install Bun + ClawMem inside WSL2. |
+| **Windows (native)** | Not recommended | Bun and sqlite-vec work, but `bin/clawmem` wrapper is bash, hooks expect bash commands, and systemd services have no equivalent. Use WSL2 instead. |
+
 ### Prerequisites
 
 - [Bun](https://bun.sh) v1.0+
