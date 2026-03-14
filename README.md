@@ -168,7 +168,45 @@ openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 
 #### Dual-Mode Operation
 
-Both integrations share the same SQLite vault. Claude Code and OpenClaw can run simultaneously - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms. WAL mode + busy_timeout handles concurrent access.
+Both integrations share the same SQLite vault by default. Claude Code and OpenClaw can run simultaneously - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms. WAL mode + busy_timeout handles concurrent access.
+
+#### Multi-Vault (Optional)
+
+By default, ClawMem uses a single vault at `~/.cache/clawmem/index.sqlite`. For users who want separate memory domains (e.g., work vs personal, or isolated vaults per project), ClawMem supports named vaults.
+
+**Configure in `~/.config/clawmem/config.yaml`:**
+
+```yaml
+vaults:
+  work: ~/.cache/clawmem/work.sqlite
+  personal: ~/.cache/clawmem/personal.sqlite
+```
+
+**Or via environment variable:**
+
+```bash
+export CLAWMEM_VAULTS='{"work":"~/.cache/clawmem/work.sqlite","personal":"~/.cache/clawmem/personal.sqlite"}'
+```
+
+**Using vaults with MCP tools:**
+
+All retrieval tools (`memory_retrieve`, `query`, `search`, `vsearch`, `intent_search`) accept an optional `vault` parameter. Omit it to use the default vault.
+
+```
+# Search the default vault (no vault param needed)
+query("authentication flow")
+
+# Search a named vault
+query("project timeline", vault="work")
+
+# List configured vaults
+list_vaults()
+
+# Sync content into a vault
+vault_sync(vault="work", content_root="~/work/docs")
+```
+
+**Single-vault users:** No action needed. Everything works without configuration. The `vault` parameter is always optional and ignored when no vaults are configured.
 
 ### GPU Services
 

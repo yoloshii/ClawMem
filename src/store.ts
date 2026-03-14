@@ -37,6 +37,7 @@ import {
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
 } from "./collections.ts";
+import { getVaultPath } from "./config.ts";
 import {
   queryBeadsList,
   formatBeadsIssueAsMarkdown,
@@ -4019,4 +4020,34 @@ function searchArchivedFn(
     id: r.id, collection: r.collection, path: r.path, title: r.title,
     archived_at: r.archived_at, score: 1.0,
   }));
+}
+
+// =============================================================================
+// Vault-aware store resolution
+// =============================================================================
+
+/**
+ * Resolve a store by vault name. If no vault is specified, returns the default store.
+ * Named vaults are configured via config.yaml or CLAWMEM_VAULTS env var.
+ *
+ * @param vault  - Named vault (e.g., "work", "personal"). Omit for default.
+ * @param opts   - Store options (readonly, busyTimeout)
+ */
+export function resolveStore(
+  vault?: string,
+  opts?: { readonly?: boolean; busyTimeout?: number }
+): Store {
+  if (!vault) {
+    return createStore(undefined, opts);
+  }
+
+  const vaultPath = getVaultPath(vault);
+  if (!vaultPath) {
+    throw new Error(
+      `Unknown vault: "${vault}". Configure it via CLAWMEM_VAULTS env var ` +
+      `or in ~/.config/clawmem/config.yaml under "vaults:".`
+    );
+  }
+
+  return createStore(vaultPath, opts);
 }

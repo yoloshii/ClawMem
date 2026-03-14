@@ -66,6 +66,7 @@ curl http://host:8090/v1/models
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups. |
+| `CLAWMEM_VAULTS` | (none) | JSON map of vault name → SQLite path for multi-vault mode. E.g. `{"work":"~/.cache/clawmem/work.sqlite"}` |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing. |
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
@@ -291,6 +292,12 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `beads_sync(project_path?)` — sync Beads issues from Dolt backend (via `bd` CLI) into memory. Usually automatic via watcher.
 - `query_plan(query, compact=true)` — USE THIS for multi-topic queries. `query()` searches as one blob — this splits topics and routes each optimally.
 - `timeline(docid, before=5, after=5, same_collection=false)` — temporal neighborhood around a document. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation.
+- `list_vaults()` — show configured vault names and paths. Empty in single-vault mode (default).
+- `vault_sync(vault, content_root, pattern?, collection_name?)` — index markdown from a directory into a named vault.
+
+### Multi-Vault
+
+All retrieval tools accept an optional `vault` parameter. Omit it for the default vault (single-vault mode). Named vaults are configured in `~/.config/clawmem/config.yaml` under `vaults:` or via `CLAWMEM_VAULTS` env var.
 
 ### Memory Lifecycle
 

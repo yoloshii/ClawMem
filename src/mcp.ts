@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import {
   createStore,
+  resolveStore,
   extractSnippet,
   extractIntentTerms,
   INTENT_CHUNK_WEIGHT,
@@ -19,6 +20,7 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  type Store,
   type SearchResult,
   type CausalLink,
   type EvolutionEntry,
@@ -37,6 +39,7 @@ import { classifyIntent, decomposeQuery, type IntentType } from "./intent.ts";
 import { adaptiveTraversal, mergeTraversalResults } from "./graph-traversal.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
+import { listVaults, loadVaultConfig } from "./config.ts";
 
 // =============================================================================
 // Types
@@ -133,7 +136,13 @@ function addLineNumbers(text: string, startLine: number = 1): string {
 // =============================================================================
 
 export async function startMcpServer(): Promise<void> {
-  const store = createStore();
+  const store = createStore(undefined, { busyTimeout: 5000 });
+
+  // Vault-aware store resolution: returns named vault store or default
+  function getStore(vault?: string): Store {
+    if (!vault) return store;
+    return resolveStore(vault, { busyTimeout: 5000 });
+  }
 
   const server = new McpServer({
     name: "clawmem",
@@ -202,9 +211,11 @@ This is the recommended entry point for ALL memory queries.`,
         mode: z.enum(["auto", "keyword", "semantic", "causal", "timeline", "discovery", "complex", "hybrid"]).optional().default("auto").describe("Override auto-detection: keyword=BM25, semantic=vector, causal=graph traversal, timeline=session history, discovery=similar docs, complex=multi-topic, hybrid=full pipeline"),
         limit: z.number().optional().default(10),
         compact: z.boolean().optional().default(true),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, mode, limit, compact }) => {
+    async ({ query, mode, limit, compact, vault }) => {
+      const store = getStore(vault);
       const effectiveMode = mode === "auto" ? classifyRetrievalMode(query) : mode;
       const lim = limit || 10;
 
@@ -416,9 +427,11 @@ This is the recommended entry point for ALL memory queries.`,
         minScore: z.number().optional().default(0),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact }) => {
+    async ({ query, limit, minScore, collection, compact, vault }) => {
+      const store = getStore(vault);
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
@@ -475,9 +488,11 @@ This is the recommended entry point for ALL memory queries.`,
         minScore: z.number().optional().default(0.3),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact }) => {
+    async ({ query, limit, minScore, collection, compact, vault }) => {
+      const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
         return { content: [{ type: "text", text: "Vector index not found. Run 'clawmem embed' first." }], isError: true };
@@ -542,9 +557,11 @@ This is the recommended entry point for ALL memory queries.`,
         diverse: z.boolean().optional().default(true).describe("Apply MMR diversity filter to reduce near-duplicate results"),
         intent: z.string().optional().describe("Domain intent hint for disambiguation — steers expansion, reranking, chunk selection, and snippet extraction"),
         candidateLimit: z.number().optional().default(30).describe("Max candidates reaching the reranker (default 30)"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit }) => {
+    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit, vault }) => {
+      const store = getStore(vault);
       const candLimit = candidateLimit || 30;
       const rankedLists: RankedResult[][] = [];
       const docidMap = new Map<string, string>();
@@ -1205,9 +1222,11 @@ This is the recommended entry point for ALL memory queries.`,
         limit: z.number().optional().default(10),
         force_intent: z.enum(['WHY', 'WHEN', 'ENTITY', 'WHAT']).optional().describe("Override automatic intent detection"),
         enable_graph_traversal: z.boolean().optional().default(true).describe("Enable multi-hop graph expansion"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, force_intent, enable_graph_traversal }) => {
+    async ({ query, limit, force_intent, enable_graph_traversal, vault }) => {
+      const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
       // Step 1: Intent classification
@@ -1912,6 +1931,76 @@ This is the recommended entry point for ALL memory queries.`,
       }
 
       return { content: [{ type: "text", text: "Specify query, collection, or all=true" }], isError: true };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: list_vaults
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "list_vaults",
+    {
+      title: "List Configured Vaults",
+      description: "Show all configured vault names and their SQLite paths. Returns empty if running in single-vault mode (default).",
+      inputSchema: {},
+    },
+    async () => {
+      const vaults = listVaults();
+      if (vaults.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: "No named vaults configured (single-vault mode). Add vaults via config.yaml or CLAWMEM_VAULTS env var.",
+          }],
+        };
+      }
+
+      const config = loadVaultConfig();
+      const lines = vaults.map(name => `  ${name}: ${config.vaults[name]}`);
+      return {
+        content: [{ type: "text", text: `Configured vaults (${vaults.length}):\n${lines.join('\n')}` }],
+        structuredContent: { vaults: config.vaults },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: vault_sync
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "vault_sync",
+    {
+      title: "Sync Content to Vault",
+      description: "Index markdown documents from a directory into a named vault. Use to populate a vault with content from a specific path.",
+      inputSchema: {
+        vault: z.string().describe("Target vault name (must be configured in config.yaml or CLAWMEM_VAULTS)"),
+        content_root: z.string().describe("Directory path to index markdown files from"),
+        pattern: z.string().optional().default("**/*.md").describe("Glob pattern (default: **/*.md)"),
+        collection_name: z.string().optional().describe("Collection name in the vault. Defaults to vault name."),
+      },
+    },
+    async ({ vault, content_root, pattern, collection_name }) => {
+      const s = getStore(vault);
+      const root = content_root.replace(/^~/, process.env.HOME || "/tmp");
+      const collName = collection_name || vault;
+
+      try {
+        const stats = await indexCollection(s, collName, root, pattern || "**/*.md");
+        return {
+          content: [{
+            type: "text",
+            text: `Synced to vault "${vault}":\n  Collection: ${collName}\n  Root: ${root}\n  Added: ${stats.added}\n  Updated: ${stats.updated}\n  Deleted: ${stats.removed}`,
+          }],
+          structuredContent: { vault, collection: collName, ...stats },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Vault sync failed: ${err.message}` }],
+          isError: true,
+        };
+      }
     }
   );
 

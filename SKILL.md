@@ -259,6 +259,8 @@ Once escalated, route by query type:
 | `reindex` | Force re-index (BM25 only, does NOT embed). |
 | `memory_evolution_status` | Track how a doc's A-MEM metadata evolved over time. |
 | `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
+| `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
+| `vault_sync` | Index markdown from a directory into a named vault. |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |
 | `lifecycle_sweep` | Run lifecycle policies: archive stale docs. Defaults to dry_run (preview only). |
 | `lifecycle_restore` | Restore auto-archived documents. Filter by query, collection, or all. Does NOT restore manually forgotten docs. |

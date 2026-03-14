@@ -387,15 +387,10 @@ async function handleLifecycleSweep(req: Request, _url: URL, store: Store): Prom
   const dryRun = body?.dry_run ?? true;
 
   // Load lifecycle policy from config
-  let policy;
-  try {
-    const { loadVaultConfig } = await import("./config.ts");
-    const config = loadVaultConfig();
-    policy = config.lifecycle;
-  } catch {
-    // Public repo — no config.ts, use defaults
-    policy = { archive_after_days: 90, type_overrides: {}, purge_after_days: null, exempt_collections: [], dry_run: dryRun };
-  }
+  const { loadVaultConfig } = await import("./config.ts");
+  const config = loadVaultConfig();
+  const policy = config.lifecycle
+    ?? { archive_after_days: 90, type_overrides: {}, purge_after_days: null, exempt_collections: [], dry_run: dryRun };
 
   if (!policy) return jsonError("No lifecycle policy configured");
 
