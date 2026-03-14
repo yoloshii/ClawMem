@@ -224,7 +224,7 @@ export type LlamaCppConfig = {
   remoteEmbedApiKey?: string;
   /**
    * Model name to send with embedding requests (e.g. "text-embedding-3-small",
-   * "voyage-3-large", "jina-embeddings-v3", "embed-v4.0").
+   * "voyage-4-large", "jina-embeddings-v3", "embed-v4.0").
    * Defaults to "embedding" (llama-server convention).
    * Env: CLAWMEM_EMBED_MODEL
    */
@@ -927,7 +927,7 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  *
  * Cloud embedding providers (set CLAWMEM_EMBED_API_KEY + CLAWMEM_EMBED_URL):
  *   OpenAI:   CLAWMEM_EMBED_URL=https://api.openai.com  CLAWMEM_EMBED_MODEL=text-embedding-3-small
- *   Voyage:   CLAWMEM_EMBED_URL=https://api.voyageai.com CLAWMEM_EMBED_MODEL=voyage-3-large
+ *   Voyage:   CLAWMEM_EMBED_URL=https://api.voyageai.com CLAWMEM_EMBED_MODEL=voyage-4-large
  *   Jina:     CLAWMEM_EMBED_URL=https://api.jina.ai     CLAWMEM_EMBED_MODEL=jina-embeddings-v3
  *   Cohere:   CLAWMEM_EMBED_URL=https://api.cohere.com   CLAWMEM_EMBED_MODEL=embed-v4.0
  */

@@ -239,10 +239,10 @@ export CLAWMEM_EMBED_MODEL=text-embedding-3-small     # Model name
 
 | Provider | `CLAWMEM_EMBED_URL` | `CLAWMEM_EMBED_MODEL` | Dimensions | Notes |
 |---|---|---|---|---|
-| OpenAI | `https://api.openai.com` | `text-embedding-3-small` | 1536 | Most popular, good quality/price ratio |
-| Voyage AI | `https://api.voyageai.com` | `voyage-3-large` | 1024 | Top MTEB scores, code-aware |
-| Jina AI | `https://api.jina.ai` | `jina-embeddings-v3` | 1024 | Multilingual, long context (8192 tokens) |
-| Cohere | `https://api.cohere.com` | `embed-v4.0` | 1024 | Search-optimized, multilingual |
+| OpenAI | `https://api.openai.com` | `text-embedding-3-small` | 1536 | 8K context, $0.02/1M tokens |
+| Voyage AI | `https://api.voyageai.com` | `voyage-4-large` | 1024 | 32K context, $0.12/1M tokens, 200M free tokens |
+| Jina AI | `https://api.jina.ai` | `jina-embeddings-v3` | 1024 | 8K context, 1M free tokens |
+| Cohere | `https://api.cohere.ai/compatibility` | `embed-v4.0` | 1024 | 128K context, $0.12/1M tokens |
 
 **Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server uses 1100-char truncation (granite-278m has 512-token context).
 
