@@ -204,23 +204,18 @@ unset CLAWMEM_EMBED_URL CLAWMEM_LLM_URL CLAWMEM_RERANK_URL
 
 `node-llama-cpp` will auto-download GGUF models on first use (~1.1GB LLM + ~600MB reranker). CPU inference works but is much slower — GPU is strongly recommended for responsive query expansion and reranking.
 
-**Note:** Embedding requires a running `llama-server --embeddings` instance (local or remote) — there is no in-process fallback for embedding.
+**Note:** Embedding has no in-process fallback - it requires either a local `llama-server --embeddings` instance or a cloud embedding API.
 
-### Embedding Server
+### Embedding
 
-Embeddings use [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) via `llama-server --embeddings` on port 8088. ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint.
+ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint for all embedding operations. This works with local llama-server instances and cloud providers alike.
 
-**Model specs:**
-- Size: 226MB, Dimensions: 768
-- Performance: **~5ms per fragment**, ~200 fragments/sec on RTX 3090
-- Benchmark: 180 docs, 6,335 fragments in **67 seconds**
+#### Option A: Local GPU (default)
 
-**Known issues:**
-- Native context is only 512 tokens (~1100 chars after formatting)
-- Client-side truncation at 1100 chars prevents HTTP 500 errors
-- Code fragments have higher token density (occasionally fail even at 1100 chars)
+Use [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) via `llama-server --embeddings` on port 8088.
 
-**Server setup:**
+- Size: 226MB, Dimensions: 768, VRAM: ~400MB
+- Performance: ~5ms per fragment, ~200 fragments/sec on RTX 3090
 
 ```bash
 # Download model
@@ -232,12 +227,36 @@ llama-server -m granite-embedding-278m-multilingual-Q6_K.gguf \
   --no-mmap -ngl 99 -c 2048 --batch-size 2048
 ```
 
-**Verify:** `curl http://localhost:8088/v1/embeddings -d '{"input":"test","model":"embedding"}' -H 'Content-Type: application/json'` should return a 768-dimensional vector.
+#### Option B: Cloud Embedding API
 
-To embed your vault:
+If you don't have a local GPU, use a cloud embedding service. Any provider with an OpenAI-compatible `/v1/embeddings` endpoint works. Set three env vars:
 
 ```bash
-./bin/clawmem embed  # Embeds all documents via the embedding server
+export CLAWMEM_EMBED_URL=https://api.openai.com      # Provider base URL
+export CLAWMEM_EMBED_API_KEY=sk-...                   # API key
+export CLAWMEM_EMBED_MODEL=text-embedding-3-small     # Model name
+```
+
+| Provider | `CLAWMEM_EMBED_URL` | `CLAWMEM_EMBED_MODEL` | Dimensions | Notes |
+|---|---|---|---|---|
+| OpenAI | `https://api.openai.com` | `text-embedding-3-small` | 1536 | Most popular, good quality/price ratio |
+| Voyage AI | `https://api.voyageai.com` | `voyage-3-large` | 1024 | Top MTEB scores, code-aware |
+| Jina AI | `https://api.jina.ai` | `jina-embeddings-v3` | 1024 | Multilingual, long context (8192 tokens) |
+| Cohere | `https://api.cohere.com` | `embed-v4.0` | 1024 | Search-optimized, multilingual |
+
+**Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server uses 1100-char truncation (granite-278m has 512-token context).
+
+#### Verify and embed
+
+```bash
+# Verify endpoint is reachable
+curl $CLAWMEM_EMBED_URL/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLAWMEM_EMBED_API_KEY" \
+  -d "{\"input\":\"test\",\"model\":\"$CLAWMEM_EMBED_MODEL\"}"
+
+# Embed your vault
+./bin/clawmem embed
 ```
 
 ### LLM Server

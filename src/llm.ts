@@ -217,6 +217,19 @@ export type LlamaCppConfig = {
    */
   remoteEmbedUrl?: string;
   /**
+   * API key for remote embedding service (e.g. OpenAI, Voyage AI, Jina AI, Cohere).
+   * When set, sent as Authorization: Bearer header with embedding requests.
+   * Env: CLAWMEM_EMBED_API_KEY
+   */
+  remoteEmbedApiKey?: string;
+  /**
+   * Model name to send with embedding requests (e.g. "text-embedding-3-small",
+   * "voyage-3-large", "jina-embeddings-v3", "embed-v4.0").
+   * Defaults to "embedding" (llama-server convention).
+   * Env: CLAWMEM_EMBED_MODEL
+   */
+  remoteEmbedModel?: string;
+  /**
    * Remote LLM server URL for text generation (e.g. http://localhost:8089).
    * When set, generate() calls /v1/chat/completions instead of local node-llama-cpp.
    */
@@ -254,6 +267,8 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
   private remoteEmbedUrl: string | null;
+  private remoteEmbedApiKey: string | null;
+  private remoteEmbedModel: string;
   private remoteLlmUrl: string | null;
 
   // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
@@ -274,6 +289,8 @@ export class LlamaCpp implements LLM {
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.remoteEmbedUrl = config.remoteEmbedUrl || null;
+    this.remoteEmbedApiKey = config.remoteEmbedApiKey || null;
+    this.remoteEmbedModel = config.remoteEmbedModel || "embedding";
     this.remoteLlmUrl = config.remoteLlmUrl || null;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
@@ -505,21 +522,40 @@ export class LlamaCpp implements LLM {
     return this.embedRemoteBatch(texts);
   }
 
-  // ---------- Remote embedding (GPU server via /v1/embeddings) ----------
+  // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
 
   // granite-embedding-278m: 512 token context. With -c 2048 server context,
   // the server can handle more tokens but quality degrades past model training length.
   // Empirically: failures at ~1200+ chars; 1100 is safe across all content types.
+  // Cloud providers (OpenAI, Voyage, Jina, Cohere) handle their own truncation.
   private static readonly MAX_REMOTE_EMBED_CHARS = 1100;
+
+  private isCloudEmbedding(): boolean {
+    return !!this.remoteEmbedApiKey;
+  }
+
+  private getEmbedHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.remoteEmbedApiKey) {
+      headers["Authorization"] = `Bearer ${this.remoteEmbedApiKey}`;
+    }
+    return headers;
+  }
+
+  private truncateForEmbed(text: string): string {
+    // Cloud providers handle their own context window limits
+    if (this.isCloudEmbedding()) return text;
+    return text.length > LlamaCpp.MAX_REMOTE_EMBED_CHARS
+      ? text.slice(0, LlamaCpp.MAX_REMOTE_EMBED_CHARS) : text;
+  }
 
   private async embedRemote(text: string): Promise<EmbeddingResult | null> {
     try {
-      const input = text.length > LlamaCpp.MAX_REMOTE_EMBED_CHARS
-        ? text.slice(0, LlamaCpp.MAX_REMOTE_EMBED_CHARS) : text;
+      const input = this.truncateForEmbed(text);
       const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input, model: "embedding" }),
+        headers: this.getEmbedHeaders(),
+        body: JSON.stringify({ input, model: this.remoteEmbedModel }),
       });
       if (!resp.ok) {
         console.error(`Remote embed HTTP ${resp.status}: ${await resp.text()}`);
@@ -541,13 +577,11 @@ export class LlamaCpp implements LLM {
 
   private async embedRemoteBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     try {
-      const truncated = texts.map(t =>
-        t.length > LlamaCpp.MAX_REMOTE_EMBED_CHARS ? t.slice(0, LlamaCpp.MAX_REMOTE_EMBED_CHARS) : t
-      );
+      const truncated = texts.map(t => this.truncateForEmbed(t));
       const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: truncated, model: "embedding" }),
+        headers: this.getEmbedHeaders(),
+        body: JSON.stringify({ input: truncated, model: this.remoteEmbedModel }),
       });
       if (!resp.ok) {
         console.error(`Remote batch embed HTTP ${resp.status}: ${await resp.text()}`);
@@ -889,12 +923,20 @@ let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed).
- * Reads CLAWMEM_EMBED_URL env var for remote GPU embedding.
+ * Reads CLAWMEM_EMBED_URL, CLAWMEM_EMBED_API_KEY, CLAWMEM_EMBED_MODEL env vars.
+ *
+ * Cloud embedding providers (set CLAWMEM_EMBED_API_KEY + CLAWMEM_EMBED_URL):
+ *   OpenAI:   CLAWMEM_EMBED_URL=https://api.openai.com  CLAWMEM_EMBED_MODEL=text-embedding-3-small
+ *   Voyage:   CLAWMEM_EMBED_URL=https://api.voyageai.com CLAWMEM_EMBED_MODEL=voyage-3-large
+ *   Jina:     CLAWMEM_EMBED_URL=https://api.jina.ai     CLAWMEM_EMBED_MODEL=jina-embeddings-v3
+ *   Cohere:   CLAWMEM_EMBED_URL=https://api.cohere.com   CLAWMEM_EMBED_MODEL=embed-v4.0
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp({
       remoteEmbedUrl: process.env.CLAWMEM_EMBED_URL || undefined,
+      remoteEmbedApiKey: process.env.CLAWMEM_EMBED_API_KEY || undefined,
+      remoteEmbedModel: process.env.CLAWMEM_EMBED_MODEL || undefined,
       remoteLlmUrl: process.env.CLAWMEM_LLM_URL || undefined,
     });
   }
