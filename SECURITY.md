@@ -37,7 +37,7 @@ Given the local-first architecture, the primary security concerns are:
 
 **Do not open a public issue for security vulnerabilities.**
 
-Email **clawmem@proton.me** with:
+Email **sciros@lazyvibecoder.com** with:
 
 - Description of the vulnerability
 - Steps to reproduce
