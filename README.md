@@ -131,57 +131,11 @@ One command to set up a vault:
 
 ### OpenClaw Integration: Memory System Configuration
 
-When using ClawMem with OpenClaw, you have two options:
+When using ClawMem with OpenClaw, choose one of three options:
 
-#### Option 1: ClawMem Exclusive (Recommended)
+#### Option 1: ContextEngine Plugin (Recommended)
 
-Use ClawMem hooks + MCP for **100% of memory operations** with zero redundancy. This approach:
-- Avoids 10-15% context window waste from duplicate context injection
-- Prevents OpenClaw's native memory from auto-initializing on updates
-- Keeps all memory operations in ClawMem's hybrid search + graph traversal system
-
-**To disable OpenClaw's native memory initialization:**
-
-```bash
-# Set extraPaths to empty array
-openclaw config set agents.defaults.memorySearch.extraPaths "[]"
-
-# Verify configuration
-openclaw config get agents.defaults.memorySearch
-# Expected output: {"extraPaths": []}
-
-# Verify no native memory index exists
-ls ~/.openclaw/agents/main/memory/
-# Expected: "No such file or directory"
-```
-
-**Memory distribution with this setup:**
-- **ClawMem Tier 2 (90%):** Automatic hooks inject context on every prompt
-  - `session-bootstrap` - Profile, latest handoff, recent decisions
-  - `context-surfacing` - Hybrid search results (800 token budget)
-  - `staleness-check` - Flags stale notes (30+ days)
-  - `decision-extractor`, `handoff-generator`, `feedback-loop` - Capture session state
-- **ClawMem Tier 3 (10%):** Agent-initiated MCP tools (`query`, `intent_search`, etc.)
-
-#### Option 2: Hybrid (ClawMem + Native)
-
-Keep both systems active for redundancy or experimentation:
-
-```bash
-# Add paths for OpenClaw's native memory to index
-openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/notes"]'
-```
-
-**Tradeoffs:**
-- ✅ Redundant recall (two independent memory systems)
-- ❌ 10-15% context window waste (duplicate facts injected)
-- ❌ Higher maintenance (two memory indices to keep fresh)
-
-**Most users should choose Option 1** (ClawMem exclusive) unless they have a specific need for redundant memory systems.
-
-#### Option 3: ContextEngine Plugin (Native OpenClaw Integration)
-
-Register ClawMem as an OpenClaw [ContextEngine](https://docs.openclaw.ai/configuration#context-engines) plugin for deep lifecycle integration. ClawMem handles context assembly, post-turn extraction, and compaction orchestration natively — no hook configuration needed on the OpenClaw side.
+Register ClawMem as a native OpenClaw ContextEngine plugin for deep lifecycle integration. This is the recommended approach - ClawMem handles context assembly, post-turn extraction, and compaction orchestration natively through OpenClaw's plugin system.
 
 ```bash
 # Install the plugin
@@ -195,15 +149,49 @@ clawmem setup openclaw
 ```
 
 **What the plugin provides:**
-- **`before_prompt_build` hook** — prompt-aware retrieval (replaces context-surfacing + session-bootstrap)
-- **`ContextEngine.afterTurn()`** — decision extraction, handoff generation, feedback loop
-- **`ContextEngine.compact()`** — pre-compaction state preservation, delegates real compaction to legacy engine
-- **5 agent tools** — `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
-- **Session lifecycle hooks** — `session_start`, `session_end`, `before_reset` safety net
+- **`before_prompt_build` hook** - prompt-aware retrieval (context-surfacing + session-bootstrap)
+- **`ContextEngine.afterTurn()`** - decision extraction, handoff generation, feedback loop
+- **`ContextEngine.compact()`** - pre-compaction state preservation, delegates real compaction to legacy engine
+- **5 agent tools** - `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
+- **Session lifecycle hooks** - `session_start`, `session_end`, `before_reset` safety net
+
+**Memory distribution (same 90/10 split as Claude Code):**
+- **Tier 2 (90%):** Automatic context injection on every prompt via `before_prompt_build` + extraction via `afterTurn()`
+- **Tier 3 (10%):** Agent-initiated tool calls (`clawmem_search`, `clawmem_get`, etc.)
+
+**Disable OpenClaw's native memory to avoid duplicate injection:**
+```bash
+openclaw config set agents.defaults.memorySearch.extraPaths "[]"
+```
+
+If `memory-lancedb` is installed, disable its auto-recall and auto-capture as well.
+
+#### Option 2: Hooks + MCP (Legacy)
+
+Use ClawMem hooks + MCP for 100% of memory operations. This was the original integration method before the ContextEngine plugin and still works, but the plugin approach is preferred for new setups.
+
+```bash
+clawmem setup hooks
+clawmem setup mcp
+
+# Disable native memory
+openclaw config set agents.defaults.memorySearch.extraPaths "[]"
+```
+
+#### Option 3: Hybrid (ClawMem + Native)
+
+Keep both ClawMem and OpenClaw's native memory active for redundancy or experimentation:
+
+```bash
+openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/notes"]'
+```
+
+**Tradeoffs:**
+- Redundant recall from two independent memory systems
+- 10-15% context window waste from duplicate facts injected
+- Two memory indices to maintain
 
 **Dual-mode operation:** The plugin shares the same SQLite vault as Claude Code hooks. Both runtimes can be active simultaneously — decisions captured in one are immediately visible in the other. WAL mode + busy_timeout handles concurrent access.
-
-**Note:** If using the ContextEngine plugin, disable `memory-lancedb` auto-recall and auto-capture to avoid duplicate context injection.
 
 ### GPU Services
 
