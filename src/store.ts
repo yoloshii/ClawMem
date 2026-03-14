@@ -349,6 +349,15 @@ function initializeDatabase(db: Database): void {
     ["quality_score", "ALTER TABLE documents ADD COLUMN quality_score REAL NOT NULL DEFAULT 0.5"],
     ["pinned", "ALTER TABLE documents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"],
     ["snoozed_until", "ALTER TABLE documents ADD COLUMN snoozed_until TEXT"],
+    ["last_accessed_at", "ALTER TABLE documents ADD COLUMN last_accessed_at TEXT"],
+    ["archived_at", "ALTER TABLE documents ADD COLUMN archived_at TEXT"],
+    ["memory_type", "ALTER TABLE documents ADD COLUMN memory_type TEXT DEFAULT 'semantic'"],
+    // Engram integration: dedup + topic key columns
+    ["normalized_hash", "ALTER TABLE documents ADD COLUMN normalized_hash TEXT"],
+    ["duplicate_count", "ALTER TABLE documents ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 1"],
+    ["last_seen_at", "ALTER TABLE documents ADD COLUMN last_seen_at TEXT"],
+    ["topic_key", "ALTER TABLE documents ADD COLUMN topic_key TEXT"],
+    ["revision_count", "ALTER TABLE documents ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 1"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -356,8 +365,29 @@ function initializeDatabase(db: Database): void {
     }
   }
 
+  // Backfill last_accessed_at from modified_at for existing docs
+  try {
+    db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+  } catch { /* ignore if already backfilled */ }
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
+
+  // Engram integration: indexes for dedup, topic key, timeline
+  // Re-check columns after migration (handles concurrent processes where ALTER TABLE
+  // may race with PRAGMA table_info snapshot taken earlier)
+  const postMigrationCols = new Set(
+    (db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]).map(c => c.name)
+  );
+  if (postMigrationCols.has("normalized_hash")) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_dedup ON documents(collection, content_type, normalized_hash, created_at DESC) WHERE active = 1 AND normalized_hash IS NOT NULL`);
+  }
+  if (postMigrationCols.has("topic_key")) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_topic_key ON documents(topic_key, collection) WHERE active = 1 AND topic_key IS NOT NULL`);
+  }
+  // Timeline indexes use existing columns (modified_at, id) — always safe
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline ON documents(modified_at, id) WHERE active = 1`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline_coll ON documents(collection, modified_at, id) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
   // Cache table for LLM API calls
@@ -768,6 +798,13 @@ export type Store = {
   // Usage relation tracking
   insertRelation: (fromDoc: number, toDoc: number, relType: string, weight?: number) => void;
 
+  // Engram integration: unified save API for hook-generated memories
+  saveMemory: (params: SaveMemoryParams) => SaveMemoryResult;
+  hashNormalized: typeof hashNormalized;
+
+  // Engram integration: temporal timeline
+  timeline: (docId: number, options?: { before?: number; after?: number; sameCollection?: boolean }) => TimelineResult;
+
   // Document archival & lifecycle
   archiveDocuments: (ids: number[]) => number;
   getArchiveCandidates: (policy: import("./collections.ts").LifecyclePolicy) => { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[];
@@ -956,6 +993,13 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           created_at = excluded.created_at
       `).run(fromDoc, toDoc, relType, weight, new Date().toISOString());
     },
+
+    // Engram integration: unified save API for hook-generated memories
+    saveMemory: (params: SaveMemoryParams) => saveMemory(db, params),
+    hashNormalized,
+
+    // Engram integration: temporal timeline
+    timeline: (docId: number, options?) => timeline(db, docId, options),
 
     // Document archival — deactivates documents by ID
     archiveDocuments: (ids: number[]) => {
@@ -1425,6 +1469,293 @@ export function insertDocument(
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+}
+
+// =============================================================================
+// Engram Integration: Dedup Hash & Unified Save API
+// =============================================================================
+
+/**
+ * Compute a normalized hash for dedup comparison.
+ * Lowercases, collapses whitespace, trims — so cosmetic formatting changes
+ * don't create false negatives.
+ */
+export function hashNormalized(content: string): string {
+  const normalized = content.toLowerCase().replace(/\s+/g, " ").trim();
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(normalized);
+  return hasher.digest("hex");
+}
+
+/**
+ * Parameters for the unified saveMemory API.
+ * Used by hooks (decision-extractor, handoff-generator) to write
+ * agent-generated observations with dedup protection.
+ */
+export type SaveMemoryParams = {
+  collection: string;
+  path: string;
+  title: string;
+  body: string;
+  contentType: string;
+  confidence?: number;
+  qualityScore?: number;
+  /** Stable semantic payload for dedup hashing. If omitted, uses body. */
+  semanticPayload?: string;
+  /** Topic key for future upsert support (Phase 2). */
+  topicKey?: string;
+};
+
+export type SaveMemoryResult = {
+  action: 'inserted' | 'deduplicated' | 'updated';
+  docId: number;
+  duplicateCount?: number;
+  revisionCount?: number;
+};
+
+/**
+ * Unified save API for agent-generated memories (hook output).
+ *
+ * Dedup logic (from Engram's AddObservation pattern):
+ * 1. Compute normalized_hash from semanticPayload (or body)
+ * 2. Check dedup window: same normalized_hash + collection + content_type
+ *    within DEDUP_WINDOW_MINUTES → increment duplicate_count, skip insert
+ * 3. Otherwise insert new document with metadata
+ *
+ * This function does NOT apply to file-backed indexing (indexer.ts).
+ * File-backed docs use the existing insertDocument/updateDocument path
+ * which preserves path-based identity.
+ */
+const DEDUP_WINDOW_MINUTES = 30;
+
+export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryResult {
+  const now = new Date().toISOString();
+  const payload = params.semanticPayload || params.body;
+  const normHash = hashNormalized(payload);
+  const bodyHasher = new Bun.CryptoHasher("sha256");
+  bodyHasher.update(params.body);
+  const bodyHash = bodyHasher.digest("hex");
+
+  // --- Dedup check: same normalized_hash within window ---
+  const dedupRow = db.prepare(`
+    SELECT id, duplicate_count
+    FROM documents
+    WHERE active = 1
+      AND collection = ?
+      AND content_type = ?
+      AND normalized_hash = ?
+      AND datetime(created_at) >= datetime('now', ?)
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(
+    params.collection,
+    params.contentType,
+    normHash,
+    `-${DEDUP_WINDOW_MINUTES} minutes`
+  ) as { id: number; duplicate_count: number } | null;
+
+  if (dedupRow) {
+    // Increment duplicate_count and update last_seen_at
+    db.prepare(`
+      UPDATE documents
+      SET duplicate_count = duplicate_count + 1,
+          last_seen_at = ?
+      WHERE id = ?
+    `).run(now, dedupRow.id);
+
+    return {
+      action: 'deduplicated',
+      docId: dedupRow.id,
+      duplicateCount: dedupRow.duplicate_count + 1,
+    };
+  }
+
+  // --- Insert new document ---
+  // Store content
+  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+    .run(bodyHash, params.body, now);
+
+  // Insert document row
+  try {
+    db.prepare(`
+      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
+                             content_type, confidence, quality_score, normalized_hash,
+                             duplicate_count, revision_count, last_seen_at, topic_key)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?)
+    `).run(
+      params.collection,
+      params.path,
+      params.title,
+      bodyHash,
+      now,
+      now,
+      params.contentType,
+      params.confidence ?? 0.5,
+      params.qualityScore ?? 0.5,
+      normHash,
+      now,
+      params.topicKey ?? null,
+    );
+  } catch (err: any) {
+    // UNIQUE(collection, path) conflict — update existing row
+    if (err?.message?.includes("UNIQUE constraint")) {
+      const existing = db.prepare(
+        "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
+      ).get(params.collection, params.path) as { id: number } | null;
+
+      if (existing) {
+        db.prepare(`
+          UPDATE documents
+          SET hash = ?, title = ?, modified_at = ?, content_type = ?,
+              confidence = ?, quality_score = ?, normalized_hash = ?,
+              revision_count = revision_count + 1, last_seen_at = ?
+          WHERE id = ?
+        `).run(
+          bodyHash, params.title, now, params.contentType,
+          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
+          now, existing.id
+        );
+
+        const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
+          .get(existing.id) as { revision_count: number } | null;
+
+        return {
+          action: 'updated',
+          docId: existing.id,
+          revisionCount: updated?.revision_count ?? 1,
+        };
+      }
+    }
+    throw err;
+  }
+
+  // Get the inserted row ID
+  const newDoc = db.prepare(
+    "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
+  ).get(params.collection, params.path) as { id: number } | null;
+
+  return {
+    action: 'inserted',
+    docId: newDoc?.id ?? -1,
+  };
+}
+
+// =============================================================================
+// Engram Integration: Timeline
+// =============================================================================
+
+export type TimelineEntry = {
+  id: number;
+  collection: string;
+  path: string;
+  title: string;
+  contentType: string;
+  modifiedAt: string;
+  isFocus: boolean;
+};
+
+export type TimelineResult = {
+  focus: TimelineEntry;
+  before: TimelineEntry[];
+  after: TimelineEntry[];
+  totalInRange: number;
+  sessionId?: string;
+  sessionSummary?: string;
+};
+
+/**
+ * Get the temporal neighborhood around a document.
+ * Returns N documents before and after the focus, ordered by (modified_at, id).
+ * Optionally constrained to the same collection (like Engram's session scoping).
+ */
+export function timeline(
+  db: Database,
+  docId: number,
+  options?: { before?: number; after?: number; sameCollection?: boolean }
+): TimelineResult {
+  const before = options?.before ?? 5;
+  const after = options?.after ?? 5;
+  const sameCollection = options?.sameCollection ?? false;
+
+  // 1. Get focus document
+  const focusRow = db.prepare(`
+    SELECT id, collection, path, title, content_type, modified_at
+    FROM documents WHERE id = ? AND active = 1
+  `).get(docId) as { id: number; collection: string; path: string; title: string; content_type: string; modified_at: string } | null;
+
+  if (!focusRow) {
+    throw new Error(`Timeline: document #${docId} not found or inactive`);
+  }
+
+  const focus: TimelineEntry = {
+    id: focusRow.id,
+    collection: focusRow.collection,
+    path: focusRow.path,
+    title: focusRow.title,
+    contentType: focusRow.content_type,
+    modifiedAt: focusRow.modified_at,
+    isFocus: true,
+  };
+
+  // 2. Build collection filter (split queries per Codex review — avoid OR NULL in WHERE)
+  const collFilter = sameCollection ? "AND collection = ?" : "";
+  const collArgs = sameCollection ? [focusRow.collection] : [];
+
+  // 3. Before: documents modified before focus, closest first, compound ordering
+  const beforeRows = db.prepare(`
+    SELECT id, collection, path, title, content_type, modified_at
+    FROM documents
+    WHERE active = 1
+      AND (modified_at < ? OR (modified_at = ? AND id < ?))
+      ${collFilter}
+    ORDER BY modified_at DESC, id DESC
+    LIMIT ?
+  `).all(focusRow.modified_at, focusRow.modified_at, focusRow.id, ...collArgs, before) as typeof focusRow[];
+
+  // Reverse to chronological order (oldest first)
+  beforeRows.reverse();
+
+  // 4. After: documents modified after focus, closest first
+  const afterRows = db.prepare(`
+    SELECT id, collection, path, title, content_type, modified_at
+    FROM documents
+    WHERE active = 1
+      AND (modified_at > ? OR (modified_at = ? AND id > ?))
+      ${collFilter}
+    ORDER BY modified_at ASC, id ASC
+    LIMIT ?
+  `).all(focusRow.modified_at, focusRow.modified_at, focusRow.id, ...collArgs, after) as typeof focusRow[];
+
+  // 5. Count total in range (same collection or all)
+  const countSql = sameCollection
+    ? "SELECT COUNT(*) as cnt FROM documents WHERE active = 1 AND collection = ?"
+    : "SELECT COUNT(*) as cnt FROM documents WHERE active = 1";
+  const countRow = (sameCollection
+    ? db.prepare(countSql).get(focusRow.collection)
+    : db.prepare(countSql).get()
+  ) as { cnt: number };
+
+  // 6. Session correlation: check if focus falls within a tracked session
+  const sessionRow = db.prepare(`
+    SELECT session_id, summary FROM session_log
+    WHERE started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
+    LIMIT 1
+  `).get(focusRow.modified_at, focusRow.modified_at) as { session_id: string; summary: string | null } | null;
+
+  const toEntry = (r: typeof focusRow): TimelineEntry => ({
+    id: r.id, collection: r.collection, path: r.path,
+    title: r.title, contentType: r.content_type,
+    modifiedAt: r.modified_at, isFocus: false,
+  });
+
+  return {
+    focus,
+    before: beforeRows.map(toEntry),
+    after: afterRows.map(toEntry),
+    totalInRange: countRow.cnt,
+    sessionId: sessionRow?.session_id,
+    sessionSummary: sessionRow?.summary ?? undefined,
+  };
 }
 
 /**

@@ -24,6 +24,9 @@ ClawMem turns your markdown notes, project docs, and research dumps into an inte
 - **Decomposes complex queries** into typed retrieval clauses (BM25/vector/graph) for multi-topic questions
 - **Cleans stale embeddings** automatically before embed runs, removing orphans from deleted/changed documents
 - **Transaction-safe indexing** — crash mid-index leaves zero partial state (atomic commit with rollback)
+- **Deduplicates hook-generated observations** within a 30-minute window using normalized content hashing, preventing memory bloat from repeated hook output
+- **Navigates temporal neighborhoods** around any document via the `timeline` tool — progressive disclosure from search to chronological context to full content
+- **Boosts frequently-revised memories** — documents with higher revision counts get a durability signal in composite scoring (capped at 10%)
 - **Supports pin/snooze lifecycle** for persistent boosts and temporary suppression
 - **Manages document lifecycle** — policy-driven archival sweeps with restore capability
 - **Auto-routes queries** via `memory_retrieve` — classifies intent and dispatches to the optimal search backend
@@ -283,7 +286,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 25 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
+ClawMem exposes 26 tools via the [Model Context Protocol](https://modelcontextprotocol.io). Any MCP-compatible client can use it.
 
 **Claude Code (automatic):**
 
@@ -489,6 +492,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `build_graphs` | Build temporal and/or semantic graphs from document corpus |
 | `find_causal_links` | Trace decision chains: "what led to X", "how we got from A to B". Follow up `intent_search` with this tool on a top result to walk the full causal chain. Traverses causes / caused_by / both up to N hops with depth-annotated reasoning. |
 | `memory_evolution_status` | Show how a document's A-MEM metadata evolved over time |
+| `timeline` | Show the temporal neighborhood around a document — what was created/modified before and after it. Progressive disclosure: search → timeline (context) → get (full content). Supports same-collection scoping and session correlation. |
 
 ### Beads Integration
 
@@ -587,6 +591,8 @@ Content types are inferred from frontmatter or file path patterns. Half-lives ex
 **Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision/correction keywords, and frontmatter richness. Applied as `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
 
 **Length normalization:** `1/(1 + 0.5 × log2(max(bodyLength/500, 1)))` — penalizes verbose entries that dominate via keyword density. Floor at 30% of original score.
+
+**Frequency boost:** Documents with higher revision counts or duplicate counts get a durability signal: `freqSignal = (revisions - 1) × 2 + (duplicates - 1)`, `freqBoost = min(0.10, log1p(freqSignal) × 0.03)`. Revision count (content evolution) is weighted 2× vs duplicate count (ingest repetition). Capped at 10%.
 
 **Pin boost:** Pinned documents get +0.3 additive boost (capped at 1.0). Use `memory_pin` to pin critical memories.
 
@@ -772,7 +778,7 @@ Each project gets its own collection. Same structure, with optional Beads integr
 | **Resources are first-class** | Static knowledge (runbooks, architecture docs, API refs) should never lose relevance due to recency decay. | `resources/` indexed with `content_type: hub` → ∞ half-life in composite scoring |
 | **Progressive disclosure** | Hook injection (2000 token budget) benefits from tiered loading: compact snippets first, full content on demand. | `compact=true` (L1) → `multi_get` (L2) at query time. Pre-computed abstracts not yet implemented — candidate for future L0 tier. |
 | **Beads as memory edges** | Issue tracker data bridges into the knowledge graph via typed relations, not just as flat documents. | `syncBeadsIssues()` maps deps → `memory_relations`: blocks→causal, discovered-from→supporting, relates-to→semantic |
-| **Merge policies per facet** | Different memory types need different deduplication strategies to prevent bloat. | `getMergePolicy()`: decision→dedup_check (cosine>0.92), antipattern→merge_recent (7d), preference→update_existing, handoff→always_new |
+| **Merge policies per facet** | Different memory types need different deduplication strategies to prevent bloat. | `saveMemory()` dedup window (30min, normalized hash) + `getMergePolicy()`: decision→dedup_check (cosine>0.92), antipattern→merge_recent (7d), preference→update_existing, handoff→always_new |
 
 ### Layer Mapping
 

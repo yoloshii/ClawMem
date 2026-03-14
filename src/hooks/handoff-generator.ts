@@ -15,7 +15,6 @@ import {
   validateTranscriptPath,
   type TranscriptMessage,
 } from "../hooks.ts";
-import { hashContent } from "../indexer.ts";
 import { extractSummary, type SessionSummary } from "../observer.ts";
 import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
@@ -50,37 +49,28 @@ export async function handoffGenerator(
   const handoff = summary
     ? buildHandoffFromSummary(summary, messages, sessionId, dateStr)
     : buildHandoff(messages, sessionId, dateStr);
-  const handoffHash = hashContent(handoff);
 
-  // Store in _clawmem collection
-  store.insertContent(handoffHash, handoff, timestamp);
+  // Use saveMemory API with dedup protection.
+  // semanticPayload = session ID + core summary fields.
+  // Include sessionId so different sessions never dedup even if content is similar.
+  // SessionSummary fields: request, investigated, learned, completed, nextSteps (all strings)
+  const semanticPayload = summary
+    ? [sessionId, summary.request, summary.investigated, summary.learned, summary.completed, summary.nextSteps].filter(Boolean).join("\n")
+    : [sessionId, extractSummaryLine(messages) || handoff].join("\n");
 
   const handoffPath = `handoffs/${dateStr}-${sessionId.slice(0, 8)}.md`;
-  try {
-    store.insertDocument(
-      "_clawmem",
-      handoffPath,
-      `Handoff ${dateStr}`,
-      handoffHash,
-      timestamp,
-      timestamp
-    );
+  const result = store.saveMemory({
+    collection: "_clawmem",
+    path: handoffPath,
+    title: `Handoff ${dateStr}`,
+    body: handoff,
+    contentType: "handoff",
+    confidence: 0.60,
+    semanticPayload,
+  });
 
-    const doc = store.findActiveDocument("_clawmem", handoffPath);
-    if (doc) {
-      store.updateDocumentMeta(doc.id, {
-        content_type: "handoff",
-        confidence: 0.60,
-      });
-    }
-  } catch {
-    // May already exist; update
-    const existing = store.findActiveDocument("_clawmem", handoffPath);
-    if (existing) {
-      store.db.prepare(
-        "UPDATE documents SET hash = ?, modified_at = ? WHERE id = ?"
-      ).run(handoffHash, timestamp, existing.id);
-    }
+  if (result.action === 'deduplicated') {
+    process.stderr.write(`[handoff-generator] Dedup: existing handoff within window (doc ${result.docId}, count=${result.duplicateCount})\n`);
   }
 
   // Update session record with handoff path

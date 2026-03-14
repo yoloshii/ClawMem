@@ -1656,6 +1656,83 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: timeline (Engram integration)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "timeline",
+    {
+      title: "Document Timeline",
+      description: "Show the temporal neighborhood around a document — what was created/modified before and after it. Token-efficient progressive disclosure: search → timeline (context) → get (full content). Use after finding a document via search to understand what happened around it.",
+      inputSchema: {
+        docid: z.string().describe("Document ID (e.g., '#123' or short hash)"),
+        before: z.number().optional().default(5).describe("Number of documents to show before the focus (1-20)"),
+        after: z.number().optional().default(5).describe("Number of documents to show after the focus (1-20)"),
+        same_collection: z.boolean().optional().default(false).describe("Constrain to same collection (like session scoping)"),
+      },
+    },
+    async ({ docid, before, after, same_collection }) => {
+      // Resolve docid to numeric ID
+      const resolved = store.findDocumentByDocid(docid);
+      if (!resolved) {
+        return { content: [{ type: "text", text: `Document not found: ${docid}` }] };
+      }
+
+      const doc = store.db.prepare(`
+        SELECT id, title, collection, path FROM documents WHERE hash = ? AND active = 1 LIMIT 1
+      `).get(resolved.hash) as { id: number; title: string; collection: string; path: string } | undefined;
+
+      if (!doc) {
+        return { content: [{ type: "text", text: `Document not found: ${docid}` }] };
+      }
+
+      try {
+        const result = store.timeline(doc.id, { before, after, sameCollection: same_collection });
+
+        const lines: string[] = [];
+
+        // Session info if available
+        if (result.sessionId) {
+          lines.push(`Session: ${result.sessionId}${result.sessionSummary ? ` — ${result.sessionSummary}` : ""}`);
+          lines.push("");
+        }
+
+        lines.push(`Total documents in scope: ${result.totalInRange}`);
+        lines.push("");
+
+        // Before
+        if (result.before.length > 0) {
+          lines.push("─── BEFORE ───");
+          for (const e of result.before) {
+            lines.push(`  [${e.contentType}] ${e.collection}/${e.path} (${e.modifiedAt.slice(0, 16)})`);
+          }
+          lines.push("");
+        }
+
+        // Focus
+        lines.push("─── FOCUS ───");
+        lines.push(`→ [${result.focus.contentType}] ${result.focus.collection}/${result.focus.path} (${result.focus.modifiedAt.slice(0, 16)}) ← you are here`);
+        lines.push("");
+
+        // After
+        if (result.after.length > 0) {
+          lines.push("─── AFTER ───");
+          for (const e of result.after) {
+            lines.push(`  [${e.contentType}] ${e.collection}/${e.path} (${e.modifiedAt.slice(0, 16)})`);
+          }
+        }
+
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          structuredContent: result,
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `Timeline error: ${err.message}` }] };
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: memory_pin
   // ---------------------------------------------------------------------------
 

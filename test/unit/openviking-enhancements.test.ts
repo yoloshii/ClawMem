@@ -212,6 +212,8 @@ describe("co-activation boost in applyCompositeScoring", () => {
     confidence: 0.8,
     qualityScore: 0.5,
     accessCount: 1,
+    duplicateCount: 1,
+    revisionCount: 1,
   });
 
   it("boosts lower-ranked results that co-activate with top results", () => {

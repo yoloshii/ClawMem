@@ -19,6 +19,8 @@ function makeScoredResult(overrides: Partial<ScoredResult> & { filepath: string;
     collectionName: "test",
     bodyLength: overrides.body.length,
     source: "fts" as const,
+    duplicateCount: 1,
+    revisionCount: 1,
     recencyScore: 0.8,
     ...overrides,
   };

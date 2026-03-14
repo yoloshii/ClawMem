@@ -22,7 +22,8 @@ export function enrichResults(
 ): EnrichedResult[] {
   return results.map(r => {
     const row = store.db.prepare(`
-      SELECT content_type, modified_at, access_count, confidence, domain, workstream, tags, quality_score, pinned, last_accessed_at
+      SELECT content_type, modified_at, access_count, confidence, domain, workstream, tags,
+             quality_score, pinned, last_accessed_at, duplicate_count, revision_count
       FROM documents
       WHERE active = 1 AND (collection || '/' || path) = ?
       LIMIT 1
@@ -37,6 +38,8 @@ export function enrichResults(
       qualityScore: row?.quality_score ?? 0.5,
       pinned: !!(row?.pinned),
       lastAccessedAt: row?.last_accessed_at ?? null,
+      duplicateCount: row?.duplicate_count ?? 1,
+      revisionCount: row?.revision_count ?? 1,
     } as EnrichedResult;
   });
 }

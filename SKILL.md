@@ -229,6 +229,10 @@ Once escalated, route by query type:
    Traverses causal edges between _clawmem/agent/observations/ docs.
 
 5. Memory debugging -> memory_evolution_status(docid)
+
+6. Temporal context -> timeline(docid, before=5, after=5, same_collection=false)
+   Shows what was created/modified before and after a document.
+   Use after search to understand chronological neighborhood.
 ```
 
 ### All MCP Tools
@@ -256,6 +260,7 @@ Once escalated, route by query type:
 | `status` | Quick index health. |
 | `reindex` | Force re-index (BM25 only, does NOT embed). |
 | `memory_evolution_status` | Track how a doc's A-MEM metadata evolved over time. |
+| `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |
 | `lifecycle_sweep` | Run lifecycle policies: archive stale docs. Defaults to dry_run (preview only). |
 | `lifecycle_restore` | Restore auto-archived documents. Filter by query, collection, or all. Does NOT restore manually forgotten docs. |
@@ -404,6 +409,8 @@ Where `qualityMultiplier = 0.7 + 0.6 x qualityScore` (range: 0.7x penalty to 1.3
 `coActivationBoost = 1 + min(coCount/10, 0.15)` — documents frequently surfaced together get up to 15% boost.
 
 Length normalization: `1/(1 + 0.5 x log2(max(bodyLength/500, 1)))` — penalizes verbose entries, floor at 30%.
+
+Frequency boost: `freqSignal = (revisions-1)x2 + (duplicates-1)`, `freqBoost = min(0.10, log1p(freqSignal)x0.03)`. Revision count weighted 2x vs duplicate count. Capped at 10%.
 
 Pinned documents get +0.3 additive boost (capped at 1.0).
 

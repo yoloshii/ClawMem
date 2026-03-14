@@ -353,10 +353,12 @@ export async function decisionExtractor(
   // Extract decisions (observer-first, regex fallback)
   let decisionBody: string;
   let decisionCount: number;
+  let decisionFacts: string = ""; // Stable semantic payload for dedup hashing
 
   if (observedDecisions.length > 0) {
     decisionBody = formatObservedDecisions(observedDecisions, dateStr, sessionId);
     decisionCount = observedDecisions.length;
+    decisionFacts = observedDecisions.map(d => [d.title, ...d.facts].join(". ")).join("\n");
 
     // Detect contradictions with existing decisions
     try {
@@ -378,39 +380,92 @@ export async function decisionExtractor(
     } else {
       decisionBody = formatDecisionLog(decisions, dateStr, sessionId);
       decisionCount = decisions.length;
+      decisionFacts = decisions.map(d => d.text).join("\n");
     }
   }
 
-  const decisionHash = hashContent(decisionBody);
-
-  // Store main decision document
-  store.insertContent(decisionHash, decisionBody, timestamp);
+  // Save decision via unified saveMemory API (handles dedup + upsert)
+  const semanticPayload = decisionFacts || decisionBody;
 
   const decisionPath = `decisions/${dateStr}-${sessionId.slice(0, 8)}.md`;
-  try {
-    store.insertDocument(
-      "_clawmem",
-      decisionPath,
-      `Decisions ${dateStr}`,
-      decisionHash,
-      timestamp,
-      timestamp
-    );
 
-    const doc = store.findActiveDocument("_clawmem", decisionPath);
-    if (doc) {
-      store.updateDocumentMeta(doc.id, {
-        content_type: "decision",
-        confidence: observedDecisions.length > 0 ? 0.90 : 0.85,
-      });
+  // Check existing merge policy first (vector-based dedup for decisions)
+  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem");
+
+  if (mergeResult.action === 'skip') {
+    process.stderr.write(`[decision-extractor] Skipped near-duplicate decision (vector dedup)\n`);
+  } else if (mergeResult.action === 'merge' && mergeResult.existingId) {
+    // Merge with existing entry (update content)
+    const mergeHash = hashContent(decisionBody);
+    store.insertContent(mergeHash, decisionBody, timestamp);
+    store.db.prepare(
+      "UPDATE documents SET hash = ?, modified_at = ?, revision_count = revision_count + 1, last_seen_at = ? WHERE id = ?"
+    ).run(mergeHash, timestamp, timestamp, mergeResult.existingId);
+  } else {
+    // Use saveMemory for dedup-protected insert
+    const result = store.saveMemory({
+      collection: "_clawmem",
+      path: decisionPath,
+      title: `Decisions ${dateStr}`,
+      body: decisionBody,
+      contentType: "decision",
+      confidence: observedDecisions.length > 0 ? 0.90 : 0.85,
+      semanticPayload,
+    });
+
+    if (result.action === 'deduplicated') {
+      process.stderr.write(`[decision-extractor] Dedup: existing decision within window (doc ${result.docId}, count=${result.duplicateCount})\n`);
+    }
+  }
+
+  // Extract and store antipatterns (E8) via saveMemory
+  try {
+    const antipatterns = extractAntipatterns(messages);
+    if (antipatterns.length > 0) {
+      const antiBody = [
+        `# Antipatterns ${dateStr}`,
+        ``,
+        `_Session: ${sessionId.slice(0, 8)}_`,
+        ``,
+        ...antipatterns.map(a => {
+          const ctx = a.context ? `\n  > Context: ${a.context.slice(0, 150)}` : "";
+          return `- **Avoid:** ${a.text}${ctx}`;
+        }),
+      ].join("\n");
+
+      // Semantic payload: the antipattern texts only (stable across date wrappers)
+      const antiSemanticPayload = antipatterns.map(a => a.text).join("\n");
+      const antiPath = `antipatterns/${dateStr}-${sessionId.slice(0, 8)}.md`;
+
+      // Check existing merge policy first (merge_recent for antipatterns)
+      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem");
+
+      if (antiMerge.action === 'skip') {
+        // Near-duplicate — skip
+      } else if (antiMerge.action === 'merge' && antiMerge.existingId) {
+        const antiHash = hashContent(antiBody);
+        store.insertContent(antiHash, antiBody, timestamp);
+        store.db.prepare(
+          "UPDATE documents SET hash = ?, modified_at = ?, revision_count = revision_count + 1, last_seen_at = ? WHERE id = ?"
+        ).run(antiHash, timestamp, timestamp, antiMerge.existingId);
+      } else {
+        const result = store.saveMemory({
+          collection: "_clawmem",
+          path: antiPath,
+          title: `Antipatterns ${dateStr}`,
+          body: antiBody,
+          contentType: "antipattern",
+          confidence: 0.75,
+          semanticPayload: antiSemanticPayload,
+        });
+
+        if (result.action === 'deduplicated') {
+          process.stderr.write(`[decision-extractor] Dedup: antipattern within window (doc ${result.docId})\n`);
+        }
+      }
     }
   } catch {
-    const existing = store.findActiveDocument("_clawmem", decisionPath);
-    if (existing) {
-      store.db.prepare(
-        "UPDATE documents SET hash = ?, modified_at = ? WHERE id = ?"
-      ).run(decisionHash, timestamp, existing.id);
-    }
+    // Non-fatal
   }
 
   // Trigger directory context update if enabled and observer found files

@@ -231,6 +231,9 @@ export type EnrichedResult = {
   fragmentType?: string;
   fragmentLabel?: string;
   lastAccessedAt?: string | null;
+  // Engram integration: frequency/evolution metadata
+  duplicateCount: number;
+  revisionCount: number;
 };
 
 export type ScoredResult = EnrichedResult & {
@@ -267,6 +270,15 @@ export function applyCompositeScoring(
     const lenRatio = Math.log2(Math.max((r.bodyLength || 500) / 500, 1));
     const lenFactor = 1 / (1 + 0.5 * lenRatio);
     adjusted = Math.max(adjusted * 0.3, adjusted * lenFactor);
+
+    // Engram integration: revision durability signal (Phase 3)
+    // revision_count is weighted more heavily than duplicate_count (evolution vs noise).
+    // Capped at 10% to prevent runaway amplification.
+    const revisions = (r.revisionCount || 1) - 1;
+    const duplicates = (r.duplicateCount || 1) - 1;
+    const freqSignal = revisions * 2 + duplicates; // revisions weighted 2x
+    const freqBoost = freqSignal > 0 ? Math.min(0.10, Math.log1p(freqSignal) * 0.03) : 0;
+    adjusted *= (1 + freqBoost);
 
     // Pin boost: +0.3 additive, capped at 1.0
     if (r.pinned) {

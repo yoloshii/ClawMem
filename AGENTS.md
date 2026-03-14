@@ -273,6 +273,10 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
    Traverses causal edges between _clawmem/agent/observations/ docs (from decision-extractor).
 
 5. Memory debugging → memory_evolution_status(docid)
+
+6. Temporal context → timeline(docid, before=5, after=5, same_collection=false)
+   Shows what was created/modified before and after a document.
+   Use after search to understand chronological neighborhood.
 ```
 
 **Other tools:**
@@ -285,6 +289,7 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `build_graphs(temporal?, semantic?)` — build temporal backbone + semantic graph after bulk ingestion. Not needed after routine indexing (A-MEM handles per-doc links).
 - `beads_sync(project_path?)` — sync Beads issues from Dolt backend (via `bd` CLI) into memory. Usually automatic via watcher.
 - `query_plan(query, compact=true)` — USE THIS for multi-topic queries. `query()` searches as one blob — this splits topics and routes each optimally.
+- `timeline(docid, before=5, after=5, same_collection=false)` — temporal neighborhood around a document. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation.
 
 ### Memory Lifecycle
 
@@ -377,6 +382,7 @@ compositeScore = (0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenc
 Where `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
 `coActivationBoost = 1 + min(coCount/10, 0.15)` — documents frequently surfaced together get up to 15% boost.
 Length normalization: `1/(1 + 0.5 × log2(max(bodyLength/500, 1)))` — penalizes verbose entries, floor at 30%.
+Frequency boost: `freqSignal = (revisions-1)×2 + (duplicates-1)`, `freqBoost = min(0.10, log1p(freqSignal)×0.03)`. Revision count weighted 2× vs duplicate count. Capped at 10%.
 Pinned documents get +0.3 additive boost (capped at 1.0).
 
 Recency intent detected ("latest", "recent", "last session"):
