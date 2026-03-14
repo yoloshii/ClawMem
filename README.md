@@ -283,7 +283,7 @@ export CLAWMEM_EMBED_MODEL=text-embedding-3-small     # Model name
 | Jina AI | `https://api.jina.ai` | `jina-embeddings-v3` | 1024 | 8K context, 1M free tokens |
 | Cohere | `https://api.cohere.ai/compatibility` | `embed-v4.0` | 1024 | 128K context, $0.12/1M tokens |
 
-**Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server truncates at `CLAWMEM_EMBED_MAX_CHARS` (default: 4000 chars for EmbeddingGemma's 2048-token context). Set to `1100` if using granite-278m (512-token context).
+**Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server truncates at `CLAWMEM_EMBED_MAX_CHARS` (default: 6000 chars for EmbeddingGemma's 2048-token context). Set to `1100` if using granite-278m (512-token context).
 
 #### Verify and embed
 

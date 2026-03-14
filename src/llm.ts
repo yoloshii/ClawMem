@@ -524,13 +524,14 @@ export class LlamaCpp implements LLM {
 
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
 
-  // Default: 4000 chars (~1000 tokens) for EmbeddingGemma-300M (2048-token context).
-  // Conservative: code/markup tokenizes at ~2-3 chars/token, so 4000 chars stays
-  // safely under 2048 tokens. Override via CLAWMEM_EMBED_MAX_CHARS.
-  // (e.g. 1100 for granite-278m which has only 512-token context).
+  // Default: 6000 chars for EmbeddingGemma-300M (2048-token context).
+  // At ~3 chars/token (mixed code+prose), 6000 chars ≈ 2000 tokens — safely under 2048.
+  // Pure code tokenizes at ~2 chars/token (3000 tokens) but chunks are pre-split
+  // at 900 tokens so this only applies to the formatting wrapper.
+  // Override via CLAWMEM_EMBED_MAX_CHARS (e.g. 1100 for granite-278m, 512-token context).
   // Cloud providers (API key set) skip truncation entirely.
   private readonly maxRemoteEmbedChars: number =
-    parseInt(process.env.CLAWMEM_EMBED_MAX_CHARS || "4000", 10);
+    parseInt(process.env.CLAWMEM_EMBED_MAX_CHARS || "6000", 10);
 
   private isCloudEmbedding(): boolean {
     return !!this.remoteEmbedApiKey;
