@@ -62,7 +62,7 @@ curl http://host:8090/v1/models
 | `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Local llama-server or cloud API (OpenAI, Voyage, Jina, Cohere). No in-process fallback. |
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding providers. Sent as Bearer token. Skips client-side truncation when set. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `text-embedding-3-small`). |
-| `CLAWMEM_EMBED_MAX_CHARS` | `8000` | Max chars per embedding input. Default fits EmbeddingGemma (2048 tokens). Set to `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |
+| `CLAWMEM_EMBED_MAX_CHARS` | `4000` | Max chars per embedding input. Default fits EmbeddingGemma (2048 tokens). Set to `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups. |
