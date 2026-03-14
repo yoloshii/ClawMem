@@ -1,5 +1,9 @@
 # ClawMem
 
+<p align="center">
+  <img src="docs/clawmem_hero.png" alt="ClawMem" width="100%">
+</p>
+
 Hybrid agent memory system built on [QMD](https://github.com/tobi/qmd)'s retrieval substrate (BM25 + vectors + RRF + query expansion + cross-encoder reranking), layered with [SAME](https://github.com/sgx-labs/statelessagent)-derived composite scoring (recency decay, confidence, content-type half-lives), [MAGMA](https://arxiv.org/abs/2501.13956)-inspired intent classification and multi-graph traversal (semantic, temporal, causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes with automatic keyword/tag/context enrichment and inter-document link generation. Designed for [OpenClaw](https://github.com/openclaw/openclaw) and Claude Code.
 
 TypeScript on Bun. ~15,500 lines across 35 source files. 139 tests.
