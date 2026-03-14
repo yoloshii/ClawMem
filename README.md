@@ -164,6 +164,8 @@ Disable OpenClaw's native memory and `memory-lancedb` auto-recall/capture to avo
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
+**Alternative:** You can also use the Claude Code-style hooks + MCP approach with OpenClaw (`clawmem setup hooks && clawmem setup mcp`). This works but bypasses OpenClaw's ContextEngine lifecycle - you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups.
+
 #### Dual-Mode Operation
 
 Both integrations share the same SQLite vault. Claude Code and OpenClaw can run simultaneously - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms. WAL mode + busy_timeout handles concurrent access.
