@@ -10,7 +10,7 @@ ClawMem fuses state-of-the-art approaches from recent research into a single ret
 
 Dual-mode delivery: integrates as Claude Code hooks + MCP server, or as a native OpenClaw ContextEngine plugin. Both modes share the same local SQLite vault - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms.
 
-TypeScript on Bun. ~15,500 lines across 35 source files. 157 tests.
+TypeScript on Bun. ~15,500 lines across 35 source files. 171 tests.
 
 ## What It Does
 
