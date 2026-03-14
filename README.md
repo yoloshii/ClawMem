@@ -32,7 +32,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into an inte
 - **Auto-routes queries** via `memory_retrieve` — classifies intent and dispatches to the optimal search backend
 - **Syncs project issues** from Beads issue trackers into searchable memory
 
-Runs fully local — no API keys, no cloud services. Integrates via Claude Code hooks (automatic context injection) and MCP tools (agent-initiated retrieval). Works with any MCP-compatible client.
+Runs fully local — no API keys, no cloud services. Dual-mode delivery: integrates via Claude Code hooks + MCP tools, and/or as an OpenClaw ContextEngine plugin. Both modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
 
 ## Architecture
 
@@ -170,6 +170,32 @@ openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/
 - ❌ Higher maintenance (two memory indices to keep fresh)
 
 **Most users should choose Option 1** (ClawMem exclusive) unless they have a specific need for redundant memory systems.
+
+#### Option 3: ContextEngine Plugin (Native OpenClaw Integration)
+
+Register ClawMem as an OpenClaw [ContextEngine](https://docs.openclaw.ai/configuration#context-engines) plugin for deep lifecycle integration. ClawMem handles context assembly, post-turn extraction, and compaction orchestration natively — no hook configuration needed on the OpenClaw side.
+
+```bash
+# Install the plugin
+clawmem setup openclaw
+
+# Follow the printed steps:
+# 1. Symlink plugin into OpenClaw extensions
+# 2. Set ClawMem as active context engine
+# 3. Configure GPU endpoints
+# 4. Start REST API for tool calls
+```
+
+**What the plugin provides:**
+- **`before_prompt_build` hook** — prompt-aware retrieval (replaces context-surfacing + session-bootstrap)
+- **`ContextEngine.afterTurn()`** — decision extraction, handoff generation, feedback loop
+- **`ContextEngine.compact()`** — pre-compaction state preservation, delegates real compaction to legacy engine
+- **5 agent tools** — `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
+- **Session lifecycle hooks** — `session_start`, `session_end`, `before_reset` safety net
+
+**Dual-mode operation:** The plugin shares the same SQLite vault as Claude Code hooks. Both runtimes can be active simultaneously — decisions captured in one are immediately visible in the other. WAL mode + busy_timeout handles concurrent access.
+
+**Note:** If using the ContextEngine plugin, disable `memory-lancedb` auto-recall and auto-capture to avoid duplicate context injection.
 
 ### GPU Services
 

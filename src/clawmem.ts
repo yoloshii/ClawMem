@@ -66,7 +66,7 @@ let store: Store | null = null;
 
 function getStore(): Store {
   if (!store) {
-    store = createStore();
+    store = createStore(undefined, { busyTimeout: 5000 });
   }
   return store;
 }
@@ -853,7 +853,8 @@ async function cmdSetup(args: string[]) {
     case "hooks": await cmdSetupHooks(args.slice(1)); break;
     case "mcp": await cmdSetupMcp(args.slice(1)); break;
     case "curator": await cmdSetupCurator(args.slice(1)); break;
-    default: die("Usage: clawmem setup <hooks|mcp|curator> [--remove]");
+    case "openclaw": await cmdSetupOpenClaw(args.slice(1)); break;
+    default: die("Usage: clawmem setup <hooks|mcp|curator|openclaw> [--remove]");
   }
 }
 
@@ -980,6 +981,49 @@ async function cmdSetupCurator(args: string[]) {
 
 function cmdPath() {
   console.log(getDefaultDbPath());
+}
+
+async function cmdSetupOpenClaw(args: string[]) {
+  const remove = args.includes("--remove");
+  const binPath = findClawmemBinary();
+  const pluginDir = pathResolve(import.meta.dir, "openclaw");
+
+  if (remove) {
+    console.log(`${c.green}To remove ClawMem from OpenClaw:${c.reset}`);
+    console.log(`  1. Remove the symlink: rm ~/.openclaw/extensions/clawmem`);
+    console.log(`  2. Remove from config: openclaw config set plugins.slots.contextEngine legacy`);
+    return;
+  }
+
+  if (!existsSync(pathResolve(pluginDir, "index.ts"))) {
+    die(`OpenClaw plugin files not found at ${pluginDir}`);
+  }
+
+  console.log(`${c.green}ClawMem OpenClaw Plugin Setup${c.reset}`);
+  console.log();
+  console.log(`Plugin source: ${pluginDir}`);
+  console.log(`ClawMem binary: ${binPath}`);
+  console.log();
+  console.log(`${c.bold}Installation steps:${c.reset}`);
+  console.log();
+  console.log(`  1. Symlink the plugin into OpenClaw extensions:`);
+  console.log(`     ${c.cyan}ln -s ${pluginDir} ~/.openclaw/extensions/clawmem${c.reset}`);
+  console.log();
+  console.log(`  2. Copy the plugin manifest:`);
+  console.log(`     ${c.cyan}cp ${pluginDir}/plugin.json ~/.openclaw/extensions/clawmem/openclaw.plugin.json${c.reset}`);
+  console.log();
+  console.log(`  3. Set ClawMem as the active context engine:`);
+  console.log(`     ${c.cyan}openclaw config set plugins.slots.contextEngine clawmem${c.reset}`);
+  console.log();
+  console.log(`  4. Configure GPU endpoints (if not using defaults):`);
+  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
+  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlm http://YOUR_GPU:8089${c.reset}`);
+  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuRerank http://YOUR_GPU:8090${c.reset}`);
+  console.log();
+  console.log(`  5. Start the REST API (for tool calls):`);
+  console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
+  console.log();
+  console.log(`${c.dim}ClawMem will work alongside Claude Code hooks — both modes share the same vault.${c.reset}`);
 }
 
 function findClawmemBinary(): string {
@@ -1660,6 +1704,7 @@ ${c.bold}Setup:${c.reset}
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
   clawmem setup curator [--remove]     Install/remove curator agent to ~/.claude/agents/
+  clawmem setup openclaw [--remove]    Show OpenClaw plugin installation steps
   clawmem install-service [--enable]   Install systemd watcher service
 
 ${c.bold}Indexing:${c.reset}

@@ -1,0 +1,83 @@
+{
+  "id": "clawmem",
+  "kind": "context-engine",
+  "uiHints": {
+    "clawmemBin": {
+      "label": "ClawMem Binary Path",
+      "placeholder": "/usr/local/bin/clawmem",
+      "help": "Path to clawmem binary. Auto-detected from PATH if not set."
+    },
+    "tokenBudget": {
+      "label": "Context Token Budget",
+      "placeholder": "800",
+      "help": "Max tokens for context surfacing injection (default: 800)"
+    },
+    "profile": {
+      "label": "Retrieval Profile",
+      "help": "speed (400 tokens) | balanced (800) | deep (1200)"
+    },
+    "enableTools": {
+      "label": "Register Agent Tools",
+      "help": "Register ClawMem retrieval tools for agent-initiated queries"
+    },
+    "servePort": {
+      "label": "REST API Port",
+      "placeholder": "7438",
+      "help": "Port for ClawMem HTTP REST API (used by tools)",
+      "advanced": true
+    },
+    "gpuEmbed": {
+      "label": "Embedding Endpoint",
+      "placeholder": "http://localhost:8088",
+      "help": "URL for granite-embed embedding service",
+      "advanced": true
+    },
+    "gpuLlm": {
+      "label": "LLM Endpoint",
+      "placeholder": "http://localhost:8089",
+      "help": "URL for ClawMem LLM (query expansion, extraction)",
+      "advanced": true
+    },
+    "gpuRerank": {
+      "label": "Reranker Endpoint",
+      "placeholder": "http://localhost:8090",
+      "help": "URL for reranking service",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "clawmemBin": {
+        "type": "string"
+      },
+      "tokenBudget": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 4000
+      },
+      "profile": {
+        "type": "string",
+        "enum": ["speed", "balanced", "deep"]
+      },
+      "enableTools": {
+        "type": "boolean"
+      },
+      "servePort": {
+        "type": "number",
+        "minimum": 1024,
+        "maximum": 65535
+      },
+      "gpuEmbed": {
+        "type": "string"
+      },
+      "gpuLlm": {
+        "type": "string"
+      },
+      "gpuRerank": {
+        "type": "string"
+      }
+    }
+  }
+}

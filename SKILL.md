@@ -676,6 +676,7 @@ Write to `docs/issues/YYYY-MM-DD-<slug>.md`:
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs. Only runs if MCP process stays alive long enough (every 5min).
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
 - HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Same search/retrieval/lifecycle as MCP tools. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
+- OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction.
 
 ## Tool Selection (one-liner)
 
