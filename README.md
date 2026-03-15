@@ -210,7 +210,7 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### GPU Services
 
-ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. LLM and reranker have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads on first use). Embedding uses a `llama-server --embeddings` instance — runs on GPU or CPU. All three models work without a GPU.
+ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. All three have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads on first use), so ClawMem works without any GPU. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback to slower CPU inference.
 
 **GPU with VRAM to spare (12GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~10GB VRAM.
 
@@ -232,9 +232,9 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. LL
 | LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
-All three models auto-download via `node-llama-cpp` and run on CPU if no server is running.
+The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable, ClawMem silently falls back to in-process CPU inference via `node-llama-cpp` (auto-downloads the QMD native models on first use). This means ClawMem always works, but **if you're running GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up** — otherwise a crashed server silently degrades to much slower CPU models without warning.
 
-The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. Start the three servers, and ClawMem connects automatically.
+To prevent silent fallback and fail fast instead, set `CLAWMEM_NO_LOCAL_MODELS=true`.
 
 #### Remote GPU (optional)
 
@@ -246,7 +246,7 @@ export CLAWMEM_LLM_URL=http://gpu-host:8089
 export CLAWMEM_RERANK_URL=http://gpu-host:8090
 ```
 
-For remote setups, set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent `node-llama-cpp` from auto-downloading multi-GB model files if a server is unreachable. Operations fail fast instead of silently falling back.
+For remote setups, set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent `node-llama-cpp` from auto-downloading multi-GB model files if a server is unreachable.
 
 #### CPU-Only Mode (no GPU)
 
