@@ -21,7 +21,7 @@ The plugin uses a hybrid approach — ContextEngine methods for lifecycle manage
 | `ContextEngine.compact()` | Pre-compaction state preservation (delegates real compaction to legacy engine) |
 | `ContextEngine.bootstrap()` | Session bookkeeping |
 | `ContextEngine.assemble()` | Pass-through (retrieval done in hook, not here) |
-| Agent tools | 5 tools via REST API: search, get, session_log, timeline, similar |
+| Agent tools | 5 retrieval tools registered with OpenClaw via REST API: search, get, session_log, timeline, similar. The full [REST API](../reference/rest-api.md) exposes 20+ endpoints (lifecycle, graph traversal, mutations, export, etc.) accessible via HTTP but not registered as agent tools. |
 
 ### Why hybrid?
 
