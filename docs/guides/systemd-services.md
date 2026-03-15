@@ -94,6 +94,37 @@ systemctl --user daemon-reload
 systemctl --user restart clawmem-watcher.service
 ```
 
+## REST API service (for OpenClaw)
+
+Required for OpenClaw agent tools. Optional for Claude Code (which uses MCP stdio).
+
+```bash
+cat > ~/.config/systemd/user/clawmem-serve.service << 'EOF'
+[Unit]
+Description=ClawMem REST API server
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/clawmem/bin/clawmem serve --port 7438
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+```
+
+For authenticated access, add `Environment=CLAWMEM_API_TOKEN=your-secret` to the `[Service]` section.
+
+Enable alongside the other services:
+
+```bash
+systemctl --user enable --now clawmem-serve.service
+```
+
+See the [REST API reference](../reference/rest-api.md) for endpoints and usage.
+
 ## GPU service units
 
 The three llama-server instances can also run as systemd services:

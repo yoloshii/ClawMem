@@ -76,4 +76,46 @@ SQLite WAL mode + `busy_timeout=5000ms` ensures safe concurrent access across ru
 
 The plugin spawns `clawmem hook <name>` as Bun subprocesses (Phase 1 transport). This avoids importing Bun-specific modules into the Node.js OpenClaw runtime. Each hook receives JSON on stdin and returns JSON on stdout.
 
-The REST API server is launched via `spawnBackground()` as a persistent background process, managed by the plugin's service lifecycle (started on plugin init, SIGTERM on stop).
+## REST API dependency
+
+The 5 agent tools (search, get, session_log, timeline, similar) are served via ClawMem's HTTP REST API. The plugin manages this in one of two ways:
+
+**Auto-managed (default):** The plugin launches `clawmem serve` via `spawnBackground()` on init and sends SIGTERM on stop. This works for development but the process may not survive plugin crashes or OpenClaw restarts.
+
+**Systemd-managed (recommended for production):** Run `clawmem serve` as a persistent systemd service. The plugin connects to the existing server. See the [REST API reference](../reference/rest-api.md#running-as-a-systemd-service) for the service unit.
+
+If the REST API is unreachable, agent tools fail silently — the agent won't get search results but hooks (context-surfacing, decision-extractor, etc.) continue working since they use shell-out transport, not REST.
+
+## What needs to be running
+
+For full OpenClaw integration, these services must be active:
+
+| Service | Purpose | Managed by |
+|---------|---------|------------|
+| `clawmem serve` | REST API for agent tools | Plugin auto-start or [systemd](../reference/rest-api.md#running-as-a-systemd-service) |
+| `clawmem-watcher` | Auto-index on file changes | [systemd](systemd-services.md#watcher-service) |
+| `clawmem-embed.timer` | Daily embedding sweep | [systemd](systemd-services.md#embed-timer) |
+| GPU servers (optional) | Embedding, LLM, reranker | [systemd](systemd-services.md#gpu-service-units) or in-process fallback |
+
+The **curator agent** (`clawmem setup curator`) handles periodic maintenance — lifecycle triage, retrieval health checks, graph rebuilds. It runs on-demand, not as a service. Invoke via "curate memory" or "run curator" in a Claude Code session.
+
+## Verify
+
+After setup, check all components:
+
+```bash
+# Plugin registered
+openclaw plugins list | grep clawmem
+
+# REST API responding
+curl http://localhost:7438/health
+
+# Hooks working (check vault for recent context)
+clawmem status
+
+# Watcher active
+systemctl --user status clawmem-watcher.service
+
+# Embed timer scheduled
+systemctl --user status clawmem-embed.timer
+```

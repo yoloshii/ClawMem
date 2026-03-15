@@ -66,12 +66,20 @@
 ## OpenClaw
 
 **REST API tools return no results**
-- The `clawmem serve` process may not be running.
-- Fix: Check if the OpenClaw plugin started the serve process. Look for `[clawmem-serve]` in logs.
+- The `clawmem serve` process may not be running. The plugin auto-starts it, but it doesn't survive plugin crashes.
+- Fix: Check with `curl http://localhost:7438/health`. If unreachable, either restart OpenClaw or run `clawmem serve` as a [systemd service](guides/systemd-services.md#rest-api-service-for-openclaw) for persistence.
+
+**Agent tools silently fail but hooks still work**
+- Hooks use shell-out transport (independent of REST). Agent tools use REST. If the REST server is down, tools fail but hooks continue.
+- Fix: Verify REST server: `curl http://localhost:7438/health`. Start it manually (`./bin/clawmem serve`) or via systemd.
 
 **Plugin registers but hooks don't fire**
 - Verify ClawMem is selected as the active context engine in OpenClaw config.
 - If using hybrid mode, OpenClaw's native memory may be intercepting.
+
+**OpenClaw agent doesn't use ClawMem tools**
+- The 5 agent tools (search, get, session_log, timeline, similar) require the REST API. Verify it's running and accessible from the OpenClaw process.
+- Check plugin config: `enableTools` must be `true` and `servePort` must match the running server port (default 7438).
 
 ## General
 

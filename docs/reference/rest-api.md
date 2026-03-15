@@ -1,6 +1,6 @@
 # REST API Reference
 
-Optional HTTP REST API for non-MCP clients, web dashboards, and cross-machine access.
+HTTP REST API for non-MCP clients, web dashboards, cross-machine access, and **OpenClaw agent tools**. Required for OpenClaw integration — the ContextEngine plugin serves 5 agent tools (search, get, session_log, timeline, similar) via this API. See the [OpenClaw plugin guide](../guides/openclaw-plugin.md) for details.
 
 ## Start the server
 
@@ -162,6 +162,41 @@ All responses are JSON. Search/retrieve responses include:
 ```
 
 When `compact=false`, results include `modifiedAt`, `confidence`, and full `body` instead of `snippet`.
+
+## Running as a systemd service
+
+For production deployments (especially OpenClaw), run the REST API as a persistent service instead of relying on the plugin's `spawnBackground()`:
+
+```bash
+cat > ~/.config/systemd/user/clawmem-serve.service << 'EOF'
+[Unit]
+Description=ClawMem REST API server
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/clawmem/bin/clawmem serve --port 7438
+Restart=on-failure
+RestartSec=5
+Environment=CLAWMEM_API_TOKEN=your-secret-here
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now clawmem-serve.service
+```
+
+When running as a systemd service, set `enableTools: true` and `servePort: 7438` in the OpenClaw plugin manifest — the plugin will connect to the existing server instead of spawning its own.
+
+For remote GPU setups, add environment overrides (same pattern as the [watcher service](../guides/systemd-services.md#remote-gpu)):
+
+```ini
+Environment=CLAWMEM_EMBED_URL=http://gpu-host:8088
+Environment=CLAWMEM_LLM_URL=http://gpu-host:8089
+Environment=CLAWMEM_RERANK_URL=http://gpu-host:8090
+```
 
 ## CORS
 
