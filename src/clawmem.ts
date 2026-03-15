@@ -976,7 +976,7 @@ async function cmdSetupHooks(args: string[]) {
 
     // Timeout per event type (seconds)
     const timeouts: Record<string, number> = {
-      UserPromptSubmit: 5,
+      UserPromptSubmit: 8,
       SessionStart: 5,
       PreCompact: 5,
       Stop: 10,
