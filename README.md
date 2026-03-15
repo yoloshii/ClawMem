@@ -212,7 +212,19 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. The LLM and reranker have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads the QMD native models on first use). Embedding always requires either a `llama-server --embeddings` instance or a cloud API.
 
-**Default (no GPU / any GPU):** The QMD native combo runs on CPU or any GPU — total ~1.7GB VRAM.
+**GPU with VRAM to spare (12GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~10GB VRAM.
+
+| Service | Port | Model | VRAM | Purpose |
+|---|---|---|---|---|
+| Embedding | 8088 | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) | ~4.4GB | SOTA embedding (2560d, 32K context). Distilled from zerank-2 via zELO. |
+| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
+| Reranker | 8090 | [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) | ~3.3GB | SOTA reranker. Outperforms Cohere rerank-3.5. Optimal pairing with zembed-1. |
+
+**Important:** zembed-1 and zerank-2 use non-causal attention — `-ub` must equal `-b` on llama-server (e.g. `-b 2048 -ub 2048`). See [Reranker Server](#reranker-server) for details.
+
+**License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The QMD native models below have no such restriction.
+
+**CPU / GPU without VRAM to spare:** The QMD native combo — total ~4GB VRAM, also runs on CPU.
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
@@ -221,18 +233,6 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Th
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
 LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance (or [cloud embedding](#option-b-cloud-embedding-api)).
-
-**SOTA upgrade (12GB+ GPU):** For best retrieval quality, use the ZeroEntropy distillation-paired stack — total ~10GB VRAM.
-
-| Service | Port | Model | VRAM | Purpose |
-|---|---|---|---|---|
-| Embedding | 8088 | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) | ~4.4GB | SOTA embedding (2560d, 32K context). Distilled from zerank-2 via zELO. |
-| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Same LLM — unchanged |
-| Reranker | 8090 | [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) | ~3.3GB | SOTA reranker. Outperforms Cohere rerank-3.5. Optimal pairing with zembed-1. |
-
-**Important:** Embedding and reranking models use non-causal attention — `-ub` must equal `-b` on llama-server (e.g. `-b 2048 -ub 2048`). See [Reranker Server](#reranker-server) for details.
-
-**License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The default QMD native models have no such restriction.
 
 The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. Start the three servers, and ClawMem connects automatically.
 
@@ -264,25 +264,34 @@ unset CLAWMEM_EMBED_URL CLAWMEM_LLM_URL CLAWMEM_RERANK_URL
 
 ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint for all embedding operations. This works with local llama-server instances and cloud providers alike.
 
-#### Option A: Local (default)
+#### Option A: Local GPU
 
-Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) via `llama-server --embeddings` on port 8088. This is the QMD native embedding model — small enough to run on CPU.
+**GPU with VRAM to spare (recommended):** Use [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) — SOTA retrieval quality, distilled from zerank-2 via [ZeroEntropy's zELO methodology](https://docs.zeroentropy.dev). **CC-BY-NC-4.0** — non-commercial only.
+
+- Size: 2.4GB, Dimensions: 2560, VRAM: ~4.4GB, Context: 32K tokens
+
+```bash
+wget https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF/resolve/main/zembed-1-Q4_K_M.gguf
+
+# -ub must match -b for non-causal attention
+llama-server -m zembed-1-Q4_K_M.gguf \
+  --embeddings --port 8088 --host 0.0.0.0 \
+  -ngl 99 -c 8192 -b 2048 -ub 2048
+```
+
+**CPU / GPU without VRAM to spare:** Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) — the QMD native embedding model. Small enough to run on CPU.
 
 - Size: 314MB, Dimensions: 768, VRAM: ~400MB (or CPU), Context: 2048 tokens
 
 ```bash
-# Download model
 wget https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
 
-# Start llama-server in embedding mode
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 \
   -ngl 99 -c 2048 --batch-size 2048
 ```
 
 For multilingual corpora: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) (set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
-
-**SOTA upgrade (12GB+ GPU):** [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) (2.4GB, 2560d, ~4.4GB VRAM, 32K context). Distilled from zerank-2 via [ZeroEntropy's zELO methodology](https://docs.zeroentropy.dev). Pair with zerank-2 reranker for optimal results. Requires `-ub` equal to `-b` (e.g. `-b 2048 -ub 2048`) and `-c 8192` for full-doc fragments. **CC-BY-NC-4.0** — non-commercial only.
 
 #### Option B: Cloud Embedding API
 
@@ -357,34 +366,30 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
 
 Cross-encoder reranking for `query` and `intent_search` pipelines on port 8090. ClawMem calls the `/v1/rerank` endpoint (or falls back to scoring via `/v1/completions` for compatible servers).
 
-**Default:** [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) — the QMD native reranker. Auto-downloaded by `node-llama-cpp` if no server is running.
+Scores each candidate against the original query (cross-encoder architecture). `query` pipeline: 4000 char context per doc (deep reranking); `intent_search`: 200 char context per doc (fast reranking).
 
-- Size: ~600MB (Q8_0), VRAM: ~1.3GB on GPU (or CPU via node-llama-cpp)
-- Scores each candidate against the original query (cross-encoder architecture)
-- `query` pipeline: 4000 char context per doc (deep reranking); `intent_search`: 200 char context per doc (fast reranking)
-
-**Server setup:**
+**GPU with VRAM to spare (recommended):** [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) (2.4GB, ~3.3GB VRAM). Outperforms Cohere rerank-3.5 and Gemini 2.5 Flash. Optimal pairing with zembed-1 (same distillation architecture via zELO). **CC-BY-NC-4.0** — non-commercial only.
 
 ```bash
-# Download model
-wget https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/Qwen3-Reranker-0.6B-Q8_0.gguf
+wget https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m/resolve/main/zerank-2-Q4_k_m.gguf
 
-# Start llama-server for reranking
-llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --reranking --port 8090 --host 0.0.0.0 \
-  -ngl 99 -c 2048 --batch-size 512
-```
-
-**SOTA upgrade (12GB+ GPU):** [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) (2.4GB, ~3.3GB VRAM). Outperforms Cohere rerank-3.5 and Gemini 2.5 Flash. Optimal pairing with zembed-1 (same distillation architecture via zELO). **CC-BY-NC-4.0** — non-commercial only.
-
-```bash
-# SOTA reranker (-ub must match -b for non-causal attention)
+# -ub must match -b for non-causal attention
 llama-server -m zerank-2-Q4_K_M.gguf \
   --reranking --port 8090 --host 0.0.0.0 \
   -ngl 99 -c 2048 -b 2048 -ub 2048
 ```
 
-**Important:** zerank-2 and zembed-1 use non-causal attention — `-ub` (ubatch) must equal `-b` (batch). Omitting `-ub` or setting it lower than `-b` causes assertion crashes. The default qwen3-reranker-0.6B does not have this requirement. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
+**CPU / GPU without VRAM to spare:** [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600MB, ~1.3GB VRAM). The QMD native reranker — auto-downloaded by `node-llama-cpp` if no server is running.
+
+```bash
+wget https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/Qwen3-Reranker-0.6B-Q8_0.gguf
+
+llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
+  --reranking --port 8090 --host 0.0.0.0 \
+  -ngl 99 -c 2048 --batch-size 512
+```
+
+**Note:** zerank-2 and zembed-1 use non-causal attention — `-ub` (ubatch) must equal `-b` (batch). Omitting `-ub` or setting it lower causes assertion crashes. qwen3-reranker-0.6B does not have this requirement. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
 
 ### MCP Server
 
