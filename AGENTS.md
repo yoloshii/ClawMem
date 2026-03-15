@@ -241,13 +241,13 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate → profile-driven hybrid search (vector if `useVector`, timeout from profile) → FTS supplement → snooze filter → noise filter → `<vault-context>` injection. Budget, max results, vector timeout, and min score all driven by `CLAWMEM_PROFILE`. |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate → profile-driven hybrid search (vector if `useVector`, timeout from profile) → FTS supplement → file-aware supplemental search (E13) → snooze filter → noise filter → spreading activation (E11: co-activated doc boost) → memory type diversification (E10) → tiered injection (HOT/WARM/COLD snippets) → `<vault-context>` + optional `<vault-routing>` hint. Budget, max results, vector timeout, and min score all driven by `CLAWMEM_PROFILE`. |
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + recent decisions (400) + antipatterns (150) + vault context (200) → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. Reindexes auto-memory collection. |
 | `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/agent/observations/`, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/agent/handoffs/` |
-| `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence |
+| `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence, records usage relations + co-activations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
 
 **Default behavior:** Read injected `<vault-context>` first. If sufficient, answer immediately.
 

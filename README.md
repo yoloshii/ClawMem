@@ -680,13 +680,13 @@ Hooks installed by `clawmem setup hooks`:
 
 | Hook | Event | What It Does |
 |---|---|---|
-| `context-surfacing` | UserPromptSubmit | Hybrid search (900ms vector timeout) → snooze filter → file-aware supplemental search → sanitize → inject (800 token budget) |
+| `context-surfacing` | UserPromptSubmit | Hybrid search → FTS supplement → file-aware search (E13) → snooze filter → spreading activation (E11) → memory type diversification (E10) → tiered injection (HOT/WARM/COLD) → `<vault-context>` + `<vault-routing>` hint. Profile-driven budget/results/timeout. |
 | `postcompact-inject` | SessionStart | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
 | `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory |
 | `decision-extractor` | Stop | GGUF observer extracts structured decisions, infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
-| `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation for documents surfaced together |
+| `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation + usage relations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
 
 Additional hooks available but not installed by default:
 
