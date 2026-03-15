@@ -46,9 +46,18 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-# Load .env if present (before defaults so .env values take precedence)
+# Load .env if present — only sets vars not already exported in shell
+# Precedence: shell env > .env > wrapper defaults below
 if [[ -f "$SCRIPT_DIR/../.env" ]]; then
-  set -a; source "$SCRIPT_DIR/../.env"; set +a
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    [[ -z "$key" || "$key" == *" "* ]] && continue
+    # Only export if not already set in environment
+    if [[ -z "${!key+x}" ]]; then
+      export "$line"
+    fi
+  done < "$SCRIPT_DIR/../.env"
 fi
 
 # GPU inference endpoints — set these to your llama-server instances

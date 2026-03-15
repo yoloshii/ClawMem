@@ -332,11 +332,11 @@ async function cmdEmbed(args: string[]) {
         if (lastBatchSentAt > 0) {
           // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
           //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
-          const actualTokens = llm.lastBatchTokens;
           const batchEnd0 = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
           const estimatedTokens = allTexts.slice(batchStart, batchEnd0)
             .reduce((sum, t) => sum + Math.ceil(t.length / CHARS_PER_TOKEN), 0);
-          const batchTokens = actualTokens > 0 ? actualTokens : estimatedTokens;
+          // Use current batch estimate (not previous batch actuals — previous batch may differ in size)
+          const batchTokens = estimatedTokens;
           const safeTPM = CLOUD_TPM_LIMIT * CLOUD_TPM_SAFETY;
           const requiredGapMs = Math.max(500, (batchTokens / safeTPM) * 60_000);
           const elapsed = Date.now() - lastBatchSentAt;

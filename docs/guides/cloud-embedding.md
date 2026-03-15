@@ -1,6 +1,6 @@
 # Cloud Embedding
 
-By default, ClawMem uses a local `llama-server` for embeddings. If you don't have a GPU, you can use a cloud embedding provider instead.
+By default, ClawMem uses local embedding (via `llama-server` or in-process `node-llama-cpp` CPU fallback). As an alternative, you can use a cloud embedding provider.
 
 ## Supported providers
 
@@ -98,7 +98,7 @@ The LLM (query expansion) and reranker always use local `llama-server` or in-pro
 
 ## Model recommendations
 
-**Default (QMD native combo, any GPU or CPU):** EmbeddingGemma-300M-Q8_0 (314MB, 768d, ~400MB VRAM) + qwen3-reranker-0.6B (600MB, ~1.3GB). These are the QMD native models — the reranker auto-downloads via `node-llama-cpp` if no server is running. Works on CPU.
+**Default (QMD native combo, any GPU or CPU):** EmbeddingGemma-300M-Q8_0 (314MB, 768d) + qwen3-reranker-0.6B (600MB) + qmd-query-expansion-1.7B (~1.1GB). All three auto-download via `node-llama-cpp` if no server is running. Works on CPU.
 
 ```bash
 llama-server -m embeddinggemma-300M-Q8_0.gguf \

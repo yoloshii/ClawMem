@@ -565,21 +565,16 @@ export class LlamaCpp implements LLM {
     // Remote server or cloud API — preferred path
     if (this.remoteEmbedUrl) {
       const extraParams = this.getCloudEmbedParams(!!options.isQuery);
-      return this.embedRemote(text, extraParams);
+      const result = await this.embedRemote(text, extraParams);
+      if (result) return result;
+      // Cloud providers don't fall back — if API key is set, the user chose cloud
+      if (this.isCloudEmbedding()) return null;
+      // Local server unreachable — fall through to in-process fallback
+      console.error("[embed] Remote server unreachable, falling back to in-process embedding");
     }
 
-    // Local fallback via node-llama-cpp (auto-downloads EmbeddingGemma on first use)
-    try {
-      const context = await this.ensureEmbedContext();
-      const embedding = await context.getEmbeddingFor(text);
-      return {
-        embedding: Array.from(embedding.vector),
-        model: this.embedModelUri,
-      };
-    } catch (error) {
-      console.error("[embed] Local embedding error:", error);
-      return null;
-    }
+    // In-process fallback via node-llama-cpp (auto-downloads EmbeddingGemma on first use)
+    return this.embedLocal(text);
   }
 
   /**
@@ -593,16 +588,44 @@ export class LlamaCpp implements LLM {
     // Remote server or cloud API
     if (this.remoteEmbedUrl) {
       const extraParams = this.getCloudEmbedParams(false);
-      return this.embedRemoteBatch(texts, extraParams);
+      const results = await this.embedRemoteBatch(texts, extraParams);
+      // If we got at least one result, remote is working
+      if (results.some(r => r !== null)) return results;
+      // Cloud providers don't fall back
+      if (this.isCloudEmbedding()) return results;
+      // Local server unreachable — fall through to in-process fallback
+      console.error("[embed] Remote server unreachable, falling back to in-process embedding");
     }
 
-    // Local fallback via node-llama-cpp
+    // In-process fallback via node-llama-cpp
+    return this.embedLocalBatch(texts);
+  }
+
+  /** In-process embedding via node-llama-cpp with truncation guard */
+  private async embedLocal(text: string): Promise<EmbeddingResult | null> {
+    try {
+      const context = await this.ensureEmbedContext();
+      const safeText = this.truncateForLocalEmbed(text);
+      const embedding = await context.getEmbeddingFor(safeText);
+      return {
+        embedding: Array.from(embedding.vector),
+        model: this.embedModelUri,
+      };
+    } catch (error) {
+      console.error("[embed] Local embedding error:", error);
+      return null;
+    }
+  }
+
+  /** In-process batch embedding via node-llama-cpp with truncation guard */
+  private async embedLocalBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     try {
       const context = await this.ensureEmbedContext();
       const results: (EmbeddingResult | null)[] = [];
       for (const text of texts) {
         try {
-          const embedding = await context.getEmbeddingFor(text);
+          const safeText = this.truncateForLocalEmbed(text);
+          const embedding = await context.getEmbeddingFor(safeText);
           results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
         } catch (err) {
           console.error("[embed] Local batch embedding error:", err);
@@ -614,6 +637,12 @@ export class LlamaCpp implements LLM {
       console.error("[embed] Failed to initialize local embedding:", error);
       return texts.map(() => null);
     }
+  }
+
+  /** Truncate text to maxRemoteEmbedChars for local in-process embedding (prevents context overflow crash) */
+  private truncateForLocalEmbed(text: string): string {
+    if (text.length <= this.maxRemoteEmbedChars) return text;
+    return text.slice(0, this.maxRemoteEmbedChars);
   }
 
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------

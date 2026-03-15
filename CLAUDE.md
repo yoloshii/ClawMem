@@ -97,7 +97,7 @@ curl http://host:8090/v1/models
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
 
-**Note:** The `bin/clawmem` wrapper sets all endpoint defaults and `CLAWMEM_NO_LOCAL_MODELS=true`. Always use the wrapper — never `bun run src/clawmem.ts` directly. For remote GPU setups, add the same env vars to the watcher service via a systemd drop-in.
+**Note:** The `bin/clawmem` wrapper sets all endpoint defaults. Always use the wrapper — never `bun run src/clawmem.ts` directly. For remote GPU setups, add the same env vars to the watcher service via a systemd drop-in.
 
 ## Quick Setup
 

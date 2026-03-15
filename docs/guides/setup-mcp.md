@@ -68,5 +68,4 @@ The `bin/clawmem` wrapper sets all GPU endpoint defaults. If running the MCP ser
 CLAWMEM_EMBED_URL=http://localhost:8088
 CLAWMEM_LLM_URL=http://localhost:8089
 CLAWMEM_RERANK_URL=http://localhost:8090
-CLAWMEM_NO_LOCAL_MODELS=true
 ```

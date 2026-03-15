@@ -1,6 +1,6 @@
 # CLI Reference
 
-Always use the `bin/clawmem` wrapper — it sets GPU endpoint defaults and `CLAWMEM_NO_LOCAL_MODELS=true`.
+Always use the `bin/clawmem` wrapper — it sets GPU endpoint defaults.
 
 ## Core commands
 
