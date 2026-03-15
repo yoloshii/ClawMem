@@ -66,11 +66,32 @@ openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents"]'
 
 Tradeoff: redundant recall from two systems, but 10-15% context window waste from duplicates.
 
-## Dual-mode
+## Shared vault across frameworks
 
-The plugin shares the same SQLite vault as Claude Code hooks. Both runtimes read and write the same memory — decisions captured in a Claude Code session are visible to OpenClaw, and vice versa.
+Claude Code and OpenClaw access the same SQLite vault file (`~/.cache/clawmem/index.sqlite` by default). Both runtimes read and write the same memory — decisions captured in a Claude Code session are visible to OpenClaw agents, and vice versa.
 
-SQLite WAL mode + `busy_timeout=5000ms` ensures safe concurrent access across runtimes.
+### How it works
+
+Both frameworks resolve the vault path from the same config file (`~/.config/clawmem/config.yaml`). Claude Code hooks invoke `bin/clawmem hook <name>` which opens the vault. The OpenClaw plugin spawns the same binary via shell-out. Since they share a filesystem, they share the vault.
+
+SQLite WAL mode allows concurrent readers with a single writer. `busy_timeout=5000ms` on all connections prevents "database is locked" errors when both frameworks access the vault simultaneously.
+
+### Same-machine requirement
+
+By default, both frameworks must run on the same machine (or share the same filesystem mount) because they both open the SQLite file directly. SQLite does not support network-based concurrent access.
+
+### Remote access options
+
+For cross-machine setups where one runtime is on a different host:
+
+| Method | How | Latency | Full feature set |
+|--------|-----|---------|-----------------|
+| **REST API** | Run `clawmem serve --port 7438` on the vault host. Remote agents call HTTP endpoints. | ~5-20ms per call | Search, retrieval, lifecycle, graph traversal. No hooks (hooks are local-only). |
+| **MCP over SSE** | Run the MCP server as an SSE transport instead of stdio. Configure the remote Claude Code instance to connect via SSE URL. | ~5-20ms per call | All 20+ MCP tools. No hooks. |
+
+In both cases, hooks (context-surfacing, decision-extractor, etc.) only run on the machine where the vault lives. Remote agents get tool access but not automatic context injection.
+
+To add hooks on the remote machine, run a second ClawMem instance with its own local vault and use `clawmem serve` on the primary host for cross-machine queries.
 
 ## Shell-out transport
 
