@@ -5,8 +5,8 @@ Thanks for your interest in contributing. This guide covers everything you need 
 ## Prerequisites
 
 - [Bun](https://bun.sh/) >= 1.0.0
-- [llama-server](https://github.com/ggerganov/llama.cpp) (optional — all three models auto-download via `node-llama-cpp` and run on CPU)
-- A GPU with 4-12 GB VRAM for performance (or CPU with patience)
+- [llama-server](https://github.com/ggerganov/llama.cpp) (optional — all three models auto-download via `node-llama-cpp`, using Metal on Apple Silicon or Vulkan/CPU)
+- A dedicated GPU with 4-12 GB VRAM for best performance (optional — works without one)
 
 ## Development Setup
 
@@ -17,7 +17,7 @@ cd ClawMem
 bun install
 
 # Optional: start GPU inference services for performance (see CLAUDE.md for model details)
-# Without these, all three models auto-download and run on CPU via node-llama-cpp
+# Without these, all three models auto-download via node-llama-cpp (Metal/Vulkan/CPU)
 llama-server -m embeddinggemma-300M-Q8_0.gguf --embeddings --port 8088 -ngl 99 -c 2048 --batch-size 2048
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf --port 8089 -ngl 99 -c 4096
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf --reranking --port 8090 -ngl 99 -c 2048 --batch-size 512

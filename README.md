@@ -172,7 +172,7 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### GPU Services
 
-ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. All three have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads on first use), so ClawMem works without any GPU. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback to slower CPU inference.
+ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. All three have in-process fallbacks via `node-llama-cpp` (auto-downloads on first use), so ClawMem works without a dedicated GPU. `node-llama-cpp` auto-detects the best available backend — Metal on Apple Silicon, Vulkan where available, CPU otherwise. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback to slower in-process inference.
 
 **GPU with VRAM to spare (12GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~10GB VRAM.
 
@@ -186,7 +186,7 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Al
 
 **License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The QMD native models below have no such restriction.
 
-**CPU / GPU without VRAM to spare:** The QMD native combo — total ~4GB VRAM, also runs on CPU.
+**No dedicated GPU / GPU without VRAM to spare:** The QMD native combo — total ~4GB VRAM, also runs via `node-llama-cpp` (Metal on Apple Silicon, Vulkan/CPU otherwise).
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
@@ -194,7 +194,7 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Al
 | LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
-The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable, ClawMem silently falls back to in-process CPU inference via `node-llama-cpp` (auto-downloads the QMD native models on first use). This means ClawMem always works, but **if you're running GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up** — otherwise a crashed server silently degrades to much slower CPU models without warning.
+The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp` (auto-downloads the QMD native models on first use, uses Metal/Vulkan/CPU depending on hardware). This means ClawMem always works, but **if you're running dedicated GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up** — otherwise a crashed server silently degrades to slower in-process models without warning.
 
 To prevent silent fallback and fail fast instead, set `CLAWMEM_NO_LOCAL_MODELS=true`.
 
@@ -210,9 +210,9 @@ export CLAWMEM_RERANK_URL=http://gpu-host:8090
 
 For remote setups, set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent `node-llama-cpp` from auto-downloading multi-GB model files if a server is unreachable.
 
-#### CPU-Only Mode (no GPU)
+#### No Dedicated GPU (in-process inference)
 
-All three QMD native models run on CPU — no GPU required. `node-llama-cpp` auto-downloads them on first use (~300MB embedding + ~1.1GB LLM + ~600MB reranker). CPU inference is slower but fully functional.
+All three QMD native models run locally without a dedicated GPU. `node-llama-cpp` auto-downloads them on first use (~300MB embedding + ~1.1GB LLM + ~600MB reranker) and auto-detects the best backend — **Metal on Apple Silicon** (fast, uses integrated GPU), Vulkan where available, or CPU. In-process inference is slower than a dedicated `llama-server` but fully functional.
 
 Alternatively, use a [cloud embedding provider](#option-c-cloud-embedding-api) if you prefer not to run models locally.
 
@@ -960,7 +960,7 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 
 ## Deployment
 
-Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box on CPU (all models auto-download via `node-llama-cpp`). For best performance, run three `llama-server` instances — see [GPU Services](#gpu-services) for model tiers (SOTA vs QMD native) and [Cloud Embedding](#option-c-cloud-embedding-api) for cloud embedding alternatives.
+Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box without a dedicated GPU (all models auto-download via `node-llama-cpp`, uses Metal on Apple Silicon). For best performance, run three `llama-server` instances — see [GPU Services](#gpu-services) for model tiers (SOTA vs QMD native) and [Cloud Embedding](#option-c-cloud-embedding-api) for cloud embedding alternatives.
 
 Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 9 Claude Code hooks (context injection, session bootstrap, decision extraction, handoffs, feedback, compaction support). Optional `clawmem-curator` agent for on-demand lifecycle triage, retrieval health checks, and maintenance (`clawmem setup curator`).
 

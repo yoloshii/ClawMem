@@ -4,7 +4,7 @@
 
 ClawMem uses three `llama-server` instances for neural inference. By default, the `bin/clawmem` wrapper points at `localhost:8088/8089/8090`.
 
-**Default (QMD native combo, any GPU or CPU):**
+**Default (QMD native combo, any GPU or in-process):**
 
 | Service | Port | Model | VRAM | Protocol |
 |---|---|---|---|---|
@@ -12,7 +12,7 @@ ClawMem uses three `llama-server` instances for neural inference. By default, th
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
-All three models auto-download via `node-llama-cpp` and run on CPU if no server is running.
+All three models auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan/CPU otherwise).
 
 **SOTA upgrade (12GB+ GPU):** CC-BY-NC-4.0 — non-commercial only.
 
@@ -570,7 +570,7 @@ Symptom: "Local model download blocked" error
   → Fix: Start the llama-server instance. Or set CLAWMEM_NO_LOCAL_MODELS=false for in-process fallback.
 
 Symptom: Query expansion always fails / returns garbage
-  → In-process CPU inference is significantly slower and less reliable than GPU.
+  → In-process inference is slower and less reliable than a dedicated GPU server.
   → Fix: Run llama-server on a GPU. Even a low-end NVIDIA card handles 1.7B models.
 
 Symptom: Vector search returns no results but BM25 works

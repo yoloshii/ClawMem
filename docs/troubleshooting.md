@@ -4,14 +4,14 @@
 
 **"Local model download blocked" error**
 - The llama-server endpoint is unreachable while `CLAWMEM_NO_LOCAL_MODELS=true`.
-- Fix: Start the llama-server instance. Or set `CLAWMEM_NO_LOCAL_MODELS=false` for in-process CPU fallback.
+- Fix: Start the llama-server instance. Or set `CLAWMEM_NO_LOCAL_MODELS=false` for in-process fallback.
 
-**Unexpectedly slow inference (silent CPU fallback)**
-- If a llama-server instance crashes or is unreachable, ClawMem silently falls back to in-process CPU inference via `node-llama-cpp`. There is no visible warning — embedding, query expansion, and reranking just become much slower.
+**Unexpectedly slow inference (silent in-process fallback)**
+- If a llama-server instance crashes or is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp` (Metal on Apple Silicon, Vulkan/CPU otherwise). There is no visible warning — embedding, query expansion, and reranking just become slower.
 - Fix: Run GPU servers via [systemd services](guides/systemd-services.md) with `Restart=on-failure`. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back.
 
 **Query expansion always fails or returns garbage**
-- In-process CPU inference is significantly slower and less reliable than GPU.
+- In-process inference is slower and less reliable than a dedicated GPU server.
 - Fix: Run llama-server on a GPU. Even a low-end NVIDIA card handles 1.7B models.
 
 **Vector search returns no results but BM25 works**

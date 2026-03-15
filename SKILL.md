@@ -20,7 +20,7 @@ Two tiers: **hooks** handle automatic context flow (surfacing, extraction, compa
 
 Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`.
 
-**Default (QMD native combo, any GPU or CPU):**
+**Default (QMD native combo, any GPU or in-process):**
 
 | Service | Port | Model | VRAM | Protocol |
 |---|---|---|---|---|
@@ -28,7 +28,7 @@ Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper d
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
-All three models auto-download via `node-llama-cpp` and run on CPU if no server is running.
+All three models auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan/CPU otherwise).
 
 **SOTA upgrade (12GB+ GPU):** zembed-1-Q4_K_M (embedding, 2560d, ~4.4GB) + zerank-2-Q4_K_M (reranker, ~3.3GB). Total ~10GB with LLM. Distillation-paired via zELO. `-ub` must match `-b` for both. **CC-BY-NC-4.0** — non-commercial only.
 
@@ -596,7 +596,7 @@ Symptom: "Local model download blocked" error
   -> Fix: Start llama-server. Or set CLAWMEM_NO_LOCAL_MODELS=false for in-process fallback.
 
 Symptom: Query expansion always fails / returns garbage
-  -> In-process CPU inference is slow and unreliable.
+  -> In-process inference is slower and less reliable than a dedicated GPU server.
   -> Fix: Run llama-server on GPU.
 
 Symptom: Vector search returns no results but BM25 works

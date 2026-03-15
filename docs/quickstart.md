@@ -47,18 +47,18 @@ This creates a vault at `~/.cache/clawmem/index.sqlite`, indexes all `.md` files
 
 ## Start GPU services
 
-ClawMem uses three llama-server instances for best performance. All three models also auto-download and run on CPU via `node-llama-cpp` if no server is running — but CPU inference is significantly slower. If you're using GPU servers, run them via [systemd services](guides/systemd-services.md) to prevent silent fallback to CPU on server crash.
+ClawMem uses three llama-server instances for best performance. All three models also auto-download and run locally via `node-llama-cpp` if no server is running — using Metal on Apple Silicon, Vulkan where available, or CPU. In-process inference is slower than a dedicated server. If you're using GPU servers, run them via [systemd services](guides/systemd-services.md) to prevent silent fallback on server crash.
 
 ```bash
-# Embedding (recommended for performance — falls back to in-process CPU if no server)
+# Embedding (recommended for performance — falls back to in-process if no server)
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 
-# LLM — query expansion (falls back to CPU if unavailable)
+# LLM — query expansion (falls back to in-process if unavailable)
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
   --port 8089 --host 0.0.0.0 -ngl 99 -c 4096
 
-# Reranker (falls back to CPU if unavailable)
+# Reranker (falls back to in-process if unavailable)
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
