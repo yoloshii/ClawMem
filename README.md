@@ -10,7 +10,7 @@ ClawMem fuses state-of-the-art approaches from recent research into a single ret
 
 Dual-mode delivery: integrates as Claude Code hooks + MCP server, or as a native OpenClaw ContextEngine plugin. Both modes share the same local SQLite vault - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms.
 
-TypeScript on Bun. ~19,400 lines across 42 source files. 471 tests.
+TypeScript on Bun. MIT License.
 
 ## What It Does
 
@@ -44,47 +44,9 @@ Runs fully local — no API keys, no cloud services. Dual-mode delivery: integra
 
 ## Architecture
 
-```
-Claude Code Session
-    │
-    ├─ UserPromptSubmit ──→ context-surfacing hook
-    │                       search vault → composite score → sanitize → inject
-    │
-    ├─ SessionStart ──────→ postcompact-inject + curator-nudge hooks
-    │                       re-inject state after compaction + surface curator actions
-    │
-    └─ Stop ──────────────→ decision-extractor + handoff-generator + feedback-loop
-    │                       + causal inference from Observer facts
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  Intent-Aware Search Layer                               │
-│  Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)    │
-│  → Intent-Weighted RRF → Graph Expansion → Reranking     │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────┐
-│  Multi-Graph Memory Layer                                │
-│  Semantic Graph (vector similarity > 0.7 threshold)      │
-│  Temporal Backbone (chronological document ordering)     │
-│  Causal Graph (LLM-inferred cause → effect chains)       │
-│  A-MEM Notes (keywords, tags, contextual descriptions)   │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────┐
-│  SAME Composite Scoring Layer                            │
-│  compositeScore = (w.search × searchScore                │
-│                 + w.recency × recencyDecay               │
-│                 + w.confidence × confidence)              │
-│                 × qualityMultiplier × lengthNorm          │
-│                 × coActivationBoost + pinBoost            │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────┐
-│  QMD Search Backend (forked)                             │
-│  BM25 (FTS5) + Vector (sqlite-vec) + Query               │
-│  Expansion + RRF (k=60) + Cross-Encoder Reranking        │
-└─────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/clawmem-architecture.png" alt="ClawMem Architecture" width="100%">
+</p>
 
 ## Install
 
@@ -293,7 +255,7 @@ llama-server -m embeddinggemma-300M-Q8_0.gguf \
   -c 2048 --batch-size 2048
 ```
 
-For multilingual corpora: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) (set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
+For multilingual corpora, the SOTA zembed-1 (Option A) supports multilingual out of the box. For a lightweight alternative: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) (314MB, set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
 
 #### Option C: Cloud Embedding API
 

@@ -63,7 +63,7 @@ src/
     shell.ts          Shell-out transport utilities
     tools.ts          REST API agent tools
     plugin.json       Plugin manifest
-test/
+tests/
   unit/               Unit tests
   integration/        Integration tests (when present)
 docs/                 Documentation (this folder)

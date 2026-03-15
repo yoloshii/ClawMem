@@ -70,7 +70,7 @@ Fragments are embedded independently. The full-document fragment catches broad q
 | Vector (vec0) | Semantic similarity | 1 call | Conceptual queries, fuzzy recall |
 | Hybrid (RRF) | BM25 + Vector fused | 1+ calls | General recall (default) |
 
-BM25 uses SQLite's FTS5 extension with prefix matching. Vector search uses the `vec0` extension with cosine similarity on 768-dimensional embeddings.
+BM25 uses SQLite's FTS5 extension with prefix matching. Vector search uses the `vec0` extension with cosine similarity. Embedding dimensions depend on the model: 768 for the default EmbeddingGemma-300M, 2560 for the SOTA zembed-1, or provider-determined for cloud embedding.
 
 ## Retrieval tiers
 

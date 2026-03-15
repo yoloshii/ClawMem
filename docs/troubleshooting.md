@@ -8,7 +8,7 @@
 
 **Unexpectedly slow inference (silent CPU fallback)**
 - If a llama-server instance crashes or is unreachable, ClawMem silently falls back to in-process CPU inference via `node-llama-cpp`. There is no visible warning — embedding, query expansion, and reranking just become much slower.
-- Fix: Run GPU servers via [systemd services](../docs/guides/systemd-services.md) with `Restart=on-failure`. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back.
+- Fix: Run GPU servers via [systemd services](guides/systemd-services.md) with `Restart=on-failure`. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back.
 
 **Query expansion always fails or returns garbage**
 - In-process CPU inference is significantly slower and less reliable than GPU.

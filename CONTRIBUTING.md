@@ -5,8 +5,8 @@ Thanks for your interest in contributing. This guide covers everything you need 
 ## Prerequisites
 
 - [Bun](https://bun.sh/) >= 1.0.0
-- [llama-server](https://github.com/ggerganov/llama.cpp) (for embedding/LLM/reranker inference)
-- A GPU with ~4.5 GB VRAM (or CPU with patience)
+- [llama-server](https://github.com/ggerganov/llama.cpp) (optional — all three models auto-download via `node-llama-cpp` and run on CPU)
+- A GPU with 4-12 GB VRAM for performance (or CPU with patience)
 
 ## Development Setup
 
@@ -16,15 +16,11 @@ git clone https://github.com/yoloshii/ClawMem.git
 cd ClawMem
 bun install
 
-# Start inference services (see CLAUDE.md for model downloads)
-llama-server -m granite-embedding-278m-multilingual-Q6_K.gguf --embeddings --port 8088 -ngl 99
-llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf --port 8089 -ngl 99
-llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf --port 8090 -ngl 99 --reranking
-
-# Verify
-curl http://localhost:8088/v1/models
-curl http://localhost:8089/v1/models
-curl http://localhost:8090/v1/models
+# Optional: start GPU inference services for performance (see CLAUDE.md for model details)
+# Without these, all three models auto-download and run on CPU via node-llama-cpp
+llama-server -m embeddinggemma-300M-Q8_0.gguf --embeddings --port 8088 -ngl 99 -c 2048 --batch-size 2048
+llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf --port 8089 -ngl 99 -c 4096
+llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf --reranking --port 8090 -ngl 99 -c 2048 --batch-size 512
 ```
 
 ## Running Tests
@@ -34,10 +30,7 @@ curl http://localhost:8090/v1/models
 bun test
 
 # Specific test file
-bun test test/unit/some-file.test.ts
-
-# Smoke tests (requires running inference services)
-bun test test/smoke.test.ts
+bun test tests/unit/some-file.test.ts
 ```
 
 ## Project Structure
@@ -45,11 +38,10 @@ bun test test/smoke.test.ts
 ```
 src/           # Source code (TypeScript)
 bin/           # CLI wrapper
-test/
+tests/
   unit/        # Unit tests (no GPU needed)
   fixtures/    # Test data
   helpers/     # Shared test utilities
-  smoke.test.ts  # Integration tests (needs inference services)
 config.yaml    # Default configuration
 ```
 
@@ -60,7 +52,7 @@ config.yaml    # Default configuration
    git checkout -b feature/your-change
    ```
 
-2. **Write tests first** -- add or update tests in `test/` for your change. Tests should assert correct behavior, not current behavior.
+2. **Write tests first** -- add or update tests in `tests/` for your change. Tests should assert correct behavior, not current behavior.
 
 3. **Make your changes** -- keep commits focused. One logical change per commit.
 

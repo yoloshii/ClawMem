@@ -103,6 +103,8 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 | `CLAWMEM_EMBED_API_KEY` | — | API key for cloud embedding |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests |
 | `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input |
+| `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing |
+| `CLAWMEM_EMBED_DIMENSIONS` | — | Output dimensions for OpenAI `text-embedding-3-*` models |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block node-llama-cpp auto-downloads |

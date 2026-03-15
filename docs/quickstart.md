@@ -74,7 +74,7 @@ No GPU? See [cloud embedding](guides/cloud-embedding.md) for OpenAI, Voyage, Jin
 ```bash
 ./bin/clawmem doctor    # Full health check
 ./bin/clawmem status    # Quick index status
-bun test                # Run test suite (471 tests)
+bun test                # Run test suite
 ```
 
 ## What happens next

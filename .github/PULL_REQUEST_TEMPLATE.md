@@ -13,7 +13,7 @@
 ## Testing
 
 - [ ] Unit tests added/updated
-- [ ] Smoke tests pass (`bun test test/smoke.test.ts`)
+- [ ] All tests pass (`bun test`)
 - [ ] Manual testing done with `bin/clawmem`
 
 ## Notes
