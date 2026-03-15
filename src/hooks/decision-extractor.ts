@@ -479,10 +479,7 @@ export async function decisionExtractor(
     }
   }
 
-  return makeContextOutput(
-    "decision-extractor",
-    `<vault-decisions>Extracted ${decisionCount} decision(s) from session (observer: ${observedDecisions.length > 0}).</vault-decisions>`
-  );
+  return makeEmptyOutput("decision-extractor");
 }
 
 // =============================================================================

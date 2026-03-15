@@ -21,6 +21,7 @@ import {
 import {
   applyCompositeScoring,
   hasRecencyIntent,
+  inferMemoryType,
   type EnrichedResult,
   type ScoredResult,
 } from "../memory.ts";
@@ -34,12 +35,25 @@ import { getActiveProfile } from "../config.ts";
 // Config
 // =============================================================================
 
+// Profile-driven defaults (overridden by CLAWMEM_PROFILE env var)
+const DEFAULT_TOKEN_BUDGET = 800;
+const DEFAULT_MAX_RESULTS = 10;
+const DEFAULT_MIN_SCORE = 0.45;
 const MIN_COMPOSITE_SCORE_RECENCY = 0.35;
-const SNIPPET_MAX_CHARS = 300;
 const MIN_PROMPT_LENGTH = 20;
+
+// Tiered injection: HOT gets full snippets, WARM gets shorter, COLD gets title-only
+function getTierConfig(score: number): { snippetLen: number; showMeta: boolean; tier: string } {
+  if (score > 0.8) return { snippetLen: 300, showMeta: true, tier: "HOT" };
+  if (score > 0.6) return { snippetLen: 150, showMeta: false, tier: "WARM" };
+  return { snippetLen: 0, showMeta: false, tier: "COLD" };
+}
 
 // Directories to never surface
 const FILTERED_PATHS = ["_PRIVATE/", "experiments/", "_clawmem/"];
+
+// File path patterns to extract from prompts (E13: file-aware UserPromptSubmit)
+const FILE_PATH_RE = /(?:^|\s)((?:\/[\w.@-]+)+(?:\.\w+)?|[\w.@-]+\.(?:ts|js|py|md|sh|yaml|yml|json|toml|rs|go|tsx|jsx|css|html))\b/g;
 
 // =============================================================================
 // Handler
@@ -75,7 +89,7 @@ export async function contextSurfacing(
   const isRecency = hasRecencyIntent(prompt);
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : profile.minScore;
 
-  // Search: try vector first (if profile enables it), fall back to BM25
+  // Search: try vector first (if profile allows), fall back to BM25
   // When vector succeeds, also supplement with FTS for keyword-exact recall
   let results: SearchResult[] = [];
   if (profile.useVector) {
@@ -104,6 +118,24 @@ export async function contextSurfacing(
     }
   }
 
+  // File-aware supplemental search (E13): extract file paths/names from prompt
+  // and run targeted FTS queries to surface file-specific vault context
+  const fileMatches = [...prompt.matchAll(FILE_PATH_RE)].map(m => m[1]!.trim()).filter(Boolean);
+  if (fileMatches.length > 0) {
+    const seen = new Set(results.map(r => r.filepath));
+    for (const fp of fileMatches.slice(0, 3)) {
+      try {
+        const fileResults = store.searchFTS(fp, 2);
+        for (const r of fileResults) {
+          if (!seen.has(r.filepath)) {
+            seen.add(r.filepath);
+            results.push(r);
+          }
+        }
+      } catch { /* non-fatal */ }
+    }
+  }
+
   if (results.length === 0) return makeEmptyOutput("context-surfacing");
 
   // Filter out private/excluded paths
@@ -116,8 +148,6 @@ export async function contextSurfacing(
   // Filter out snoozed documents
   const now = new Date();
   results = results.filter(r => {
-    // filepath is a virtual path (clawmem://collection/path) but findActiveDocument
-    // expects the collection-relative path, not the full virtual path
     const parsed = r.filepath.startsWith('clawmem://') ? r.filepath.replace(/^clawmem:\/\/[^/]+\/?/, '') : r.filepath;
     const doc = store.findActiveDocument(r.collectionName, parsed);
     if (!doc) return true;
@@ -149,7 +179,42 @@ export async function contextSurfacing(
 
   if (scored.length === 0) return makeEmptyOutput("context-surfacing");
 
-  // Build context within token budget
+  // Spreading activation (E11): boost results co-activated with top HOT results
+  if (scored.length > 3) {
+    const hotPaths = scored.slice(0, 3)
+      .filter(r => r.compositeScore > 0.8)
+      .map(r => r.displayPath);
+
+    for (const hotPath of hotPaths) {
+      try {
+        const coActs = store.getCoActivated(hotPath, 3);
+        for (const ca of coActs) {
+          const existing = scored.find(r => r.displayPath === ca.path);
+          if (existing && existing.compositeScore <= 0.8) {
+            existing.compositeScore += Math.min(0.2, 0.1 * Math.min(ca.count, 2));
+          }
+        }
+      } catch {
+        // co_activations table may not exist yet
+      }
+    }
+    scored.sort((a, b) => b.compositeScore - a.compositeScore);
+  }
+
+  // Memory type diversification (E10): ensure procedural results aren't crowded out
+  if (scored.length > 3) {
+    const top3Types = scored.slice(0, 3).map(r => inferMemoryType(r.displayPath, r.contentType, r.body));
+    const hasProc = top3Types.includes("procedural");
+    if (!hasProc) {
+      const procIdx = scored.findIndex(r => inferMemoryType(r.displayPath, r.contentType, r.body) === "procedural");
+      if (procIdx > 3) {
+        const [proc] = scored.splice(procIdx, 1);
+        scored.splice(3, 0, proc!);
+      }
+    }
+  }
+
+  // Build context within token budget (profile-driven)
   const { context, paths, tokens } = buildContext(scored, prompt, tokenBudget);
 
   if (!context) return makeEmptyOutput("context-surfacing");
@@ -159,9 +224,14 @@ export async function contextSurfacing(
     logInjection(store, input.sessionId, "context-surfacing", paths, tokens);
   }
 
+  // Routing hint: detect query intent signals and prepend a tool routing directive
+  const routingHint = detectRoutingHint(prompt);
+
   return makeContextOutput(
     "context-surfacing",
-    `<vault-context>\n${context}\n</vault-context>`
+    routingHint
+      ? `<vault-routing>${routingHint}</vault-routing>\n<vault-context>\n${context}\n</vault-context>`
+      : `<vault-context>\n${context}\n</vault-context>`
   );
 }
 
@@ -169,10 +239,33 @@ export async function contextSurfacing(
 // Helpers
 // =============================================================================
 
+/**
+ * Detect causal/temporal/discovery signals in the prompt and return a
+ * routing hint that makes the correct tool choice salient at the moment
+ * of tool selection. Returns null for general queries (no hint needed).
+ */
+function detectRoutingHint(prompt: string): string | null {
+  const q = prompt.toLowerCase();
+
+  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do|cross.session|earlier today|what we discussed|when we last)\b/i.test(q)) {
+    return "If searching memory for this: use session_log or memory_retrieve, NOT query.";
+  }
+
+  if (/\b(why did|why was|why were|what caused|what led to|reason for|decided to|decision about|trade.?off|instead of|chose to)\b/i.test(q) || /^why\b/i.test(q)) {
+    return "If searching memory for this: use intent_search or memory_retrieve, NOT query.";
+  }
+
+  if (/\b(similar to|related to|what else|what other|reminds? me of|like this)\b/i.test(q)) {
+    return "If searching memory for this: use find_similar or memory_retrieve, NOT query.";
+  }
+
+  return null;
+}
+
 function buildContext(
   scored: ScoredResult[],
   query: string,
-  budget: number = 800
+  budget: number = DEFAULT_TOKEN_BUDGET
 ): { context: string; paths: string[]; tokens: number } {
   const lines: string[] = [];
   const paths: string[] = [];
@@ -181,16 +274,8 @@ function buildContext(
   for (const r of scored) {
     if (totalTokens >= budget) break;
 
-    const bodyStr = r.body || "";
-
-    // Prompt injection guard: sanitize snippet before injection
-    const sanitized = sanitizeSnippet(bodyStr);
-    if (sanitized === "[content filtered for security]") continue;
-
-    const snippet = smartTruncate(
-      extractSnippet(sanitized, query, SNIPPET_MAX_CHARS, r.chunkPos).snippet,
-      SNIPPET_MAX_CHARS
-    );
+    // Tiered injection: allocate snippet length by composite score
+    const tier = getTierConfig(r.compositeScore);
 
     // Sanitize title and displayPath to prevent injection via metadata fields
     const safeTitle = sanitizeSnippet(r.title);
@@ -198,7 +283,23 @@ function buildContext(
     if (safeTitle === "[content filtered for security]" || safePath === "[content filtered for security]") continue;
 
     const typeTag = r.contentType !== "note" ? ` (${r.contentType})` : "";
-    const entry = `**${safeTitle}**${typeTag}\n${safePath}\n${snippet}`;
+    let entry: string;
+
+    if (tier.snippetLen > 0) {
+      // HOT or WARM: include snippet
+      const bodyStr = r.body || "";
+      const sanitized = sanitizeSnippet(bodyStr);
+      if (sanitized === "[content filtered for security]") continue;
+
+      const snippet = smartTruncate(
+        extractSnippet(sanitized, query, tier.snippetLen, r.chunkPos).snippet,
+        tier.snippetLen
+      );
+      entry = `**${safeTitle}**${typeTag}\n${safePath}\n${snippet}`;
+    } else {
+      // COLD: title + path only, no snippet
+      entry = `**${safeTitle}**${typeTag}\n${safePath}`;
+    }
 
     const entryTokens = estimateTokens(entry);
     if (totalTokens + entryTokens > budget && lines.length > 0) break;
