@@ -96,6 +96,8 @@ The LLM (query expansion) and reranker always use local `llama-server` or in-pro
 - **LLM** — local GPU, falls back to in-process CPU
 - **Reranker** — local GPU, falls back to in-process CPU
 
+**Note:** CPU fallback is silent — if a GPU server crashes, there is no warning. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead, or use [systemd services](systemd-services.md) to keep servers running.
+
 ## Model recommendations
 
 **Default (QMD native combo, any GPU or CPU):** EmbeddingGemma-300M-Q8_0 (314MB, 768d) + qwen3-reranker-0.6B (600MB) + qmd-query-expansion-1.7B (~1.1GB). All three auto-download via `node-llama-cpp` if no server is running. Works on CPU.
