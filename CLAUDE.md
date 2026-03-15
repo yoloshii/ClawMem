@@ -625,6 +625,14 @@ Symptom: embed --force with new model produces 3 docs stuck as "Unembedded" but 
 Symptom: CLI reindex/update falls back to node-llama-cpp Vulkan (not GPU server)
   → GPU env vars only in systemd drop-in, not in wrapper script. CLI invocations missed them.
   → Fixed 2026-02-12: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
+
+Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
+  → SQLite contention between the watcher and the hook. The watcher processes filesystem events
+    (including non-.md files like session .jsonl transcripts) and holds brief write locks. If the
+    hook fires during a lock, it can exceed its timeout. More likely during active conversations
+    when the watcher is processing rapid transcript changes.
+  → Fix: Bump the hook timeout from 5s to 8s in ~/.claude/settings.json. If persistent, restart
+    the watcher to clear memory bloat: `systemctl --user restart clawmem-watcher.service`.
 ```
 
 ## CLI Reference

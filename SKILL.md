@@ -630,6 +630,13 @@ Symptom: reindex --force crashes with UNIQUE constraint
 Symptom: CLI reindex/update falls back to node-llama-cpp
   -> GPU env vars only in systemd drop-in, not in wrapper script.
   -> Fixed: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
+
+Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
+  -> SQLite contention between watcher and hook. Watcher processes filesystem events (including
+     non-.md files like session .jsonl transcripts) and holds brief write locks. If the hook fires
+     during a lock, it can exceed its timeout. More likely during active conversations.
+  -> Fix: Bump hook timeout from 5s to 8s in ~/.claude/settings.json. If persistent, restart
+     the watcher: `systemctl --user restart clawmem-watcher.service`.
 ```
 
 ---
