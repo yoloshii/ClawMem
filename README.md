@@ -1,4 +1,4 @@
-# ClawMem — Memory engine for Claude Code and AI agents
+# ClawMem — Context engine for Claude Code and AI agents
 
 <p align="center">
   <img src="docs/clawmem_hero.jpg" alt="ClawMem" width="100%">
