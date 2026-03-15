@@ -1,6 +1,6 @@
 # Quickstart
 
-Get ClawMem running with a searchable vault in under 5 minutes.
+Set up ClawMem as persistent memory for Claude Code in under 5 minutes. By the end you'll have hooks injecting context on every prompt and an MCP server for agent-initiated retrieval.
 
 ## Prerequisites
 

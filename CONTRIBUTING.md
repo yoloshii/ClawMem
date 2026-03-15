@@ -1,6 +1,6 @@
 # Contributing to ClawMem
 
-Thanks for your interest in contributing. This guide covers everything you need to get started.
+ClawMem is an on-device memory engine for Claude Code and AI agents, built with TypeScript on Bun. Thanks for your interest in contributing.
 
 ## Prerequisites
 

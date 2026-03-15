@@ -1,4 +1,6 @@
-# Architecture
+# ClawMem architecture
+
+ClawMem stores AI agent memory in a single SQLite vault that combines BM25 full-text search with vector embeddings and graph-based retrieval. This page explains how vaults, collections, documents, and search backends fit together.
 
 ## Vaults
 

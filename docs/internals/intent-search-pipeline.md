@@ -1,6 +1,6 @@
-# Intent Search Pipeline
+# Intent search pipeline
 
-The `intent_search` tool classifies query intent and uses graph traversal to find causal chains that keyword/vector search can't reach.
+The `intent_search` MCP tool classifies query intent and uses graph traversal to find causal chains across AI agent memory that keyword and vector search alone can't reach.
 
 ## Pipeline stages
 

@@ -1,4 +1,6 @@
-# Contributing
+# Contributing to ClawMem
+
+Development guide for the ClawMem memory engine (TypeScript on Bun, SQLite vector search, Claude Code hooks, MCP server).
 
 ## Development setup
 
@@ -11,7 +13,7 @@ bun install
 ## Running tests
 
 ```bash
-bun test              # All tests (471)
+bun test              # All tests
 bun test tests/unit   # Unit tests only
 ```
 
@@ -30,7 +32,7 @@ Must pass with zero errors on source files.
 ```
 src/
   clawmem.ts         CLI entry point
-  mcp.ts             MCP server (24+ tools)
+  mcp.ts             MCP server
   server.ts          REST API server
   store.ts           SQLite store (documents, vectors, relations)
   llm.ts             LLM abstraction (embedding, generation, reranking)

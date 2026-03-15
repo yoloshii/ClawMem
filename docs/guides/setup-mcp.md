@@ -1,6 +1,6 @@
-# Setup MCP
+# Setting up the MCP server
 
-Register ClawMem as an MCP (Model Context Protocol) server so agents can call memory tools directly.
+Register ClawMem as an MCP (Model Context Protocol) server so AI agents can call memory tools directly. This works alongside Claude Code hooks or standalone with any MCP-compatible client.
 
 ## Install
 

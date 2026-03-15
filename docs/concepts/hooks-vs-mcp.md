@@ -1,6 +1,6 @@
-# Hooks vs MCP Tools
+# Claude Code hooks vs MCP tools
 
-ClawMem uses a two-tier retrieval model: hooks handle ~90% of context delivery automatically, MCP tools cover the remaining ~10% when the agent needs to escalate.
+ClawMem delivers AI agent memory through two tiers: Claude Code hooks handle about 90% of context delivery automatically, while MCP server tools cover the remaining 10% when the agent needs to escalate.
 
 ## Tier 2 — Hooks (automatic)
 

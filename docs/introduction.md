@@ -1,6 +1,6 @@
-# Introduction
+# ClawMem overview
 
-ClawMem is an open-source, on-device context engine for AI agents. It gives agents persistent, searchable memory that survives across sessions, compactions, and runtime boundaries.
+ClawMem is an open-source memory engine for Claude Code and AI agents. It runs on-device, giving agents persistent and searchable memory that survives across sessions, compactions, and runtime boundaries. The system integrates as Claude Code hooks with an MCP server, or as a native OpenClaw ContextEngine plugin.
 
 ## What it does
 
@@ -76,4 +76,4 @@ All integrations share the same SQLite vault. The [watcher](guides/systemd-servi
 
 - [Quickstart](quickstart.md) — install and bootstrap in 5 minutes
 - [Concepts](concepts/architecture.md) — understand vaults, collections, and scoring
-- [MCP Tools Reference](reference/mcp-tools.md) — all 24+ tools with examples
+- [MCP Tools Reference](reference/mcp-tools.md) — full tool reference with examples

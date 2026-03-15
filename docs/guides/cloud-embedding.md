@@ -1,6 +1,6 @@
-# Cloud Embedding
+# Cloud embedding for ClawMem
 
-By default, ClawMem uses local embedding (via `llama-server` or in-process `node-llama-cpp` fallback — Metal on Apple Silicon, Vulkan where available, CPU as last resort). With GPU acceleration the fallback is fast; CPU-only is significantly slower. As an alternative, you can use a cloud embedding provider.
+By default, ClawMem embeds AI agent memory locally via `llama-server` or in-process `node-llama-cpp` fallback (Metal on Apple Silicon, Vulkan where available, CPU as last resort). With GPU acceleration the fallback is fast; CPU-only is significantly slower. As an alternative, you can use a cloud embedding provider instead of running models on your machine.
 
 ## Supported providers
 

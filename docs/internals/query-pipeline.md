@@ -1,6 +1,6 @@
-# Query Pipeline
+# Query pipeline
 
-The `query` tool runs the full hybrid retrieval pipeline — the most comprehensive search path in ClawMem.
+The `query` MCP tool runs the full hybrid retrieval pipeline, combining BM25, vector search, query expansion, and cross-encoder reranking in a single call.
 
 ## Pipeline stages
 

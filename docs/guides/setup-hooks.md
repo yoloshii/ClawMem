@@ -1,6 +1,6 @@
-# Setup Hooks
+# Setting up Claude Code hooks
 
-Hooks provide automatic context injection and extraction for Claude Code sessions.
+Claude Code hooks give ClawMem automatic context injection and extraction on every prompt and response. This is the primary integration path for Claude Code memory.
 
 ## Install default hooks
 

@@ -1,6 +1,6 @@
-# Multi-Vault
+# Multi-vault configuration
 
-By default, ClawMem operates as a single-vault system — all documents, embeddings, and graphs live in `~/.cache/clawmem/index.sqlite`. Multi-vault is opt-in for users who want separate memory domains.
+By default, ClawMem stores all AI agent memory in a single vault at `~/.cache/clawmem/index.sqlite`. Multi-vault is opt-in for users who want separate memory domains.
 
 ## When to use multiple vaults
 

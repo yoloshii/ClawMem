@@ -1,6 +1,6 @@
-# CLI Reference
+# ClawMem CLI reference
 
-Always use the `bin/clawmem` wrapper — it sets GPU endpoint defaults.
+Complete command reference for the ClawMem memory engine. Always use the `bin/clawmem` wrapper, which sets GPU endpoint defaults.
 
 ## Core commands
 

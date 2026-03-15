@@ -1,6 +1,6 @@
-# Multi-Vault Configuration
+# Multi-vault configuration
 
-Step-by-step guide for setting up multiple independent vaults.
+Step-by-step guide for setting up multiple independent ClawMem vaults to isolate AI agent memory by project or team.
 
 ## 1. Define vaults
 

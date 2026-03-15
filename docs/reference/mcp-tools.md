@@ -1,6 +1,6 @@
-# MCP Tools Reference
+# MCP server tools reference
 
-All tools accept an optional `vault` parameter for multi-vault setups. Omit for the default vault.
+Complete reference for ClawMem's MCP server tools. These let AI agents search, retrieve, and manage persistent memory. All tools accept an optional `vault` parameter for multi-vault setups. Omit for the default vault.
 
 ## Retrieval
 

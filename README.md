@@ -1,20 +1,20 @@
-# ClawMem
+# ClawMem — Memory engine for Claude Code and AI agents
 
 <p align="center">
-  <img src="docs/clawmem_hero.png" alt="ClawMem" width="100%">
+  <img src="docs/clawmem_hero.jpg" alt="ClawMem" width="100%">
 </p>
 
-**Local shared memory and context engine for AI agents.** Built for Claude Code and OpenClaw - runs entirely on-device with no API keys or cloud dependencies.
+**On-device memory for Claude Code and AI agents.** Retrieval-augmented search, hooks, and an MCP server in a single local system. No API keys, no cloud dependencies.
 
-ClawMem fuses state-of-the-art approaches from recent research into a single retrieval-augmented memory layer that agents actually use. The hybrid architecture combines [QMD](https://github.com/tobi/qmd)-derived multi-signal retrieval (BM25 + vector search + reciprocal rank fusion + query expansion + cross-encoder reranking), [SAME](https://github.com/sgx-labs/statelessagent)-inspired composite scoring (recency decay, confidence, content-type half-lives, co-activation reinforcement), [MAGMA](https://arxiv.org/abs/2501.13956)-style intent classification with multi-graph traversal (semantic, temporal, and causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes that automatically enrich documents with keywords, tags, and inter-document causal links. Pattern extraction from [Engram](https://github.com/Gentleman-Programming/engram) adds deduplication windows, frequency-based durability scoring, and temporal navigation.
+ClawMem fuses recent research into a retrieval-augmented memory layer that agents actually use. The hybrid architecture combines [QMD](https://github.com/tobi/qmd)-derived multi-signal retrieval (BM25 + vector search + reciprocal rank fusion + query expansion + cross-encoder reranking), [SAME](https://github.com/sgx-labs/statelessagent)-inspired composite scoring (recency decay, confidence, content-type half-lives, co-activation reinforcement), [MAGMA](https://arxiv.org/abs/2501.13956)-style intent classification with multi-graph traversal (semantic, temporal, and causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes that enrich documents with keywords, tags, and causal links between entries. Pattern extraction from [Engram](https://github.com/Gentleman-Programming/engram) adds deduplication windows, frequency-based durability scoring, and temporal navigation.
 
-Dual-mode delivery: integrates as Claude Code hooks + MCP server, or as a native OpenClaw ContextEngine plugin. Both modes share the same local SQLite vault - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms.
+Two integration paths: Claude Code hooks paired with an MCP server, or a native OpenClaw ContextEngine plugin. Both write to the same local SQLite vault. A decision captured during a Claude Code session shows up immediately when an OpenClaw agent picks up the same project.
 
 TypeScript on Bun. MIT License.
 
 ## What It Does
 
-ClawMem turns your markdown notes, project docs, and research dumps into an intelligent memory layer for AI coding agents. It automatically:
+ClawMem turns your markdown notes, project docs, and research dumps into persistent memory for AI coding agents. It automatically:
 
 - **Surfaces relevant context** on every prompt (context-surfacing hook)
 - **Bootstraps sessions** with your profile, latest handoff, recent decisions, and stale notes
@@ -40,7 +40,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into an inte
 - **Auto-routes queries** via `memory_retrieve` — classifies intent and dispatches to the optimal search backend
 - **Syncs project issues** from Beads issue trackers into searchable memory
 
-Runs fully local — no API keys, no cloud services. Dual-mode delivery: integrates via Claude Code hooks + MCP tools, and/or as an OpenClaw ContextEngine plugin. Both modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
+Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, or as an OpenClaw ContextEngine plugin. Both modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
 
 ## Architecture
 
@@ -433,7 +433,7 @@ curl -X POST http://localhost:7438/search \
 ```bash
 ./bin/clawmem doctor   # Full health check
 ./bin/clawmem status   # Quick index status
-bun test               # Run test suite (471 tests)
+bun test               # Run test suite
 ```
 
 ## Agent Instructions

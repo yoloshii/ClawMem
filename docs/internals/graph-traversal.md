@@ -1,6 +1,6 @@
-# Graph Traversal
+# Graph traversal in ClawMem
 
-ClawMem maintains a multi-graph of relationships between documents in the `memory_relations` table. These edges power `intent_search` graph expansion and `find_causal_links` chain tracing.
+ClawMem maintains a multi-graph of relationships between AI agent memory documents in the `memory_relations` table. These edges power `intent_search` graph expansion and `find_causal_links` chain tracing.
 
 ## Edge types
 

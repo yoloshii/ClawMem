@@ -1,5 +1,7 @@
 # Troubleshooting
 
+Common issues when running ClawMem as Claude Code memory or with an MCP server setup. Organized by subsystem.
+
 ## Embedding & GPU
 
 **"Local model download blocked" error**

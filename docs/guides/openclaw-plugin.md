@@ -1,6 +1,6 @@
-# OpenClaw ContextEngine Plugin
+# OpenClaw ContextEngine plugin
 
-ClawMem integrates with OpenClaw as a native ContextEngine plugin, providing the same memory capabilities available to Claude Code.
+ClawMem integrates with OpenClaw as a native ContextEngine plugin, giving OpenClaw agents the same persistent memory available to Claude Code. Both runtimes share a single vault, so decisions captured in one are available in the other.
 
 ## Install
 
