@@ -47,7 +47,7 @@ This creates a vault at `~/.cache/clawmem/index.sqlite`, indexes all `.md` files
 
 ## Start GPU services
 
-ClawMem uses three llama-server instances for best performance. All three models also auto-download and run locally via `node-llama-cpp` if no server is running — using Metal on Apple Silicon, Vulkan where available, or CPU. In-process inference is slower than a dedicated server. If you're using GPU servers, run them via [systemd services](guides/systemd-services.md) to prevent silent fallback on server crash.
+ClawMem uses three llama-server instances for best performance. All three models also auto-download and run locally via `node-llama-cpp` if no server is running — using Metal on Apple Silicon, Vulkan where available, or CPU as last resort. With GPU acceleration (Metal/Vulkan), in-process inference is fast for these small models; on CPU-only systems it is significantly slower. If you're using GPU servers, run them via [systemd services](guides/systemd-services.md) to prevent silent fallback on server crash.
 
 ```bash
 # Embedding (recommended for performance — falls back to in-process if no server)

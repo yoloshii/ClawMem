@@ -70,7 +70,7 @@ ClawMem is an open-source, on-device context engine for AI agents. It gives agen
 | Any MCP client | MCP stdio | Add to MCP config | watcher + embed timer |
 | Web / scripts | REST API | `clawmem serve` | watcher + embed timer + `clawmem serve` |
 
-All integrations share the same SQLite vault. The [watcher](guides/systemd-services.md#watcher-service) keeps the index fresh, the [embed timer](guides/systemd-services.md#embed-timer) maintains vector embeddings, and the [REST API](reference/rest-api.md) serves OpenClaw agent tools. GPU servers are optional — `node-llama-cpp` provides in-process fallback (Metal on Apple Silicon, Vulkan/CPU otherwise). The [curator agent](../agents/clawmem-curator.md) handles periodic maintenance on demand.
+All integrations share the same SQLite vault. The [watcher](guides/systemd-services.md#watcher-service) keeps the index fresh, the [embed timer](guides/systemd-services.md#embed-timer) maintains vector embeddings, and the [REST API](reference/rest-api.md) serves OpenClaw agent tools. GPU servers are optional — `node-llama-cpp` provides in-process fallback (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration; significantly slower on CPU-only. The [curator agent](../agents/clawmem-curator.md) handles periodic maintenance on demand.
 
 ## Next steps
 

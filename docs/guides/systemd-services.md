@@ -1,6 +1,6 @@
 # Systemd Services
 
-Keep ClawMem's background services running automatically with systemd user units. This is important for GPU setups — if a llama-server crashes, ClawMem silently falls back to slower in-process inference via `node-llama-cpp` (Metal on Apple Silicon, Vulkan/CPU otherwise). Systemd's `Restart=on-failure` ensures servers come back up automatically. To disable silent fallback entirely, set `CLAWMEM_NO_LOCAL_MODELS=true`.
+Keep ClawMem's background services running automatically with systemd user units. This is important for GPU setups — if a llama-server crashes, ClawMem silently falls back to in-process inference via `node-llama-cpp` (Metal on Apple Silicon, Vulkan where available, CPU as last resort). With GPU acceleration (Metal/Vulkan) the fallback is fast; on CPU-only systems it is significantly slower. Systemd's `Restart=on-failure` ensures servers come back up automatically. To disable silent fallback entirely, set `CLAWMEM_NO_LOCAL_MODELS=true`.
 
 ## Watcher service
 

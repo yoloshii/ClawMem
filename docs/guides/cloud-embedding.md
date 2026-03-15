@@ -1,6 +1,6 @@
 # Cloud Embedding
 
-By default, ClawMem uses local embedding (via `llama-server` or in-process `node-llama-cpp` fallback — Metal on Apple Silicon, Vulkan/CPU otherwise). As an alternative, you can use a cloud embedding provider.
+By default, ClawMem uses local embedding (via `llama-server` or in-process `node-llama-cpp` fallback — Metal on Apple Silicon, Vulkan where available, CPU as last resort). With GPU acceleration the fallback is fast; CPU-only is significantly slower. As an alternative, you can use a cloud embedding provider.
 
 ## Supported providers
 
@@ -92,15 +92,15 @@ If you set `CLAWMEM_EMBED_API_KEY` but your `CLAWMEM_EMBED_URL` points to localh
 
 The LLM (query expansion) and reranker always use local `llama-server` or in-process `node-llama-cpp` fallback. Only embedding supports cloud providers. This means:
 
-- **Embedding** — local GPU, cloud API, or in-process via `node-llama-cpp` (Metal/Vulkan/CPU)
+- **Embedding** — local GPU, cloud API, or in-process via `node-llama-cpp` (Metal/Vulkan/CPU — fast with GPU acceleration, slow on CPU-only)
 - **LLM** — local GPU, falls back to in-process `node-llama-cpp`
 - **Reranker** — local GPU, falls back to in-process `node-llama-cpp`
 
-**Note:** In-process fallback is silent — if a GPU server crashes, there is no warning. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead, or use [systemd services](systemd-services.md) to keep servers running.
+**Note:** In-process fallback is silent — if a GPU server crashes, there is no warning. With Metal/Vulkan the fallback is fast; on CPU-only it is significantly slower. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead, or use [systemd services](systemd-services.md) to keep servers running.
 
 ## Model recommendations
 
-**Default (QMD native combo, any GPU or CPU):** EmbeddingGemma-300M-Q8_0 (314MB, 768d) + qwen3-reranker-0.6B (600MB) + qmd-query-expansion-1.7B (~1.1GB). All three auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan/CPU otherwise).
+**Default (QMD native combo, any GPU or in-process):** EmbeddingGemma-300M-Q8_0 (314MB, 768d) + qwen3-reranker-0.6B (600MB) + qmd-query-expansion-1.7B (~1.1GB). All three auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration; significantly slower on CPU-only.
 
 ```bash
 llama-server -m embeddinggemma-300M-Q8_0.gguf \

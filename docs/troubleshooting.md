@@ -7,11 +7,11 @@
 - Fix: Start the llama-server instance. Or set `CLAWMEM_NO_LOCAL_MODELS=false` for in-process fallback.
 
 **Unexpectedly slow inference (silent in-process fallback)**
-- If a llama-server instance crashes or is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp` (Metal on Apple Silicon, Vulkan/CPU otherwise). There is no visible warning — embedding, query expansion, and reranking just become slower.
+- If a llama-server instance crashes or is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp`. With GPU acceleration (Metal on Apple Silicon, Vulkan on supported hardware), the fallback is fast for these small models. On CPU-only systems (no Metal, no Vulkan), inference is significantly slower. There is no visible warning either way.
 - Fix: Run GPU servers via [systemd services](guides/systemd-services.md) with `Restart=on-failure`. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back.
 
 **Query expansion always fails or returns garbage**
-- In-process inference is slower and less reliable than a dedicated GPU server.
+- On CPU-only systems (no Metal, no Vulkan), in-process inference is significantly slower and less reliable than a dedicated GPU server. Systems with GPU acceleration (Metal/Vulkan) handle these models well in-process.
 - Fix: Run llama-server on a GPU. Even a low-end NVIDIA card handles 1.7B models.
 
 **Vector search returns no results but BM25 works**

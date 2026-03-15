@@ -172,7 +172,7 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### GPU Services
 
-ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. All three have in-process fallbacks via `node-llama-cpp` (auto-downloads on first use), so ClawMem works without a dedicated GPU. `node-llama-cpp` auto-detects the best available backend — Metal on Apple Silicon, Vulkan where available, CPU otherwise. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback to slower in-process inference.
+ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. All three have in-process fallbacks via `node-llama-cpp` (auto-downloads on first use), so ClawMem works without a dedicated GPU. `node-llama-cpp` auto-detects the best available backend — Metal on Apple Silicon, Vulkan where available, CPU as last resort. With GPU acceleration (Metal/Vulkan), in-process inference is fast for these small models (0.3B–1.7B); on CPU-only systems it is significantly slower. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback.
 
 **GPU with VRAM to spare (12GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~10GB VRAM.
 
@@ -186,7 +186,7 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Al
 
 **License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The QMD native models below have no such restriction.
 
-**No dedicated GPU / GPU without VRAM to spare:** The QMD native combo — total ~4GB VRAM, also runs via `node-llama-cpp` (Metal on Apple Silicon, Vulkan/CPU otherwise).
+**No dedicated GPU / GPU without VRAM to spare:** The QMD native combo — total ~4GB VRAM, also runs via `node-llama-cpp` (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration; significantly slower on CPU-only.
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
@@ -194,7 +194,7 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Al
 | LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
-The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp` (auto-downloads the QMD native models on first use, uses Metal/Vulkan/CPU depending on hardware). This means ClawMem always works, but **if you're running dedicated GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up** — otherwise a crashed server silently degrades to slower in-process models without warning.
+The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp` (auto-downloads the QMD native models on first use, uses Metal/Vulkan/CPU depending on hardware). With GPU acceleration this is fast; on CPU-only it is significantly slower. ClawMem always works either way, but **if you're running dedicated GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up** — otherwise a crashed server silently degrades without warning.
 
 To prevent silent fallback and fail fast instead, set `CLAWMEM_NO_LOCAL_MODELS=true`.
 
@@ -212,7 +212,7 @@ For remote setups, set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent `node-llama-cpp
 
 #### No Dedicated GPU (in-process inference)
 
-All three QMD native models run locally without a dedicated GPU. `node-llama-cpp` auto-downloads them on first use (~300MB embedding + ~1.1GB LLM + ~600MB reranker) and auto-detects the best backend — **Metal on Apple Silicon** (fast, uses integrated GPU), Vulkan where available, or CPU. In-process inference is slower than a dedicated `llama-server` but fully functional.
+All three QMD native models run locally without a dedicated GPU. `node-llama-cpp` auto-downloads them on first use (~300MB embedding + ~1.1GB LLM + ~600MB reranker) and auto-detects the best backend — **Metal on Apple Silicon** (fast, uses integrated GPU), **Vulkan where available** (fast, uses discrete or integrated GPU), or **CPU as last resort** (significantly slower). With Metal or Vulkan, in-process inference handles these small models well; CPU-only is functional but noticeably slower.
 
 Alternatively, use a [cloud embedding provider](#option-c-cloud-embedding-api) if you prefer not to run models locally.
 
