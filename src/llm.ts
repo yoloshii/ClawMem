@@ -507,11 +507,13 @@ export class LlamaCpp implements LLM {
       console.error("[embed] CLAWMEM_EMBED_URL not set — remote GPU embedding server required");
       return null;
     }
-    return this.embedRemote(text);
+    const extraParams = this.getCloudEmbedParams(!!options.isQuery);
+    return this.embedRemote(text, extraParams);
   }
 
   /**
    * Batch embed multiple texts efficiently via single HTTP request.
+   * Cloud providers get provider-specific params (task/input_type, truncation).
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
@@ -519,7 +521,8 @@ export class LlamaCpp implements LLM {
       console.error("[embed] CLAWMEM_EMBED_URL not set — remote GPU embedding server required");
       return texts.map(() => null);
     }
-    return this.embedRemoteBatch(texts);
+    const extraParams = this.getCloudEmbedParams(false);
+    return this.embedRemoteBatch(texts, extraParams);
   }
 
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
@@ -537,6 +540,26 @@ export class LlamaCpp implements LLM {
     return !!this.remoteEmbedApiKey;
   }
 
+  /** Detect cloud provider from embed URL and return provider-specific request params */
+  private getCloudEmbedParams(isQuery: boolean): Record<string, unknown> {
+    if (!this.isCloudEmbedding() || !this.remoteEmbedUrl) return {};
+    const url = this.remoteEmbedUrl.toLowerCase();
+    if (url.includes("jina.ai")) {
+      return { task: isQuery ? "retrieval.query" : "retrieval.passage", truncate: true };
+    }
+    if (url.includes("voyageai.com")) {
+      return { input_type: isQuery ? "query" : "document" };
+    }
+    if (url.includes("cohere.")) {
+      return { input_type: isQuery ? "search_query" : "search_document", truncate: "END" };
+    }
+    if (url.includes("openai.com")) {
+      const dims = parseInt(process.env.CLAWMEM_EMBED_DIMENSIONS || "", 10);
+      return dims > 0 ? { dimensions: dims } : {};
+    }
+    return {};
+  }
+
   private getEmbedHeaders(): Record<string, string> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.remoteEmbedApiKey) {
@@ -552,59 +575,104 @@ export class LlamaCpp implements LLM {
       ? text.slice(0, this.maxRemoteEmbedChars) : text;
   }
 
-  private async embedRemote(text: string): Promise<EmbeddingResult | null> {
-    try {
-      const input = this.truncateForEmbed(text);
-      const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
-        method: "POST",
-        headers: this.getEmbedHeaders(),
-        body: JSON.stringify({ input, model: this.remoteEmbedModel }),
-      });
-      if (!resp.ok) {
-        console.error(`Remote embed HTTP ${resp.status}: ${await resp.text()}`);
-        return null;
-      }
-      const data = await resp.json() as {
-        data: { embedding: number[] }[];
-        model?: string;
-      };
-      return {
-        embedding: data.data[0]!.embedding,
-        model: data.model || this.remoteEmbedUrl!,
-      };
-    } catch (error) {
-      console.error("Remote embed error:", error);
-      return null;
-    }
+  /** Parse Retry-After header (seconds or HTTP-date) into milliseconds to wait */
+  private parseRetryAfter(resp: Response): number | null {
+    const header = resp.headers.get("retry-after");
+    if (!header) return null;
+    const secs = parseInt(header, 10);
+    if (!isNaN(secs)) return secs * 1000;
+    const date = Date.parse(header);
+    if (!isNaN(date)) return Math.max(0, date - Date.now());
+    return null;
   }
 
-  private async embedRemoteBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    try {
-      const truncated = texts.map(t => this.truncateForEmbed(t));
-      const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
-        method: "POST",
-        headers: this.getEmbedHeaders(),
-        body: JSON.stringify({ input: truncated, model: this.remoteEmbedModel }),
-      });
-      if (!resp.ok) {
-        console.error(`Remote batch embed HTTP ${resp.status}: ${await resp.text()}`);
+  /** Add ±25% jitter to a delay to prevent synchronized retries */
+  private jitter(delayMs: number): number {
+    return Math.floor(delayMs * (0.75 + Math.random() * 0.5));
+  }
+
+  private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5): Promise<EmbeddingResult | null> {
+    const input = this.truncateForEmbed(text);
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const body: Record<string, unknown> = { input, model: this.remoteEmbedModel, ...extraParams };
+        const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
+          method: "POST",
+          headers: this.getEmbedHeaders(),
+          body: JSON.stringify(body),
+        });
+        if (resp.status === 429) {
+          const retryAfter = this.parseRetryAfter(resp);
+          const delay = retryAfter ?? Math.min(1000 * 2 ** attempt, 30000);
+          console.error(`Remote embed rate-limited, retry ${attempt + 1}/${retries} in ${this.jitter(delay)}ms`);
+          await new Promise(r => setTimeout(r, this.jitter(delay)));
+          continue;
+        }
+        if (!resp.ok) {
+          console.error(`Remote embed HTTP ${resp.status}: ${await resp.text()}`);
+          return null;
+        }
+        const data = await resp.json() as {
+          data: { embedding: number[] }[];
+          model?: string;
+        };
+        return {
+          embedding: data.data[0]!.embedding,
+          model: data.model || this.remoteEmbedUrl!,
+        };
+      } catch (error) {
+        console.error("Remote embed error:", error);
+        return null;
+      }
+    }
+    console.error("Remote embed: max retries exceeded (rate limit)");
+    return null;
+  }
+
+  /** Token usage from the last successful batch embed call (for adaptive pacing) */
+  lastBatchTokens = 0;
+
+  private async embedRemoteBatch(texts: string[], extraParams: Record<string, unknown> = {}, retries = 3): Promise<(EmbeddingResult | null)[]> {
+    const truncated = texts.map(t => this.truncateForEmbed(t));
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const body: Record<string, unknown> = { input: truncated, model: this.remoteEmbedModel, ...extraParams };
+        const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
+          method: "POST",
+          headers: this.getEmbedHeaders(),
+          body: JSON.stringify(body),
+        });
+        if (resp.status === 429) {
+          const retryAfter = this.parseRetryAfter(resp);
+          const delay = retryAfter ?? Math.min(5000 * 2 ** attempt, 60000);
+          const jittered = this.jitter(delay);
+          console.error(`Remote batch embed rate-limited, retry ${attempt + 1}/${retries} in ${(jittered / 1000).toFixed(1)}s${retryAfter ? ` (Retry-After: ${Math.ceil(retryAfter / 1000)}s)` : ""}`);
+          await new Promise(r => setTimeout(r, jittered));
+          continue;
+        }
+        if (!resp.ok) {
+          console.error(`Remote batch embed HTTP ${resp.status}: ${await resp.text()}`);
+          return texts.map(() => null);
+        }
+        const data = await resp.json() as {
+          data: { embedding: number[]; index: number }[];
+          model?: string;
+          usage?: { total_tokens?: number; prompt_tokens?: number };
+        };
+        this.lastBatchTokens = data.usage?.total_tokens ?? data.usage?.prompt_tokens ?? 0;
+        const modelName = data.model || this.remoteEmbedUrl!;
+        const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+        for (const item of data.data) {
+          results[item.index] = { embedding: item.embedding, model: modelName };
+        }
+        return results;
+      } catch (error) {
+        console.error("Remote batch embed error:", error);
         return texts.map(() => null);
       }
-      const data = await resp.json() as {
-        data: { embedding: number[]; index: number }[];
-        model?: string;
-      };
-      const modelName = data.model || this.remoteEmbedUrl!;
-      // Server returns data sorted by index
-      const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
-      for (const item of data.data) {
-        results[item.index] = { embedding: item.embedding, model: modelName };
-      }
-      return results;
-    } catch (error) {
-      console.error("Remote batch embed error:", error);
-      return texts.map(() => null);
     }
+    console.error("Remote batch embed: max retries exceeded (rate limit)");
+    return texts.map(() => null);
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {

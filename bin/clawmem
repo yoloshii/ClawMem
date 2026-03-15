@@ -37,18 +37,6 @@ find_bun() {
   return 1
 }
 
-# GPU inference endpoints — set these to your llama-server instances
-# Embedding (granite-278m or similar, --embeddings mode)
-export CLAWMEM_EMBED_URL="${CLAWMEM_EMBED_URL:-http://localhost:8088}"
-# LLM text generation (qmd-query-expansion-1.7B or similar, /v1/chat/completions)
-export CLAWMEM_LLM_URL="${CLAWMEM_LLM_URL:-http://localhost:8089}"
-# Cross-encoder reranker (qwen3-reranker or similar)
-export CLAWMEM_RERANK_URL="${CLAWMEM_RERANK_URL:-http://localhost:8090}"
-# Allow node-llama-cpp to auto-download models if no server is running.
-# Set to "true" in remote/distributed setups to prevent surprise downloads.
-export CLAWMEM_NO_LOCAL_MODELS="${CLAWMEM_NO_LOCAL_MODELS:-false}"
-BUN=$(find_bun) || { echo "Error: bun not found. Install from https://bun.sh" >&2; exit 1; }
-
 # Resolve symlinks to find script location
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE" ]]; do
@@ -57,5 +45,22 @@ while [[ -L "$SOURCE" ]]; do
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Load .env if present (before defaults so .env values take precedence)
+if [[ -f "$SCRIPT_DIR/../.env" ]]; then
+  set -a; source "$SCRIPT_DIR/../.env"; set +a
+fi
+
+# GPU inference endpoints — set these to your llama-server instances
+# Embedding (zembed-1 recommended, --embeddings mode, -ub must match -b)
+export CLAWMEM_EMBED_URL="${CLAWMEM_EMBED_URL:-http://localhost:8088}"
+# LLM text generation (qmd-query-expansion-1.7B or similar, /v1/chat/completions)
+export CLAWMEM_LLM_URL="${CLAWMEM_LLM_URL:-http://localhost:8089}"
+# Cross-encoder reranker (zerank-2 recommended, -ub must match -b)
+export CLAWMEM_RERANK_URL="${CLAWMEM_RERANK_URL:-http://localhost:8090}"
+# Allow node-llama-cpp to auto-download models if no server is running.
+# Set to "true" in remote/distributed setups to prevent surprise downloads.
+export CLAWMEM_NO_LOCAL_MODELS="${CLAWMEM_NO_LOCAL_MODELS:-false}"
+BUN=$(find_bun) || { echo "Error: bun not found. Install from https://bun.sh" >&2; exit 1; }
 
 exec "$BUN" "$SCRIPT_DIR/../src/clawmem.ts" "$@"

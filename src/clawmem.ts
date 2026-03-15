@@ -290,6 +290,15 @@ async function cmdEmbed(args: string[]) {
   let failedFragments = 0;
   const batchStart = Date.now();
 
+  // Cloud API: global batch pacing state (persists across documents)
+  // TPM is the binding constraint, not RPM. 50 frags × ~800 tokens ≈ 40K tokens/batch → max ~2.5 batches/min at 100K TPM.
+  const isCloudEmbed = !!process.env.CLAWMEM_EMBED_API_KEY;
+  const CLOUD_BATCH_SIZE = 50;
+  const CLOUD_TPM_LIMIT = parseInt(process.env.CLAWMEM_EMBED_TPM_LIMIT || "100000", 10);
+  const CLOUD_TPM_SAFETY = 0.85;
+  const CHARS_PER_TOKEN = 4;
+  let lastBatchSentAt = 0;
+
   for (let docIdx = 0; docIdx < hashes.length; docIdx++) {
     const { hash, body, path, title: docTitle, collection } = hashes[docIdx]!;
     const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
@@ -308,32 +317,96 @@ async function cmdEmbed(args: string[]) {
     const docStart = Date.now();
     console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
 
-    for (let seq = 0; seq < fragments.length; seq++) {
-      const frag = fragments[seq]!;
-      const label = frag.label || title;
-      const text = formatDocForEmbedding(frag.content, label);
+    if (isCloudEmbed) {
+      // Batch mode: collect all texts, send in chunks of CLOUD_BATCH_SIZE
+      const allTexts: string[] = [];
+      for (const frag of fragments) {
+        const label = frag.label || title;
+        allTexts.push(formatDocForEmbedding(frag.content, label));
+      }
 
-      try {
-        const fragStart = Date.now();
-        const result = await llm.embed(text);
-        const fragMs = Date.now() - fragStart;
-        if (result) {
-          s.ensureVecTable(result.embedding.length);
-          s.insertEmbedding(
-            hash, seq, frag.startLine, new Float32Array(result.embedding),
-            result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
-          );
-          totalFragments++;
-          if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
-            console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) ${fragMs}ms [${text.length} chars]`);
+      for (let batchStart = 0; batchStart < allTexts.length; batchStart += CLOUD_BATCH_SIZE) {
+        // Global TPM-aware delay: compute required wait based on last batch's token count,
+        // then wait only the remaining time since lastBatchSentAt. Applies to ALL batches
+        // including first batch of each document (inter-document pacing).
+        if (lastBatchSentAt > 0) {
+          // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
+          //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
+          const actualTokens = llm.lastBatchTokens;
+          const batchEnd0 = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
+          const estimatedTokens = allTexts.slice(batchStart, batchEnd0)
+            .reduce((sum, t) => sum + Math.ceil(t.length / CHARS_PER_TOKEN), 0);
+          const batchTokens = actualTokens > 0 ? actualTokens : estimatedTokens;
+          const safeTPM = CLOUD_TPM_LIMIT * CLOUD_TPM_SAFETY;
+          const requiredGapMs = Math.max(500, (batchTokens / safeTPM) * 60_000);
+          const elapsed = Date.now() - lastBatchSentAt;
+          const remainingMs = requiredGapMs - elapsed;
+          if (remainingMs > 0) {
+            const jittered = Math.floor(remainingMs * (0.85 + Math.random() * 0.3));
+            await new Promise(r => setTimeout(r, jittered));
           }
-        } else {
-          failedFragments++;
-          console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) → null result [${text.length} chars]`);
         }
-      } catch (err) {
-        failedFragments++;
-        console.error(`${c.yellow}Warning: failed to embed fragment ${seq} (${frag.type}) of ${path}: ${err}${c.reset}`);
+
+        const batchEnd = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
+        const batchTexts = allTexts.slice(batchStart, batchEnd);
+        lastBatchSentAt = Date.now();
+        const reqStart = Date.now();
+
+        try {
+          const results = await llm.embedBatch(batchTexts);
+          const reqMs = Date.now() - reqStart;
+          const tokensUsed = llm.lastBatchTokens;
+
+          for (let i = 0; i < results.length; i++) {
+            const seq = batchStart + i;
+            const frag = fragments[seq]!;
+            const result = results[i];
+            if (result) {
+              s.ensureVecTable(result.embedding.length);
+              s.insertEmbedding(
+                hash, seq, frag.startLine, new Float32Array(result.embedding),
+                result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
+              );
+              totalFragments++;
+            } else {
+              failedFragments++;
+            }
+          }
+          console.error(`    batch ${batchStart + 1}-${batchEnd}/${allTexts.length} (${results.filter(r => r).length} ok) ${reqMs}ms${tokensUsed ? ` ${tokensUsed} tok` : ""}`);
+        } catch (err) {
+          failedFragments += batchTexts.length;
+          console.error(`${c.yellow}Warning: batch embed failed for ${path} frags ${batchStart + 1}-${batchEnd}: ${err}${c.reset}`);
+        }
+      }
+    } else {
+      // Local mode: embed one at a time (no rate limit concern)
+      for (let seq = 0; seq < fragments.length; seq++) {
+        const frag = fragments[seq]!;
+        const label = frag.label || title;
+        const text = formatDocForEmbedding(frag.content, label);
+
+        try {
+          const fragStart = Date.now();
+          const result = await llm.embed(text);
+          const fragMs = Date.now() - fragStart;
+          if (result) {
+            s.ensureVecTable(result.embedding.length);
+            s.insertEmbedding(
+              hash, seq, frag.startLine, new Float32Array(result.embedding),
+              result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
+            );
+            totalFragments++;
+            if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
+              console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) ${fragMs}ms [${text.length} chars]`);
+            }
+          } else {
+            failedFragments++;
+            console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) → null result [${text.length} chars]`);
+          }
+        } catch (err) {
+          failedFragments++;
+          console.error(`${c.yellow}Warning: failed to embed fragment ${seq} (${frag.type}) of ${path}: ${err}${c.reset}`);
+        }
       }
     }
 

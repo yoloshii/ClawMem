@@ -102,14 +102,14 @@ The three llama-server instances can also run as systemd services:
 # Example: embedding server
 cat > ~/.config/systemd/user/clawmem-embed-server.service << 'EOF'
 [Unit]
-Description=ClawMem embedding server (EmbeddingGemma-300M)
+Description=ClawMem embedding server (zembed-1)
 After=default.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/llama-server \
-  -m %h/models/embeddinggemma-300M-Q8_0.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
+  -m %h/models/zembed-1-Q4_K_M.gguf \
+  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 Restart=on-failure
 RestartSec=5
 

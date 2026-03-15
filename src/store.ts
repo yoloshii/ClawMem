@@ -660,18 +660,25 @@ function initializeDatabase(db: Database): void {
 }
 
 
+let vecTableDims: number | null = null; // Cache to avoid repeated schema checks
+
 function ensureVecTableInternal(db: Database, dimensions: number): void {
+  if (vecTableDims === dimensions) return;
+
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
     const hasHashSeq = tableInfo.sql.includes('hash_seq');
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
-    if (existingDims === dimensions && hasHashSeq && hasCosine) return;
-    // Table exists but wrong schema - need to rebuild
+    if (existingDims === dimensions && hasHashSeq && hasCosine) {
+      vecTableDims = dimensions;
+      return;
+    }
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
-  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
+  vecTableDims = dimensions;
 }
 
 // =============================================================================
@@ -2689,6 +2696,7 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
 export function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  vecTableDims = null;
 }
 
 /**
@@ -2708,13 +2716,13 @@ export function insertEmbedding(
   canonicalId?: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(
+  // vec0 virtual tables don't support INSERT OR REPLACE — delete first if exists.
+  // Try-catch: table may not exist yet during dimension migration (ensureVecTable drops+recreates).
+  try { db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq); } catch {}
+  db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
+  db.prepare(
     `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-
-  insertVecStmt.run(hashSeq, embedding);
-  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
+  ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
 }
 
 // =============================================================================

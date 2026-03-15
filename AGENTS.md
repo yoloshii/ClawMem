@@ -2,44 +2,68 @@
 
 ## Inference Services
 
-ClawMem uses three `llama-server` instances for neural inference. By default, the `bin/clawmem` wrapper points at `localhost:8088/8089/8090` — run them on your local GPU.
+ClawMem uses three `llama-server` instances for neural inference. By default, the `bin/clawmem` wrapper points at `localhost:8088/8089/8090`.
+
+**Default (QMD native combo, any GPU or CPU):**
 
 | Service | Port | Model | VRAM | Protocol |
 |---|---|---|---|---|
-| Embedding | 8088 | embeddinggemma-300M-Q8_0 | ~400MB | `/v1/embeddings` |
+| Embedding | 8088 | EmbeddingGemma-300M-Q8_0 | ~400MB | `/v1/embeddings` |
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
-**Total VRAM:** ~4.5GB. Fits alongside other workloads on any modern GPU.
+LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance or cloud API (no in-process fallback).
 
-**Remote option:** To offload to a separate GPU machine, set `CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` to the remote host. Set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent surprise fallback downloads.
+**SOTA upgrade (12GB+ GPU):** CC-BY-NC-4.0 — non-commercial only.
 
-**No GPU:** LLM and reranker fall back to in-process `node-llama-cpp` automatically (auto-downloads models on first use). CPU inference works but is significantly slower — GPU is strongly recommended. Embedding has no in-process fallback — a `llama-server --embeddings` instance is always required.
+| Service | Port | Model | VRAM | Protocol |
+|---|---|---|---|---|
+| Embedding | 8088 | zembed-1-Q4_K_M | ~4.4GB | `/v1/embeddings` |
+| LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
+| Reranker | 8090 | zerank-2-Q4_K_M | ~3.3GB | `/v1/rerank` |
+
+Total ~10GB VRAM. zembed-1 (2560d, 32K context, SOTA retrieval) distilled from zerank-2 via zELO. Optimal pairing.
+
+**Remote option:** Set `CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` to the remote host. Set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent surprise fallback downloads.
+
+**Cloud embedding:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` to use a cloud provider instead of local GPU. Supported: Jina AI (recommended: `jina-embeddings-v5-text-small`, 1024d), OpenAI, Voyage, Cohere. Cloud mode enables batch embedding (50 frags/request), provider-specific retrieval params auto-detected from URL (Jina `task`, Voyage/Cohere `input_type`), server-side truncation, and adaptive TPM-aware pacing. Set `CLAWMEM_EMBED_TPM_LIMIT` to match your tier.
+
+**Qwen3 /no_think flag:** Qwen3 uses thinking tokens by default. ClawMem appends `/no_think` to all prompts automatically for structured output.
 
 ### Model Recommendations
 
-| Role | Recommended Model | Source | Size | Notes |
-|---|---|---|---|---|
-| Embedding | embeddinggemma-300M-Q8_0 | [ggml-org/embeddinggemma-300M-GGUF](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | 314MB | 768 dimensions. 2048-token context. Default (matches QMD). Truncation configurable via `CLAWMEM_EMBED_MAX_CHARS` (default 8000). |
-| LLM | qmd-query-expansion-1.7B-q4_k_m | [tobil/qmd-query-expansion-1.7B-gguf](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~1.1GB | QMD's Qwen3-1.7B finetune — trained specifically for query expansion (hyde/lex/vec). |
-| Reranker | qwen3-reranker-0.6B-Q8_0 | [ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~600MB | Cross-encoder architecture. Scores candidates against original query. |
-
-**Qwen3 /no_think flag:** Qwen3 uses thinking tokens by default. ClawMem appends `/no_think` to all prompts automatically for structured output.
+| Role | Default (QMD native) | SOTA Upgrade | Notes |
+|---|---|---|---|
+| Embedding | [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) (314MB, 768d) | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) (2.4GB, 2560d) | zembed-1: 32K context, SOTA retrieval. `-ub` must match `-b`. |
+| LLM | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) (~1.1GB) | Same | QMD's Qwen3-1.7B finetune for query expansion. |
+| Reranker | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600MB) | [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) (2.4GB) | zerank-2: outperforms Cohere rerank-3.5. `-ub` must match `-b`. |
 
 ### Server Setup (all three use llama-server)
 
 ```bash
+# === Default (QMD native combo) ===
+
 # Embedding (--embeddings flag required)
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 --no-mmap -ngl 99 -c 2048 --batch-size 2048
+  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 
-# LLM (QMD finetuned model recommended)
+# LLM (QMD finetuned model)
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
   --port 8089 --host 0.0.0.0 -ngl 99 -c 4096 --batch-size 512
 
-# Reranker (--reranking flag required)
+# Reranker
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512 --reranking
+  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
+
+# === SOTA upgrade (12GB+ GPU) — -ub must match -b for non-causal attention ===
+
+# Embedding
+llama-server -m zembed-1-Q4_K_M.gguf \
+  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
+
+# Reranker
+llama-server -m zerank-2-Q4_K_M.gguf \
+  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 -b 2048 -ub 2048
 ```
 
 ### Verify Endpoints
@@ -60,9 +84,11 @@ curl http://host:8090/v1/models
 | Variable | Default (via wrapper) | Effect |
 |---|---|---|
 | `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Local llama-server or cloud API (OpenAI, Voyage, Jina, Cohere). No in-process fallback. |
-| `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding providers. Sent as Bearer token. Skips client-side truncation when set. |
-| `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `text-embedding-3-small`). |
+| `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding providers. Sent as Bearer token. Enables cloud mode: skips client-side truncation, sends `truncate: true` + `task` param (LoRA adapter selection for Jina v5), and activates batch embedding with adaptive TPM-aware pacing. |
+| `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input. Default fits EmbeddingGemma (2048 tokens). Set to `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |
+| `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier: Free 100000, Paid 2000000, Premium 50000000. |
+| `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). Only sent when URL contains `openai.com`. |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups. |
@@ -551,6 +577,10 @@ Symptom: Vector search returns no results but BM25 works
   → Missing embeddings. Watcher indexes but does NOT embed.
   → Fix: Run `clawmem embed` or wait for the daily embed timer.
 
+Symptom: llama-server crashes with "non-causal attention requires n_ubatch >= n_tokens"
+  → Embedding/reranking models use non-causal attention. When -b (batch) > -ub (ubatch), the assertion fails.
+  → Fix: Set -ub equal to -b (e.g. -b 2048 -ub 2048). Never omit -ub for embedding/reranking servers.
+
 Symptom: context-surfacing hook returns empty
   → Prompt too short (<20 chars), starts with `/`, or no docs score above threshold.
   → Fix: Check `clawmem status` for doc counts. Check `clawmem embed` for embedding coverage.
@@ -570,6 +600,23 @@ Symptom: Watcher fires events but wrong collection processes them (e.g., workspa
 Symptom: reindex --force crashes with "UNIQUE constraint failed: documents.collection, documents.path"
   → Force deactivates rows (active=0) but UNIQUE(collection, path) doesn't discriminate by active flag.
   → Fixed 2026-02-12: indexer.ts checks for inactive rows and reactivates instead of inserting.
+
+Symptom: embed crashes with "UNIQUE constraint failed on vectors_vec primary key" on restart
+  → vectors_vec is a vec0 virtual table — INSERT OR REPLACE is not supported by vec0.
+  → Fixed 2026-03-15: insertEmbedding() uses DELETE (try-catch) + INSERT instead of INSERT OR REPLACE.
+  → Embed can now resume after interrupted runs without --force.
+
+Symptom: embed crashes with alternating "no such table: vectors_vec" / "table vectors_vec already exists"
+  → Dimension migration race: --force drops vectors_vec, ensureVecTable per-fragment drops+recreates on dimension
+    mismatch, causing rapid table existence flickering between fragments.
+  → Fixed 2026-03-15: ensureVecTable caches verified dimensions (vecTableDims), uses CREATE VIRTUAL TABLE IF NOT EXISTS,
+    and clearAllEmbeddings resets the cache. First fragment creates, rest skip the check.
+
+Symptom: embed --force with new model produces 3 docs stuck as "Unembedded" but "All documents already embedded"
+  → First fragment (seq=0) failed during a crashed embed run. Later fragments succeeded.
+    getHashesNeedingFragments thinks the doc is done but status checks seq=0 specifically.
+  → Fix: Delete partial content_vectors + vectors_vec for the stuck hashes, then re-run embed (no --force).
+    The vec0 DELETE try-catch prevents cascading failures during the re-embed.
 
 Symptom: CLI reindex/update falls back to node-llama-cpp Vulkan (not GPU server)
   → GPU env vars only in systemd drop-in, not in wrapper script. CLI invocations missed them.

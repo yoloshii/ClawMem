@@ -5,7 +5,7 @@ Get ClawMem running with a searchable vault in under 5 minutes.
 ## Prerequisites
 
 - [Bun](https://bun.sh) v1.0+
-- A GPU with ~4.5GB VRAM for local inference (or use [cloud embedding](guides/cloud-embedding.md))
+- A GPU for local inference (default models need ~4GB VRAM; SOTA upgrade needs ~10GB). Or use [cloud embedding](guides/cloud-embedding.md)
 - Claude Code, OpenClaw, or any MCP-compatible client
 
 ## Install
@@ -47,7 +47,7 @@ This creates a vault at `~/.cache/clawmem/index.sqlite`, indexes all `.md` files
 
 ## Start GPU services
 
-ClawMem uses three llama-server instances. Download the models and start them:
+ClawMem uses three llama-server instances. LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a server (no in-process fallback).
 
 ```bash
 # Embedding (required — no in-process fallback)
@@ -60,8 +60,10 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
 
 # Reranker (falls back to CPU if unavailable)
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --reranking
+  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
+
+> **SOTA upgrade (12GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`) and reranker with zerank-2-Q4_K_M (`-b 2048 -ub 2048`). See [GPU services](../README.md#gpu-services) for details.
 
 See [GPU services guide](guides/systemd-services.md) for systemd setup and remote GPU configuration.
 

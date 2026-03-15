@@ -81,7 +81,7 @@ Claude Code Session
                             │
 ┌───────────────────────────▼─────────────────────────────┐
 │  QMD Search Backend (forked)                             │
-│  BM25 (FTS5) + Vector (sqlite-vec 768d) + Query         │
+│  BM25 (FTS5) + Vector (sqlite-vec) + Query               │
 │  Expansion + RRF (k=60) + Cross-Encoder Reranking        │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -210,13 +210,29 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### GPU Services
 
-ClawMem uses three lightweight `llama-server` (llama.cpp) instances for neural inference. Run them on your local GPU — total VRAM is ~4.5GB, fitting comfortably alongside other workloads on any modern NVIDIA card.
+ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. The LLM and reranker have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads the QMD native models on first use). Embedding always requires either a `llama-server --embeddings` instance or a cloud API.
+
+**Default (no GPU / any GPU):** The QMD native combo runs on CPU or any GPU — total ~1.7GB VRAM.
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
-| Embedding | 8088 | embeddinggemma-300M-Q8_0 | ~400MB | Vector search, indexing, context-surfacing |
-| LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | Intent classification, query expansion, A-MEM |
-| Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | Cross-encoder reranking (query, intent_search) |
+| Embedding | 8088 | [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | ~400MB | Vector search, indexing, context-surfacing (768d, 2K context) |
+| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
+| Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
+
+LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance (or [cloud embedding](#option-b-cloud-embedding-api)).
+
+**SOTA upgrade (12GB+ GPU):** For best retrieval quality, use the ZeroEntropy distillation-paired stack — total ~10GB VRAM.
+
+| Service | Port | Model | VRAM | Purpose |
+|---|---|---|---|---|
+| Embedding | 8088 | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) | ~4.4GB | SOTA embedding (2560d, 32K context). Distilled from zerank-2 via zELO. |
+| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Same LLM — unchanged |
+| Reranker | 8090 | [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) | ~3.3GB | SOTA reranker. Outperforms Cohere rerank-3.5. Optimal pairing with zembed-1. |
+
+**Important:** Embedding and reranking models use non-causal attention — `-ub` must equal `-b` on llama-server (e.g. `-b 2048 -ub 2048`). See [Reranker Server](#reranker-server) for details.
+
+**License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The default QMD native models have no such restriction.
 
 The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. Start the three servers, and ClawMem connects automatically.
 
@@ -248,11 +264,11 @@ unset CLAWMEM_EMBED_URL CLAWMEM_LLM_URL CLAWMEM_RERANK_URL
 
 ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint for all embedding operations. This works with local llama-server instances and cloud providers alike.
 
-#### Option A: Local GPU (default)
+#### Option A: Local (default)
 
-Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) via `llama-server --embeddings` on port 8088. This is the same default model used by [QMD](https://github.com/tobi/qmd).
+Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) via `llama-server --embeddings` on port 8088. This is the QMD native embedding model — small enough to run on CPU.
 
-- Size: 314MB, Dimensions: 768, VRAM: ~400MB, Context: 2048 tokens
+- Size: 314MB, Dimensions: 768, VRAM: ~400MB (or CPU), Context: 2048 tokens
 
 ```bash
 # Download model
@@ -261,29 +277,39 @@ wget https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embed
 # Start llama-server in embedding mode
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 \
-  --no-mmap -ngl 99 -c 2048 --batch-size 2048
+  -ngl 99 -c 2048 --batch-size 2048
 ```
 
-Alternative: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) for multilingual corpora (set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
+For multilingual corpora: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) (set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
+
+**SOTA upgrade (12GB+ GPU):** [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) (2.4GB, 2560d, ~4.4GB VRAM, 32K context). Distilled from zerank-2 via [ZeroEntropy's zELO methodology](https://docs.zeroentropy.dev). Pair with zerank-2 reranker for optimal results. Requires `-ub` equal to `-b` (e.g. `-b 2048 -ub 2048`) and `-c 8192` for full-doc fragments. **CC-BY-NC-4.0** — non-commercial only.
 
 #### Option B: Cloud Embedding API
 
-If you don't have a local GPU, use a cloud embedding service. Any provider with an OpenAI-compatible `/v1/embeddings` endpoint works. Set three env vars:
+If you don't have a local GPU, use a cloud embedding provider. Any provider with an OpenAI-compatible `/v1/embeddings` endpoint works.
+
+**Configuration:** Copy `.env.example` to `.env` and set your provider credentials:
 
 ```bash
-export CLAWMEM_EMBED_URL=https://api.openai.com      # Provider base URL
-export CLAWMEM_EMBED_API_KEY=sk-...                   # API key
-export CLAWMEM_EMBED_MODEL=text-embedding-3-small     # Model name
+cp .env.example .env
+# Edit .env:
+CLAWMEM_EMBED_URL=https://api.jina.ai
+CLAWMEM_EMBED_API_KEY=jina_your-key-here
+CLAWMEM_EMBED_MODEL=jina-embeddings-v5-text-small
 ```
+
+Or export them in your shell. **Precedence:** shell environment > `.env` file > `bin/clawmem` wrapper defaults.
 
 | Provider | `CLAWMEM_EMBED_URL` | `CLAWMEM_EMBED_MODEL` | Dimensions | Notes |
 |---|---|---|---|---|
-| OpenAI | `https://api.openai.com` | `text-embedding-3-small` | 1536 | 8K context, $0.02/1M tokens |
-| Voyage AI | `https://api.voyageai.com` | `voyage-4-large` | 1024 | 32K context, $0.12/1M tokens, 200M free tokens |
-| Jina AI | `https://api.jina.ai` | `jina-embeddings-v3` | 1024 | 8K context, 1M free tokens |
-| Cohere | `https://api.cohere.ai/compatibility` | `embed-v4.0` | 1024 | 128K context, $0.12/1M tokens |
+| Jina AI | `https://api.jina.ai` | `jina-embeddings-v5-text-small` | 1024 | 32K context, task-specific LoRA adapters |
+| OpenAI | `https://api.openai.com` | `text-embedding-3-small` | 1536 | 8K context, Matryoshka dimensions via `CLAWMEM_EMBED_DIMENSIONS` |
+| Voyage AI | `https://api.voyageai.com` | `voyage-4-large` | 1024 | 32K context |
+| Cohere | `https://api.cohere.com` | `embed-v4.0` | 1024 | 128K context |
 
-**Note:** Cloud providers handle their own context window limits - ClawMem skips client-side truncation when an API key is set. Local llama-server truncates at `CLAWMEM_EMBED_MAX_CHARS` (default: 6000 chars for EmbeddingGemma's 2048-token context). Set to `1100` if using granite-278m (512-token context).
+Cloud mode auto-detects your provider from the URL and sends the right parameters (Jina `task`, Voyage/Cohere `input_type`, OpenAI `dimensions`). Batch embedding (50 fragments/request), server-side truncation, adaptive TPM-aware pacing, and retry with jitter are all handled automatically. Set `CLAWMEM_EMBED_TPM_LIMIT` to match your provider tier (default: 100000). See [docs/guides/cloud-embedding.md](docs/guides/cloud-embedding.md) for full details.
+
+**Note:** Cloud providers handle their own context window limits — ClawMem skips client-side truncation when an API key is set. Local llama-server truncates at `CLAWMEM_EMBED_MAX_CHARS` (default: 6000 chars).
 
 #### Verify and embed
 
@@ -329,14 +355,13 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
 
 ### Reranker Server
 
-Cross-encoder reranking for `query` and `intent_search` pipelines using [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) on port 8090. ClawMem calls the `/v1/rerank` endpoint (or falls back to scoring via `/v1/completions` for compatible servers).
+Cross-encoder reranking for `query` and `intent_search` pipelines on port 8090. ClawMem calls the `/v1/rerank` endpoint (or falls back to scoring via `/v1/completions` for compatible servers).
 
-**Model specs:**
-- Size: ~600MB (Q8_0), VRAM: ~1.3GB on GPU
+**Default:** [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) — the QMD native reranker. Auto-downloaded by `node-llama-cpp` if no server is running.
+
+- Size: ~600MB (Q8_0), VRAM: ~1.3GB on GPU (or CPU via node-llama-cpp)
 - Scores each candidate against the original query (cross-encoder architecture)
 - `query` pipeline: 4000 char context per doc (deep reranking); `intent_search`: 200 char context per doc (fast reranking)
-
-**Without a server:** If `CLAWMEM_RERANK_URL` is unset, `node-llama-cpp` auto-downloads the model (~600MB) on first use.
 
 **Server setup:**
 
@@ -346,9 +371,20 @@ wget https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/
 
 # Start llama-server for reranking
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --port 8090 --host 0.0.0.0 \
-  -ngl 99 -c 2048 --batch-size 512 --reranking
+  --reranking --port 8090 --host 0.0.0.0 \
+  -ngl 99 -c 2048 --batch-size 512
 ```
+
+**SOTA upgrade (12GB+ GPU):** [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) (2.4GB, ~3.3GB VRAM). Outperforms Cohere rerank-3.5 and Gemini 2.5 Flash. Optimal pairing with zembed-1 (same distillation architecture via zELO). **CC-BY-NC-4.0** — non-commercial only.
+
+```bash
+# SOTA reranker (-ub must match -b for non-causal attention)
+llama-server -m zerank-2-Q4_K_M.gguf \
+  --reranking --port 8090 --host 0.0.0.0 \
+  -ngl 99 -c 2048 -b 2048 -ub 2048
+```
+
+**Important:** zerank-2 and zembed-1 use non-causal attention — `-ub` (ubatch) must equal `-b` (batch). Omitting `-ub` or setting it lower than `-b` causes assertion crashes. The default qwen3-reranker-0.6B does not have this requirement. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
 
 ### MCP Server
 
@@ -784,6 +820,10 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker for backlog A-MEM enrichment |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000) |
 | `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. No in-process fallback — a `llama-server --embeddings` instance is required. |
+| `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
+| `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
+| `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
+| `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
@@ -951,7 +991,7 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 
 ## Deployment
 
-Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Best with three `llama-server` instances (embedding, LLM, reranker) on a local or remote GPU. See GPU Services section above for setup.
+Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Best with three `llama-server` instances on a local or remote GPU: zembed-1 (embedding, ~4.4GB), qmd-query-expansion (LLM, ~2.2GB), zerank-2 (reranker, ~3.3GB). See GPU Services section above for setup.
 
 Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 9 Claude Code hooks (context injection, session bootstrap, decision extraction, handoffs, feedback, compaction support). Optional `clawmem-curator` agent for on-demand lifecycle triage, retrieval health checks, and maintenance (`clawmem setup curator`).
 

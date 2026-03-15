@@ -20,42 +20,48 @@ Two tiers: **hooks** handle automatic context flow (surfacing, extraction, compa
 
 Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`.
 
+**Default (QMD native combo, any GPU or CPU):**
+
 | Service | Port | Model | VRAM | Protocol |
 |---|---|---|---|---|
-| Embedding | 8088 | embeddinggemma-300M-Q8_0 | ~400MB | `/v1/embeddings` |
+| Embedding | 8088 | EmbeddingGemma-300M-Q8_0 | ~400MB | `/v1/embeddings` |
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
-**Total VRAM:** ~4.5GB.
+LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance or cloud API.
+
+**SOTA upgrade (12GB+ GPU):** zembed-1-Q4_K_M (embedding, 2560d, ~4.4GB) + zerank-2-Q4_K_M (reranker, ~3.3GB). Total ~10GB with LLM. Distillation-paired via zELO. `-ub` must match `-b` for both. **CC-BY-NC-4.0** — non-commercial only.
 
 **Remote option:** Set `CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` to remote host. Set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent fallback downloads.
 
-**No GPU:** LLM and reranker fall back to in-process `node-llama-cpp` (auto-downloads, CPU-only, slow). Embedding has no in-process fallback — `llama-server --embeddings` always required.
-
-### Model Recommendations
-
-| Role | Model | Source | Size | Notes |
-|---|---|---|---|---|
-| Embedding | embeddinggemma-300M-Q8_0 | ggml-org/embeddinggemma-300M-GGUF | 314MB | 768 dims, 2048-token context. Default (matches QMD). |
-| LLM | qmd-query-expansion-1.7B-q4_k_m | tobil/qmd-query-expansion-1.7B-gguf | ~1.1GB | QMD Qwen3-1.7B finetune for query expansion |
-| Reranker | qwen3-reranker-0.6B-Q8_0 | ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF | ~600MB | Cross-encoder scoring |
-
-**Qwen3 /no_think:** ClawMem appends `/no_think` to all prompts automatically for structured output.
+**Cloud embedding:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` for cloud providers. Supported: Jina AI (`jina-embeddings-v5-text-small`, 1024d), OpenAI, Voyage, Cohere. Batch embedding, TPM-aware pacing, provider-specific params auto-detected.
 
 ### Server Setup
 
 ```bash
+# === Default (QMD native combo) ===
+
 # Embedding (--embeddings flag required)
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 --no-mmap -ngl 99 -c 2048 --batch-size 2048
+  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 
-# LLM
+# LLM (auto-downloads via node-llama-cpp if no server)
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
   --port 8089 --host 0.0.0.0 -ngl 99 -c 4096 --batch-size 512
 
-# Reranker (--reranking flag required)
+# Reranker (auto-downloads via node-llama-cpp if no server)
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512 --reranking
+  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
+
+# === SOTA upgrade (12GB+ GPU) — -ub must match -b ===
+
+# Embedding (zembed-1)
+llama-server -m zembed-1-Q4_K_M.gguf \
+  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
+
+# Reranker (zerank-2)
+llama-server -m zerank-2-Q4_K_M.gguf \
+  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 -b 2048 -ub 2048
 ```
 
 ### Verify Endpoints
@@ -71,6 +77,10 @@ curl http://host:8090/v1/models
 | Variable | Default (via wrapper) | Effect |
 |---|---|---|
 | `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server. No in-process fallback. |
+| `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
+| `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
+| `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
+| `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models. |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` auto-downloads. Set `true` for remote-only. |
