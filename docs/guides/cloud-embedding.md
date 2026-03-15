@@ -92,7 +92,7 @@ If you set `CLAWMEM_EMBED_API_KEY` but your `CLAWMEM_EMBED_URL` points to localh
 
 The LLM (query expansion) and reranker always use local `llama-server` or in-process `node-llama-cpp` fallback. Only embedding supports cloud providers. This means:
 
-- **Embedding** — local GPU or cloud API (no in-process fallback)
+- **Embedding** — local GPU, cloud API, or in-process CPU via `node-llama-cpp`
 - **LLM** — local GPU, falls back to in-process CPU
 - **Reranker** — local GPU, falls back to in-process CPU
 

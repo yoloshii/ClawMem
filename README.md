@@ -210,7 +210,7 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### GPU Services
 
-ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. The LLM and reranker have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads the QMD native models on first use). Embedding always requires either a `llama-server --embeddings` instance or a cloud API.
+ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. LLM and reranker have in-process CPU fallbacks via `node-llama-cpp` (auto-downloads on first use). Embedding uses a `llama-server --embeddings` instance — runs on GPU or CPU. All three models work without a GPU.
 
 **GPU with VRAM to spare (12GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~10GB VRAM.
 
@@ -232,7 +232,7 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Th
 | LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
-LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance (or [cloud embedding](#option-b-cloud-embedding-api)).
+All three models auto-download via `node-llama-cpp` and run on CPU if no server is running.
 
 The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. Start the three servers, and ClawMem connects automatically.
 
@@ -250,23 +250,17 @@ For remote setups, set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent `node-llama-cpp
 
 #### CPU-Only Mode (no GPU)
 
-Without a GPU, unset the endpoint vars:
+All three QMD native models run on CPU — no GPU required. `node-llama-cpp` auto-downloads them on first use (~300MB embedding + ~1.1GB LLM + ~600MB reranker). CPU inference is slower but fully functional.
 
-```bash
-unset CLAWMEM_EMBED_URL CLAWMEM_LLM_URL CLAWMEM_RERANK_URL
-```
-
-`node-llama-cpp` will auto-download GGUF models on first use (~1.1GB LLM + ~600MB reranker). CPU inference works but is much slower — GPU is strongly recommended for responsive query expansion and reranking.
-
-**Note:** Embedding has no in-process fallback - it requires either a local `llama-server --embeddings` instance or a cloud embedding API.
+Alternatively, use a [cloud embedding provider](#option-c-cloud-embedding-api) if you prefer not to run models locally.
 
 ### Embedding
 
 ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint for all embedding operations. This works with local llama-server instances and cloud providers alike.
 
-#### Option A: Local GPU
+#### Option A: GPU with VRAM to spare (recommended)
 
-**GPU with VRAM to spare (recommended):** Use [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) — SOTA retrieval quality, distilled from zerank-2 via [ZeroEntropy's zELO methodology](https://docs.zeroentropy.dev). **CC-BY-NC-4.0** — non-commercial only.
+Use [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) — SOTA retrieval quality, distilled from zerank-2 via [ZeroEntropy's zELO methodology](https://docs.zeroentropy.dev). **CC-BY-NC-4.0** — non-commercial only.
 
 - Size: 2.4GB, Dimensions: 2560, VRAM: ~4.4GB, Context: 32K tokens
 
@@ -279,23 +273,31 @@ llama-server -m zembed-1-Q4_K_M.gguf \
   -ngl 99 -c 8192 -b 2048 -ub 2048
 ```
 
-**CPU / GPU without VRAM to spare:** Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) — the QMD native embedding model. Small enough to run on CPU.
+#### Option B: No GPU / GPU without VRAM to spare
+
+Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) — the QMD native embedding model. Only 300MB, runs on CPU or any GPU.
 
 - Size: 314MB, Dimensions: 768, VRAM: ~400MB (or CPU), Context: 2048 tokens
 
 ```bash
 wget https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
 
+# On GPU (add -ngl 99):
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 \
   -ngl 99 -c 2048 --batch-size 2048
+
+# On CPU (omit -ngl):
+llama-server -m embeddinggemma-300M-Q8_0.gguf \
+  --embeddings --port 8088 --host 0.0.0.0 \
+  -c 2048 --batch-size 2048
 ```
 
 For multilingual corpora: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) (set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
 
-#### Option B: Cloud Embedding API
+#### Option C: Cloud Embedding API
 
-If you don't have a local GPU, use a cloud embedding provider. Any provider with an OpenAI-compatible `/v1/embeddings` endpoint works.
+Alternatively, use a cloud embedding provider instead of running a local server. Any provider with an OpenAI-compatible `/v1/embeddings` endpoint works.
 
 **Configuration:** Copy `.env.example` to `.env` and set your provider credentials:
 
@@ -824,7 +826,7 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing |
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker for backlog A-MEM enrichment |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000) |
-| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. No in-process fallback — a `llama-server --embeddings` instance is required. |
+| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Uses llama-server (GPU or CPU) or cloud API. Falls back to in-process `node-llama-cpp` if unset. |
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |

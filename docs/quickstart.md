@@ -47,10 +47,10 @@ This creates a vault at `~/.cache/clawmem/index.sqlite`, indexes all `.md` files
 
 ## Start GPU services
 
-ClawMem uses three llama-server instances. LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a server (no in-process fallback).
+ClawMem uses three llama-server instances for best performance. All three models also auto-download and run on CPU via `node-llama-cpp` if no server is running.
 
 ```bash
-# Embedding (required — no in-process fallback)
+# Embedding (recommended for performance — falls back to in-process CPU if no server)
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 

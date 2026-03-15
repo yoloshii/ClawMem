@@ -1,8 +1,8 @@
 /**
  * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
  *
- * Provides text generation and reranking using local GGUF models.
- * Embeddings are served by a remote GPU server (CLAWMEM_EMBED_URL).
+ * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Embeddings can use a remote server (CLAWMEM_EMBED_URL), cloud API, or local node-llama-cpp fallback.
  */
 
 // node-llama-cpp is loaded lazily to avoid ~630ms import cost when all
@@ -19,6 +19,7 @@ async function getNodeLlamaCpp() {
 // Re-export type aliases for internal use (structural, no runtime cost)
 type Llama = any;
 type LlamaModel = any;
+type LlamaEmbeddingContext = any;
 type LlamaToken = any;
 
 import { homedir } from "os";
@@ -155,6 +156,7 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
+const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -207,6 +209,7 @@ export interface LLM {
 // =============================================================================
 
 export type LlamaCppConfig = {
+  embedModel?: string;
   generateModel?: string;
   rerankModel?: string;
   modelCacheDir?: string;
@@ -259,10 +262,13 @@ const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
+  private embedModel: LlamaModel | null = null;
+  private embedContext: LlamaEmbeddingContext | null = null;
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
   private rerankContext: Awaited<ReturnType<LlamaModel["createRankingContext"]>> | null = null;
 
+  private embedModelUri: string;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
@@ -272,6 +278,7 @@ export class LlamaCpp implements LLM {
   private remoteLlmUrl: string | null;
 
   // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
+  private embedModelLoadPromise: Promise<LlamaModel> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
@@ -285,6 +292,7 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
+    this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
@@ -323,7 +331,7 @@ export class LlamaCpp implements LLM {
    * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
    */
   private hasLoadedContexts(): boolean {
-    return !!this.rerankContext;
+    return !!this.embedContext || !!this.rerankContext;
   }
 
   /**
@@ -345,6 +353,10 @@ export class LlamaCpp implements LLM {
     }
 
     // Dispose contexts first
+    if (this.embedContext) {
+      await this.embedContext.dispose();
+      this.embedContext = null;
+    }
     if (this.rerankContext) {
       await this.rerankContext.dispose();
       this.rerankContext = null;
@@ -352,6 +364,10 @@ export class LlamaCpp implements LLM {
 
     // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
+      if (this.embedModel) {
+        await this.embedModel.dispose();
+        this.embedModel = null;
+      }
       if (this.generateModel) {
         await this.generateModel.dispose();
         this.generateModel = null;
@@ -361,6 +377,7 @@ export class LlamaCpp implements LLM {
         this.rerankModel = null;
       }
       // Reset load promises so models can be reloaded later
+      this.embedModelLoadPromise = null;
       this.generateModelLoadPromise = null;
       this.rerankModelLoadPromise = null;
     }
@@ -394,11 +411,53 @@ export class LlamaCpp implements LLM {
    */
   private async resolveModel(modelUri: string): Promise<string> {
     if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") {
-      throw new Error(`Local model download blocked (CLAWMEM_NO_LOCAL_MODELS=true). Model: ${modelUri}. Set CLAWMEM_LLM_URL / CLAWMEM_RERANK_URL to use GPU endpoints.`);
+      throw new Error(`Local model download blocked (CLAWMEM_NO_LOCAL_MODELS=true). Model: ${modelUri}. Set CLAWMEM_EMBED_URL / CLAWMEM_LLM_URL / CLAWMEM_RERANK_URL to use GPU endpoints.`);
     }
     this.ensureModelCacheDir();
     const { resolveModelFile } = await getNodeLlamaCpp();
     return await resolveModelFile(modelUri, this.modelCacheDir);
+  }
+
+  /**
+   * Load embedding model (lazy) — used for in-process CPU fallback when no remote embed server.
+   * Auto-downloads EmbeddingGemma-300M from HuggingFace on first use (~300MB).
+   */
+  private async ensureEmbedModel(): Promise<LlamaModel> {
+    if (this.embedModel) {
+      return this.embedModel;
+    }
+    if (this.embedModelLoadPromise) {
+      return await this.embedModelLoadPromise;
+    }
+
+    this.embedModelLoadPromise = (async () => {
+      const llama = await this.ensureLlama();
+      const modelPath = await this.resolveModel(this.embedModelUri);
+      const model = await llama.loadModel({ modelPath });
+      this.embedModel = model;
+      this.touchActivity();
+      return model;
+    })();
+
+    try {
+      return await this.embedModelLoadPromise;
+    } finally {
+      this.embedModelLoadPromise = null;
+    }
+  }
+
+  /**
+   * Get or create a single embedding context (lazy).
+   */
+  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
+    if (this.embedContext) {
+      this.touchActivity();
+      return this.embedContext;
+    }
+    const model = await this.ensureEmbedModel();
+    this.embedContext = await model.createEmbeddingContext();
+    this.touchActivity();
+    return this.embedContext;
   }
 
   /**
@@ -503,26 +562,58 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    if (!this.remoteEmbedUrl) {
-      console.error("[embed] CLAWMEM_EMBED_URL not set — remote GPU embedding server required");
+    // Remote server or cloud API — preferred path
+    if (this.remoteEmbedUrl) {
+      const extraParams = this.getCloudEmbedParams(!!options.isQuery);
+      return this.embedRemote(text, extraParams);
+    }
+
+    // Local fallback via node-llama-cpp (auto-downloads EmbeddingGemma on first use)
+    try {
+      const context = await this.ensureEmbedContext();
+      const embedding = await context.getEmbeddingFor(text);
+      return {
+        embedding: Array.from(embedding.vector),
+        model: this.embedModelUri,
+      };
+    } catch (error) {
+      console.error("[embed] Local embedding error:", error);
       return null;
     }
-    const extraParams = this.getCloudEmbedParams(!!options.isQuery);
-    return this.embedRemote(text, extraParams);
   }
 
   /**
-   * Batch embed multiple texts efficiently via single HTTP request.
-   * Cloud providers get provider-specific params (task/input_type, truncation).
+   * Batch embed multiple texts efficiently.
+   * Remote: single HTTP request with up to 50 texts.
+   * Local: sequential via node-llama-cpp embedding context.
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
-    if (!this.remoteEmbedUrl) {
-      console.error("[embed] CLAWMEM_EMBED_URL not set — remote GPU embedding server required");
+
+    // Remote server or cloud API
+    if (this.remoteEmbedUrl) {
+      const extraParams = this.getCloudEmbedParams(false);
+      return this.embedRemoteBatch(texts, extraParams);
+    }
+
+    // Local fallback via node-llama-cpp
+    try {
+      const context = await this.ensureEmbedContext();
+      const results: (EmbeddingResult | null)[] = [];
+      for (const text of texts) {
+        try {
+          const embedding = await context.getEmbeddingFor(text);
+          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+        } catch (err) {
+          console.error("[embed] Local batch embedding error:", err);
+          results.push(null);
+        }
+      }
+      return results;
+    } catch (error) {
+      console.error("[embed] Failed to initialize local embedding:", error);
       return texts.map(() => null);
     }
-    const extraParams = this.getCloudEmbedParams(false);
-    return this.embedRemoteBatch(texts, extraParams);
   }
 
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
@@ -975,12 +1066,15 @@ Final Output:`;
     }
 
     // Clear references
+    this.embedContext = null;
+    this.embedModel = null;
     this.rerankContext = null;
     this.generateModel = null;
     this.rerankModel = null;
     this.llama = null;
 
     // Clear any in-flight load promises
+    this.embedModelLoadPromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
   }

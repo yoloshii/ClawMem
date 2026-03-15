@@ -12,7 +12,7 @@ ClawMem uses three `llama-server` instances for neural inference. By default, th
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
-LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance or cloud API (no in-process fallback).
+All three models auto-download via `node-llama-cpp` and run on CPU if no server is running.
 
 **SOTA upgrade (12GB+ GPU):** CC-BY-NC-4.0 — non-commercial only.
 
@@ -83,7 +83,7 @@ curl http://host:8090/v1/models
 
 | Variable | Default (via wrapper) | Effect |
 |---|---|---|
-| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Local llama-server or cloud API (OpenAI, Voyage, Jina, Cohere). No in-process fallback. |
+| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Local llama-server, cloud API, or falls back to in-process `node-llama-cpp` if unset. |
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding providers. Sent as Bearer token. Enables cloud mode: skips client-side truncation, sends `truncate: true` + `task` param (LoRA adapter selection for Jina v5), and activates batch embedding with adaptive TPM-aware pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input. Default fits EmbeddingGemma (2048 tokens). Set to `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |

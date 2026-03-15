@@ -28,7 +28,7 @@ Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper d
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
 | Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
 
-LLM and reranker auto-download via `node-llama-cpp` if no server is running. Embedding requires a `llama-server --embeddings` instance or cloud API.
+All three models auto-download via `node-llama-cpp` and run on CPU if no server is running.
 
 **SOTA upgrade (12GB+ GPU):** zembed-1-Q4_K_M (embedding, 2560d, ~4.4GB) + zerank-2-Q4_K_M (reranker, ~3.3GB). Total ~10GB with LLM. Distillation-paired via zELO. `-ub` must match `-b` for both. **CC-BY-NC-4.0** — non-commercial only.
 
@@ -76,7 +76,7 @@ curl http://host:8090/v1/models
 
 | Variable | Default (via wrapper) | Effect |
 |---|---|---|
-| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server. No in-process fallback. |
+| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server. Falls back to in-process `node-llama-cpp` if unset. |
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
