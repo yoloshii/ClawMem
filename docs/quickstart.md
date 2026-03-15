@@ -11,6 +11,11 @@ Set up ClawMem as persistent memory for Claude Code in under 5 minutes. By the e
 ## Install
 
 ```bash
+# Via npm (recommended)
+bun add -g clawmem
+# or: npm install -g clawmem
+
+# From source
 git clone https://github.com/yoloshii/clawmem.git ~/clawmem
 cd ~/clawmem && bun install
 ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem

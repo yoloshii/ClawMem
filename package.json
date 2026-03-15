@@ -1,16 +1,50 @@
 {
   "name": "clawmem",
   "version": "0.1.0",
-  "description": "Hybrid agent memory: QMD search backend + SAME agent memory layer",
+  "description": "On-device context engine and memory for AI agents. Claude Code and OpenClaw. Hooks + MCP server + hybrid RAG search.",
   "type": "module",
   "bin": {
     "clawmem": "./bin/clawmem"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "SKILL.md"
+  ],
   "scripts": {
     "test": "bun test",
     "dev": "bun src/clawmem.ts",
     "inspector": "npx @modelcontextprotocol/inspector bun src/clawmem.ts mcp"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yoloshii/ClawMem.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yoloshii/ClawMem/issues"
+  },
+  "author": "yoloshii",
+  "keywords": [
+    "mcp-server",
+    "model-context-protocol",
+    "claude-code",
+    "ai-agent-memory",
+    "retrieval-augmented-generation",
+    "rag",
+    "vector-search",
+    "sqlite",
+    "bun",
+    "llama-cpp",
+    "local-first",
+    "context-engine",
+    "openclaw",
+    "mcp-tools",
+    "hybrid-search"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
     "gray-matter": "^4.0.3",

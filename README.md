@@ -64,14 +64,23 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 - [Bun](https://bun.sh) v1.0+
 - SQLite with FTS5 support (included with Bun)
 
-### Setup
+### Install via npm (recommended)
+
+```bash
+bun add -g clawmem
+```
+
+Or with npm:
+
+```bash
+npm install -g clawmem
+```
+
+### Install from source
 
 ```bash
 git clone https://github.com/yoloshii/clawmem.git ~/clawmem
-cd ~/clawmem
-bun install
-
-# Add to PATH
+cd ~/clawmem && bun install
 ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 ```
 

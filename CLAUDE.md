@@ -102,12 +102,16 @@ curl http://host:8090/v1/models
 ## Quick Setup
 
 ```bash
+# Install via npm
+bun add -g clawmem   # or: npm install -g clawmem
+
+# Or from source
 git clone https://github.com/yoloshii/clawmem.git ~/clawmem
 cd ~/clawmem && bun install
 ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 
 # Bootstrap a vault (init + index + embed + hooks + MCP)
-./bin/clawmem bootstrap ~/notes --name notes
+clawmem bootstrap ~/notes --name notes
 
 # Or step by step:
 ./bin/clawmem init
