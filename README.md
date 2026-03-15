@@ -453,7 +453,7 @@ ClawMem ships three instruction files and an optional maintenance agent:
 |------|--------|---------|
 | `CLAUDE.md` | Automatically (Claude Code, when working in this repo) | Complete operational reference — hooks, tools, query optimization, scoring, pipeline details, troubleshooting |
 | `AGENTS.md` | Framework-dependent | Identical to CLAUDE.md — cross-framework compatibility (Cursor, Windsurf, Codex, etc.) |
-| `SKILL.md` | On-demand via Claude Code skill system | Same reference as CLAUDE.md, available across all projects |
+| `SKILL.md` | On-demand (agent reads when needed) | Same reference as CLAUDE.md, shipped with the package for cross-project use |
 | `agents/clawmem-curator.md` | On-demand via `clawmem setup curator` | Maintenance agent — lifecycle triage, retrieval health checks, dedup sweeps, graph rebuilds |
 
 **Working in the ClawMem repo:** No action needed — `CLAUDE.md` loads automatically.
@@ -464,16 +464,9 @@ ClawMem ships three instruction files and an optional maintenance agent:
 
 Copy the contents of `CLAUDE.md` (or the relevant sections) into your project's own `CLAUDE.md` or `AGENTS.md`. Simple but requires manual updates when ClawMem changes.
 
-### Option B: Install as a skill (recommended)
+### Option B: Add a trigger block (recommended)
 
-Symlink ClawMem into Claude Code's skill directory for on-demand reference across all projects:
-
-```bash
-mkdir -p ~/.claude/skills
-ln -sf ~/clawmem ~/.claude/skills/clawmem
-```
-
-Then add this minimal trigger block to your global `~/.claude/CLAUDE.md`:
+Add this minimal trigger block to your global `~/.claude/CLAUDE.md`. It gives the agent routing rules always loaded, and tells it how to find the full reference (SKILL.md) shipped with your installation when deeper guidance is needed:
 
 ```markdown
 ## ClawMem
@@ -525,15 +518,12 @@ ALWAYS `compact=true` first → review → `multi_get` for full content.
 - Do NOT forget memories to "clean up" — let confidence decay handle it
 - Do NOT wait for curator to pin decisions — pin immediately when critical
 
-Invoke `Skill tool with skill="clawmem"` when:
-- Retrieval quality is poor or results miss expected content (query optimization, troubleshooting)
-- Adding new content directories or indexing something (collection setup, embedding workflow)
-- After bulk document creation or ingestion (graph building, embedding)
-- Need lifecycle triage beyond basic status/sweep (run curator: "curate memory")
-- Any operation beyond the basic tool routing above
+For detailed operational guidance (query optimization, troubleshooting, collection setup, embedding workflow, graph building, curator), find and read the shipped SKILL.md:
+  Bash: CLAWMEM_ROOT=$(cd "$(dirname "$(which clawmem)")/.." && pwd) && echo "$CLAWMEM_ROOT/SKILL.md"
+  Then: Read the file at that path.
 ```
 
-This gives your agent the 3-rule gate, tool routing, and proactive behaviors always loaded, with situation-triggered skill invocation for the ~10% manual operations.
+This gives your agent the 3-rule gate, tool routing, and proactive behaviors always loaded. When it needs deeper guidance, it locates and reads the full SKILL.md reference shipped with your installation — no symlinks or skill registration required.
 
 ---
 
