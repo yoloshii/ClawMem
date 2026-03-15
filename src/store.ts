@@ -660,18 +660,11 @@ function initializeDatabase(db: Database): void {
 }
 
 
-// Per-database dimension cache (keyed by db filename to handle multi-vault)
-const vecTableDimsCache = new Map<string, number>();
-
-function getDbKey(db: Database): string {
-  try {
-    return (db as any).filename || "default";
-  } catch { return "default"; }
-}
+// Per-database dimension cache (WeakMap keyed by db object — no collisions for in-memory DBs)
+const vecTableDimsCache = new WeakMap<Database, number>();
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
-  const dbKey = getDbKey(db);
-  if (vecTableDimsCache.get(dbKey) === dimensions) return;
+  if (vecTableDimsCache.get(db) === dimensions) return;
 
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
@@ -680,13 +673,13 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
     if (existingDims === dimensions && hasHashSeq && hasCosine) {
-      vecTableDimsCache.set(dbKey, dimensions);
+      vecTableDimsCache.set(db, dimensions);
       return;
     }
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
-  vecTableDimsCache.set(dbKey, dimensions);
+  vecTableDimsCache.set(db, dimensions);
 }
 
 // =============================================================================
@@ -2704,7 +2697,7 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
 export function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
-  vecTableDimsCache.delete(getDbKey(db));
+  vecTableDimsCache.delete(db);
 }
 
 /**
