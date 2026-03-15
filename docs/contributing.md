@@ -11,8 +11,8 @@ bun install
 ## Running tests
 
 ```bash
-bun test              # All tests (171)
-bun test test/unit    # Unit tests only
+bun test              # All tests (471)
+bun test tests/unit   # Unit tests only
 ```
 
 Tests use in-memory SQLite databases and don't require GPU services.
