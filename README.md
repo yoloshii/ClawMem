@@ -67,8 +67,13 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 ### Install from npm (recommended)
 
 ```bash
-bun add -g clawmem     # if you use Bun
-npm install -g clawmem  # if you use npm
+npm install -g clawmem
+```
+
+If you use Bun as your package manager:
+
+```bash
+bun add -g clawmem
 ```
 
 ### Install from source
