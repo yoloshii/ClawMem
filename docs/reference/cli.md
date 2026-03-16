@@ -81,7 +81,7 @@ clawmem hook curator-nudge
 
 ## IO6 surface commands (daemon integration)
 
-For `--print` daemon mode (claude-serve) where CLI hooks don't work:
+For non-hook integrations where a host process needs to inject context programmatically (e.g., daemon mode, custom orchestrators):
 
 ```bash
 echo "user query" | clawmem surface --context --stdin     # Per-prompt context injection
