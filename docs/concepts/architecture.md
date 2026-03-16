@@ -30,6 +30,12 @@ collections:
 
 Only markdown files are indexed. Binary files, code, and credentials are never indexed.
 
+### What to index
+
+The retrieval pipeline surfaces better results from a richer corpus. Beyond the default memory and session log patterns, consider adding collections for research notes, architecture decisions, domain references, project specs, and any markdown you regularly consult during agent sessions. The broader the indexed field, the more likely context-surfacing will find something relevant to the current task.
+
+Code files (`.ts`, `.py`, `.go`, etc.) are intentionally excluded. BM25 and embedding models trained on natural language don't perform well on code syntax — variable names, imports, and bracket-heavy constructs pollute the search index. Code retrieval is better served by tools built for that purpose (tree-sitter, LSP, semantic code search). Capture your technical decisions and architecture rationale in markdown instead; that's what agents need when making decisions during a coding session.
+
 ### Excluded directories
 
 These directories are always skipped during indexing:

@@ -78,3 +78,19 @@ Use `memory_retrieve(query)` — it auto-classifies the query and routes to the 
 - Do NOT re-search what's already in `<vault-context>`
 - Do NOT use `query()` for "why" questions — use `intent_search` or `memory_retrieve`
 - Do NOT use `query()` for session history — use `session_log`
+
+## Why hooks handle 90%
+
+The 90/10 split between hooks and MCP tools is a deliberate architectural response to a real limitation: agents are not reliably proactive with memory tools.
+
+When an agent has both native tools (Read, Grep) and memory tools (query, intent_search) available, it will consistently default to the simpler native tools or answer from existing context — even when a vault search would produce better results. This isn't a bug in any particular model. MCP tool calls add latency and consume context window. The agent's implicit cost/benefit calculation favors "answer now" over "search first, answer better." The result is that purely agent-initiated memory systems get underused in practice.
+
+Hooks bypass this problem entirely. Context-surfacing fires on every prompt regardless of what the agent decides to do. Decision-extractor captures observations after every response. Feedback-loop tracks what was referenced. The agent doesn't get to skip these — they run as part of the Claude Code lifecycle, not as tool calls the agent can choose to make.
+
+The remaining 10% — the MCP tools — covers situations where hooks can't help: the agent needs deeper search than what context-surfacing provided, the question spans multiple sessions, or a destructive action needs a vault check first. These genuinely require agent initiative, and the 3-rule escalation gate keeps the scope narrow enough that agents can follow it.
+
+### Making agents more proactive
+
+For the proactive operations agents should be doing (pinning critical decisions, snoozing noisy context, running deeper searches when surfaced context is relevant but thin), instruction redundancy helps. Place the routing rules and escalation gates in your global CLAUDE.md or AGENTS.md so they load on every conversation. The trigger block in the README's [Agent Instructions](../README.md#agent-instructions) section is designed for this — it gives the agent routing rules always loaded, with SKILL.md as on-demand deep reference.
+
+This stubbornness around proactive memory tool use is unlikely to change until model providers include memory management patterns in their training data. Until then, hooks carry the weight, and instruction redundancy is the best mitigation for the rest.

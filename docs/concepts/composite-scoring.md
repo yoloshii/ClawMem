@@ -62,6 +62,24 @@ Quality score (0.0 - 1.0) is computed during indexing based on:
 - Correction keywords
 - Frontmatter richness
 
+A document with headings, structured lists, decision-related terms ("decided", "chose", "tradeoff"), and YAML frontmatter will score near the top of the range. A single paragraph with no structure scores near the bottom and gets penalized to 0.7x in every search result.
+
+### Writing documents that score well
+
+Structure your notes the way you'd want to read them later. Use headings to separate topics — each heading creates a separate fragment that can be embedded and retrieved independently. Bullet lists score better than run-on paragraphs. If a document records a decision, say so explicitly ("We decided X because Y") rather than burying it in narrative.
+
+Frontmatter adds 0.2 to the quality score. Even minimal frontmatter helps:
+
+```yaml
+---
+title: Switch from REST to gRPC for internal services
+type: decision
+date: 2026-03-15
+---
+```
+
+This is not about gaming the scoring system. Documents that score well are also documents that agents (and humans) can actually use — they have structure, they state their purpose, and they're findable by the terms you'd naturally search for.
+
 ### Co-activation boost (1.0 - 1.15)
 
 ```

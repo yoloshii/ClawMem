@@ -61,6 +61,31 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
 4. **Progressive disclosure** — agents see compact results first (`compact=true`), then fetch full content only when needed. Minimizes context window usage.
 5. **Zero-config default** — a single vault with `clawmem bootstrap` gets you running. Multi-vault, cloud embedding, and profiles are opt-in.
 
+## Building a rich context field
+
+A filesystem-based context engine is only as useful as what you put into the filesystem. If your vault contains a handful of sparse memory files, the retrieval pipeline has little to work with — BM25 won't find relevant terms, vector search has few neighbors to compare, and graph traversal has no edges to follow.
+
+The agents that get the most from ClawMem are the ones with rich, diverse collections. Index broadly:
+
+| Content type | Example | Why it helps |
+|-------------|---------|-------------|
+| Memory files | `MEMORY.md`, session logs | Captures what happened and what was decided |
+| Research outputs | Analysis notes, comparison docs | Gives the agent domain knowledge it would otherwise lack |
+| Decision records | Architecture decisions, tradeoffs | Lets the agent understand *why*, not just *what* |
+| Learnings and antipatterns | Post-mortems, things to avoid | Prevents repeated mistakes across sessions |
+| Domain expertise | Reference docs, runbooks, SOPs | Provides stable context that rarely changes |
+| Project notes | Status updates, meeting notes, specs | Keeps the agent current on project state |
+
+A practical starting point: configure each project collection to index every `.md` file in the project (`pattern: "**/*.md"`). The composite scoring system handles the rest — decisions and hubs never decay, progress notes fade after 45 days, and the quality multiplier rewards well-structured documents over flat text dumps.
+
+### Document structure matters
+
+How you write documents affects how well they score. The [quality multiplier](concepts/composite-scoring.md#quality-multiplier-07---13) ranges from 0.7x (penalty) to 1.3x (boost) based on headings, lists, decision keywords, and frontmatter. Five well-structured decision documents with clear headings will consistently outscore fifty single-paragraph notes.
+
+### Keep code out of the vault
+
+ClawMem indexes prose, not code. Source files (`.ts`, `.py`, `.go`, etc.) are excluded by design — BM25 and vector models trained on natural language perform poorly on code syntax, and code retrieval needs AST-aware, symbol-level tools (call graphs, definitions, references). Document your technical decisions and architecture in markdown. Let the code live in version control and use a dedicated code search tool for code retrieval.
+
 ## Integrations
 
 | Runtime | Integration | How | Services needed |
