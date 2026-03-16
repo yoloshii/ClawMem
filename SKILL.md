@@ -191,6 +191,8 @@ Hooks handle ~90% of retrieval. Zero agent effort.
 
 **Hook blind spots (by design):** Hooks filter out `_clawmem/` system artifacts, enforce score thresholds, and cap token budget. Absence in `<vault-context>` does NOT mean absence in memory. Escalate to Tier 3 if expected memory wasn't surfaced.
 
+**Adaptive thresholds:** Context-surfacing uses ratio-based scoring that adapts to vault characteristics. Results are kept within a percentage of the best result's composite score (speed: 65%, balanced: 55%, deep: 45%). An activation floor prevents surfacing when all results are weak. `CLAWMEM_PROFILE=deep` adds query expansion + reranking. MCP tools use fixed absolute thresholds, not adaptive.
+
 ---
 
 ## Tier 3 — Agent-Initiated Retrieval (MCP Tools)

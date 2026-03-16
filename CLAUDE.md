@@ -257,6 +257,8 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 
 **Hook blind spots (by design):** Hooks filter out `_clawmem/` system artifacts, enforce score thresholds, and cap token budget. Absence in `<vault-context>` does NOT mean absence in memory. If you expect a memory to exist but it wasn't surfaced, escalate to Tier 3.
 
+**Adaptive thresholds:** Context-surfacing uses ratio-based scoring that adapts to vault characteristics (size, document quality, content age, embedding model). Results are kept within a percentage of the best result's composite score rather than a fixed absolute threshold. An activation floor prevents surfacing when all results are weak. Profiles control the ratio: `speed` (65%), `balanced` (55%), `deep` (45% + query expansion + reranking). `CLAWMEM_PROFILE=deep` is recommended for vaults with older content or lower-quality documents. MCP tools use fixed absolute thresholds, not adaptive.
+
 ### Tier 3 — Agent-Initiated (one targeted MCP call)
 
 **Escalate ONLY when one of these three rules fires:**
