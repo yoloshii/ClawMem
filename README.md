@@ -1015,6 +1015,21 @@ Built on the shoulders of:
 - [SAME](https://github.com/sgx-labs/statelessagent) — agent memory concepts (recency decay, confidence scoring, session tracking)
 - [supermemory](https://github.com/supermemoryai/clawdbot-supermemory) — hook patterns and context surfacing ideas
 
+## Roadmap
+
+| Status | Feature | Description |
+|--------|---------|-------------|
+| :white_check_mark: | Adaptive thresholds | Ratio-based filtering that adapts to vault characteristics (v0.1.3) |
+| :white_check_mark: | Deep escalation | Budget-aware query expansion + cross-encoder reranking for `deep` profile |
+| :white_check_mark: | Cloud embedding providers | Jina, OpenAI, Voyage, Cohere with batch embedding + TPM pacing |
+| :construction: | Calibration probes | One-time `clawmem calibrate` command that measures your vault's score distribution and tunes thresholds automatically |
+| :construction: | Rolling threshold learning | Learns optimal activation floor from actual usage patterns (which surfaced content gets referenced vs ignored) |
+| :memo: | Multi-vault namespacing | Isolated vaults with independent calibration and lifecycle policies |
+| :memo: | REST API authentication | Token-scoped access for multi-agent deployments |
+| :memo: | Streaming rerank | Cross-encoder reranking within the hook timeout budget for larger candidate sets |
+
+:white_check_mark: Shipped&ensp; :construction: Planned&ensp; :memo: Exploring
+
 ## License
 
 MIT
