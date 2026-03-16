@@ -101,9 +101,44 @@ clawmem update --embed
 
 A practical starting point: index every `.md` file in each project you regularly work on with agents. Include memory files, research outputs, decision records, learnings, project notes, and domain references. The more relevant context in the vault, the more the context-surfacing hook has to work with on each prompt.
 
-Code files are excluded by design — BM25 and embedding models don't perform well on code syntax. Capture technical decisions and architecture rationale in markdown instead. Use a dedicated code search tool for code retrieval.
+### Customize index patterns
 
-For the quality scoring system to work in your favor, structure your documents with headings, lists, and decision keywords. Frontmatter adds a 0.2 quality score bonus. See [composite scoring](concepts/composite-scoring.md) for details.
+Each collection has a `pattern` field that controls which files get indexed (default: `**/*.md`). Edit `~/.config/clawmem/config.yaml` to customize:
+
+```yaml
+collections:
+  notes:
+    path: ~/notes
+    pattern: "**/*.md"              # default — all markdown recursively
+
+  project:
+    path: ~/projects/myapp
+    pattern: "**/*.md"              # all markdown in the project
+
+  research:
+    path: ~/research
+    pattern: "**/*.{md,txt}"        # markdown and text files
+
+  obsidian:
+    path: ~/vault
+    pattern: "**/*.md"              # works with Obsidian, Logseq, Foam, Dendron
+```
+
+After editing the config, re-index and embed:
+
+```bash
+clawmem update --embed
+```
+
+The [watcher service](guides/systemd-services.md) picks up new files automatically, but adding or changing collections requires a manual `update`. Certain directories are always excluded regardless of pattern: `.git`, `node_modules`, `dist`, `build`, `vendor`, and others listed in [architecture](concepts/architecture.md#excluded-directories).
+
+### Code stays out of the vault
+
+ClawMem indexes prose, not code. Source files (`.ts`, `.py`, `.go`, etc.) are excluded by design — BM25 and embedding models trained on natural language perform poorly on code syntax. Capture technical decisions and architecture rationale in markdown instead. Use a dedicated code search tool for code retrieval.
+
+### Structure documents for better scoring
+
+Documents with headings, lists, and decision keywords score higher in retrieval. Frontmatter adds a 0.2 quality score bonus. The [quality multiplier](concepts/composite-scoring.md#quality-multiplier-07---13) ranges from 0.7x (penalty for flat text) to 1.3x (boost for well-structured docs) — so structure directly affects how often your content gets surfaced.
 
 ## What happens next
 
