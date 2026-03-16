@@ -606,7 +606,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (25)
+## MCP Tools (28)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
