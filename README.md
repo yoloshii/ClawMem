@@ -100,6 +100,8 @@ After installing, here's the full journey from zero to working memory:
 
 **Fastest path:** Step 1 alone gets you a working system with in-process CPU/GPU inference and default models — no manual model downloads or service configuration needed. Steps 2-4 are optional upgrades for better performance. Steps 5-6 are where you customize what gets indexed and how your agent connects.
 
+**Customize what gets indexed:** Each collection has a `pattern` field in `~/.config/clawmem/config.yaml` (default: `**/*.md`). Tailor it per collection — index project docs, research notes, decision records, Obsidian vaults, or anything else your agents should know about. The more relevant content in the vault, the better retrieval works. See the [quickstart](docs/quickstart.md#customize-index-patterns) for config examples.
+
 ### Quick start commands
 
 ```bash
