@@ -10,7 +10,7 @@ function makeInput(prompt: string, sessionId?: string): HookInput {
   return {
     prompt,
     sessionId: sessionId || "test-session",
-    hookName: "context-surfacing",
+    hookEventName: "UserPromptSubmit",
   };
 }
 
