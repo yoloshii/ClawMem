@@ -96,7 +96,7 @@ systemctl --user restart clawmem-watcher.service
 
 ## REST API service (for OpenClaw)
 
-Required for OpenClaw agent tools. Optional for Claude Code (which uses MCP stdio).
+Required for OpenClaw agent tools and remote access. Optional for local MCP clients like Claude Code (which use MCP stdio directly).
 
 ```bash
 cat > ~/.config/systemd/user/clawmem-serve.service << 'EOF'

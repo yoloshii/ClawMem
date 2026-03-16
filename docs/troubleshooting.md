@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues when running ClawMem as Claude Code memory or with an MCP server setup. Organized by subsystem.
+Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. Organized by subsystem.
 
 ## Embedding & GPU
 

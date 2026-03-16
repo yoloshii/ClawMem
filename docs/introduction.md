@@ -1,6 +1,6 @@
 # ClawMem overview
 
-ClawMem is an open-source memory engine for Claude Code and AI agents. It runs on-device, giving agents persistent and searchable memory that survives across sessions, compactions, and runtime boundaries. The system integrates as Claude Code hooks with an MCP server, or as a native OpenClaw ContextEngine plugin.
+ClawMem is an open-source memory engine for Claude Code and AI agents. It runs on-device, giving agents persistent and searchable memory that survives across sessions, compactions, and runtime boundaries. The system integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client including OpenClaw), or a native OpenClaw ContextEngine plugin.
 
 ## What it does
 
