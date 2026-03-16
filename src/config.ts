@@ -71,12 +71,16 @@ export interface ProfileConfig {
   useVector: boolean;
   vectorTimeout: number;
   minScore: number;
+  /** Budget-aware escalation: if fast path finishes early, spend remaining time on expansion + reranking */
+  deepEscalation: boolean;
+  /** Max time (ms) allowed for the fast path before escalation is considered */
+  escalationBudgetMs: number;
 }
 
 export const PROFILES: Record<PerformanceProfile, ProfileConfig> = {
-  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55 },
-  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45 },
-  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.35 },
+  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, deepEscalation: false, escalationBudgetMs: 0 },
+  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, deepEscalation: false, escalationBudgetMs: 0 },
+  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.35, deepEscalation: true,  escalationBudgetMs: 4000 },
 };
 
 export function getActiveProfile(): ProfileConfig {

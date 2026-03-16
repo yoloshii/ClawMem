@@ -7,7 +7,8 @@
  */
 
 import type { Store, SearchResult } from "../store.ts";
-import { DEFAULT_EMBED_MODEL, extractSnippet } from "../store.ts";
+import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, extractSnippet, resolveStore } from "../store.ts";
+import { getVaultPath, getActiveProfile } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -29,13 +30,12 @@ import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
 import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
-import { getActiveProfile } from "../config.ts";
 
 // =============================================================================
 // Config
 // =============================================================================
 
-// Profile-driven defaults (overridden by CLAWMEM_PROFILE env var)
+// Profile-driven defaults (overridden by CLAWMEM_PROFILE env var via E14)
 const DEFAULT_TOKEN_BUDGET = 800;
 const DEFAULT_MAX_RESULTS = 10;
 const DEFAULT_MIN_SCORE = 0.45;
@@ -52,7 +52,7 @@ function getTierConfig(score: number): { snippetLen: number; showMeta: boolean; 
 // Directories to never surface
 const FILTERED_PATHS = ["_PRIVATE/", "experiments/", "_clawmem/"];
 
-// File path patterns to extract from prompts (E13: file-aware UserPromptSubmit)
+// File path patterns to extract from prompts (E13 replacement: file-aware UserPromptSubmit)
 const FILE_PATH_RE = /(?:^|\s)((?:\/[\w.@-]+)+(?:\.\w+)?|[\w.@-]+\.(?:ts|js|py|md|sh|yaml|yml|json|toml|rs|go|tsx|jsx|css|html))\b/g;
 
 // =============================================================================
@@ -81,10 +81,11 @@ export async function contextSurfacing(
     return makeEmptyOutput("context-surfacing");
   }
 
-  // Load active performance profile
+  // Load active performance profile (E14)
   const profile = getActiveProfile();
   const maxResults = profile.maxResults;
   const tokenBudget = profile.tokenBudget;
+  const startTime = Date.now();
 
   const isRecency = hasRecencyIntent(prompt);
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : profile.minScore;
@@ -118,7 +119,22 @@ export async function contextSurfacing(
     }
   }
 
-  // File-aware supplemental search (E13): extract file paths/names from prompt
+  // Dual-query: also search skill vault if configured (secondary source)
+  if (getVaultPath("skill")) {
+    try {
+      const skillStore = resolveStore("skill");
+      const skillResults = skillStore.searchFTS(prompt, 5);
+      // Tag skill vault results for identification in output
+      for (const r of skillResults) {
+        (r as any)._fromVault = "skill";
+      }
+      results = [...results, ...skillResults];
+    } catch {
+      // Skill vault unavailable — continue with general results only
+    }
+  }
+
+  // File-aware supplemental search (E13 replacement): extract file paths/names from prompt
   // and run targeted FTS queries to surface file-specific vault context
   const fileMatches = [...prompt.matchAll(FILE_PATH_RE)].map(m => m[1]!.trim()).filter(Boolean);
   if (fileMatches.length > 0) {
@@ -138,6 +154,54 @@ export async function contextSurfacing(
 
   if (results.length === 0) return makeEmptyOutput("context-surfacing");
 
+  // Budget-aware deep escalation (deep profile only):
+  // If the fast path finished quickly and found results, spend remaining time budget
+  // on query expansion (discovers new candidates) and cross-encoder reranking (reorders).
+  if (profile.deepEscalation && results.length >= 2) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed < profile.escalationBudgetMs) {
+      try {
+        // Phase 1: Query expansion — discover candidates BM25+vector missed
+        const expanded = await store.expandQuery(prompt, DEFAULT_QUERY_MODEL);
+        if (expanded.length > 0) {
+          const seen = new Set(results.map(r => r.filepath));
+          for (const eq of expanded.slice(0, 3)) {
+            if (Date.now() - startTime > 6000) break; // hard stop at 6s
+            const ftsExp = store.searchFTS(eq, 5);
+            for (const r of ftsExp) {
+              if (!seen.has(r.filepath)) {
+                seen.add(r.filepath);
+                results.push(r);
+              }
+            }
+          }
+        }
+
+        // Phase 2: Cross-encoder reranking — reorder with deeper relevance signal
+        if (Date.now() - startTime < 6000 && results.length >= 3) {
+          const toRerank = results.slice(0, 15).map(r => ({
+            file: r.filepath,
+            text: (r.body || "").slice(0, 2000),
+          }));
+          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL);
+          if (reranked.length > 0) {
+            const rerankedMap = new Map(reranked.map(r => [r.file, r.score]));
+            // Blend: 60% original score + 40% reranker score for stability
+            for (const r of results) {
+              const rerankScore = rerankedMap.get(r.filepath);
+              if (rerankScore !== undefined) {
+                r.score = 0.6 * r.score + 0.4 * rerankScore;
+              }
+            }
+            results.sort((a, b) => b.score - a.score);
+          }
+        }
+      } catch {
+        // Escalation failed (GPU down, timeout, etc.) — continue with fast-path results
+      }
+    }
+  }
+
   // Filter out private/excluded paths
   results = results.filter(r =>
     !FILTERED_PATHS.some(p => r.displayPath.includes(p))
@@ -148,8 +212,12 @@ export async function contextSurfacing(
   // Filter out snoozed documents
   const now = new Date();
   results = results.filter(r => {
+    // filepath is a virtual path (clawmem://collection/path) but findActiveDocument
+    // expects the collection-relative path, not the full virtual path
     const parsed = r.filepath.startsWith('clawmem://') ? r.filepath.replace(/^clawmem:\/\/[^/]+\/?/, '') : r.filepath;
-    const doc = store.findActiveDocument(r.collectionName, parsed);
+    // Use the correct store for skill-vault results
+    const targetStore = (r as any)._fromVault === "skill" ? (() => { try { return resolveStore("skill"); } catch { return store; } })() : store;
+    const doc = targetStore.findActiveDocument(r.collectionName, parsed);
     if (!doc) return true;
     if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
     return true;
@@ -170,8 +238,19 @@ export async function contextSurfacing(
   // Filter out noise results (agent denials, too-short snippets) before enrichment
   results = results.filter(r => !r.body || !isRetrievedNoise(r.body));
 
-  // Enrich with SAME metadata
-  const enriched = enrichResults(store, results, prompt);
+  // Enrich with SAME metadata — route skill-vault results through their own store
+  const generalResults = results.filter(r => !(r as any)._fromVault);
+  const skillResults = results.filter(r => (r as any)._fromVault === "skill");
+  let enriched = enrichResults(store, generalResults, prompt);
+  if (skillResults.length > 0) {
+    try {
+      const skillStore = resolveStore("skill");
+      enriched = [...enriched, ...enrichResults(skillStore, skillResults, prompt)];
+    } catch {
+      // Skill store unavailable — enrich with general store as fallback
+      enriched = [...enriched, ...enrichResults(store, skillResults, prompt)];
+    }
+  }
 
   // Apply composite scoring
   const scored = applyCompositeScoring(enriched, prompt)
@@ -191,6 +270,7 @@ export async function contextSurfacing(
         for (const ca of coActs) {
           const existing = scored.find(r => r.displayPath === ca.path);
           if (existing && existing.compositeScore <= 0.8) {
+            // Boost by 0.1 per co-activation count, capped at +0.2
             existing.compositeScore += Math.min(0.2, 0.1 * Math.min(ca.count, 2));
           }
         }
@@ -202,12 +282,14 @@ export async function contextSurfacing(
   }
 
   // Memory type diversification (E10): ensure procedural results aren't crowded out
+  // If top results are all semantic, promote the best procedural result
   if (scored.length > 3) {
     const top3Types = scored.slice(0, 3).map(r => inferMemoryType(r.displayPath, r.contentType, r.body));
     const hasProc = top3Types.includes("procedural");
     if (!hasProc) {
       const procIdx = scored.findIndex(r => inferMemoryType(r.displayPath, r.contentType, r.body) === "procedural");
       if (procIdx > 3) {
+        // Move the best procedural result to position 3
         const [proc] = scored.splice(procIdx, 1);
         scored.splice(3, 0, proc!);
       }
@@ -225,6 +307,7 @@ export async function contextSurfacing(
   }
 
   // Routing hint: detect query intent signals and prepend a tool routing directive
+  // This makes routing instructions salient at the moment of tool selection (per research)
   const routingHint = detectRoutingHint(prompt);
 
   return makeContextOutput(
@@ -247,14 +330,17 @@ export async function contextSurfacing(
 function detectRoutingHint(prompt: string): string | null {
   const q = prompt.toLowerCase();
 
+  // Timeline/session signals
   if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do|cross.session|earlier today|what we discussed|when we last)\b/i.test(q)) {
     return "If searching memory for this: use session_log or memory_retrieve, NOT query.";
   }
 
+  // Causal signals
   if (/\b(why did|why was|why were|what caused|what led to|reason for|decided to|decision about|trade.?off|instead of|chose to)\b/i.test(q) || /^why\b/i.test(q)) {
     return "If searching memory for this: use intent_search or memory_retrieve, NOT query.";
   }
 
+  // Discovery signals
   if (/\b(similar to|related to|what else|what other|reminds? me of|like this)\b/i.test(q)) {
     return "If searching memory for this: use find_similar or memory_retrieve, NOT query.";
   }
