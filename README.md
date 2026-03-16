@@ -172,7 +172,7 @@ Disable OpenClaw's native memory and `memory-lancedb` auto-recall/capture to avo
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
-**Alternative:** You can also use the Claude Code-style hooks + MCP approach with OpenClaw (`clawmem setup hooks && clawmem setup mcp`). This works but bypasses OpenClaw's ContextEngine lifecycle - you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups.
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 26 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
 
 #### Dual-Mode Operation
 
