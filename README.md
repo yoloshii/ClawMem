@@ -69,7 +69,7 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 **Optional (for better performance):**
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server`) — for dedicated GPU inference. Without it, `node-llama-cpp` runs models in-process (auto-downloads on first use). GPU servers give better throughput and prevent silent CPU fallback.
-- systemd (Linux) — for persistent background services (watcher, embed timer, GPU servers). See [systemd services](docs/guides/systemd-services.md).
+- systemd (Linux) or launchd (macOS) — for persistent background services (watcher, embed timer, GPU servers). ClawMem ships systemd unit templates; macOS users can create equivalent launchd plists. See [systemd services](docs/guides/systemd-services.md).
 
 **Optional integrations:**
 
