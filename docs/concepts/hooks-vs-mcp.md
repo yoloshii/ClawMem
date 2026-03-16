@@ -38,6 +38,8 @@ Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's behavior:
 
 Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
 
+**Threshold caveats:** The minimum score values (0.55/0.45/0.25) are fixed defaults that work for a ~300-doc vault with mixed-age content. In practice, the effective threshold depends on vault size (smaller vaults produce higher per-hit BM25 scores), document quality (the 0.7x-1.3x quality multiplier shifts all scores), embedding model (zembed-1 and EmbeddingGemma produce different cosine similarity distributions), and content age (recency decay is 25% of composite score, so older vaults need lower thresholds). If `balanced` returns empty context but your vault has relevant content, try `deep` — its lower threshold (0.25) and deep escalation compensate for these variations.
+
 ### Deep escalation (deep profile only)
 
 On the `deep` profile, context-surfacing uses a budget-aware escalation strategy. After the fast path (BM25 + vector search) completes, the hook checks how much of its 8-second timeout remains. If the fast path finished in under 4 seconds, the remaining time is spent on two additional phases:
