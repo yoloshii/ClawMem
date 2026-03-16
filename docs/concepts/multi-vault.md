@@ -29,7 +29,7 @@ Environment variables override config file values. Vault paths support `~` expan
 
 ## Using vaults with tools
 
-All 24+ MCP tools accept an optional `vault` parameter. Omit it for the default vault.
+All MCP tools accept an optional `vault` parameter. Omit it for the default vault.
 
 ```
 # Search the work vault

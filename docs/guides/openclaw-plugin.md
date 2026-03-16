@@ -21,7 +21,7 @@ The plugin uses a hybrid approach — ContextEngine methods for lifecycle manage
 | `ContextEngine.compact()` | Pre-compaction state preservation (delegates real compaction to legacy engine) |
 | `ContextEngine.bootstrap()` | Session bookkeeping |
 | `ContextEngine.assemble()` | Pass-through (retrieval done in hook, not here) |
-| Agent tools | 5 retrieval tools registered with OpenClaw via REST API: search, get, session_log, timeline, similar. The full [REST API](../reference/rest-api.md) exposes 20+ endpoints (lifecycle, graph traversal, mutations, export, etc.) accessible via HTTP but not registered as agent tools. |
+| Agent tools | 5 retrieval tools registered with OpenClaw via REST API: search, get, session_log, timeline, similar. The full [REST API](../reference/rest-api.md) exposes additional endpoints (lifecycle, graph traversal, mutations, export, etc.) accessible via HTTP but not registered as agent tools. |
 
 ### Why hybrid?
 
@@ -87,7 +87,7 @@ For cross-machine setups where one runtime is on a different host:
 | Method | How | Latency | Full feature set |
 |--------|-----|---------|-----------------|
 | **REST API** | Run `clawmem serve --port 7438` on the vault host. Remote agents call HTTP endpoints. | ~5-20ms per call | Search, retrieval, lifecycle, graph traversal. No hooks (hooks are local-only). |
-| **MCP over SSE** | Run the MCP server as an SSE transport instead of stdio. Configure the remote MCP client (Claude Code, OpenClaw, etc.) to connect via SSE URL. | ~5-20ms per call | All 20+ MCP tools. No hooks. |
+| **MCP over SSE** | Run the MCP server as an SSE transport instead of stdio. Configure the remote MCP client (Claude Code, OpenClaw, etc.) to connect via SSE URL. | ~5-20ms per call | All 28 MCP tools. No hooks. |
 
 In both cases, hooks (context-surfacing, decision-extractor, etc.) only run on the machine where the vault lives. Remote agents get tool access but not automatic context injection.
 

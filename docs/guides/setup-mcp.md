@@ -28,7 +28,7 @@ Add to your MCP client config:
 
 ## What it exposes
 
-The MCP server registers 24+ tools:
+The MCP server registers 28 tools:
 
 **Retrieval** — `memory_retrieve`, `query`, `search`, `vsearch`, `intent_search`, `query_plan`
 

@@ -145,7 +145,7 @@ ClawMem integrates via hooks (`settings.json`) and an MCP stdio server. Hooks ha
 
 ```bash
 clawmem setup hooks    # Install lifecycle hooks (SessionStart, UserPromptSubmit, Stop, PreCompact)
-clawmem setup mcp      # Register MCP server in ~/.claude.json (20+ agent tools)
+clawmem setup mcp      # Register MCP server in ~/.claude.json (28 tools)
 ```
 
 **Automatic (90%):** `context-surfacing` injects relevant memory on every prompt. `postcompact-inject` re-injects state after compaction. `decision-extractor`, `handoff-generator`, `feedback-loop` capture session state on stop.
@@ -172,7 +172,7 @@ Disable OpenClaw's native memory and `memory-lancedb` auto-recall/capture to avo
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
-**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 26 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 28 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
 
 #### Dual-Mode Operation
 
@@ -403,7 +403,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 26 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
+ClawMem exposes 28 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
 
 **Claude Code (automatic):**
 
