@@ -9,6 +9,7 @@
 import { resolve as pathResolve } from "path";
 import { existsSync, readFileSync } from "fs";
 import type { Store } from "../store.ts";
+import { getIndexHealth } from "../store.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -64,11 +65,23 @@ export async function curatorNudge(
     return makeEmptyOutput("curator-nudge");
   }
 
+  // Override embedding backlog with live data (report value goes stale after embed timer runs)
+  let actions = [...report.actions];
+  try {
+    const health = getIndexHealth(store.db);
+    actions = actions.filter(a => !/documents? need embedding/i.test(a));
+    if (health.needsEmbedding > 0) {
+      actions.unshift(`${health.needsEmbedding} documents need embedding`);
+    }
+  } catch { /* fail-open: use report actions as-is */ }
+
+  if (actions.length === 0) return makeEmptyOutput("curator-nudge");
+
   // Build compact action summary within budget
   const lines = [`**Curator (${report.timestamp.slice(0, 10)}):**`];
   let tokens = estimateTokens(lines[0]!);
 
-  for (const action of report.actions) {
+  for (const action of actions) {
     const line = `- ${action}`;
     const lineTokens = estimateTokens(line);
     if (tokens + lineTokens > MAX_TOKEN_BUDGET && lines.length > 1) break;
