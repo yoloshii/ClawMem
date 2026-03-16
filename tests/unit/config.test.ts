@@ -82,6 +82,38 @@ describe("PROFILES", () => {
       expect(typeof p.useVector).toBe("boolean");
       expect(typeof p.vectorTimeout).toBe("number");
       expect(typeof p.minScore).toBe("number");
+      expect(typeof p.minScoreRatio).toBe("number");
+      expect(typeof p.absoluteFloor).toBe("number");
+      expect(typeof p.activationFloor).toBe("number");
+      expect(typeof p.thresholdMode).toBe("string");
     }
+  });
+
+  it("all profiles default to adaptive thresholdMode", () => {
+    for (const name of ["speed", "balanced", "deep"] as PerformanceProfile[]) {
+      expect(PROFILES[name].thresholdMode).toBe("adaptive");
+    }
+  });
+
+  it("adaptive thresholds are ordered correctly across profiles", () => {
+    // Deeper profiles should be more permissive (lower floors, lower ratios)
+    expect(PROFILES.speed.minScoreRatio).toBeGreaterThan(PROFILES.balanced.minScoreRatio);
+    expect(PROFILES.balanced.minScoreRatio).toBeGreaterThan(PROFILES.deep.minScoreRatio);
+    expect(PROFILES.speed.activationFloor).toBeGreaterThan(PROFILES.balanced.activationFloor);
+    expect(PROFILES.balanced.activationFloor).toBeGreaterThan(PROFILES.deep.activationFloor);
+    expect(PROFILES.speed.absoluteFloor).toBeGreaterThan(PROFILES.balanced.absoluteFloor);
+    expect(PROFILES.balanced.absoluteFloor).toBeGreaterThan(PROFILES.deep.absoluteFloor);
+  });
+
+  it("activationFloor > absoluteFloor for all profiles", () => {
+    for (const name of ["speed", "balanced", "deep"] as PerformanceProfile[]) {
+      expect(PROFILES[name].activationFloor).toBeGreaterThan(PROFILES[name].absoluteFloor);
+    }
+  });
+
+  it("deep profile has deepEscalation enabled", () => {
+    expect(PROFILES.deep.deepEscalation).toBe(true);
+    expect(PROFILES.speed.deepEscalation).toBe(false);
+    expect(PROFILES.balanced.deepEscalation).toBe(false);
   });
 });

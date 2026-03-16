@@ -88,6 +88,8 @@ coActivationBoost = 1 + min(coCount / 10, 0.15)
 
 Documents frequently surfaced together in the same session get up to 15% boost.
 
+**Where co-activation is applied depends on the caller.** MCP tools (`query`, `search`, `vsearch`) pass a co-activation function into `applyCompositeScoring()`, so the boost is part of the composite score used for ranking and `minScore` filtering. The context-surfacing hook does NOT pass co-activation into composite scoring — instead it applies a separate spreading-activation step *after* adaptive threshold filtering. This means the hook's threshold decisions are based on scores without co-activation, and co-activation only boosts results that already passed the threshold. This is intentional: it prevents relationship boosts from rescuing otherwise-weak results into the surfaced set.
+
 ## Additional modifiers
 
 ### Pin boost
