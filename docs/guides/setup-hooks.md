@@ -12,10 +12,10 @@ This installs hooks into `~/.claude/settings.json`:
 
 | Hook | Event | Timeout | Purpose |
 |------|-------|---------|---------|
-| `context-surfacing` | UserPromptSubmit | 5s | Search vault, inject relevant context |
+| `context-surfacing` | UserPromptSubmit | 8s | Search vault, inject relevant context |
 | `curator-nudge` | SessionStart | 5s | Surface maintenance suggestions |
 | `postcompact-inject` | SessionStart | 5s | Re-inject state after compaction |
-| `precompact-extract` | PreCompact | 10s | Preserve state before compaction |
+| `precompact-extract` | PreCompact | 5s | Preserve state before compaction |
 | `decision-extractor` | Stop | 10s | Extract observations from conversation |
 | `handoff-generator` | Stop | 10s | Summarize session for continuity |
 | `feedback-loop` | Stop | 10s | Track referenced notes, boost confidence |
@@ -52,7 +52,7 @@ To add them manually, edit `~/.claude/settings.json`:
 
 ## Timeout wrappers
 
-All default hooks use `timeout` wrappers (5s for lightweight hooks, 10s for LLM-based extraction). This prevents hung GPU services from blocking Claude Code.
+All default hooks use `timeout` wrappers (5s for SessionStart/PreCompact hooks, 8s for context-surfacing, 10s for LLM-based Stop hooks). This prevents hung GPU services from blocking the agent.
 
 ## Deduplication
 
