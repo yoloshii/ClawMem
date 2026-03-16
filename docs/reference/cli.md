@@ -108,7 +108,7 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block node-llama-cpp auto-downloads |
-| `CLAWMEM_PROFILE` | `balanced` | Performance profile (speed/balanced/deep) |
+| `CLAWMEM_PROFILE` | `balanced` | Performance profile: `speed` (BM25 only), `balanced` (BM25+vector), `deep` (BM25+vector+expansion+reranking) |
 | `CLAWMEM_VAULTS` | — | JSON map of vault name to SQLite path |
 | `CLAWMEM_API_TOKEN` | — | Bearer token for REST API auth |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction during indexing |

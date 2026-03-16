@@ -62,4 +62,4 @@ The Stop-event hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`
 
 ## Profile integration
 
-`context-surfacing` reads `CLAWMEM_PROFILE` to configure its token budget, max results, vector timeout, and minimum score threshold. See [Tuning context-surfacing with profiles](../concepts/hooks-vs-mcp.md#tuning-context-surfacing-with-profiles).
+`context-surfacing` reads `CLAWMEM_PROFILE` to configure its token budget, max results, vector timeout, minimum score threshold, and deep escalation (query expansion + reranking on the `deep` profile). See [Tuning context-surfacing with profiles](../concepts/hooks-vs-mcp.md#tuning-context-surfacing-with-profiles).

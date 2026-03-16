@@ -28,15 +28,27 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 
 ### Tuning context-surfacing with profiles
 
-Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's resource budget:
+Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's behavior:
 
-| Profile | Token budget | Max results | Vector | Timeout | Min score |
-|---------|-------------|-------------|--------|---------|-----------|
-| `speed` | 400 | 5 | Off | — | 0.55 |
-| `balanced` (default) | 800 | 10 | On | 900ms | 0.45 |
-| `deep` | 1200 | 15 | On | 2000ms | 0.35 |
+| Profile | Token budget | Max results | Vector | Vector timeout | Min score | Deep escalation |
+|---------|-------------|-------------|--------|----------------|-----------|-----------------|
+| `speed` | 400 | 5 | Off | — | 0.55 | No |
+| `balanced` (default) | 800 | 10 | On | 900ms | 0.45 | No |
+| `deep` | 1200 | 15 | On | 2000ms | 0.35 | Yes |
 
 Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
+
+### Deep escalation (deep profile only)
+
+On the `deep` profile, context-surfacing uses a budget-aware escalation strategy. After the fast path (BM25 + vector search) completes, the hook checks how much of its 8-second timeout remains. If the fast path finished in under 4 seconds, the remaining time is spent on two additional phases:
+
+1. **Query expansion** — the LLM generates lexical and semantic variants of the prompt. These expanded queries run through BM25 to discover candidates that the original query terms missed. New candidates are merged into the result set (deduplicated).
+
+2. **Cross-encoder reranking** — the top 15 candidates are scored by the reranker with 2000 chars of document context per candidate. Results are blended (60% original score, 40% reranker score) to avoid over-relying on either signal.
+
+Both phases have a hard stop at 6 seconds (leaving 2 seconds of headroom within the hook timeout). If GPU services are unavailable or either phase times out, the hook falls back to the fast-path results. On a GPU system, expansion typically takes ~300ms and reranking ~200ms, so both phases fire on nearly every prompt. On CPU-only systems, the fast path alone usually consumes most of the 4-second budget, so escalation skips naturally.
+
+The effect: `deep` profile hooks produce results closer to what the `query` MCP tool returns (which always runs expansion + reranking), while `speed` and `balanced` continue using the fast path only.
 
 ### Hook blind spots
 

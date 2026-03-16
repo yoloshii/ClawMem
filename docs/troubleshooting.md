@@ -67,7 +67,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively: prompts under 20 chars, slash commands, and heartbeat-like prompts are skipped. If no documents score above the profile's minimum threshold, it returns empty.
-- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Try a lower-threshold profile: `CLAWMEM_PROFILE=deep`.
+- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Try `CLAWMEM_PROFILE=deep` for lower score thresholds, more results, and budget-aware query expansion + reranking.
 
 **Duplicate observations after every session**
 - The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.
