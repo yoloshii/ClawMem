@@ -1,6 +1,8 @@
 # Graph traversal in ClawMem
 
-ClawMem maintains a multi-graph of relationships between AI agent memory documents in the `memory_relations` table. These edges power `intent_search` graph expansion and `find_causal_links` chain tracing.
+ClawMem maintains a multi-graph of relationships between documents in the `memory_relations` table. These edges let agents trace chains of reasoning across documents — answering questions like "why did we decide X", "what caused Y", and "what else supports Z" that keyword and vector search alone can't handle.
+
+Most edges are created automatically during indexing (A-MEM link generation) and after each response (causal inference from decision-extractor). The `build_graphs` tool adds temporal backbone and bulk semantic edges for vaults with sparse A-MEM coverage. You don't need to manage the graph manually under normal use.
 
 ## Edge types
 

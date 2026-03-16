@@ -80,6 +80,14 @@ Fragments are embedded independently. The full-document fragment catches broad q
 
 BM25 uses SQLite's FTS5 extension with prefix matching. Vector search uses the `vec0` extension with cosine similarity. Embedding dimensions depend on the model: 768 for the default EmbeddingGemma-300M, 2560 for the SOTA zembed-1, or provider-determined for cloud embedding.
 
+## Graphs
+
+ClawMem maintains a `memory_relations` table of typed edges between documents: semantic, supporting, contradicts, causal, and temporal. These edges let `intent_search` answer "why" and "what led to" questions by following chains across documents rather than relying on keyword or vector similarity alone.
+
+Most edges are created automatically. When new documents are indexed, A-MEM finds vector neighbors and uses the LLM to classify relationships (semantic, supporting, contradicts). When `decision-extractor` runs after each response, it infers causal links between observations. The `build_graphs` MCP tool adds temporal backbone edges (creation-order) and bulk semantic edges — run it after large ingestion batches, not after routine indexing.
+
+See [graph traversal](../internals/graph-traversal.md) for edge types, traversal mechanics, and beam search details.
+
 ## Retrieval tiers
 
 | Tier | Mechanism | Agent effort | Coverage |
