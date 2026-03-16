@@ -61,8 +61,21 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 
 ### Prerequisites
 
-- [Bun](https://bun.sh) v1.0+
-- SQLite with FTS5 support (included with Bun)
+**Required:**
+
+- [Bun](https://bun.sh) v1.0+ — runtime for ClawMem
+- SQLite with FTS5 — included with Bun. On macOS, install `brew install sqlite` for extension loading support (ClawMem detects and uses Homebrew SQLite automatically).
+
+**Optional (for better performance):**
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server`) — for dedicated GPU inference. Without it, `node-llama-cpp` runs models in-process (auto-downloads on first use). GPU servers give better throughput and prevent silent CPU fallback.
+- systemd (Linux) — for persistent background services (watcher, embed timer, GPU servers). See [systemd services](docs/guides/systemd-services.md).
+
+**Optional integrations:**
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — for hooks + MCP integration
+- [OpenClaw](https://github.com/openclawai/openclaw) — for ContextEngine plugin integration
+- [bd CLI](https://github.com/dolthub/dolt) v0.58.0+ — for Beads issue tracker sync (only if using Beads)
 
 ### Install from npm (recommended)
 
