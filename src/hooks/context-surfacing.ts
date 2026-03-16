@@ -178,7 +178,10 @@ export async function contextSurfacing(
         }
 
         // Phase 2: Cross-encoder reranking — reorder with deeper relevance signal
+        // Sort by score first so reranking covers the best candidates, not just
+        // the first-inserted (expansion hits appended later would otherwise be missed)
         if (Date.now() - startTime < 6000 && results.length >= 3) {
+          results.sort((a, b) => b.score - a.score);
           const toRerank = results.slice(0, 15).map(r => ({
             file: r.filepath,
             text: (r.body || "").slice(0, 2000),
