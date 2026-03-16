@@ -57,9 +57,17 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## Hooks
 
+**"UserPromptSubmit hook error" (intermittent)**
+- SQLite contention between the watcher and the context-surfacing hook. The watcher processes filesystem events (including non-.md files like session transcripts) and holds brief write locks. If the hook fires during a lock, it can exceed its timeout. More likely during active conversations with rapid transcript changes.
+- Fix: The default timeout is 8s (as of v0.1.1). If errors persist, restart the watcher to clear memory bloat: `systemctl --user restart clawmem-watcher.service`.
+
 **Hooks hang or timeout**
-- GPU services are unreachable, causing embedding/LLM calls to hang.
-- Fix: Check GPU connectivity (`curl http://host:8088/health`). Default hook timeouts (5s/10s) should prevent permanent hangs.
+- GPU services are unreachable, causing embedding/LLM calls to block until the timeout wrapper kills the process.
+- Fix: Check GPU connectivity (`curl http://host:8088/health`). Hook timeouts are 8s for context-surfacing, 5s for SessionStart/PreCompact hooks, 10s for Stop hooks. See [setup-hooks](guides/setup-hooks.md) for the full table.
+
+**Hook fires but returns empty context**
+- The context-surfacing hook filters aggressively: prompts under 20 chars, slash commands, and heartbeat-like prompts are skipped. If no documents score above the profile's minimum threshold, it returns empty.
+- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Try a lower-threshold profile: `CLAWMEM_PROFILE=deep`.
 
 **Duplicate observations after every session**
 - The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.
