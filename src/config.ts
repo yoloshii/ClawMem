@@ -70,7 +70,16 @@ export interface ProfileConfig {
   maxResults: number;
   useVector: boolean;
   vectorTimeout: number;
+  /** Legacy absolute threshold — used by MCP tools and as fallback when thresholdMode="absolute" */
   minScore: number;
+  /** Adaptive: keep results within this ratio of best score (e.g., 0.55 = top 55%) */
+  minScoreRatio: number;
+  /** Adaptive: never surface below this regardless of ratio */
+  absoluteFloor: number;
+  /** Adaptive: if best result is below this, return empty (prevents all-weak surfacing) */
+  activationFloor: number;
+  /** "adaptive" uses ratio-based filtering; "absolute" uses legacy minScore */
+  thresholdMode: "adaptive" | "absolute";
   /** Budget-aware escalation: if fast path finishes early, spend remaining time on expansion + reranking */
   deepEscalation: boolean;
   /** Max time (ms) allowed for the fast path before escalation is considered */
@@ -78,9 +87,9 @@ export interface ProfileConfig {
 }
 
 export const PROFILES: Record<PerformanceProfile, ProfileConfig> = {
-  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, deepEscalation: false, escalationBudgetMs: 0 },
-  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, deepEscalation: false, escalationBudgetMs: 0 },
-  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.25, deepEscalation: true,  escalationBudgetMs: 4000 },
+  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, minScoreRatio: 0.65, absoluteFloor: 0.18, activationFloor: 0.24, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0 },
+  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, minScoreRatio: 0.55, absoluteFloor: 0.15, activationFloor: 0.20, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0 },
+  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.25, minScoreRatio: 0.45, absoluteFloor: 0.12, activationFloor: 0.16, thresholdMode: "adaptive", deepEscalation: true,  escalationBudgetMs: 4000 },
 };
 
 export function getActiveProfile(): ProfileConfig {

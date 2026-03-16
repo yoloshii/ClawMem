@@ -253,8 +253,26 @@ export async function contextSurfacing(
   }
 
   // Apply composite scoring
-  const scored = applyCompositeScoring(enriched, prompt)
-    .filter(r => r.compositeScore >= minScore);
+  const allScored = applyCompositeScoring(enriched, prompt);
+
+  // Threshold filtering — adaptive (ratio-based) or absolute (legacy)
+  let scored: typeof allScored;
+  if (profile.thresholdMode === "adaptive") {
+    // Use max composite score across the set (not positional [0], which may be
+    // reordered by recency-intent sorting in applyCompositeScoring)
+    const bestScore = allScored.length > 0
+      ? Math.max(...allScored.map(r => r.compositeScore))
+      : 0;
+
+    // Activation floor: if even the best result is too weak, bail entirely
+    if (bestScore < profile.activationFloor) return makeEmptyOutput("context-surfacing");
+
+    const adaptiveMin = Math.max(bestScore * profile.minScoreRatio, profile.absoluteFloor);
+    scored = allScored.filter(r => r.compositeScore >= adaptiveMin);
+  } else {
+    // Legacy absolute threshold (backward compat)
+    scored = allScored.filter(r => r.compositeScore >= minScore);
+  }
 
   if (scored.length === 0) return makeEmptyOutput("context-surfacing");
 

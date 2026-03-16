@@ -115,13 +115,15 @@ Revision count weighted 2x vs duplicate count. Capped at 10%.
 
 After scoring, results pass through Maximal Marginal Relevance filtering. Documents with Jaccard bigram similarity > 0.6 to a higher-ranked result are demoted (not removed).
 
-## Score distribution and profile thresholds
+## Score distribution and adaptive thresholds
 
-Context-surfacing uses a minimum composite score threshold to filter results (see [profiles](hooks-vs-mcp.md#tuning-context-surfacing-with-profiles)). The absolute composite score a document receives depends on several vault-specific factors:
+Absolute composite scores vary across vaults due to several factors:
 
 - **Vault size** — smaller vaults produce higher BM25 scores per hit because IDF (inverse document frequency) is less diluted. A 30-doc vault may score 0.8 on a good match while a 3000-doc vault scores 0.4 for equal relevance.
 - **Quality multiplier** — ranges 0.7x to 1.3x based on document structure. A vault of well-structured docs with headings, lists, and frontmatter gets systematically higher composite scores than a vault of flat text notes.
 - **Embedding model** — zembed-1 (2560d) and EmbeddingGemma (768d) produce different cosine similarity distributions. Higher-dimensional embeddings tend toward lower absolute cosine scores but better relative ordering.
 - **Content age** — recency accounts for 25% of composite score. A vault of recent docs (< 30 days old) has minimal decay. A vault of 6-month-old research notes gets significant recency penalties even on strong search relevance.
 
-The default thresholds (`speed`: 0.55, `balanced`: 0.45, `deep`: 0.25) are calibrated for a ~300-doc vault with mixed-age content. If context-surfacing returns empty but your vault has relevant documents, try a lower-threshold profile. The `deep` profile at 0.25 catches most cases where `balanced` drops useful results due to age decay or quality penalties.
+Context-surfacing handles this with adaptive ratio-based thresholds instead of fixed absolute values. The hook computes the best composite score in the result set, then keeps results within a percentage of that best score (e.g., 55% for balanced). An activation floor prevents surfacing when even the best result is too weak. See [profiles](hooks-vs-mcp.md#adaptive-thresholds) for the specific values per profile.
+
+MCP tools use fixed absolute `minScore` thresholds since agents control those limits directly.

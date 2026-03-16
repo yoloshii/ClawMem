@@ -30,15 +30,25 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 
 Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's behavior:
 
-| Profile | Token budget | Max results | Vector | Vector timeout | Min score | Deep escalation |
-|---------|-------------|-------------|--------|----------------|-----------|-----------------|
-| `speed` | 400 | 5 | Off | — | 0.55 | No |
-| `balanced` (default) | 800 | 10 | On | 900ms | 0.45 | No |
-| `deep` | 1200 | 15 | On | 2000ms | 0.25 | Yes |
+| Profile | Token budget | Max results | Vector | Vector timeout | Score ratio | Activation floor | Deep escalation |
+|---------|-------------|-------------|--------|----------------|-------------|-----------------|-----------------|
+| `speed` | 400 | 5 | Off | — | 65% | 0.24 | No |
+| `balanced` (default) | 800 | 10 | On | 900ms | 55% | 0.20 | No |
+| `deep` | 1200 | 15 | On | 2000ms | 45% | 0.16 | Yes |
 
 Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
 
-**Threshold caveats:** The minimum score values (0.55/0.45/0.25) are fixed defaults that work for a ~300-doc vault with mixed-age content. In practice, the effective threshold depends on vault size (smaller vaults produce higher per-hit BM25 scores), document quality (the 0.7x-1.3x quality multiplier shifts all scores), embedding model (zembed-1 and EmbeddingGemma produce different cosine similarity distributions), and content age (recency decay is 25% of composite score, so older vaults need lower thresholds). If `balanced` returns empty context but your vault has relevant content, try `deep` — its lower threshold (0.25) and deep escalation compensate for these variations.
+### Adaptive thresholds
+
+Context-surfacing uses adaptive ratio-based thresholds that adjust to your vault's score distribution instead of fixed absolute values. The filter works in two steps:
+
+1. **Activation floor** — if the best result in the entire set scores below the activation floor (e.g., 0.20 for balanced), the hook returns empty. This prevents surfacing all-weak results where even the top hit isn't relevant enough to be useful.
+
+2. **Score ratio** — results are kept if they score within the ratio of the best result's composite score. For balanced at 55%, a best score of 0.60 keeps everything above 0.33 (`0.60 * 0.55`). An absolute floor (0.15 for balanced) prevents the ratio from going too low when the best score is itself marginal.
+
+This adapts to vault size (smaller vaults produce higher absolute scores), embedding model (different cosine similarity distributions), document quality (the 0.7x-1.3x quality multiplier shifts all scores), and content age (recency decay affects absolute scores but the ratio stays stable).
+
+For backward compatibility, set `thresholdMode: "absolute"` in the profile to use fixed `minScore` values instead. MCP tools always use absolute thresholds since agents control their own limits directly.
 
 ### Deep escalation (deep profile only)
 
