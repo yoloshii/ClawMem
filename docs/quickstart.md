@@ -12,8 +12,10 @@ Set up ClawMem as persistent memory for Claude Code in under 5 minutes. By the e
 
 ```bash
 # Via npm (recommended)
-bun add -g clawmem
-# or: npm install -g clawmem
+npm install -g clawmem
+
+# If you use Bun as your package manager:
+# bun add -g clawmem
 
 # From source
 git clone https://github.com/yoloshii/clawmem.git ~/clawmem
@@ -81,6 +83,27 @@ No GPU? See [cloud embedding](guides/cloud-embedding.md) for OpenAI, Voyage, Jin
 ./bin/clawmem status    # Quick index status
 bun test                # Run test suite
 ```
+
+## Build out your collections
+
+The bootstrap command indexed one directory. ClawMem gets more useful as you add more content — the retrieval pipeline surfaces better results from a richer corpus.
+
+```bash
+# Add your project docs
+clawmem collection add ~/projects/myapp --name myapp
+
+# Add research notes, decision records, domain references
+clawmem collection add ~/research --name research
+
+# Re-index and embed the new collections
+clawmem update --embed
+```
+
+A practical starting point: index every `.md` file in each project you regularly work on with agents. Include memory files, research outputs, decision records, learnings, project notes, and domain references. The more relevant context in the vault, the more the context-surfacing hook has to work with on each prompt.
+
+Code files are excluded by design — BM25 and embedding models don't perform well on code syntax. Capture technical decisions and architecture rationale in markdown instead. Use a dedicated code search tool for code retrieval.
+
+For the quality scoring system to work in your favor, structure your documents with headings, lists, and decision keywords. Frontmatter adds a 0.2 quality score bonus. See [composite scoring](concepts/composite-scoring.md) for details.
 
 ## What happens next
 
