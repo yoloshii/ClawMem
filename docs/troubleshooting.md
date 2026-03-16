@@ -2,6 +2,16 @@
 
 Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. Organized by subsystem.
 
+## Bun runtime
+
+**Snap Bun: EPERM on stdin (hooks return empty)**
+- On Linux, Bun installed via snap (`/snap/bin/bun`) cannot read stdin due to snap's confinement sandbox. Hooks receive no prompt input and silently return empty context.
+- Fix: Install Bun via the official installer (`curl -fsSL https://bun.sh/install | bash`) which places it at `~/.bun/bin/bun`. The `bin/clawmem` wrapper prefers `~/.bun/bin/bun` over the system bun for this reason. If hooks return empty on a snap-based system, verify `~/.bun/bin/bun` exists and is executable.
+
+**Two Bun binaries on PATH**
+- If both snap bun (`/snap/bin/bun`) and native bun (`~/.bun/bin/bun`) are installed, `which bun` may return the snap version. Direct `bun -e` or `bun run` commands will use the wrong binary.
+- Fix: The `bin/clawmem` wrapper handles this automatically. For manual commands, use `~/.bun/bin/bun` explicitly or add `~/.bun/bin` to PATH before `/snap/bin`.
+
 ## Embedding & GPU
 
 **"Local model download blocked" error**
@@ -19,6 +29,10 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **Vector search returns no results but BM25 works**
 - Missing embeddings. The watcher indexes but does NOT embed.
 - Fix: Run `clawmem embed` or wait for the daily embed timer.
+
+**Vector search: "Dimension mismatch" error**
+- The vault was embedded with one model (e.g., zembed-1 at 2560d) but the query is being embedded with a different model (e.g., EmbeddingGemma at 768d). This happens when the GPU embedding server is unreachable and `node-llama-cpp` falls back to the default model, which has different dimensions.
+- Fix: Ensure the embedding server is running (`curl http://host:8088/health`). Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back to a mismatched model. If you switched models, re-embed the vault with `clawmem embed --force`.
 
 **Embedding fails with "input is too large to process"**
 - The `full` document fragment exceeds the model's token context (2048 tokens for EmbeddingGemma).
@@ -66,8 +80,16 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - Fix: Check GPU connectivity (`curl http://host:8088/health`). Hook timeouts are 8s for context-surfacing, 5s for SessionStart/PreCompact hooks, 10s for Stop hooks. See [setup-hooks](guides/setup-hooks.md) for the full table.
 
 **Hook fires but returns empty context**
-- The context-surfacing hook filters aggressively: prompts under 20 chars, slash commands, and heartbeat-like prompts are skipped. If no documents score above the profile's minimum threshold, it returns empty.
-- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Try `CLAWMEM_PROFILE=deep` for lower score thresholds, more results, and budget-aware query expansion + reranking.
+- The context-surfacing hook filters aggressively. Common causes:
+  - Prompt too short (< 20 chars), starts with `/`, or matches the heartbeat/greeting filter
+  - Duplicate prompt within the 600-second dedup window (SHA-256 hash match)
+  - Vector search silently failed (dimension mismatch, server down) and BM25-only results scored too low after composite scoring
+  - All results fell below the profile's minimum composite score threshold after recency decay, confidence weighting, and quality multiplier were applied
+- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Verify the embedding server is reachable if using a remote GPU. Try `CLAWMEM_PROFILE=deep` which lowers the score threshold from 0.45 to 0.25 and adds budget-aware query expansion + reranking. For vaults with older documents, the `balanced` profile's 0.45 threshold may filter out everything — `deep` compensates with a wider net.
+
+**Context-surfacing returns results on `balanced` but not `speed`**
+- `speed` profile disables vector search entirely and uses a higher minimum score (0.55). Documents that rank well via hybrid search (BM25+vector) may not score high enough on BM25 alone.
+- Not a bug — this is the intended tradeoff. Use `balanced` or `deep` for richer retrieval.
 
 **Duplicate observations after every session**
 - The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.

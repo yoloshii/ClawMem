@@ -63,7 +63,7 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 
 **Required:**
 
-- [Bun](https://bun.sh) v1.0+ — runtime for ClawMem
+- [Bun](https://bun.sh) v1.0+ — runtime for ClawMem. On Linux, install via `curl -fsSL https://bun.sh/install | bash` (not snap — snap Bun cannot read stdin, which breaks hooks).
 - SQLite with FTS5 — included with Bun. On macOS, install `brew install sqlite` for extension loading support (ClawMem detects and uses Homebrew SQLite automatically).
 
 **Optional (for better performance):**

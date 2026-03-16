@@ -4,7 +4,7 @@ Set up ClawMem as persistent memory for AI coding agents in under 5 minutes. By 
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) v1.0+
+- [Bun](https://bun.sh) v1.0+ — install via `curl -fsSL https://bun.sh/install | bash`, not snap (snap Bun has stdin restrictions that break hooks)
 - A GPU for local inference (default models need ~4GB VRAM; SOTA upgrade needs ~10GB). Or use [cloud embedding](guides/cloud-embedding.md)
 - Claude Code, OpenClaw, or any MCP-compatible client
 
