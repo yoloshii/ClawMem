@@ -84,20 +84,42 @@ cd ~/clawmem && bun install
 ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 ```
 
-### Quick Start (Bootstrap)
+### Setup roadmap
 
-One command to set up a vault:
+After installing, here's the full journey from zero to working memory:
+
+| Step | What | How | Details |
+|------|------|-----|---------|
+| **1. Bootstrap** | Create a vault, index your first collection, embed, install hooks and MCP | `clawmem bootstrap ~/notes --name notes` | One command does it all. Or run each step manually (see below). |
+| **2. Choose models** | Pick embedding + reranker models based on your hardware | 12GB+ VRAM → SOTA stack (zembed-1 + zerank-2). Less → QMD native combo. No GPU → cloud embedding or CPU fallback. | [GPU Services](#gpu-services) |
+| **3. Download models** | Get the GGUF files for your chosen stack | `wget` from HuggingFace, or let `node-llama-cpp` auto-download the QMD native models on first use | [Embedding](#embedding), [LLM Server](#llm-server), [Reranker Server](#reranker-server) |
+| **4. Start services** | Run GPU servers (if using dedicated GPU) and background services | `llama-server` for each model. systemd units for watcher + embed timer. | [systemd services](docs/guides/systemd-services.md) |
+| **5. Decide what to index** | Add collections for your projects, notes, research, and domain docs | `clawmem collection add ~/project --name project` | The more relevant markdown you index, the better retrieval works. See [building a rich context field](docs/introduction.md#building-a-rich-context-field). |
+| **6. Connect your agent** | Hook into Claude Code, OpenClaw, or any MCP client | `clawmem setup hooks && clawmem setup mcp` for Claude Code. `clawmem setup openclaw` for OpenClaw. | [Integration](#integration) |
+| **7. Verify** | Confirm everything is working | `clawmem doctor` (full health check) or `clawmem status` (quick index stats) | [Verify Installation](#verify-installation) |
+
+**Fastest path:** Step 1 alone gets you a working system with in-process CPU/GPU inference and default models — no manual model downloads or service configuration needed. Steps 2-4 are optional upgrades for better performance. Steps 5-6 are where you customize what gets indexed and how your agent connects.
+
+### Quick start commands
 
 ```bash
-# Initialize, index, embed, install hooks, register MCP
-./bin/clawmem bootstrap ~/notes --name notes
+# One command: init + index + embed + hooks + MCP
+clawmem bootstrap ~/notes --name notes
 
 # Or step by step:
-./bin/clawmem init
-./bin/clawmem collection add ~/notes --name notes
-./bin/clawmem update --embed
-./bin/clawmem setup hooks
-./bin/clawmem setup mcp
+clawmem init
+clawmem collection add ~/notes --name notes
+clawmem update --embed
+clawmem setup hooks
+clawmem setup mcp
+
+# Add more collections (the more you index, the richer retrieval gets)
+clawmem collection add ~/projects/myapp --name myapp
+clawmem collection add ~/research --name research
+clawmem update --embed
+
+# Verify
+clawmem doctor
 ```
 
 ### Integration
