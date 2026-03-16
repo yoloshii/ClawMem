@@ -34,7 +34,7 @@ Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's behavior:
 |---------|-------------|-------------|--------|----------------|-----------|-----------------|
 | `speed` | 400 | 5 | Off | — | 0.55 | No |
 | `balanced` (default) | 800 | 10 | On | 900ms | 0.45 | No |
-| `deep` | 1200 | 15 | On | 2000ms | 0.35 | Yes |
+| `deep` | 1200 | 15 | On | 2000ms | 0.25 | Yes |
 
 Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
 
