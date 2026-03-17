@@ -130,6 +130,24 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
   - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
   - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.
 - **Why not keep models warm?** Claude Code hooks spawn a fresh process per invocation (by design — hooks are shell commands). There is no persistent process between hook calls. The MCP server does keep models warm via a 5-minute inactivity timer, but that only benefits MCP tool calls, not hooks.
+- **Adjusting hook timeouts.** If you're using in-process Metal/Vulkan and hooks are timing out intermittently, you can increase the timeout in `~/.claude/settings.json`. Edit the `command` field for the affected hook — the number after `timeout` is the limit in seconds:
+  ```json
+  "command": "timeout 12 /path/to/clawmem hook context-surfacing"
+  ```
+  Or re-run `clawmem setup hooks` after editing the timeout constant in the source.
+
+  **Tradeoffs of longer timeouts:**
+
+  | Timeout | Effect |
+  |---------|--------|
+  | 8s (default) | Good balance for `llama-server` setups (~200ms) and Metal/Vulkan in-process (~4-5s). Tight for CPU-only. |
+  | 10-12s | Accommodates in-process Metal/Vulkan with SQLite contention headroom. Adds a noticeable delay before Claude sees your prompt when the hook is slow — you'll see the spinner for up to 12s on cold starts. |
+  | 15s+ | Not recommended. Claude Code waits for the hook before processing the prompt. A 15s hook makes the agent feel unresponsive on every first prompt and after any Bun cache invalidation. If you need this, run `llama-server` instead. |
+  | 5s or less | Only viable with `llama-server` running or `CLAWMEM_PROFILE=speed`. In-process models will always timeout. |
+
+  The timeout applies per invocation. A slow first prompt (cold start) doesn't mean subsequent prompts will be slow — Bun caches modules after the first load, and `node-llama-cpp` model files are cached on disk after the first download. Subsequent prompts in the same session are typically faster.
+
+  **Stop hooks** (`decision-extractor`, `handoff-generator`, `feedback-loop`) default to 10s because they run LLM inference (observer model). These run at session end, so latency doesn't block the user. Increasing them to 15-20s is safe if your observer model is slow.
 
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively. Common causes:
