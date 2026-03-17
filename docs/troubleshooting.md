@@ -72,8 +72,14 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 ## Hooks
 
 **"UserPromptSubmit hook error" (intermittent)**
-- SQLite contention between the watcher and the context-surfacing hook. The watcher processes filesystem events (including non-.md files like session transcripts) and holds brief write locks. If the hook fires during a lock, it can exceed its timeout. More likely during active conversations with rapid transcript changes.
-- Fix: The default timeout is 8s (as of v0.1.1). If errors persist, restart the watcher to clear memory bloat: `systemctl --user restart clawmem-watcher.service`.
+- SQLite contention between the watcher and the context-surfacing hook. During active conversations, Claude Code writes rapidly to session transcript `.jsonl` files. Prior to v0.1.6, the watcher processed all `.jsonl` file changes (not just Beads `.beads/*.jsonl`), triggering database opens and brief write locks on every transcript update. If the context-surfacing hook fired during a lock, it exceeded its timeout.
+- Fixed in v0.1.6: The watcher now only processes `.jsonl` files within `.beads/` directories (Dolt backend). Claude Code transcript `.jsonl` files are ignored entirely, eliminating the main source of lock contention and memory bloat.
+- If you still see this error on v0.1.6+: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). If it persists, check `systemctl --user status clawmem-watcher.service` for memory usage — healthy is under 100MB, bloated is 400MB+.
+
+**Watcher memory bloat (400MB+)**
+- The watcher accumulates memory when processing high-frequency file change events. The most common trigger was Claude Code session transcript `.jsonl` files changing on every keystroke during active conversations. Each event opened the database briefly, and over hours of active use, memory grew to 400-800MB.
+- Fixed in v0.1.6: transcript `.jsonl` files are no longer watched. Memory stays under 100MB during normal operation.
+- If memory still grows: check which files are triggering events (`journalctl --user -u clawmem-watcher -f`). Large numbers of non-`.md` file changes in watched directories can cause similar bloat.
 
 **Hooks hang or timeout**
 - GPU services are unreachable, causing embedding/LLM calls to block until the timeout wrapper kills the process.

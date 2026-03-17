@@ -629,12 +629,11 @@ Symptom: CLI reindex/update falls back to node-llama-cpp Vulkan (not GPU server)
   → Fixed 2026-02-12: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
 
 Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
-  → SQLite contention between the watcher and the hook. The watcher processes filesystem events
-    (including non-.md files like session .jsonl transcripts) and holds brief write locks. If the
-    hook fires during a lock, it can exceed its timeout. More likely during active conversations
-    when the watcher is processing rapid transcript changes.
-  → Fix: The default timeout is 8s (since v0.1.1). If you have an older install, re-run
-    `clawmem setup hooks` to update. If persistent, restart the watcher: `systemctl --user restart clawmem-watcher.service`.
+  → Fixed in v0.1.6: watcher no longer processes session transcript .jsonl files (only .beads/*.jsonl).
+    This was the main source of SQLite lock contention during active conversations.
+  → If still occurring: restart the watcher (`systemctl --user restart clawmem-watcher.service`).
+    Check memory usage — healthy is under 100MB, bloated (400MB+) means accumulated state from
+    high-frequency events. Restart clears it.
 ```
 
 ## CLI Reference

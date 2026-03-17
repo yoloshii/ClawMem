@@ -23,7 +23,10 @@ export function startWatcher(
     try {
       const watcher = watch(dir, { recursive: true }, (event, filename) => {
         if (!filename) return;
-        if (!filename.endsWith(".md") && !filename.endsWith(".jsonl")) return;
+        // Accept .md files (indexing) and .jsonl only within .beads/ (Dolt backend)
+        const isMd = filename.endsWith(".md");
+        const isBeadsJsonl = filename.endsWith(".jsonl") && filename.includes(".beads/");
+        if (!isMd && !isBeadsJsonl) return;
         if (shouldExclude(filename)) return;
 
         const fullPath = `${dir}/${filename}`;
