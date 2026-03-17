@@ -20,6 +20,53 @@ This installs hooks into `~/.claude/settings.json`:
 | `handoff-generator` | Stop | 10s | Summarize session for continuity |
 | `feedback-loop` | Stop | 10s | Track referenced notes, boost confidence |
 
+## Manual install (full reference)
+
+If you prefer to configure hooks manually instead of running `setup hooks`, add this to `~/.claude/settings.json`. Replace `/path/to/clawmem` with your actual install path (e.g. `~/.bun/bin/clawmem` or `~/clawmem/bin/clawmem`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "timeout 8 /path/to/clawmem hook context-surfacing"
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "timeout 5 /path/to/clawmem hook curator-nudge"
+      },
+      {
+        "type": "command",
+        "command": "timeout 5 /path/to/clawmem hook postcompact-inject"
+      }
+    ],
+    "PreCompact": [
+      {
+        "type": "command",
+        "command": "timeout 5 /path/to/clawmem hook precompact-extract"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "timeout 10 /path/to/clawmem hook decision-extractor"
+      },
+      {
+        "type": "command",
+        "command": "timeout 10 /path/to/clawmem hook handoff-generator"
+      },
+      {
+        "type": "command",
+        "command": "timeout 10 /path/to/clawmem hook feedback-loop"
+      }
+    ]
+  }
+}
+```
+
 ## Remove hooks
 
 ```bash
@@ -35,22 +82,16 @@ These hooks exist but are not installed by default:
 | `session-bootstrap` | SessionStart | Redundant with `context-surfacing` for most setups. Useful for heavy bootstrap context on session start. |
 | `staleness-check` | SessionStart | Can add latency on session start. Useful for surfacing stale document alerts. |
 
-To add them manually, append to the `SessionStart` array in `~/.claude/settings.json`:
+To add them, append to the `SessionStart` array in the config above:
 
 ```json
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "type": "command",
-        "command": "timeout 5 /path/to/clawmem hook session-bootstrap"
-      },
-      {
-        "type": "command",
-        "command": "timeout 5 /path/to/clawmem hook staleness-check"
-      }
-    ]
-  }
+  "type": "command",
+  "command": "timeout 5 /path/to/clawmem hook session-bootstrap"
+},
+{
+  "type": "command",
+  "command": "timeout 5 /path/to/clawmem hook staleness-check"
 }
 ```
 
