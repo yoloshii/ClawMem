@@ -35,7 +35,7 @@ These hooks exist but are not installed by default:
 | `session-bootstrap` | SessionStart | Redundant with `context-surfacing` for most setups. Useful for heavy bootstrap context on session start. |
 | `staleness-check` | SessionStart | Can add latency on session start. Useful for surfacing stale document alerts. |
 
-To add them manually, edit `~/.claude/settings.json`:
+To add them manually, append to the `SessionStart` array in `~/.claude/settings.json`:
 
 ```json
 {
@@ -44,6 +44,10 @@ To add them manually, edit `~/.claude/settings.json`:
       {
         "type": "command",
         "command": "timeout 5 /path/to/clawmem hook session-bootstrap"
+      },
+      {
+        "type": "command",
+        "command": "timeout 5 /path/to/clawmem hook staleness-check"
       }
     ]
   }

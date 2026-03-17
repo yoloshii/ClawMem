@@ -652,6 +652,13 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `beads_sync` | Sync Beads issues from Dolt backend (`bd` CLI) into memory: creates docs, bridges all dep types to `memory_relations`, runs A-MEM enrichment |
 
+### Vault Management
+
+| Tool | Description |
+|---|---|
+| `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
+| `vault_sync` | Index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories. |
+
 ### Memory Management & Lifecycle
 
 | Tool | Description |
@@ -998,7 +1005,7 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 
 Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box without a dedicated GPU (all models auto-download via `node-llama-cpp`, uses Metal on Apple Silicon). For best performance, run three `llama-server` instances — see [GPU Services](#gpu-services) for model tiers (SOTA vs QMD native) and [Cloud Embedding](#option-c-cloud-embedding-api) for cloud embedding alternatives.
 
-Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 9 Claude Code hooks (context injection, session bootstrap, decision extraction, handoffs, feedback, compaction support). Optional `clawmem-curator` agent for on-demand lifecycle triage, retrieval health checks, and maintenance (`clawmem setup curator`).
+Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 7 Claude Code hooks installed by default (context injection, curator nudge, compaction support, decision extraction, handoffs, feedback). Optional `clawmem-curator` agent for on-demand lifecycle triage, retrieval health checks, and maintenance (`clawmem setup curator`).
 
 ## Acknowledgments
 

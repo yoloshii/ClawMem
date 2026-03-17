@@ -633,8 +633,8 @@ Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
     (including non-.md files like session .jsonl transcripts) and holds brief write locks. If the
     hook fires during a lock, it can exceed its timeout. More likely during active conversations
     when the watcher is processing rapid transcript changes.
-  → Fix: Bump the hook timeout from 5s to 8s in ~/.claude/settings.json. If persistent, restart
-    the watcher to clear memory bloat: `systemctl --user restart clawmem-watcher.service`.
+  → Fix: The default timeout is 8s (since v0.1.1). If you have an older install, re-run
+    `clawmem setup hooks` to update. If persistent, restart the watcher: `systemctl --user restart clawmem-watcher.service`.
 ```
 
 ## CLI Reference
