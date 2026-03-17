@@ -111,6 +111,26 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - GPU services are unreachable, causing embedding/LLM calls to block until the timeout wrapper kills the process.
 - Fix: Check GPU connectivity (`curl http://host:8088/health`). Hook timeouts are 8s for context-surfacing, 5s for SessionStart/PreCompact hooks, 10s for Stop hooks. See [setup-hooks](guides/setup-hooks.md) for the full table.
 
+**Hooks slow or near timeout (4-6s per invocation)**
+- Each hook spawns a fresh Bun process. If the hook path requires `node-llama-cpp` (in-process models), the native addon import alone costs ~3.5s, leaving very little headroom in the 8s timeout for actual search and scoring.
+- This only happens when no `llama-server` is running and the hook falls back to in-process inference. The MCP server (long-lived process) does not have this problem — `node-llama-cpp` loads once at startup and stays warm.
+- **Who is affected:**
+
+| Setup | Hook latency | Notes |
+|-------|-------------|-------|
+| `llama-server` running (local or remote) | ~200ms | Hooks use HTTP calls, never import `node-llama-cpp`. Recommended. |
+| In-process Metal (Apple Silicon) | ~4-5s | `node-llama-cpp` addon import + model load. Under 8s but tight. |
+| In-process Vulkan (discrete GPU) | ~4-5s | Same as Metal — addon import is the bottleneck, not inference. |
+| In-process CPU-only (no Metal, no Vulkan) | >8s | Will timeout. Use `speed` profile or cloud embedding. |
+| Cloud embedding (`CLAWMEM_EMBED_API_KEY` set) | ~500ms | HTTP call to cloud provider, no `node-llama-cpp` needed. |
+
+- **Fix by setup type:**
+  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [GPU Services](../README.md#gpu-services) for setup. This is what most users will do in practice.
+  - **Quick:** Set `CLAWMEM_PROFILE=speed` — disables vector search in hooks entirely, pure BM25, never loads `node-llama-cpp`. Hooks complete in under 500ms.
+  - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
+  - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.
+- **Why not keep models warm?** Claude Code hooks spawn a fresh process per invocation (by design — hooks are shell commands). There is no persistent process between hook calls. The MCP server does keep models warm via a 5-minute inactivity timer, but that only benefits MCP tool calls, not hooks.
+
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively. Common causes:
   - Prompt too short (< 20 chars), starts with `/`, or matches the heartbeat/greeting filter
