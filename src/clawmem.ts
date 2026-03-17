@@ -295,9 +295,9 @@ async function cmdEmbed(args: string[]) {
   const isCloudEmbed = !!process.env.CLAWMEM_EMBED_API_KEY;
   const CLOUD_BATCH_SIZE = 50;
   const CLOUD_TPM_LIMIT = parseInt(process.env.CLAWMEM_EMBED_TPM_LIMIT || "100000", 10);
-  const CLOUD_TPM_SAFETY = 0.85;
+  const CLOUD_TPM_SAFETY = 0.85; // use 85% of limit to leave headroom for retries
   const CHARS_PER_TOKEN = 4;
-  let lastBatchSentAt = 0;
+  let lastBatchSentAt = 0; // global timestamp of last batch send
 
   for (let docIdx = 0; docIdx < hashes.length; docIdx++) {
     const { hash, body, path, title: docTitle, collection } = hashes[docIdx]!;
@@ -903,6 +903,7 @@ async function cmdServe(args: string[]) {
   console.log(`ClawMem HTTP server listening on http://${host}:${port}`);
   console.log(`Token auth: ${process.env.CLAWMEM_API_TOKEN ? "enabled" : "disabled (set CLAWMEM_API_TOKEN)"}`);
   console.log(`Press Ctrl+C to stop.`);
+  // Keep alive
   await new Promise(() => {});
 }
 
@@ -962,11 +963,6 @@ async function cmdSetupHooks(args: string[]) {
     console.log(`${c.green}Removed ClawMem hooks from ${settingsPath}${c.reset}`);
   } else {
     // Install clawmem hooks
-    // Production-validated hook set:
-    // - session-bootstrap/staleness-check omitted: context-surfacing on first prompt
-    //   handles retrieval more precisely, and postcompact-inject covers post-compaction.
-    //   session-bootstrap adds ~2000 tokens before the user types anything.
-    // - timeout wrappers prevent hooks from blocking the session on GPU timeouts.
     const hookConfig: Record<string, string[]> = {
       UserPromptSubmit: ["context-surfacing"],
       SessionStart: ["postcompact-inject", "curator-nudge"],
@@ -974,7 +970,6 @@ async function cmdSetupHooks(args: string[]) {
       Stop: ["decision-extractor", "handoff-generator", "feedback-loop"],
     };
 
-    // Timeout per event type (seconds)
     const timeouts: Record<string, number> = {
       UserPromptSubmit: 8,
       SessionStart: 5,
@@ -1087,6 +1082,7 @@ async function cmdSetupOpenClaw(args: string[]) {
     return;
   }
 
+  // Check that the OpenClaw plugin files exist
   if (!existsSync(pathResolve(pluginDir, "index.ts"))) {
     die(`OpenClaw plugin files not found at ${pluginDir}`);
   }
@@ -1160,19 +1156,42 @@ async function cmdWatch() {
       const col = collections.find(c => fullPath.startsWith(c.path));
       if (!col) return;
 
-      const relativePath = fullPath.slice(col.path.length + 1);
-      console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
-
       // Beads: trigger sync on any change within .beads/ directory
       // Dolt backend writes to .beads/dolt/ — watch for any file change there
       if (fullPath.includes(".beads/")) {
         const projectDir = detectBeadsProject(fullPath.replace(/\/\.beads\/.*$/, ""));
         if (projectDir) {
+          const relativePath = fullPath.slice(col.path.length + 1);
+          console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
           const result = await s.syncBeadsIssues(projectDir);
           console.log(`  beads: +${result.created} ~${result.synced}`);
         }
         return;
       }
+
+      // Quick pattern check: skip files that can't match the collection pattern
+      // before touching the DB. This prevents broad path collections (e.g. ~/Projects)
+      // with narrow patterns (e.g. single filename) from triggering DB access on
+      // every .md change under the tree.
+      const relativePath = fullPath.slice(col.path.length + 1);
+      if (col.pattern && col.pattern !== "**/*.md") {
+        const patterns = col.pattern.includes("{")
+          ? col.pattern.replace(/^\{|\}$/g, "").split(",")
+          : [col.pattern];
+        const couldMatch = patterns.some(p => {
+          // Simple glob check: if pattern has no wildcards, it's a filename match
+          if (!p.includes("*") && !p.includes("?")) return relativePath === p || relativePath.endsWith("/" + p);
+          // If pattern starts with **/, any relative path could match
+          if (p.startsWith("**/")) return true;
+          // If pattern has a directory prefix, check it
+          const patternDir = p.substring(0, p.lastIndexOf("/") + 1);
+          if (patternDir) return relativePath.startsWith(patternDir);
+          return true; // Fallback: let indexCollection handle it
+        });
+        if (!couldMatch) return;
+      }
+
+      console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
 
       // Re-index just this collection
       const stats = await indexCollection(s, col.name, col.path, col.pattern);
@@ -1185,9 +1204,43 @@ async function cmdWatch() {
     },
   });
 
+  // Skill vault watcher: watch _clawmem-skills/ content root if configured
+  let skillWatcher: { close: () => void } | null = null;
+  try {
+    const { getVaultPath, getSkillContentRoot } = await import("./config.ts");
+    const { resolveStore } = await import("./store.ts");
+    const skillVaultPath = getVaultPath("skill");
+    const skillRoot = getSkillContentRoot();
+
+    if (skillVaultPath && existsSync(skillRoot)) {
+      const skillStore = resolveStore("skill");
+      console.log(`${c.bold}Watching skill vault content root...${c.reset}`);
+      console.log(`  ${c.dim}skill: ${skillRoot} → ${skillVaultPath}${c.reset}`);
+
+      skillWatcher = startWatcher([skillRoot], {
+        debounceMs: 2000,
+        onChanged: async (fullPath, event) => {
+          const relativePath = fullPath.slice(skillRoot.length + 1);
+          console.log(`${c.dim}[${event}]${c.reset} skill/${relativePath}`);
+
+          const stats = await indexCollection(skillStore, "skill-observations", skillRoot, "**/*.md");
+          if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
+            console.log(`  skill: +${stats.added} ~${stats.updated} -${stats.removed}`);
+          }
+        },
+        onError: (err) => {
+          console.error(`${c.red}Skill watch error: ${err.message}${c.reset}`);
+        },
+      });
+    }
+  } catch {
+    // Skill vault not configured — skip
+  }
+
   // Keep running until Ctrl+C
   process.on("SIGINT", () => {
     watcher.close();
+    skillWatcher?.close();
     closeStore();
     process.exit(0);
   });
@@ -1585,6 +1638,9 @@ async function main() {
       case "doctor":
         await cmdDoctor();
         break;
+      case "path":
+        cmdPath();
+        break;
       case "bootstrap":
         await cmdBootstrap(subArgs);
         break;
@@ -1600,14 +1656,17 @@ async function main() {
       case "surface":
         await cmdSurface(subArgs);
         break;
+      case "lifecycle":
+        await cmdLifecycle(subArgs);
+        break;
       case "reflect":
         await cmdReflect(subArgs);
         break;
-      case "path":
-        cmdPath();
-        break;
       case "consolidate":
         await cmdConsolidate(subArgs);
+        break;
+      case "curate":
+        await cmdCurate(subArgs);
         break;
       case "help":
       case "--help":
@@ -1623,17 +1682,157 @@ async function main() {
   }
 }
 
+async function cmdLifecycle(args: string[]) {
+  const subCmd = args[0];
+  const subArgs = args.slice(1);
+
+  switch (subCmd) {
+    case "status": {
+      const store = getStore();
+      const stats = store.getLifecycleStats();
+      const { loadVaultConfig } = await import("./config.ts");
+      const config = loadVaultConfig();
+      const policy = config.lifecycle;
+
+      console.log(`Active: ${stats.active}`);
+      console.log(`Archived (auto): ${stats.archived}`);
+      console.log(`Forgotten (manual): ${stats.forgotten}`);
+      console.log(`Pinned: ${stats.pinned}`);
+      console.log(`Snoozed: ${stats.snoozed}`);
+      console.log(`Never accessed: ${stats.neverAccessed}`);
+      console.log(`Oldest access: ${stats.oldestAccess?.slice(0, 10) || "n/a"}`);
+      console.log();
+      if (policy) {
+        console.log(`Policy: archive after ${policy.archive_after_days}d, purge after ${policy.purge_after_days ?? "never"}, dry_run=${policy.dry_run}`);
+        if (policy.exempt_collections.length > 0) {
+          console.log(`Exempt: ${policy.exempt_collections.join(", ")}`);
+        }
+        if (Object.keys(policy.type_overrides).length > 0) {
+          const overrides = Object.entries(policy.type_overrides)
+            .map(([k, v]) => `${k}=${v === null ? "never" : v + "d"}`)
+            .join(", ");
+          console.log(`Type overrides: ${overrides}`);
+        }
+      } else {
+        console.log("Policy: none configured");
+      }
+      break;
+    }
+
+    case "sweep": {
+      const { values } = parseArgs({
+        args: subArgs,
+        options: { "dry-run": { type: "boolean", default: false } },
+        allowPositionals: false,
+      });
+      const dryRun = values["dry-run"];
+
+      const { loadVaultConfig } = await import("./config.ts");
+      const config = loadVaultConfig();
+      const policy = config.lifecycle;
+      if (!policy) {
+        die("No lifecycle policy configured in config.yaml");
+        return;
+      }
+
+      const store = getStore();
+      const candidates = store.getArchiveCandidates(policy);
+
+      if (dryRun || policy.dry_run) {
+        console.log(`Would archive ${candidates.length} document(s):`);
+        for (const c of candidates) {
+          console.log(`  - ${c.collection}/${c.path} (${c.content_type}, modified ${c.modified_at.slice(0, 10)}, accessed ${c.last_accessed_at?.slice(0, 10) || "never"})`);
+        }
+        if (candidates.length === 0) console.log("  (none)");
+        return;
+      }
+
+      const archived = store.archiveDocuments(candidates.map(c => c.id));
+      let purged = 0;
+      if (policy.purge_after_days) {
+        purged = store.purgeArchivedDocuments(policy.purge_after_days);
+      }
+      console.log(`Lifecycle sweep: archived ${archived}, purged ${purged}`);
+      break;
+    }
+
+    case "restore": {
+      const { values } = parseArgs({
+        args: subArgs,
+        options: {
+          query: { type: "string" },
+          collection: { type: "string" },
+          all: { type: "boolean", default: false },
+        },
+        allowPositionals: false,
+      });
+
+      const store = getStore();
+
+      if (values.query) {
+        const results = store.searchArchived(values.query, 20);
+
+        if (results.length === 0) {
+          console.log("No archived documents match that query.");
+          return;
+        }
+
+        const restored = store.restoreArchivedDocuments({ ids: results.map(r => r.id) });
+        console.log(`Restored ${restored}:`);
+        for (const r of results) {
+          console.log(`  - ${r.collection}/${r.path} (archived ${r.archived_at?.slice(0, 10)})`);
+        }
+      } else if (values.collection) {
+        const restored = store.restoreArchivedDocuments({ collection: values.collection });
+        console.log(`Restored ${restored} documents from collection "${values.collection}"`);
+      } else if (values.all) {
+        const restored = store.restoreArchivedDocuments({});
+        console.log(`Restored ${restored} archived documents`);
+      } else {
+        die("Usage: clawmem lifecycle restore --query <term> | --collection <name> | --all");
+      }
+      break;
+    }
+
+    case "search": {
+      const query = subArgs.join(" ").trim();
+      if (!query) {
+        die("Usage: clawmem lifecycle search <query>");
+        return;
+      }
+
+      const store = getStore();
+      const results = store.searchArchived(query);
+
+      if (results.length === 0) {
+        console.log("No archived documents match that query.");
+        return;
+      }
+
+      console.log(`Found ${results.length} archived document(s):\n`);
+      for (const r of results) {
+        console.log(`  [${r.score.toFixed(3)}] ${r.collection}/${r.path}`);
+        console.log(`          ${r.title} (archived ${r.archived_at?.slice(0, 10)})`);
+      }
+      break;
+    }
+
+    default:
+      die("Usage: clawmem lifecycle <status|sweep|search|restore>");
+  }
+}
+
 // =============================================================================
-// Cross-Session Reflection
+// Cross-Session Reflection (E5)
 // =============================================================================
 
 async function cmdReflect(args: string[]) {
-  const s = getStore();
+  const store = getStore();
   const days = parseInt(args[0] || "14");
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
 
-  const recentDocs = s.getDocumentsByType("decision", 50)
+  const recentDocs = store.getDocumentsByType("decision", 50)
     .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
 
   if (recentDocs.length === 0) {
@@ -1648,15 +1847,15 @@ async function cmdReflect(args: string[]) {
   const stopWords = new Set(["the", "that", "this", "with", "from", "have", "will", "been", "were", "they", "their", "what", "when", "which", "about", "into", "more", "some", "than", "them", "then", "very", "also", "just", "should", "would", "could", "does", "make", "like", "using", "used"]);
 
   for (const d of recentDocs) {
-    const doc = s.findDocument(d.path);
+    const doc = store.findDocument(d.path);
     if ("error" in doc) continue;
-    const body = s.getDocumentBody(doc) || "";
+    const body = store.getDocumentBody(doc) || "";
     const words = body.toLowerCase()
       .replace(/[^a-z0-9\s-]/g, " ")
       .split(/\s+/)
       .filter(w => w.length > 3 && !stopWords.has(w));
 
-    // Ordered bigrams (preserve phrase direction)
+    // M2: Ordered bigrams (preserve phrase direction)
     for (let i = 0; i < words.length - 1; i++) {
       const pair = `${words[i]!} ${words[i + 1]!}`;
       phrases.set(pair, (phrases.get(pair) || 0) + 1);
@@ -1672,6 +1871,7 @@ async function cmdReflect(args: string[]) {
   const patterns = [...phrases.entries()]
     .filter(([, count]) => count >= 3)
     .sort((a, b) => {
+      // Prefer trigrams over bigrams at same count
       const lenDiff = b[0].split(" ").length - a[0].split(" ").length;
       return b[1] - a[1] || lenDiff;
     })
@@ -1687,7 +1887,7 @@ async function cmdReflect(args: string[]) {
   }
 
   // Also report antipatterns
-  const antiDocs = s.getDocumentsByType("antipattern", 10)
+  const antiDocs = store.getDocumentsByType("antipattern", 10)
     .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
 
   if (antiDocs.length > 0) {
@@ -1698,7 +1898,7 @@ async function cmdReflect(args: string[]) {
   }
 
   // Co-activation clusters
-  const coActs = s.db.prepare(`
+  const coActs = store.db.prepare(`
     SELECT doc_a, doc_b, count FROM co_activations
     WHERE count >= 3
     ORDER BY count DESC
@@ -1718,12 +1918,12 @@ async function cmdReflect(args: string[]) {
 // =============================================================================
 
 async function cmdConsolidate(args: string[]) {
-  const s = getStore();
+  const store = getStore();
   const dryRun = args.includes("--dry-run");
   const maxDocs = parseInt(args.find(a => /^\d+$/.test(a)) || "50");
 
   // Find low-confidence documents that might be duplicates
-  const candidates = s.db.prepare(`
+  const candidates = store.db.prepare(`
     SELECT id, collection, path, title, hash, confidence, modified_at
     FROM documents
     WHERE active = 1 AND confidence < 0.4
@@ -1742,18 +1942,18 @@ async function cmdConsolidate(args: string[]) {
 
   for (const candidate of candidates) {
     // BM25 search with title as query to find similar docs
-    const similar = s.searchFTS(candidate.title, 5);
-    const candidateBody = s.getDocumentBody({ filepath: `clawmem://${candidate.collection}/${candidate.path}` } as any) || "";
+    const similar = store.searchFTS(candidate.title, 5);
+    const candidateBody = store.getDocumentBody({ filepath: `clawmem://${candidate.collection}/${candidate.path}` } as any) || "";
 
     const matches = similar.filter(r => {
       if (r.filepath === `clawmem://${candidate.collection}/${candidate.path}`) return false;
       if (r.score < 0.7) return false;
 
-      // Require same collection
+      // M1: Require same collection
       const rCollection = r.collectionName;
       if (rCollection !== candidate.collection) return false;
 
-      // Require body similarity (Jaccard on word sets)
+      // M1: Require body similarity (Jaccard on word sets)
       const matchBody = r.body || "";
       if (matchBody.length === 0 || candidateBody.length === 0) return false;
       const wordsA = new Set(candidateBody.toLowerCase().split(/\s+/).filter(w => w.length > 3));
@@ -1774,13 +1974,200 @@ async function cmdConsolidate(args: string[]) {
     console.log(`  ${c.green}Keep:${c.reset}      ${bestMatch.displayPath} (score: ${bestMatch.score.toFixed(3)})`);
 
     if (!dryRun) {
-      s.archiveDocuments([candidate.id]);
+      // Archive the lower-confidence duplicate
+      store.archiveDocuments([candidate.id]);
       mergeCount++;
     }
     console.log();
   }
 
   console.log(`${dryRun ? "Would consolidate" : "Consolidated"}: ${mergeCount} document(s)`);
+}
+
+// =============================================================================
+// Curate — automated maintenance (designed for cron/timer)
+// =============================================================================
+
+interface CuratorReport {
+  timestamp: string;
+  health: {
+    active: number;
+    archived: number;
+    forgotten: number;
+    pinned: number;
+    snoozed: number;
+    neverAccessed: number;
+    embeddingBacklog: number;
+    infrastructure: string;
+  };
+  sweep: { candidates: number };
+  consolidation: { candidates: number };
+  retrieval: { bm25Pass: boolean; topScore: number };
+  collections: { total: number; orphaned: string[]; neverAccessedPct: number };
+  actions: string[];
+}
+
+async function cmdCurate(_args: string[]) {
+  const s = getStore();
+  const report: CuratorReport = {
+    timestamp: new Date().toISOString(),
+    health: { active: 0, archived: 0, forgotten: 0, pinned: 0, snoozed: 0, neverAccessed: 0, embeddingBacklog: 0, infrastructure: "healthy" },
+    sweep: { candidates: 0 },
+    consolidation: { candidates: 0 },
+    retrieval: { bm25Pass: false, topScore: 0 },
+    collections: { total: 0, orphaned: [], neverAccessedPct: 0 },
+    actions: [],
+  };
+
+  console.log(`${c.bold}ClawMem Curator${c.reset} — ${new Date().toISOString().slice(0, 10)}\n`);
+
+  // Phase 0: Health snapshot
+  try {
+    const stats = s.getLifecycleStats();
+    const status = s.getStatus();
+    report.health = {
+      active: stats.active,
+      archived: stats.archived,
+      forgotten: stats.forgotten,
+      pinned: stats.pinned,
+      snoozed: stats.snoozed,
+      neverAccessed: stats.neverAccessed,
+      embeddingBacklog: status.needsEmbedding,
+      infrastructure: "healthy",
+    };
+    console.log(`  Documents: ${stats.active} active, ${stats.archived} archived, ${stats.forgotten} forgotten`);
+    console.log(`  Pinned: ${stats.pinned} | Snoozed: ${stats.snoozed} | Never accessed: ${stats.neverAccessed}`);
+    console.log(`  Embedding backlog: ${status.needsEmbedding}`);
+    if (status.needsEmbedding > 0) {
+      report.actions.push(`${status.needsEmbedding} documents need embedding`);
+    }
+  } catch (err) {
+    console.log(`  ${c.red}Health snapshot failed:${c.reset} ${err}`);
+    report.health.infrastructure = "error";
+  }
+
+  // Phase 1: Doctor (infrastructure)
+  try {
+    let issues = 0;
+    const collections = collectionsList();
+    for (const col of collections) {
+      if (!existsSync(col.path)) {
+        report.collections.orphaned.push(col.name);
+        issues++;
+      }
+    }
+    report.collections.total = collections.length;
+    if (issues > 0) {
+      report.health.infrastructure = `${issues} issue(s)`;
+      report.actions.push(`${issues} orphaned collection(s): ${report.collections.orphaned.join(", ")}`);
+    }
+    console.log(`  Infrastructure: ${issues === 0 ? `${c.green}healthy${c.reset}` : `${c.yellow}${issues} issue(s)${c.reset}`}`);
+  } catch (err) {
+    console.log(`  ${c.red}Doctor failed:${c.reset} ${err}`);
+  }
+
+  // Phase 2: Lifecycle sweep (dry-run)
+  console.log();
+  try {
+    const { loadVaultConfig } = await import("./config.ts");
+    const config = loadVaultConfig();
+    if (config.lifecycle) {
+      const candidates = s.getArchiveCandidates(config.lifecycle);
+      report.sweep.candidates = candidates.length;
+      console.log(`  Sweep: ${candidates.length} archive candidate(s) [dry-run]`);
+      if (candidates.length > 0) {
+        report.actions.push(`${candidates.length} documents eligible for archival`);
+      }
+    } else {
+      console.log(`  Sweep: no lifecycle policy configured`);
+    }
+  } catch (err) {
+    console.log(`  ${c.red}Sweep failed:${c.reset} ${err}`);
+  }
+
+  // Phase 3: Consolidation (dry-run)
+  try {
+    const candidates = s.db.prepare(`
+      SELECT id, collection, path, title, hash, confidence
+      FROM documents WHERE active = 1 AND confidence < 0.4
+      ORDER BY confidence ASC LIMIT 50
+    `).all() as { id: number; collection: string; path: string; title: string; hash: string; confidence: number }[];
+
+    let dupes = 0;
+    for (const candidate of candidates) {
+      const similar = s.searchFTS(candidate.title, 5);
+      const candidateBody = s.getDocumentBody({ filepath: `clawmem://${candidate.collection}/${candidate.path}` } as any) || "";
+      for (const r of similar) {
+        if (r.filepath === `clawmem://${candidate.collection}/${candidate.path}`) continue;
+        if (r.score < 0.7 || r.collectionName !== candidate.collection) continue;
+        const matchBody = r.body || "";
+        if (!matchBody || !candidateBody) continue;
+        const wordsA = new Set(candidateBody.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+        const wordsB = new Set(matchBody.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+        if (wordsA.size === 0 || wordsB.size === 0) continue;
+        let intersection = 0;
+        for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+        const jaccard = intersection / (wordsA.size + wordsB.size - intersection);
+        if (jaccard >= 0.4) { dupes++; break; }
+      }
+    }
+    report.consolidation.candidates = dupes;
+    console.log(`  Consolidation: ${dupes} duplicate candidate(s) [dry-run]`);
+    if (dupes > 0) {
+      report.actions.push(`${dupes} duplicate documents found — run \`clawmem consolidate\` to review`);
+    }
+  } catch (err) {
+    console.log(`  ${c.red}Consolidation check failed:${c.reset} ${err}`);
+  }
+
+  // Phase 4: Retrieval probe (BM25)
+  try {
+    const results = s.searchFTS("architecture decision", 3);
+    const topScore = results[0]?.score || 0;
+    report.retrieval.bm25Pass = results.length > 0 && topScore > 0.3;
+    report.retrieval.topScore = topScore;
+    console.log(`  Retrieval: ${report.retrieval.bm25Pass ? `${c.green}OK${c.reset}` : `${c.red}DEGRADED${c.reset}`} (BM25 top=${topScore.toFixed(3)})`);
+    if (!report.retrieval.bm25Pass) {
+      report.actions.push("Retrieval degraded — BM25 probe returned no strong results");
+    }
+  } catch (err) {
+    console.log(`  ${c.red}Retrieval probe failed:${c.reset} ${err}`);
+    report.actions.push("Retrieval probe failed");
+  }
+
+  // Phase 5: Collection hygiene
+  try {
+    const naPct = report.health.active > 0
+      ? Math.round((report.health.neverAccessed / report.health.active) * 100)
+      : 0;
+    report.collections.neverAccessedPct = naPct;
+    if (naPct > 30) {
+      report.actions.push(`${report.health.neverAccessed} documents never accessed (${naPct}%) — consider review`);
+    }
+  } catch {
+    // non-critical
+  }
+
+  // Write report
+  const reportPath = pathResolve(process.env.HOME || "~", ".cache", "clawmem", "curator-report.json");
+  try {
+    mkdirSync(pathResolve(reportPath, ".."), { recursive: true });
+    Bun.write(reportPath, JSON.stringify(report, null, 2));
+    console.log(`\n  Report: ${reportPath}`);
+  } catch (err) {
+    console.log(`  ${c.red}Failed to write report:${c.reset} ${err}`);
+  }
+
+  // Summary
+  console.log();
+  if (report.actions.length === 0) {
+    console.log(`${c.green}No actions needed.${c.reset}`);
+  } else {
+    console.log(`${c.bold}Actions (${report.actions.length}):${c.reset}`);
+    for (const a of report.actions) {
+      console.log(`  ${c.yellow}→${c.reset} ${a}`);
+    }
+  }
 }
 
 function printHelp() {
@@ -1795,7 +2182,6 @@ ${c.bold}Setup:${c.reset}
   clawmem collection remove <name>
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
-  clawmem setup curator [--remove]     Install/remove curator agent to ~/.claude/agents/
   clawmem setup openclaw [--remove]    Show OpenClaw plugin installation steps
   clawmem install-service [--enable]   Install systemd watcher service
 
@@ -1822,16 +2208,24 @@ ${c.bold}Hooks:${c.reset}
   clawmem surface --context --stdin    IO6a: pre-prompt context injection
   clawmem surface --bootstrap --stdin  IO6b: per-session bootstrap injection
 
-${c.bold}Analysis:${c.reset}
-  clawmem reflect [N]                  Cross-session reflection (last N days, default 14)
-  clawmem consolidate [--dry-run] [N]  Find and archive duplicate low-confidence docs
+${c.bold}Lifecycle:${c.reset}
+  clawmem lifecycle status             Show lifecycle stats + policy
+  clawmem lifecycle sweep [--dry-run]  Archive stale docs per policy
+  clawmem lifecycle search <query>     Search archived docs (FTS, no restore)
+  clawmem lifecycle restore --query Q  Restore archived docs by keyword
+  clawmem lifecycle restore --collection N  Restore by collection
+  clawmem lifecycle restore --all      Restore all archived docs
+
+${c.bold}Intelligence:${c.reset}
+  clawmem reflect [days]               Cross-session pattern analysis
+  clawmem consolidate [--dry-run]      Merge duplicate low-confidence docs
+  clawmem curate                       Automated maintenance (health, sweep, dedup, hygiene)
 
 ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server
   clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
-  clawmem path                         Print database path
 
 ${c.bold}Options:${c.reset}
   -n, --num <N>        Number of results

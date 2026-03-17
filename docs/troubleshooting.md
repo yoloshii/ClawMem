@@ -79,7 +79,33 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **Watcher memory bloat (400MB+)**
 - The watcher accumulates memory when processing high-frequency file change events. The most common trigger was Claude Code session transcript `.jsonl` files changing on every keystroke during active conversations. Each event opened the database briefly, and over hours of active use, memory grew to 400-800MB.
 - Fixed in v0.1.6: transcript `.jsonl` files are no longer watched. Memory stays under 100MB during normal operation.
-- If memory still grows: check which files are triggering events (`journalctl --user -u clawmem-watcher -f`). Large numbers of non-`.md` file changes in watched directories can cause similar bloat.
+- If memory still grows: check which files are triggering events (`journalctl --user -u clawmem-watcher -f`). Common remaining causes:
+
+**Diagnosing watcher memory issues:**
+
+1. **Identify what's triggering events.** Watch the journal in real time:
+   ```bash
+   journalctl --user -u clawmem-watcher -f
+   ```
+   Each `[change]` or `[rename]` line shows the collection and file. High-frequency entries point to the source.
+
+2. **Broad collection paths with narrow patterns.** If a collection has a broad path (e.g. `path: ~/Projects`) but a narrow pattern (e.g. `pattern: "specific-file.md"`), the watcher receives `fs.watch` events for every `.md` change under that entire tree — even files that don't match the pattern. Prior to v0.1.7, each event still triggered `indexCollection()` and opened the database.
+   - Fixed in v0.1.7: the watcher pre-checks if the changed file could match the collection pattern before calling `indexCollection()`. Non-matching files are silently skipped with no DB access.
+   - If you're on an older version: narrow the collection path to the smallest directory that contains the files you actually want indexed.
+
+3. **Git operations in watched directories.** `git pull`, `git checkout`, or `git merge` in a directory covered by a `**/*.md` collection can change hundreds of `.md` files at once. Each triggers a watcher event, and even with debouncing (2s), batches of changes arrive in rapid succession.
+   - Not a bug — the watcher is doing its job (re-indexing changed docs). But if this causes contention with hooks, restart the watcher afterward: `systemctl --user restart clawmem-watcher.service`.
+
+4. **Editor autosave and temp files.** Some editors (VS Code, JetBrains) write `.md~`, `.md.tmp`, or shadow copies during autosave. These don't match the `.md` extension check in the watcher, but frequent filesystem churn in the same directory can cause `fs.watch` callback overhead on some platforms (especially WSL2 where filesystem events cross the Linux/Windows boundary).
+   - Fix: If memory grows without visible `[change]` log entries, the overhead is in `fs.watch` itself, not in ClawMem's handler. Consider reducing the number of watched directories by consolidating collections or excluding directories with heavy non-`.md` file churn.
+
+5. **Too many watched directories.** Each collection path gets its own recursive `fs.watch`. If you have 15+ collections, that's 15+ recursive watchers. On large directory trees, each watcher consumes memory for inotify handles (Linux) or FSEvents streams (macOS).
+   - Check watcher count: `cat /proc/sys/fs/inotify/max_user_watches` (Linux default: 8192). If the watcher reports `ENOSPC` errors, increase: `echo 65536 | sudo tee /proc/sys/fs/inotify/max_user_watches`.
+   - macOS: FSEvents has no hard limit but memory scales with watched directory depth.
+
+6. **Healthy baseline.** After a fresh restart, the watcher should stabilize under 100MB within 30 seconds. If it immediately spikes above 200MB during startup, check `journalctl --user -u clawmem-watcher` for rapid-fire events during initialization (common when collections contain recently-changed files that trigger immediate indexing).
+
+**Quick recovery:** `systemctl --user restart clawmem-watcher.service` — clears accumulated state, resets memory. Safe to do at any time; the watcher re-discovers its watch targets on startup.
 
 **Hooks hang or timeout**
 - GPU services are unreachable, causing embedding/LLM calls to block until the timeout wrapper kills the process.
