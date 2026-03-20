@@ -1237,8 +1237,22 @@ async function cmdWatch() {
     // Skill vault not configured — skip
   }
 
+  // Periodic WAL checkpoint: the watcher holds a long-lived DB connection which
+  // prevents SQLite auto-checkpoint from shrinking the WAL file. Without this,
+  // the WAL grows unbounded (observed 77MB+), slowing every concurrent DB access
+  // (hooks, MCP) and eventually causing UserPromptSubmit hook timeouts.
+  const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  const checkpointTimer = setInterval(() => {
+    try {
+      s.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+    } catch {
+      // Checkpoint failed (busy) — will retry next interval
+    }
+  }, WAL_CHECKPOINT_INTERVAL);
+
   // Keep running until Ctrl+C
   process.on("SIGINT", () => {
+    clearInterval(checkpointTimer);
     watcher.close();
     skillWatcher?.close();
     closeStore();
