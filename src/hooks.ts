@@ -84,6 +84,7 @@ const HOOK_EVENT_MAP: Record<string, string | null> = {
   "feedback-loop": null,           // Stop — no hookSpecificOutput
   "precompact-extract": null,      // PreCompact — side-effect only, no context injection
   "postcompact-inject": "SessionStart", // SessionStart(compact) — injects additionalContext
+  "curator-nudge": "SessionStart",     // SessionStart — surfaces curator report actions
   "pretool-inject": null,          // PreToolUse — disabled (cannot inject additionalContext; E13 folded into context-surfacing)
 };
 

@@ -51,6 +51,33 @@ export async function stalenessCheck(
     }
   }
 
+  // Auto-archive if lifecycle policy is configured (runs regardless of stale report results)
+  try {
+    const { loadVaultConfig } = await import("../config.ts");
+    const config = loadVaultConfig();
+    if (config.lifecycle) {
+      const candidates = store.getArchiveCandidates(config.lifecycle);
+      if (candidates.length > 0 && !config.lifecycle.dry_run) {
+        const archived = store.archiveDocuments(candidates.map(c => c.id));
+        if (archived > 0 && input.sessionId) {
+          store.insertUsage({
+            sessionId: input.sessionId,
+            timestamp: now.toISOString(),
+            hookName: "lifecycle-archive",
+            injectedPaths: candidates.map(c => `${c.collection}/${c.path}`),
+            estimatedTokens: 0,
+            wasReferenced: 0,
+          });
+        }
+      }
+      if (config.lifecycle.purge_after_days && !config.lifecycle.dry_run) {
+        store.purgeArchivedDocuments(config.lifecycle.purge_after_days);
+      }
+    }
+  } catch {
+    // Fail-open: lifecycle errors never block the hook
+  }
+
   if (allStale.size === 0) return makeEmptyOutput("staleness-check");
 
   // Build context within budget
