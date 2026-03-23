@@ -328,6 +328,14 @@ export async function enrichDocumentEntities(
       return 0;
     }
 
+    // Skip if already enriched (idempotent across multiple --enrich runs)
+    const existingMentions = db.prepare(
+      `SELECT COUNT(*) as cnt FROM entity_mentions WHERE doc_id = ?`
+    ).get(docId) as { cnt: number };
+    if (existingMentions.cnt > 0) {
+      return 0; // Already enriched — skip silently
+    }
+
     // Step 1: Extract entities
     const entities = await extractEntities(llm, doc.title, doc.body);
     if (entities.length === 0) {
