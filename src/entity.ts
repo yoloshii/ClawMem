@@ -328,12 +328,25 @@ export async function enrichDocumentEntities(
       return 0;
     }
 
-    // Skip if already enriched (idempotent across multiple --enrich runs)
-    const existingMentions = db.prepare(
-      `SELECT COUNT(*) as cnt FROM entity_mentions WHERE doc_id = ?`
-    ).get(docId) as { cnt: number };
-    if (existingMentions.cnt > 0) {
-      return 0; // Already enriched — skip silently
+    // Skip if already enriched with current content (idempotent across multiple --enrich runs)
+    // Check document hash against existing mentions — if content changed, re-extract
+    const docHash = db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(docId) as { hash: string } | undefined;
+    if (docHash) {
+      const existingMention = db.prepare(
+        `SELECT em.created_at, d.hash as doc_hash
+         FROM entity_mentions em
+         JOIN documents d ON d.id = em.doc_id
+         WHERE em.doc_id = ? LIMIT 1`
+      ).get(docId) as { created_at: string; doc_hash: string } | undefined;
+
+      if (existingMention && existingMention.doc_hash === docHash.hash) {
+        return 0; // Same content, already enriched — skip
+      }
+
+      // Content changed since last enrichment — clear old mentions before re-extracting
+      if (existingMention) {
+        db.prepare(`DELETE FROM entity_mentions WHERE doc_id = ?`).run(docId);
+      }
     }
 
     // Step 1: Extract entities
