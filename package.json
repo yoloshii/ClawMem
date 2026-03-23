@@ -1,6 +1,6 @@
 {
   "name": "clawmem",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "On-device context engine and memory for AI agents. Claude Code and OpenClaw. Hooks + MCP server + hybrid RAG search.",
   "type": "module",
   "bin": {
