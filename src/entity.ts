@@ -406,18 +406,50 @@ export async function enrichDocumentEntities(
       return 0;
     }
 
+    // Step 3: Deduplicate entities by surface form, then resolve canonical IDs
+    // Done BEFORE transaction to avoid calling upsertEntity (which mutates counters) for dupes
+    const seenKeys = new Set<string>();
+    const uniqueEntities: ExtractedEntity[] = [];
+    for (const entity of entities) {
+      const key = `${entity.type}:${entity.name.toLowerCase().trim()}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        uniqueEntities.push(entity);
+      }
+    }
+
+    // Resolve canonical IDs first (read-only lookups, no counter mutation yet)
+    const resolvedPairs: { entity: ExtractedEntity; canonicalId: string }[] = [];
+    const seenCanonicalIds = new Set<string>();
+    for (const entity of uniqueEntities) {
+      const canonicalId = resolveEntityCanonical(db, entity.name, entity.type, vault)
+        || makeEntityId(entity.name, entity.type, vault);
+      if (!seenCanonicalIds.has(canonicalId)) {
+        seenCanonicalIds.add(canonicalId);
+        resolvedPairs.push({ entity, canonicalId });
+      }
+    }
+
     // All writes in a transaction — partial failure rolls back cleanly
-    // (state not persisted unless all derived data is written)
     try {
       db.exec("BEGIN");
 
-      // Step 2: Clear old derived state if re-enriching (content changed)
-      if (existingState) {
+      // Re-check enrichment state inside transaction (prevents concurrent overcount)
+      const txState = db.prepare(
+        `SELECT input_hash FROM entity_enrichment_state WHERE doc_id = ?`
+      ).get(docId) as { input_hash: string } | undefined;
+
+      if (txState?.input_hash === inputHash) {
+        db.exec("ROLLBACK");
+        return 0; // Another worker already committed this exact enrichment
+      }
+
+      // Clear old derived state if re-enriching (content changed)
+      if (txState || existingState) {
         clearDocEntityState(db, docId);
       }
 
       if (entities.length === 0) {
-        // Persist enrichment state even for zero entities (prevents retry)
         db.prepare(`
           INSERT OR REPLACE INTO entity_enrichment_state (doc_id, input_hash, enriched_at)
           VALUES (?, ?, datetime('now'))
@@ -427,26 +459,11 @@ export async function enrichDocumentEntities(
         return 0;
       }
 
-      // Step 3: Deduplicate entities by name+type, then resolve
-      const seenKeys = new Set<string>();
-      const uniqueEntities: ExtractedEntity[] = [];
-      for (const entity of entities) {
-        const key = `${entity.type}:${entity.name.toLowerCase().trim()}`;
-        if (!seenKeys.has(key)) {
-          seenKeys.add(key);
-          uniqueEntities.push(entity);
-        }
-      }
-
-      // Resolve and deduplicate by canonical entity_id (prevents self co-occurrence)
-      const seenEntityIds = new Set<string>();
+      // Now mutate counters — one upsert per unique canonical ID (no inflation)
       const resolvedIds: string[] = [];
-      for (const entity of uniqueEntities) {
+      for (const { entity, canonicalId } of resolvedPairs) {
         const entityId = upsertEntity(db, entity.name, entity.type, vault);
-        if (!seenEntityIds.has(entityId)) {
-          seenEntityIds.add(entityId);
-          resolvedIds.push(entityId);
-        }
+        resolvedIds.push(entityId);
         recordEntityMention(db, entityId, docId, entity.name);
       }
 
