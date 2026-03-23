@@ -224,6 +224,10 @@ export async function indexCollection(
 
         if (existingRow?.content_hash === contentHash) {
           stats.unchanged++;
+          if (options?.forceEnrich) {
+            // --enrich: queue unchanged docs for full enrichment (entity extraction, links)
+            enrichQueue.push({ docId: existing.id, isNew: true });
+          }
           continue;
         }
 
