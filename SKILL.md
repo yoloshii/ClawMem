@@ -677,29 +677,6 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
                                 # Jaccard similarity within same collection
 ```
 
----
-
-## Operational Issue Tracking
-
-When encountering tool failures, instruction contradictions, retrieval gaps, or workflow friction:
-
-Write to `docs/issues/YYYY-MM-DD-<slug>.md`:
-
-```
-# <title>
-- Category: tool-failure | instruction-gap | workflow-friction | retrieval-gap | inconsistency
-- Severity: critical | high | medium
-- Status: open | resolved
-
-## Observed
-## Expected
-## Context
-## Suggested Fix
-```
-
-**Triggers:** repeated tool error, instruction contradicting observed behavior, retrieval consistently missing known content.
-
-**Do NOT log:** one-off transient errors, user-caused issues, already recorded issues.
 
 ---
 

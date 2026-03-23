@@ -555,28 +555,6 @@ User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
 | `candidateLimit` | Yes (default 30) | No |
 | Best for | Most queries, progressive disclosure | Causal chains spanning multiple docs |
 
-## Operational Issue Tracking
-
-When encountering tool failures, instruction contradictions, retrieval gaps, or workflow friction that would benefit from a fix:
-
-Write to `docs/issues/YYYY-MM-DD-<slug>.md` with: category, severity, what happened, what was expected, context, suggested fix.
-
-**File structure:**
-```
-# <title>
-- Category: tool-failure | instruction-gap | workflow-friction | retrieval-gap | inconsistency
-- Severity: critical | high | medium
-- Status: open | resolved
-
-## Observed
-## Expected
-## Context
-## Suggested Fix
-```
-
-**Triggers:** repeated tool error, instruction that contradicts observed behavior, retrieval consistently missing known content, workflow requiring unnecessary steps.
-
-**Do NOT log:** one-off transient errors, user-caused issues, issues already recorded.
 
 ## Troubleshooting
 
