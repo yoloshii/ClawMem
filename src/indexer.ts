@@ -166,7 +166,8 @@ export async function indexCollection(
   store: Store,
   collectionName: string,
   collectionPath: string,
-  pattern: string = "**/*.md"
+  pattern: string = "**/*.md",
+  options?: { forceEnrich?: boolean }
 ): Promise<IndexStats> {
   const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
   const activePaths = new Set<string>();
@@ -319,8 +320,9 @@ export async function indexCollection(
   }
 
   // A-MEM enrichment runs after successful commit (LLM calls should not block transaction)
+  // forceEnrich overrides isNew to true — triggers full pipeline (entity extraction, links, evolution)
   for (const { docId, isNew } of enrichQueue) {
-    await store.postIndexEnrich(llm, docId, isNew);
+    await store.postIndexEnrich(llm, docId, options?.forceEnrich ? true : isNew);
   }
 
   return stats;

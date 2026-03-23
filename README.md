@@ -157,12 +157,14 @@ bun update -g clawmem   # or: npm update -g clawmem
 
 Database schema migrates automatically on next startup (new tables and columns are added via `CREATE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN`).
 
-After **major version updates** (e.g. 0.1.x → 0.2.0) that add new enrichment pipelines, reindex to backfill existing documents:
+After **major version updates** (e.g. 0.1.x → 0.2.0) that add new enrichment pipelines, run a full enrichment pass to backfill existing documents:
 
 ```bash
-clawmem reindex --force   # Re-indexes all docs, triggers entity extraction + A-MEM enrichment
+clawmem reindex --enrich  # Full enrichment: entity extraction + links + evolution for all docs
 clawmem embed             # Re-embed if upgrading embedding models (not needed for most updates)
 ```
+
+`--enrich` forces the complete A-MEM pipeline (entity extraction, link generation, memory evolution) on all documents, not just new ones. Without it, reindex only refreshes metadata for existing docs.
 
 Routine patch updates (e.g. 0.2.0 → 0.2.1) do not require reindexing.
 

@@ -1269,6 +1269,7 @@ async function cmdWatch() {
 
 async function cmdReindex(args: string[]) {
   const force = args.includes("--force") || args.includes("-f");
+  const enrich = args.includes("--enrich");
   const collections = collectionsList();
 
   if (collections.length === 0) {
@@ -1283,9 +1284,13 @@ async function cmdReindex(args: string[]) {
     console.log(`${c.yellow}Force reindex: deactivated all documents${c.reset}`);
   }
 
+  if (enrich) {
+    console.log(`${c.cyan}Full enrichment: entity extraction + links + evolution for all documents${c.reset}`);
+  }
+
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern);
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
   }
 }
@@ -2202,7 +2207,7 @@ ${c.bold}Setup:${c.reset}
 ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
   clawmem embed [-f]                   Generate fragment embeddings
-  clawmem reindex [--force]            Full re-index
+  clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon
   clawmem status                       Show index status
 
