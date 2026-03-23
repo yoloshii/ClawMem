@@ -53,6 +53,11 @@ import {
   inferCausalLinks,
   type ObservationWithDoc,
 } from "./amem.ts";
+import {
+  enrichDocumentEntities,
+  searchEntities,
+  getEntityGraphNeighbors,
+} from "./entity.ts";
 
 // =============================================================================
 // Configuration
@@ -558,6 +563,19 @@ function initializeDatabase(db: Database): void {
     }
   }
 
+  // Migration: observation invalidation columns (Pattern I)
+  const invalidationMigrations: [string, string][] = [
+    ["invalidated_at", "ALTER TABLE documents ADD COLUMN invalidated_at TEXT"],
+    ["invalidated_by", "ALTER TABLE documents ADD COLUMN invalidated_by INTEGER"],
+    ["superseded_by", "ALTER TABLE documents ADD COLUMN superseded_by INTEGER"],
+  ];
+  for (const [col, sql] of invalidationMigrations) {
+    if (!colNames.has(col)) {
+      try { db.exec(sql); } catch { /* column may already exist */ }
+    }
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_invalidated ON documents(invalidated_at) WHERE invalidated_at IS NOT NULL`);
+
   // Beads integration tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS beads_issues (
@@ -611,6 +629,8 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_source ON memory_relations(source_id, relation_type)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_target ON memory_relations(target_id, relation_type)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_weight ON memory_relations(weight DESC) WHERE weight > 0.5`);
+  // MPFP composite index for efficient neighbor loading (GPT 5.4 recommendation)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_mpfp ON memory_relations(source_id, relation_type, weight DESC, target_id)`);
 
   // A-MEM: Memory evolution tracking
   db.exec(`
@@ -640,9 +660,78 @@ function initializeDatabase(db: Database): void {
       entity_type TEXT,
       name TEXT,
       description TEXT,
-      created_at TEXT
+      created_at TEXT,
+      mention_count INTEGER DEFAULT 0,
+      last_seen TEXT,
+      canonical_id TEXT,
+      vault TEXT DEFAULT 'default'
     )
   `);
+
+  // Migrate existing entity_nodes tables (add new columns if missing)
+  try { db.exec(`ALTER TABLE entity_nodes ADD COLUMN mention_count INTEGER DEFAULT 0`); } catch { /* column exists */ }
+  try { db.exec(`ALTER TABLE entity_nodes ADD COLUMN last_seen TEXT`); } catch { /* column exists */ }
+  try { db.exec(`ALTER TABLE entity_nodes ADD COLUMN canonical_id TEXT`); } catch { /* column exists */ }
+  try { db.exec(`ALTER TABLE entity_nodes ADD COLUMN vault TEXT DEFAULT 'default'`); } catch { /* column exists */ }
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_type ON entity_nodes(entity_type)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_vault ON entity_nodes(vault)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_mentions ON entity_nodes(mention_count DESC)`);
+
+  // Entity mentions: entity ↔ document junction table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_mentions (
+      entity_id TEXT NOT NULL,
+      doc_id INTEGER NOT NULL,
+      mention_text TEXT,
+      created_at TEXT,
+      PRIMARY KEY (entity_id, doc_id),
+      FOREIGN KEY (entity_id) REFERENCES entity_nodes(entity_id) ON DELETE CASCADE,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_mentions_doc ON entity_mentions(doc_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id)`);
+
+  // Entity co-occurrences: pairs of entities appearing in the same document
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_cooccurrences (
+      entity_a TEXT NOT NULL,
+      entity_b TEXT NOT NULL,
+      count INTEGER DEFAULT 1,
+      last_cooccurred TEXT,
+      PRIMARY KEY (entity_a, entity_b)
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_cooccurrences_a ON entity_cooccurrences(entity_a)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_cooccurrences_b ON entity_cooccurrences(entity_b)`);
+
+  // Entity FTS5 for fuzzy name lookup
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id, name, entity_type)`);
+
+  // 3-tier consolidation: observations synthesized from clusters of related facts
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS consolidated_observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      observation TEXT NOT NULL,
+      proof_count INTEGER NOT NULL DEFAULT 1,
+      source_doc_ids TEXT NOT NULL DEFAULT '[]',
+      trend TEXT NOT NULL DEFAULT 'NEW',
+      status TEXT NOT NULL DEFAULT 'active',
+      invalidated_at TEXT,
+      invalidated_by INTEGER,
+      superseded_by INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      collection TEXT
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consolidated_obs_status ON consolidated_observations(status)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consolidated_obs_trend ON consolidated_observations(trend)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consolidated_obs_proof ON consolidated_observations(proof_count DESC)`);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS intent_classifications (
@@ -725,8 +814,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[]) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<string[]>;
@@ -799,6 +888,11 @@ export type Store = {
   inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => Promise<number>;
   findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalLink[];
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
+
+  // Entity resolution + co-occurrence
+  enrichDocumentEntities: (llm: any, docId: number, vault?: string) => Promise<number>;
+  searchEntities: (query: string, limit?: number) => { entity_id: string; name: string; type: string; mention_count: number; cooccurrence_count: number }[];
+  getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => { docId: number; score: number; viaEntity: string }[];
 
   // Co-activation tracking
   recordCoActivation: (paths: string[]) => void;
@@ -886,8 +980,8 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[]) => searchFTS(db, query, limit, collectionId, collections),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[]) => searchVec(db, query, model, limit, collectionId, collections),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchFTS(db, query, limit, collectionId, collections, dateRange),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchVec(db, query, model, limit, collectionId, collections, dateRange),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
@@ -960,6 +1054,11 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => inferCausalLinks({ db, dbPath: resolvedPath } as Store, llm, observations),
     findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => findCausalLinks(db, docId, direction, maxDepth),
     getEvolutionTimeline: (docId: number, limit?: number) => getEvolutionTimeline(db, docId, limit),
+
+    // Entity resolution + co-occurrence
+    enrichDocumentEntities: (llm: any, docId: number, vault?: string) => enrichDocumentEntities(db, llm, docId, vault),
+    searchEntities: (query: string, limit?: number) => searchEntities(db, query, limit),
+    getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => getEntityGraphNeighbors(db, seedDocIds, limit),
 
     // Co-activation tracking
     recordCoActivation: (paths: string[]) => {
@@ -2490,7 +2589,7 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[]): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -2506,7 +2605,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
-    WHERE documents_fts MATCH ? AND d.active = 1
+    WHERE documents_fts MATCH ? AND d.active = 1 AND d.invalidated_at IS NULL
   `;
   const params: (string | number)[] = [ftsQuery];
 
@@ -2519,6 +2618,12 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     // Legacy parameter — kept for backward compatibility
     sql += ` AND d.collection = ?`;
     params.push(String(collectionId));
+  }
+
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  if (dateRange) {
+    sql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    params.push(dateRange.start, dateRange.end);
   }
 
   // bm25 lower is better; sort ascending.
@@ -2552,7 +2657,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2592,7 +2697,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       d.modified_at,
       content.doc as body
     FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
@@ -2605,6 +2710,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
   } else if (collectionId) {
     docSql += ` AND d.collection = ?`;
     params.push(String(collectionId));
+  }
+
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  if (dateRange) {
+    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    params.push(dateRange.start, dateRange.end);
   }
 
   const docRows = db.prepare(docSql).all(...params) as {

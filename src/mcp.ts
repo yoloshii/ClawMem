@@ -35,11 +35,12 @@ import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
-import { classifyIntent, decomposeQuery, type IntentType } from "./intent.ts";
-import { adaptiveTraversal, mergeTraversalResults } from "./graph-traversal.ts";
+import { classifyIntent, decomposeQuery, extractTemporalConstraint, type IntentType } from "./intent.ts";
+import { adaptiveTraversal, mergeTraversalResults, mpfpTraversal } from "./graph-traversal.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
+import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
 
 // =============================================================================
 // Types
@@ -286,7 +287,7 @@ This is the recommended entry point for ALL memory queries.`,
                   SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
                   FROM documents d
                   LEFT JOIN content c ON c.hash = d.hash
-                  WHERE d.hash = ? AND d.active = 1 LIMIT 1
+                  WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
                 `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
                 if (!doc) return null;
                 return {
@@ -609,11 +610,14 @@ This is the recommended entry point for ALL memory queries.`,
       const docidMap = new Map<string, string>();
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
+      // Step 0: Temporal constraint extraction (pure regex, ~0ms)
+      const dateRange = extractTemporalConstraint(query) || undefined;
+
       // Step 1: BM25 probe — skip expensive LLM expansion if strong signal
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const initialFts = store.searchFTS(query, 20, undefined, collections);
+      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange);
       const topScore = initialFts.length > 0 ? Math.abs(initialFts[0]!.score) : 0;
       const secondScore = initialFts.length > 1 ? Math.abs(initialFts[1]!.score) : 0;
       // When intent is provided, disable strong-signal bypass — the obvious BM25
@@ -627,13 +631,13 @@ This is the recommended entry point for ALL memory queries.`,
         : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent);
 
       for (const q of queries) {
-        const ftsResults = q === query ? initialFts : store.searchFTS(q, 20, undefined, collections);
+        const ftsResults = q === query ? initialFts : store.searchFTS(q, 20, undefined, collections, dateRange);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
         if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20, undefined, collections);
+          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -641,7 +645,65 @@ This is the recommended entry point for ALL memory queries.`,
         }
       }
 
-      const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+      // Step 2b: Temporal proximity channel (if dateRange detected)
+      // Scores documents by closeness to query's temporal center — distinct from dateRange WHERE filter
+      if (dateRange) {
+        const centerMs = (new Date(dateRange.start).getTime() + new Date(dateRange.end).getTime()) / 2;
+        const rangeMs = Math.max(new Date(dateRange.end).getTime() - new Date(dateRange.start).getTime(), 86400000);
+        const temporalDocs = store.db.prepare(`
+          SELECT 'clawmem://' || d.collection || '/' || d.path as filepath,
+                 d.collection || '/' || d.path as displayPath,
+                 d.title, d.modified_at
+          FROM documents d
+          WHERE d.active = 1 AND d.invalidated_at IS NULL AND d.modified_at >= ? AND d.modified_at <= ?
+          ORDER BY d.modified_at DESC LIMIT 30
+        `).all(dateRange.start, dateRange.end) as { filepath: string; displayPath: string; title: string; modified_at: string }[];
+
+        if (temporalDocs.length > 0) {
+          const temporalRanked: RankedResult[] = temporalDocs.map(d => {
+            const docMs = new Date(d.modified_at).getTime();
+            const proximity = 1.0 - Math.min(1.0, Math.abs(docMs - centerMs) / rangeMs);
+            return { file: d.filepath, displayPath: d.displayPath, title: d.title, body: "", score: proximity };
+          });
+          rankedLists.push(temporalRanked);
+        }
+      }
+
+      // Step 2c: Graph retrieval channel (if entity signals detected in query)
+      const entitySignals = /\b(who|person|team|project|service|tool|@\w+|#\w+|VM \d|what.*about)\b/i.test(query);
+      if (entitySignals && initialFts.length > 0) {
+        // Get doc IDs from top BM25 seeds for 1-hop entity walk
+        const seedDocIds = initialFts.slice(0, 5).map(r => {
+          const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1 LIMIT 1`).get(r.hash) as { id: number } | undefined;
+          return row?.id;
+        }).filter((id): id is number => id !== undefined);
+
+        if (seedDocIds.length > 0) {
+          const entityNeighbors = getEntityGraphNeighbors(store.db, seedDocIds, 20);
+          if (entityNeighbors.length > 0) {
+            const graphRanked: RankedResult[] = entityNeighbors.map(en => {
+              const doc = store.db.prepare(`
+                SELECT d.collection, d.path, d.title, c.doc as body
+                FROM documents d LEFT JOIN content c ON c.hash = d.hash
+                WHERE d.id = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
+              `).get(en.docId) as { collection: string; path: string; title: string; body: string | null } | undefined;
+              if (!doc) return null;
+              return {
+                file: `clawmem://${doc.collection}/${doc.path}`,
+                displayPath: `${doc.collection}/${doc.path}`,
+                title: doc.title,
+                body: doc.body?.slice(0, 200) || "",
+                score: en.score,
+              };
+            }).filter((r): r is RankedResult => r !== null);
+            if (graphRanked.length > 0) rankedLists.push(graphRanked);
+          }
+        }
+      }
+
+      // Weight: original query BM25+vec get 2x, expanded queries get 1x, temporal/entity legs get 1x
+      const numOriginalLists = hasVectors ? 2 : 1; // first BM25 + first vector from original query
+      const weights = rankedLists.map((_, i) => i < numOriginalLists ? 2.0 : 1.0);
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, candLimit);
 
@@ -681,14 +743,39 @@ This is the recommended entry point for ALL memory queries.`,
       });
       blended.sort((a, b) => b.score - a.score);
 
-      // Map to SearchResults for composite scoring
+      // Map to SearchResults for composite scoring — hydrate from DB when needed
       const allSearchResults = [...store.searchFTS(query, 30)];
       const resultMap = new Map(allSearchResults.map(r => [r.filepath, r]));
       const searchResults = blended
         .map(b => {
-          const r = resultMap.get(b.file) || candidateMap.get(b.file);
-          if (!r) return null;
-          return { ...r, score: b.score, filepath: b.file } as SearchResult;
+          const existing = resultMap.get(b.file);
+          if (existing) return { ...existing, score: b.score, filepath: b.file } as SearchResult;
+          // Hydrate candidates not in BM25 results (vec-only, temporal, entity-graph hits)
+          const candidate = candidateMap.get(b.file);
+          if (candidate) {
+            const doc = store.db.prepare(`
+              SELECT d.hash, d.collection, d.path, d.title, d.modified_at, c.doc as body
+              FROM documents d LEFT JOIN content c ON c.hash = d.hash
+              WHERE 'clawmem://' || d.collection || '/' || d.path = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
+            `).get(b.file) as { hash: string; collection: string; path: string; title: string; modified_at: string; body: string | null } | undefined;
+            if (doc) {
+              return {
+                filepath: b.file,
+                displayPath: `${doc.collection}/${doc.path}`,
+                title: doc.title,
+                hash: doc.hash,
+                docid: doc.hash.slice(0, 6),
+                collectionName: doc.collection,
+                modifiedAt: doc.modified_at || "",
+                bodyLength: doc.body?.length || 0,
+                body: doc.body || "",
+                context: null,
+                score: b.score,
+                source: "vec" as const,
+              } satisfies SearchResult;
+            }
+          }
+          return null;
         })
         .filter((r): r is SearchResult => r !== null);
 
@@ -1297,9 +1384,18 @@ This is the recommended entry point for ALL memory queries.`,
         ? { intent: force_intent as IntentType, confidence: 1.0 }
         : await classifyIntent(query, llm, store.db);
 
-      // Step 2: Baseline search (BM25 + Vector)
-      const bm25Results = store.searchFTS(query, 30);
-      const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30);
+      // Step 1b: Temporal constraint — convert intent's local dates to UTC for search
+      // extractTemporalConstraint() already returns UTC; intent classification stores local dates
+      const dateRange = (intent.temporal_start && intent.temporal_end)
+        ? {
+            start: intent.temporal_start.includes('T') ? intent.temporal_start : new Date(intent.temporal_start + 'T00:00:00').toISOString(),
+            end: intent.temporal_end.includes('T') ? intent.temporal_end : new Date(intent.temporal_end + 'T23:59:59.999').toISOString(),
+          }
+        : extractTemporalConstraint(query) || undefined;
+
+      // Step 2: Baseline search (BM25 + Vector) — with temporal filter if detected
+      const bm25Results = store.searchFTS(query, 30, undefined, undefined, dateRange);
+      const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30, undefined, undefined, dateRange);
 
       // Step 3: Intent-weighted RRF
       const rrfWeights = intent.intent === 'WHEN'
@@ -1337,6 +1433,48 @@ This is the recommended entry point for ALL memory queries.`,
             traversed
           );
 
+          // Step 4b: MPFP multi-path traversal (runs intent-specific meta-path patterns)
+          const mpfpNodes = mpfpTraversal(
+            store.db,
+            fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })),
+            intent.intent,
+            20
+          );
+          // Normalize MPFP scores to [0,1] before merging (raw Forward Push mass is unbounded)
+          const maxMpfpScore = mpfpNodes.length > 0 ? Math.max(...mpfpNodes.map(n => n.score)) : 1;
+          const mpfpNormalizer = maxMpfpScore > 0 ? 1 / maxMpfpScore : 1;
+
+          // Merge normalized MPFP results into merged array
+          for (const node of mpfpNodes) {
+            const normalizedScore = node.score * mpfpNormalizer;
+            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(node.docId) as { hash: string } | undefined;
+            if (doc) {
+              const existing = merged.find(m => m.hash === doc.hash);
+              if (existing) {
+                existing.score = Math.max(existing.score, normalizedScore * 0.9);
+              } else {
+                merged.push({ hash: doc.hash, score: normalizedScore * 0.75 });
+              }
+            }
+          }
+
+          // Step 4c: Entity co-occurrence graph expansion (ENTITY intent only)
+          if (intent.intent === 'ENTITY') {
+            // Get doc IDs from top fused results for entity seed lookup
+            const seedDocIds = fused.slice(0, 10).map(r => {
+              const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1 LIMIT 1`).get(r.hash) as { id: number } | undefined;
+              return row?.id;
+            }).filter((id): id is number => id !== undefined);
+
+            const entityNeighbors = getEntityGraphNeighbors(store.db, seedDocIds, 15);
+            for (const en of entityNeighbors) {
+              const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(en.docId) as { hash: string } | undefined;
+              if (doc && !merged.some(m => m.hash === doc.hash)) {
+                merged.push({ hash: doc.hash, score: en.score * 0.7 }); // Slight discount for entity-graph-only hits
+              }
+            }
+          }
+
           // Convert back to SearchResult format — hydrate graph-discovered nodes from DB
           expanded = merged.map(m => {
             const original = fused.find(f => f.hash === m.hash);
@@ -1346,7 +1484,7 @@ This is the recommended entry point for ALL memory queries.`,
               SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
               FROM documents d
               LEFT JOIN content c ON c.hash = d.hash
-              WHERE d.hash = ? AND d.active = 1 LIMIT 1
+              WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
             `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
             if (!doc) return null;
             return {
@@ -1481,7 +1619,7 @@ This is the recommended entry point for ALL memory queries.`,
                   SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
                   FROM documents d
                   LEFT JOIN content c ON c.hash = d.hash
-                  WHERE d.hash = ? AND d.active = 1 LIMIT 1
+                  WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
                 `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
                 if (!doc) return null;
                 return {
@@ -1852,6 +1990,14 @@ This is the recommended entry point for ALL memory queries.`,
         return { content: [{ type: "text", text: "Document not found." }], isError: true };
       }
       store.pinDocument(collection, path, !unpin);
+      store.insertUsage({
+        sessionId: "mcp-pin",
+        timestamp: new Date().toISOString(),
+        hookName: "memory_pin",
+        injectedPaths: [r.displayPath],
+        estimatedTokens: 0,
+        wasReferenced: 0,
+      });
       const action = unpin ? "Unpinned" : "Pinned";
       return { content: [{ type: "text", text: `${action}: ${r.displayPath} (${r.title})` }] };
     }
@@ -1887,6 +2033,14 @@ This is the recommended entry point for ALL memory queries.`,
         return { content: [{ type: "text", text: "Document not found." }], isError: true };
       }
       store.snoozeDocument(collection, path, until || null);
+      store.insertUsage({
+        sessionId: "mcp-snooze",
+        timestamp: new Date().toISOString(),
+        hookName: "memory_snooze",
+        injectedPaths: [r.displayPath],
+        estimatedTokens: 0,
+        wasReferenced: 0,
+      });
       const msg = until
         ? `Snoozed until ${until}: ${r.displayPath}`
         : `Unsnoozed: ${r.displayPath}`;

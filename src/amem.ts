@@ -8,6 +8,7 @@
 import type { Database } from "bun:sqlite";
 import type { LlamaCpp } from "./llm.ts";
 import type { Store } from "./store.ts";
+import { enrichDocumentEntities } from "./entity.ts";
 
 export interface MemoryNote {
   keywords: string[];
@@ -612,11 +613,21 @@ export async function postIndexEnrich(
       return;
     }
 
-    // Step 2: Generate memory links (new documents only)
+    // Step 2: Entity extraction + resolution + co-occurrence (new documents only)
+    try {
+      const entityCount = await enrichDocumentEntities(store.db, llm, docId);
+      if (entityCount > 0) {
+        console.log(`[amem] Resolved ${entityCount} entities for docId ${docId}`);
+      }
+    } catch (err) {
+      console.log(`[amem] Entity enrichment failed for docId ${docId}:`, err);
+    }
+
+    // Step 3: Generate memory links (new documents only)
     const linksCreated = await generateMemoryLinks(store, llm, docId);
     console.log(`[amem] Created ${linksCreated} links for docId ${docId}`);
 
-    // Step 3: Evolve memories based on new evidence (new documents only)
+    // Step 4: Evolve memories based on new evidence (new documents only)
     // The new document triggers evolution of its linked neighbors
     if (linksCreated > 0) {
       // Get neighbors this new document links to (outbound links from generateMemoryLinks)

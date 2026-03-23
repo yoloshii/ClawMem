@@ -96,6 +96,7 @@ curl http://host:8090/v1/models
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing. |
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
+| `CLAWMEM_NUDGE_INTERVAL` | `15` | Prompts between lifecycle tool use before `<vault-nudge>` injection. 0 to disable. |
 
 **Note:** The `bin/clawmem` wrapper sets all endpoint defaults. Always use the wrapper — never `bun run src/clawmem.ts` directly. For remote GPU setups, add the same env vars to the watcher service via a systemd drop-in.
 
@@ -415,6 +416,8 @@ Note: intent disables BM25 strong-signal bypass, forcing full expansion+rerankin
 
 ## Composite Scoring (automatic, applied to all search tools)
 
+**Observation invalidation (v0.2.0):** Documents with `invalidated_at` set are excluded from search results. Soft invalidation uses `invalidated_at`, `invalidated_by`, and `superseded_by` columns. When `decision-extractor` detects a contradiction that drops confidence ≤ 0.2, the observation is marked invalidated. Invalidated docs can be restored via lifecycle tools.
+
 ```
 compositeScore = (0.50 × searchScore + 0.25 × recencyScore + 0.25 × confidenceScore) × qualityMultiplier × coActivationBoost
 ```
@@ -482,10 +485,14 @@ The `memory_relations` table is populated by multiple independent sources:
 | Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP tool or watcher (.beads/ change) | Queries `bd` CLI (Dolt backend). Maps beads deps: blocks→causal, discovered-from→supporting, relates-to→semantic, plus conditional-blocks→causal, caused-by→causal, supersedes→supporting. Metadata: `{origin: "beads"}`. |
 | `buildTemporalBackbone()` | temporal | `build_graphs` MCP tool (manual) | Creation-order edges between all active docs. |
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP tool (manual) | Pure cosine similarity. PK collision: `INSERT OR IGNORE` means A-MEM semantic edges take precedence if they exist first. |
+| Entity co-occurrence graph | entity | A-MEM enrichment (indexing) | LLM entity extraction → canonical normalization (FTS5 + Levenshtein) → `entity_mentions` + `entity_cooccurrences` tables. Feeds ENTITY intent queries and MPFP `[entity, semantic]` patterns. |
+| `consolidated_observations` | supporting | Consolidation worker (background) | 3-tier consolidation: facts → observations → mental models. Observations track `proof_count`, `trend` (STABLE/STRENGTHENING/WEAKENING/STALE), and source links. |
 
 **Edge collision:** Both `generateMemoryLinks()` and `buildSemanticGraph()` insert `relation_type='semantic'`. PK is `(source_id, target_id, relation_type)` — first writer wins.
 
 **Graph traversal asymmetry:** `adaptiveTraversal()` traverses all edge types outbound (source→target) but only `semantic` and `entity` edges inbound (target→source). Temporal and causal edges are directional only.
+
+**MPFP graph retrieval (v0.2.0):** Multi-Path Fact Propagation runs predefined meta-path patterns in parallel (`[semantic, semantic]`, `[entity, temporal]`, `[semantic, causal]`, etc.), fuses via RRF. Hop-synchronized edge cache batches DB queries per hop instead of per pattern. Forward Push with α=0.15 teleport probability bounds active nodes sublinearly. Tier 3 only (`query`/`intent_search`), not hooks. Patterns selected per MAGMA intent: WHY → `[semantic, causal]`, ENTITY → `[entity, semantic]`, WHEN → `[temporal, semantic]`.
 
 ### When to Run `build_graphs`
 
@@ -505,11 +512,14 @@ The `memory_relations` table is populated by multiple independent sources:
 
 ```
 User Query + optional intent hint
+  → Temporal Extraction (regex date range from query: "last week", "March 2026" → WHERE modified_at BETWEEN filters)
   → BM25 Probe → Strong Signal Check (skip expansion if top hit ≥ 0.85 with gap ≥ 0.15; disabled when intent provided)
   → Query Expansion (LLM generates text variants; intent steers expansion prompt)
   → Parallel: BM25(original) + Vector(original) + BM25(each expanded) + Vector(each expanded)
+       + Temporal Proximity (date-range filtered, if temporal constraint extracted)
+       + Entity Graph (conditional 1-hop entity walk from top seeds, if entity signals present)
   → Original query lists get positional 2× weight in RRF; expanded get 1×
-  → Reciprocal Rank Fusion (k=60, top candidateLimit)
+  → Reciprocal Rank Fusion (k=60, top candidateLimit, up to 4-way parallel legs)
   → Intent-Aware Chunk Selection (intent terms at 0.5× weight alongside query terms at 1.0×)
   → Cross-Encoder Reranking (4000 char context; intent prepended to rerank query; chunk dedup; batch cap=4)
   → Position-Aware Blending (α=0.75 top3, 0.60 mid, 0.40 tail)
@@ -662,6 +672,8 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 
 ## Integration Notes
 
+- **Memory nudge (v0.2.0):** Every N prompts (default 15) without a lifecycle MCP tool call (`memory_pin`/`memory_forget`/`memory_snooze`), context-surfacing appends `<vault-nudge>` prompting proactive memory management. Counter resets on lifecycle tool use. Configure via `CLAWMEM_NUDGE_INTERVAL` (0 to disable).
+- **Entity resolution (v0.2.0):** A-MEM enrichment now extracts named entities via LLM, resolves to canonical forms using `entities_fts` + Levenshtein fuzzy matching, and tracks co-occurrence. Entity graph traversal available for ENTITY intent queries via `intent_search`.
 - QMD retrieval (BM25, vector, RRF, rerank, query expansion) is forked into ClawMem. Do not call standalone QMD tools.
 - SAME (composite scoring), MAGMA (intent + graph), A-MEM (self-evolving notes) layer on top of QMD substrate.
 - Three `llama-server` instances (embedding, LLM, reranker) on local or remote GPU. Wrapper defaults to `localhost:8088/8089/8090`.

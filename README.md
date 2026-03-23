@@ -42,6 +42,18 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 
 Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, or as an OpenClaw ContextEngine plugin. Both modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
 
+### v0.2.0 Enhancements
+
+Seven patterns extracted from competitor analysis ([Hindsight](https://github.com/vectorize-io/hindsight), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [claude-mem](https://github.com/thedotmack/claude-mem)):
+
+- **Entity resolution + co-occurrence graph** — LLM entity extraction during A-MEM enrichment, canonical normalization via FTS5 + Levenshtein fuzzy matching, co-occurrence tracking, entity graph traversal for ENTITY intent queries
+- **MPFP graph retrieval** — Multi-Path Fact Propagation with meta-path patterns per intent, hop-synchronized edge cache, Forward Push with α=0.15 teleport probability. Replaces single-beam traversal for causal/entity/temporal queries.
+- **Temporal query extraction** — regex-based date range extraction from natural language queries ("last week", "March 2026"), wired as WHERE filters into BM25 and vector search
+- **4-way parallel retrieval** — temporal proximity and entity graph channels added as parallel RRF legs in `query` tool (Tier 3 only), alongside existing BM25 + vector channels
+- **3-tier consolidation** — facts to observations (auto-generated, with proof_count and trend enum) to mental models. Background worker synthesizes clusters of related observations into consolidated patterns.
+- **Observation invalidation** — soft invalidation (invalidated_at/invalidated_by/superseded_by columns). Observations with confidence ≤ 0.2 after contradiction are filtered from search results.
+- **Memory nudge** — periodic ephemeral `<vault-nudge>` injection prompting lifecycle tool use after N turns of inactivity. Configurable via `CLAWMEM_NUDGE_INTERVAL`.
+
 ## Architecture
 
 <p align="center">

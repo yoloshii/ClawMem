@@ -254,13 +254,35 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
       if (rel.relation === "contradiction") {
         // Lower old doc confidence by 0.25 (floor 0.2)
         const currentConfidence = existingDoc.confidence ?? 0.5;
+        const newConfidence = Math.max(0.2, currentConfidence - 0.25);
         store.updateDocumentMeta(existingDoc.id, {
-          confidence: Math.max(0.2, currentConfidence - 0.25),
+          confidence: newConfidence,
         });
         contradictionCount++;
         console.error(
           `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
         );
+
+        // Soft invalidation: if confidence drops to floor AND content is observation type,
+        // mark as invalidated (Pattern I — prevents stale contradicted knowledge from surfacing)
+        if (newConfidence <= 0.2) {
+          try {
+            // Find the new contradicting observation's doc ID (if already persisted in this session)
+            const newObsDoc = store.db.prepare(`
+              SELECT id FROM documents
+              WHERE collection = '_clawmem' AND path LIKE ? AND active = 1
+              ORDER BY created_at DESC LIMIT 1
+            `).get(`%${sessionId.slice(0, 8)}%decision%`) as { id: number } | undefined;
+
+            store.db.prepare(`
+              UPDATE documents
+              SET invalidated_at = datetime('now'),
+                  invalidated_by = ?
+              WHERE id = ? AND invalidated_at IS NULL AND content_type = 'observation'
+            `).run(newObsDoc?.id || null, existingDoc.id);
+          } catch { /* non-fatal — invalidation is best-effort */ }
+        }
+
       } else if (rel.relation === "update") {
         // Lower old doc confidence by 0.15 (floor 0.3)
         const currentConfidence = existingDoc.confidence ?? 0.5;
@@ -313,7 +335,7 @@ export async function decisionExtractor(
         const doc = store.findActiveDocument("_clawmem", obsPath);
         if (doc) {
           store.updateDocumentMeta(doc.id, {
-            content_type: obs.type === "decision" ? "decision" : "note",
+            content_type: obs.type === "decision" ? "decision" : "observation",
             confidence: 0.80,
           });
           store.updateObservationFields(obsPath, "_clawmem", {

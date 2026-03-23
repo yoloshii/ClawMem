@@ -201,6 +201,238 @@ export function adaptiveTraversal(
   return Array.from(visited.values()).sort((a, b) => b.score - a.score);
 }
 
+// =============================================================================
+// MPFP: Multi-Path Fact Propagation (Pattern E)
+// =============================================================================
+
+/**
+ * Predefined meta-path patterns for graph traversal.
+ * Each pattern is a sequence of edge types to follow at each hop.
+ */
+export type MetaPath = string[];
+
+/**
+ * Get MPFP meta-path patterns based on intent.
+ */
+export function getMetaPathsForIntent(intent: IntentType): MetaPath[] {
+  switch (intent) {
+    case 'WHY':
+      return [
+        ['semantic', 'causal'],      // forward causal reasoning
+        ['causal', 'semantic'],      // backward reasoning → context
+        ['semantic', 'semantic'],    // topic expansion
+      ];
+    case 'ENTITY':
+      return [
+        ['entity', 'semantic'],      // entity → related topics
+        ['entity', 'entity'],        // entity co-occurrence chains
+        ['semantic', 'entity'],      // topic → entity discovery
+      ];
+    case 'WHEN':
+      return [
+        ['temporal', 'semantic'],    // timeline → context
+        ['semantic', 'temporal'],    // context → timeline
+      ];
+    case 'WHAT':
+      return [
+        ['semantic', 'semantic'],    // topic expansion
+        ['semantic', 'supporting'],  // evidence chains
+      ];
+  }
+}
+
+/**
+ * Shared edge cache for hop-synchronized loading.
+ * All patterns share this cache to avoid redundant DB queries.
+ */
+type EdgeCache = Map<number, Map<string, { docId: number; weight: number }[]>>;
+
+/**
+ * Batch-load edges for a set of node IDs, filtered by edge type.
+ * Results cached in edgeCache for reuse across patterns.
+ */
+function batchLoadEdges(
+  db: Database,
+  nodeIds: number[],
+  edgeType: string,
+  edgeCache: EdgeCache,
+  topK: number = 10
+): void {
+  // Only load nodes not already cached for this edge type
+  const uncached = nodeIds.filter(id => {
+    const cached = edgeCache.get(id);
+    return !cached || !cached.has(edgeType);
+  });
+
+  if (uncached.length === 0) return;
+
+  const placeholders = uncached.map(() => '?').join(',');
+
+  // Outbound edges (source → target)
+  const outbound = db.prepare(`
+    SELECT source_id, target_id as docId, weight
+    FROM memory_relations
+    WHERE source_id IN (${placeholders}) AND relation_type = ?
+    ORDER BY weight DESC
+  `).all(...uncached, edgeType) as { source_id: number; docId: number; weight: number }[];
+
+  // Inbound edges for symmetric types (semantic, entity)
+  let inbound: { source_id: number; docId: number; weight: number }[] = [];
+  if (edgeType === 'semantic' || edgeType === 'entity') {
+    inbound = db.prepare(`
+      SELECT target_id as source_id, source_id as docId, weight
+      FROM memory_relations
+      WHERE target_id IN (${placeholders}) AND relation_type = ?
+      ORDER BY weight DESC
+    `).all(...uncached, edgeType) as typeof inbound;
+  }
+
+  // Populate cache (top-k per node)
+  for (const nodeId of uncached) {
+    if (!edgeCache.has(nodeId)) edgeCache.set(nodeId, new Map());
+    const nodeEdges = [
+      ...outbound.filter(e => e.source_id === nodeId),
+      ...inbound.filter(e => e.source_id === nodeId),
+    ].slice(0, topK);
+    edgeCache.get(nodeId)!.set(edgeType, nodeEdges.map(e => ({ docId: e.docId, weight: e.weight })));
+  }
+}
+
+/**
+ * Execute a single meta-path traversal using Forward Push with teleport.
+ *
+ * @param db - Database instance
+ * @param anchors - Seed nodes with initial scores
+ * @param metaPath - Edge type sequence to follow at each hop
+ * @param edgeCache - Shared edge cache (hop-synchronized)
+ * @param alpha - Teleport probability (default 0.15)
+ * @param threshold - Mass pruning threshold (default 1e-4)
+ * @returns Nodes discovered with scores
+ */
+function executeMetaPath(
+  db: Database,
+  anchors: { docId: number; score: number }[],
+  metaPath: MetaPath,
+  edgeCache: EdgeCache,
+  alpha: number = 0.15,
+  threshold: number = 1e-4
+): TraversalNode[] {
+  const results = new Map<number, number>(); // docId → accumulated score
+
+  // Initialize residual with anchor scores
+  let residual = new Map<number, number>();
+  for (const a of anchors) {
+    residual.set(a.docId, a.score);
+    results.set(a.docId, a.score * alpha); // teleport portion stays at seed
+  }
+
+  // Walk each hop in the meta-path
+  for (let hop = 0; hop < metaPath.length; hop++) {
+    const edgeType = metaPath[hop]!;
+    const activeNodes = [...residual.entries()].filter(([_, mass]) => mass > threshold);
+    if (activeNodes.length === 0) break;
+
+    // Batch-load edges for this hop (shared cache)
+    const nodeIds = activeNodes.map(([id]) => id);
+    batchLoadEdges(db, nodeIds, edgeType, edgeCache);
+
+    const nextResidual = new Map<number, number>();
+
+    for (const [nodeId, mass] of activeNodes) {
+      const propagated = mass * (1 - alpha);
+      const nodeEdges = edgeCache.get(nodeId)?.get(edgeType) || [];
+
+      if (nodeEdges.length === 0) continue;
+
+      // Distribute mass evenly across neighbors (weighted by edge weight)
+      const totalWeight = nodeEdges.reduce((sum, e) => sum + e.weight, 0);
+      if (totalWeight === 0) continue;
+
+      for (const edge of nodeEdges) {
+        const share = (propagated * edge.weight) / totalWeight;
+        const current = nextResidual.get(edge.docId) || 0;
+        nextResidual.set(edge.docId, current + share);
+
+        // Accumulate in results (teleport portion)
+        const existing = results.get(edge.docId) || 0;
+        results.set(edge.docId, existing + share * alpha);
+      }
+    }
+
+    residual = nextResidual;
+  }
+
+  // Convert to TraversalNode array
+  return [...results.entries()]
+    .filter(([_, score]) => score > threshold)
+    .map(([docId, score]) => ({
+      docId,
+      path: getDocPath(db, docId),
+      score,
+      hops: metaPath.length,
+      viaRelation: metaPath.join('→'),
+    }))
+    .sort((a, b) => b.score - a.score);
+}
+
+/**
+ * MPFP Multi-Path Fact Propagation traversal.
+ * Runs multiple meta-path patterns in parallel, fuses results.
+ *
+ * @param db - Database instance
+ * @param anchors - Seed documents (from BM25/vector search)
+ * @param intent - Query intent for pattern selection
+ * @param budget - Maximum total nodes to return
+ * @returns Traversed nodes with scores
+ */
+export function mpfpTraversal(
+  db: Database,
+  anchors: { hash: string; score: number }[],
+  intent: IntentType,
+  budget: number = 30
+): TraversalNode[] {
+  // Convert hashes to IDs
+  const anchorNodes: { docId: number; score: number }[] = [];
+  for (const anchor of anchors) {
+    const docId = getDocIdFromHash(db, anchor.hash);
+    if (docId !== null) {
+      anchorNodes.push({ docId, score: anchor.score });
+    }
+  }
+
+  if (anchorNodes.length === 0) return [];
+
+  const metaPaths = getMetaPathsForIntent(intent);
+  const edgeCache: EdgeCache = new Map(); // Shared across all patterns
+
+  // Execute all meta-paths (synchronous — SQLite is single-threaded anyway)
+  const pathResults: TraversalNode[][] = metaPaths.map(path =>
+    executeMetaPath(db, anchorNodes, path, edgeCache)
+  );
+
+  // Fuse results via max-score (not RRF): Forward Push produces absolute propagation mass
+  // where magnitude carries signal. Rank-only fusion (RRF) would discard the difference
+  // between a strong path hit (0.9) and a barely-surviving tail hit (0.01). Meta-paths are
+  // alternative explanations — "best supporting path wins" is the correct fusion rule here.
+  const fused = new Map<number, TraversalNode>();
+  for (const results of pathResults) {
+    for (const node of results) {
+      const existing = fused.get(node.docId);
+      if (!existing || node.score > existing.score) {
+        fused.set(node.docId, node);
+      }
+    }
+  }
+
+  return [...fused.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, budget);
+}
+
+// =============================================================================
+// Merge Helpers
+// =============================================================================
+
 /**
  * Merge graph traversal results with original search results.
  * Returns results with both hash and score for re-integration.

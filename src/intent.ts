@@ -29,32 +29,106 @@ const ENTITY_PATTERNS = /\b(who|person|team|project|(?:@|#)\w+|relationship|ment
 // Temporal extraction patterns
 type TemporalExtractor = (now: Date, match?: RegExpMatchArray) => { start?: string; end?: string };
 
+const MONTH_MAP: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+/** Format a Date as YYYY-MM-DD in local timezone (avoids UTC shift from toISOString). */
+function localDateStr(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 const TEMPORAL_RELATIVE: [RegExp, TemporalExtractor][] = [
-  [/\blast week\b/i, (now: Date) => {
-    const s = new Date(now); s.setDate(s.getDate() - 7);
-    return { start: s.toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) };
-  }],
-  [/\blast month\b/i, (now: Date) => {
-    const s = new Date(now); s.setMonth(s.getMonth() - 1);
-    return { start: s.toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) };
+  [/\btoday\b/i, (now: Date) => {
+    const d = localDateStr(now);
+    return { start: d, end: d };
   }],
   [/\byesterday\b/i, (now: Date) => {
     const s = new Date(now); s.setDate(s.getDate() - 1);
-    return { start: s.toISOString().slice(0, 10), end: s.toISOString().slice(0, 10) };
+    return { start: localDateStr(s), end: localDateStr(s) };
+  }],
+  [/\bthis week\b/i, (now: Date) => {
+    const s = new Date(now); s.setDate(s.getDate() - s.getDay());
+    return { start: localDateStr(s), end: localDateStr(now) };
+  }],
+  [/\blast week\b/i, (now: Date) => {
+    const s = new Date(now); s.setDate(s.getDate() - 7);
+    return { start: localDateStr(s), end: localDateStr(now) };
+  }],
+  [/\bthis month\b/i, (now: Date) => {
+    const s = new Date(now.getFullYear(), now.getMonth(), 1);
+    return { start: localDateStr(s), end: localDateStr(now) };
+  }],
+  [/\blast month\b/i, (now: Date) => {
+    const s = new Date(now); s.setMonth(s.getMonth() - 1);
+    return { start: localDateStr(s), end: localDateStr(now) };
   }],
   [/\b(\d+)\s*days?\s*ago\b/i, (now: Date, m?: RegExpMatchArray) => {
     const s = new Date(now); s.setDate(s.getDate() - parseInt(m?.[1] ?? "1"));
-    return { start: s.toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) };
+    return { start: localDateStr(s), end: localDateStr(now) };
   }],
-  [/\bin\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*(\d{4})?\b/i, (_now: Date, m?: RegExpMatchArray) => {
-    const months: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
-    const mo = months[(m?.[1] ?? "jan").slice(0, 3).toLowerCase()] ?? 0;
-    const yr = m?.[2] ? parseInt(m[2]) : new Date().getFullYear();
+  [/\b(\d+)\s*weeks?\s*ago\b/i, (now: Date, m?: RegExpMatchArray) => {
+    const s = new Date(now); s.setDate(s.getDate() - parseInt(m?.[1] ?? "1") * 7);
+    return { start: localDateStr(s), end: localDateStr(now) };
+  }],
+  [/\b(\d+)\s*months?\s*ago\b/i, (now: Date, m?: RegExpMatchArray) => {
+    const s = new Date(now); s.setMonth(s.getMonth() - parseInt(m?.[1] ?? "1"));
+    return { start: localDateStr(s), end: localDateStr(now) };
+  }],
+  [/\bsince\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*(\d{4})?\b/i, (now: Date, m?: RegExpMatchArray) => {
+    const mo = MONTH_MAP[(m?.[1] ?? "jan").slice(0, 3).toLowerCase()] ?? 0;
+    const yr = m?.[2] ? parseInt(m[2]) : now.getFullYear();
+    const s = new Date(yr, mo, 1);
+    return { start: localDateStr(s), end: localDateStr(now) };
+  }],
+  [/\bin\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*(\d{4})?\b/i, (now: Date, m?: RegExpMatchArray) => {
+    const mo = MONTH_MAP[(m?.[1] ?? "jan").slice(0, 3).toLowerCase()] ?? 0;
+    const yr = m?.[2] ? parseInt(m[2]) : now.getFullYear();
     const s = new Date(yr, mo, 1);
     const e = new Date(yr, mo + 1, 0);
-    return { start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10) };
+    return { start: localDateStr(s), end: localDateStr(e) };
+  }],
+  [/\blast\s+(\d+)\s*days?\b/i, (now: Date, m?: RegExpMatchArray) => {
+    const s = new Date(now); s.setDate(s.getDate() - parseInt(m?.[1] ?? "7"));
+    return { start: localDateStr(s), end: localDateStr(now) };
   }],
 ];
+
+/**
+ * Convert a local date string (YYYY-MM-DD) to a UTC ISO timestamp for the start of that local day.
+ * Accounts for timezone offset so comparisons against UTC modified_at are correct.
+ */
+function localDateToUtcStart(localDate: string): string {
+  const d = new Date(localDate + 'T00:00:00');
+  return d.toISOString();
+}
+
+/**
+ * Convert a local date string (YYYY-MM-DD) to a UTC ISO timestamp for the end of that local day.
+ */
+function localDateToUtcEnd(localDate: string): string {
+  const d = new Date(localDate + 'T23:59:59.999');
+  return d.toISOString();
+}
+
+/**
+ * Extract temporal constraint from query. Returns {start, end} as UTC ISO timestamps or null.
+ * Pure regex — no LLM, ~0ms.
+ */
+export function extractTemporalConstraint(query: string): { start: string; end: string } | null {
+  const q = query.toLowerCase();
+  for (const [pattern, extractor] of TEMPORAL_RELATIVE) {
+    const match = q.match(pattern);
+    if (match) {
+      const result = extractor(new Date(), match);
+      if (result.start && result.end) {
+        return {
+          start: localDateToUtcStart(result.start),
+          end: localDateToUtcEnd(result.end),
+        };
+      }
+    }
+  }
+  return null;
+}
 
 /**
  * Fast heuristic intent classification (no LLM, instant).
@@ -62,7 +136,7 @@ const TEMPORAL_RELATIVE: [RegExp, TemporalExtractor][] = [
 function classifyIntentHeuristic(query: string): IntentResult {
   const q = query.toLowerCase();
 
-  // Extract temporal info
+  // Extract temporal info (local date strings for intent scoring; UTC conversion at query time)
   let temporal_start: string | undefined;
   let temporal_end: string | undefined;
   const now = new Date();

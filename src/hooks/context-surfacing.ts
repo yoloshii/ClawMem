@@ -52,6 +52,11 @@ function getTierConfig(score: number): { snippetLen: number; showMeta: boolean; 
 // Directories to never surface
 const FILTERED_PATHS = ["_PRIVATE/", "experiments/", "_clawmem/"];
 
+// Memory nudge: prompt agent to use lifecycle tools after N prompts without use
+const NUDGE_INTERVAL = parseInt(process.env.CLAWMEM_NUDGE_INTERVAL || "15", 10);
+const LIFECYCLE_HOOK_NAMES = ["memory_pin", "memory_forget", "memory_snooze", "lifecycle-archive"];
+const NUDGE_TEXT = "You haven't managed memory recently. If vault-context is surfacing noise → snooze it. If a critical decision was just made → pin it. If stale knowledge appeared → forget it.";
+
 // File path patterns to extract from prompts (E13 replacement: file-aware UserPromptSubmit)
 const FILE_PATH_RE = /(?:^|\s)((?:\/[\w.@-]+)+(?:\.\w+)?|[\w.@-]+\.(?:ts|js|py|md|sh|yaml|yml|json|toml|rs|go|tsx|jsx|css|html))\b/g;
 
@@ -331,12 +336,15 @@ export async function contextSurfacing(
   // This makes routing instructions salient at the moment of tool selection (per research)
   const routingHint = detectRoutingHint(prompt);
 
-  return makeContextOutput(
-    "context-surfacing",
-    routingHint
-      ? `<vault-routing>${routingHint}</vault-routing>\n<vault-context>\n${context}\n</vault-context>`
-      : `<vault-context>\n${context}\n</vault-context>`
-  );
+  // Memory nudge: periodically remind agent to use lifecycle tools
+  const nudge = NUDGE_INTERVAL > 0 ? shouldNudge(store) : null;
+
+  const parts: string[] = [];
+  if (routingHint) parts.push(`<vault-routing>${routingHint}</vault-routing>`);
+  parts.push(`<vault-context>\n${context}\n</vault-context>`);
+  if (nudge) parts.push(`<vault-nudge>${NUDGE_TEXT}</vault-nudge>`);
+
+  return makeContextOutput("context-surfacing", parts.join("\n"));
 }
 
 // =============================================================================
@@ -421,4 +429,29 @@ function buildContext(
     paths,
     tokens: totalTokens,
   };
+}
+
+/**
+ * Check if the agent should be nudged to use lifecycle tools.
+ * Returns true if N+ context-surfacing invocations have occurred since the
+ * last lifecycle tool use (memory_pin, memory_forget, memory_snooze).
+ */
+function shouldNudge(store: Store): boolean {
+  try {
+    // Count context-surfacing invocations since last lifecycle tool use
+    const lastLifecycle = store.db.prepare(`
+      SELECT MAX(id) as max_id FROM context_usage
+      WHERE hook_name IN (${LIFECYCLE_HOOK_NAMES.map(() => "?").join(",")})
+    `).get(...LIFECYCLE_HOOK_NAMES) as { max_id: number | null } | undefined;
+
+    const sinceId = lastLifecycle?.max_id ?? 0;
+    const count = store.db.prepare(`
+      SELECT COUNT(*) as cnt FROM context_usage
+      WHERE hook_name = 'context-surfacing' AND id > ?
+    `).get(sinceId) as { cnt: number } | undefined;
+
+    return (count?.cnt ?? 0) >= NUDGE_INTERVAL;
+  } catch {
+    return false; // DB error — fail silent, no nudge
+  }
 }
