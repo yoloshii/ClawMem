@@ -711,6 +711,16 @@ function initializeDatabase(db: Database): void {
   // Entity FTS5 for fuzzy name lookup
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id, name, entity_type)`);
 
+  // Entity enrichment state: tracks what input was used for extraction (idempotent --enrich)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_enrichment_state (
+      doc_id INTEGER PRIMARY KEY,
+      input_hash TEXT NOT NULL,
+      enriched_at TEXT NOT NULL,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    )
+  `);
+
   // 3-tier consolidation: observations synthesized from clusters of related facts
   db.exec(`
     CREATE TABLE IF NOT EXISTS consolidated_observations (

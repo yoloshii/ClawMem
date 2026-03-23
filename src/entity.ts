@@ -8,6 +8,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { createHash } from "crypto";
 import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 
@@ -300,11 +301,62 @@ export function trackCoOccurrences(
 // =============================================================================
 
 /**
+ * Compute extraction input hash from title + body.
+ * Captures the actual input to the LLM prompt — changes to either trigger re-extraction.
+ */
+function computeInputHash(title: string, body: string): string {
+  return createHash('sha256').update(title + '\0' + body).digest('hex');
+}
+
+/**
+ * Clear all derived entity state for a document:
+ * mentions, co-occurrence contributions, entity edges, and mention counts.
+ */
+function clearDocEntityState(db: Database, docId: number): void {
+  // Get entity IDs this doc mentions (before deletion)
+  const oldMentions = db.prepare(
+    `SELECT entity_id FROM entity_mentions WHERE doc_id = ?`
+  ).all(docId) as { entity_id: string }[];
+
+  // Delete mentions
+  db.prepare(`DELETE FROM entity_mentions WHERE doc_id = ?`).run(docId);
+
+  // Decrement mention_count for each entity
+  for (const m of oldMentions) {
+    db.prepare(`
+      UPDATE entity_nodes SET mention_count = MAX(0, mention_count - 1) WHERE entity_id = ?
+    `).run(m.entity_id);
+  }
+
+  // Remove entity edges involving this doc
+  db.prepare(`
+    DELETE FROM memory_relations WHERE (source_id = ? OR target_id = ?) AND relation_type = 'entity'
+  `).run(docId, docId);
+
+  // Decrement co-occurrence counts for entity pairs from this doc
+  if (oldMentions.length >= 2) {
+    const ids = oldMentions.map(m => m.entity_id);
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const sorted = [ids[i]!, ids[j]!].sort();
+        db.prepare(`
+          UPDATE entity_cooccurrences SET count = MAX(0, count - 1)
+          WHERE entity_a = ? AND entity_b = ?
+        `).run(sorted[0]!, sorted[1]!);
+      }
+    }
+    // Clean up zero-count rows
+    db.prepare(`DELETE FROM entity_cooccurrences WHERE count <= 0`).run();
+  }
+}
+
+/**
  * Full entity enrichment for a document:
- * 1. Extract entities via LLM
- * 2. Resolve each to canonical form
- * 3. Record mentions
- * 4. Track co-occurrences
+ * 1. Check enrichment state (skip if input unchanged)
+ * 2. Extract entities via LLM
+ * 3. Resolve each to canonical form
+ * 4. Record mentions + co-occurrences + entity edges
+ * 5. Persist enrichment state for idempotency
  *
  * @returns Number of entities resolved
  */
@@ -315,7 +367,7 @@ export async function enrichDocumentEntities(
   vault: string = 'default'
 ): Promise<number> {
   try {
-    // Get document content
+    // Get document content (snapshot for extraction)
     const doc = db.prepare(`
       SELECT d.title, c.doc as body
       FROM documents d
@@ -328,35 +380,49 @@ export async function enrichDocumentEntities(
       return 0;
     }
 
-    // Skip if already enriched with current content (idempotent across multiple --enrich runs)
-    // Check document hash against existing mentions — if content changed, re-extract
-    const docHash = db.prepare(`SELECT hash FROM documents WHERE id = ?`).get(docId) as { hash: string } | undefined;
-    if (docHash) {
-      const existingMention = db.prepare(
-        `SELECT em.created_at, d.hash as doc_hash
-         FROM entity_mentions em
-         JOIN documents d ON d.id = em.doc_id
-         WHERE em.doc_id = ? LIMIT 1`
-      ).get(docId) as { created_at: string; doc_hash: string } | undefined;
+    // Compute extraction input hash (title + body — the actual LLM prompt input)
+    const inputHash = computeInputHash(doc.title, doc.body);
 
-      if (existingMention && existingMention.doc_hash === docHash.hash) {
-        return 0; // Same content, already enriched — skip
-      }
+    // Check enrichment state — skip if already enriched with same input
+    const existingState = db.prepare(
+      `SELECT input_hash FROM entity_enrichment_state WHERE doc_id = ?`
+    ).get(docId) as { input_hash: string } | undefined;
 
-      // Content changed since last enrichment — clear old mentions before re-extracting
-      if (existingMention) {
-        db.prepare(`DELETE FROM entity_mentions WHERE doc_id = ?`).run(docId);
-      }
+    if (existingState?.input_hash === inputHash) {
+      return 0; // Same input, already enriched — skip
     }
 
-    // Step 1: Extract entities
+    // Step 1: Extract entities via LLM
     const entities = await extractEntities(llm, doc.title, doc.body);
+
+    // Recheck input hash before writing — abort if content changed during LLM call
+    const recheckHash = db.prepare(`
+      SELECT d.title, c.doc as body FROM documents d
+      JOIN content c ON c.hash = d.hash WHERE d.id = ? AND d.active = 1
+    `).get(docId) as { title: string; body: string } | null;
+
+    if (!recheckHash || computeInputHash(recheckHash.title, recheckHash.body) !== inputHash) {
+      console.log(`[entity] Document ${docId} changed during extraction — aborting`);
+      return 0;
+    }
+
+    // Step 2: Clear old derived state if re-enriching (content changed)
+    if (existingState) {
+      clearDocEntityState(db, docId);
+    }
+
+    // Persist enrichment state (even for zero entities — prevents retry)
+    db.prepare(`
+      INSERT OR REPLACE INTO entity_enrichment_state (doc_id, input_hash, enriched_at)
+      VALUES (?, ?, datetime('now'))
+    `).run(docId, inputHash);
+
     if (entities.length === 0) {
       console.log(`[entity] No entities found in docId ${docId}`);
       return 0;
     }
 
-    // Step 2-3: Deduplicate entities by name+type, then resolve and record mentions
+    // Step 3: Deduplicate entities by name+type, then resolve and record mentions
     const seenKeys = new Set<string>();
     const uniqueEntities: ExtractedEntity[] = [];
     for (const entity of entities) {
@@ -379,7 +445,6 @@ export async function enrichDocumentEntities(
 
     // Step 5: Create entity edges in memory_relations
     for (const entityId of resolvedIds) {
-      // Find other documents mentioning this entity
       const otherDocs = db.prepare(`
         SELECT doc_id FROM entity_mentions
         WHERE entity_id = ? AND doc_id != ?
@@ -387,7 +452,6 @@ export async function enrichDocumentEntities(
       `).all(entityId, docId) as { doc_id: number }[];
 
       for (const other of otherDocs) {
-        // Insert entity relation (unidirectional; graph traversal handles inbound for entity/semantic types)
         db.prepare(`
           INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
           VALUES (?, ?, 'entity', 0.7, ?, datetime('now'))
