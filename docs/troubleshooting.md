@@ -69,6 +69,12 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **reindex --force crashes with "UNIQUE constraint failed"**
 - Fixed in current version. Force mode now reactivates inactive rows instead of inserting.
 
+**reindex --force after v0.2.0 upgrade shows no entity extraction**
+- `reindex --force` treats existing documents as updates (`isNew=false`). The A-MEM pipeline skips entity extraction, link generation, and memory evolution for updates to avoid churn on routine reindexes.
+- Fix: Use `clawmem reindex --enrich` instead. The `--enrich` flag forces the full enrichment pipeline (entity extraction + canonical resolution + co-occurrence tracking + link generation + memory evolution) on all documents, including unchanged ones.
+- `--force` alone only refreshes A-MEM notes (keywords, tags, context). `--enrich` is needed after major upgrades that add new enrichment stages (e.g. 0.1.x → 0.2.0 added entity resolution).
+- Always run ClawMem through the `bin/clawmem` wrapper, not `bun run src/clawmem.ts` directly. The wrapper sets GPU endpoint defaults (`CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL`). Bypassing the wrapper causes fallback to slow in-process `node-llama-cpp` inference.
+
 ## Hooks
 
 **"UserPromptSubmit hook error" (intermittent)**
