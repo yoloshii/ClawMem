@@ -634,9 +634,20 @@ Symptom: embed --force with new model produces 3 docs stuck as "Unembedded" but 
   → Fix: Delete partial content_vectors + vectors_vec for the stuck hashes, then re-run embed (no --force).
     The vec0 DELETE try-catch prevents cascading failures during the re-embed.
 
+Symptom: reindex --force after v0.2.0 upgrade shows no entity extraction
+  → `reindex --force` treats existing docs as updates (isNew=false). The A-MEM pipeline
+    skips entity extraction, link generation, and evolution for updates to avoid churn.
+  → Fix: Use `clawmem reindex --enrich` instead. The `--enrich` flag forces the full
+    enrichment pipeline (entity extraction + links + evolution) on all documents.
+  → `--force` alone only refreshes A-MEM notes (keywords, tags, context). `--enrich`
+    is needed after major upgrades that add new enrichment stages.
+
 Symptom: CLI reindex/update falls back to node-llama-cpp Vulkan (not GPU server)
   → GPU env vars only in systemd drop-in, not in wrapper script. CLI invocations missed them.
   → Fixed 2026-02-12: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
+  → Always run ClawMem via the `bin/clawmem` wrapper, not `bun run src/clawmem.ts` directly.
+    The wrapper sets CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults. Scripts or inline bun
+    commands that bypass the wrapper will fall back to in-process node-llama-cpp (slow, CPU).
 
 Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
   → SQLite contention between the watcher and the hook. The watcher processes filesystem events
