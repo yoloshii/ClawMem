@@ -406,61 +406,82 @@ export async function enrichDocumentEntities(
       return 0;
     }
 
-    // Step 2: Clear old derived state if re-enriching (content changed)
-    if (existingState) {
-      clearDocEntityState(db, docId);
-    }
+    // All writes in a transaction — partial failure rolls back cleanly
+    // (state not persisted unless all derived data is written)
+    try {
+      db.exec("BEGIN");
 
-    // Persist enrichment state (even for zero entities — prevents retry)
-    db.prepare(`
-      INSERT OR REPLACE INTO entity_enrichment_state (doc_id, input_hash, enriched_at)
-      VALUES (?, ?, datetime('now'))
-    `).run(docId, inputHash);
-
-    if (entities.length === 0) {
-      console.log(`[entity] No entities found in docId ${docId}`);
-      return 0;
-    }
-
-    // Step 3: Deduplicate entities by name+type, then resolve and record mentions
-    const seenKeys = new Set<string>();
-    const uniqueEntities: ExtractedEntity[] = [];
-    for (const entity of entities) {
-      const key = `${entity.type}:${entity.name.toLowerCase().trim()}`;
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        uniqueEntities.push(entity);
+      // Step 2: Clear old derived state if re-enriching (content changed)
+      if (existingState) {
+        clearDocEntityState(db, docId);
       }
-    }
 
-    const resolvedIds: string[] = [];
-    for (const entity of uniqueEntities) {
-      const entityId = upsertEntity(db, entity.name, entity.type, vault);
-      resolvedIds.push(entityId);
-      recordEntityMention(db, entityId, docId, entity.name);
-    }
-
-    // Step 4: Track co-occurrences (deduplicated IDs prevent inflated pair counts)
-    trackCoOccurrences(db, resolvedIds);
-
-    // Step 5: Create entity edges in memory_relations
-    for (const entityId of resolvedIds) {
-      const otherDocs = db.prepare(`
-        SELECT doc_id FROM entity_mentions
-        WHERE entity_id = ? AND doc_id != ?
-        LIMIT 10
-      `).all(entityId, docId) as { doc_id: number }[];
-
-      for (const other of otherDocs) {
+      if (entities.length === 0) {
+        // Persist enrichment state even for zero entities (prevents retry)
         db.prepare(`
-          INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
-          VALUES (?, ?, 'entity', 0.7, ?, datetime('now'))
-        `).run(docId, other.doc_id, JSON.stringify({ entity: entityId }));
+          INSERT OR REPLACE INTO entity_enrichment_state (doc_id, input_hash, enriched_at)
+          VALUES (?, ?, datetime('now'))
+        `).run(docId, inputHash);
+        db.exec("COMMIT");
+        console.log(`[entity] No entities found in docId ${docId}`);
+        return 0;
       }
-    }
 
-    console.log(`[entity] Enriched docId ${docId}: ${resolvedIds.length} entities, ${entities.length} extracted`);
-    return resolvedIds.length;
+      // Step 3: Deduplicate entities by name+type, then resolve
+      const seenKeys = new Set<string>();
+      const uniqueEntities: ExtractedEntity[] = [];
+      for (const entity of entities) {
+        const key = `${entity.type}:${entity.name.toLowerCase().trim()}`;
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          uniqueEntities.push(entity);
+        }
+      }
+
+      // Resolve and deduplicate by canonical entity_id (prevents self co-occurrence)
+      const seenEntityIds = new Set<string>();
+      const resolvedIds: string[] = [];
+      for (const entity of uniqueEntities) {
+        const entityId = upsertEntity(db, entity.name, entity.type, vault);
+        if (!seenEntityIds.has(entityId)) {
+          seenEntityIds.add(entityId);
+          resolvedIds.push(entityId);
+        }
+        recordEntityMention(db, entityId, docId, entity.name);
+      }
+
+      // Step 4: Track co-occurrences (deduplicated by canonical ID)
+      trackCoOccurrences(db, resolvedIds);
+
+      // Step 5: Create entity edges in memory_relations
+      for (const entityId of resolvedIds) {
+        const otherDocs = db.prepare(`
+          SELECT doc_id FROM entity_mentions
+          WHERE entity_id = ? AND doc_id != ?
+          LIMIT 10
+        `).all(entityId, docId) as { doc_id: number }[];
+
+        for (const other of otherDocs) {
+          db.prepare(`
+            INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
+            VALUES (?, ?, 'entity', 0.7, ?, datetime('now'))
+          `).run(docId, other.doc_id, JSON.stringify({ entity: entityId }));
+        }
+      }
+
+      // Persist enrichment state LAST — only after all derived data written
+      db.prepare(`
+        INSERT OR REPLACE INTO entity_enrichment_state (doc_id, input_hash, enriched_at)
+        VALUES (?, ?, datetime('now'))
+      `).run(docId, inputHash);
+
+      db.exec("COMMIT");
+      console.log(`[entity] Enriched docId ${docId}: ${resolvedIds.length} entities, ${entities.length} extracted`);
+      return resolvedIds.length;
+    } catch (txErr) {
+      try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
+      throw txErr; // re-throw to outer catch
+    }
   } catch (err) {
     console.log(`[entity] Error enriching docId ${docId}:`, err);
     return 0;
