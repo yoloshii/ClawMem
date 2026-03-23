@@ -44,8 +44,6 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 
 ### v0.2.0 Enhancements
 
-Seven patterns extracted from competitor analysis ([Hindsight](https://github.com/vectorize-io/hindsight), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [claude-mem](https://github.com/thedotmack/claude-mem)):
-
 - **Entity resolution + co-occurrence graph** — LLM entity extraction during A-MEM enrichment, canonical normalization via FTS5 + Levenshtein fuzzy matching, co-occurrence tracking, entity graph traversal for ENTITY intent queries
 - **MPFP graph retrieval** — Multi-Path Fact Propagation with meta-path patterns per intent, hop-synchronized edge cache, Forward Push with α=0.15 teleport probability. Replaces single-beam traversal for causal/entity/temporal queries.
 - **Temporal query extraction** — regex-based date range extraction from natural language queries ("last week", "March 2026"), wired as WHERE filters into BM25 and vector search
@@ -1046,6 +1044,8 @@ Built on the shoulders of:
 - [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
 - [claude-mem](https://github.com/thedotmack/claude-mem) — Claude Code memory integration reference
 - [Engram](https://github.com/Gentleman-Programming/engram) — observation dedup window, topic-key upsert pattern, temporal timeline navigation, duplicate metadata scoring signals
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — memory nudge system (periodic lifecycle tool prompting)
+- [Hindsight](https://github.com/vectorize-io/hindsight) — entity resolution, MPFP graph traversal, temporal extraction, 3-tier consolidation, observation invalidation, 4-way parallel retrieval
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
 - [OpenViking](https://github.com/volcengine/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
