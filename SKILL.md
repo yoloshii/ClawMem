@@ -272,7 +272,7 @@ Once escalated, route by query type:
 | `beads_sync` | Sync Beads issues from Dolt backend into memory. |
 | `index_stats` | Doc counts, embedding coverage, content type distribution. |
 | `status` | Quick index health. |
-| `reindex` | Force re-index (BM25 only, does NOT embed). |
+| `reindex` | Force re-index (BM25 only, does NOT embed). Use `--enrich` after major upgrades to backfill entity extraction + links on existing docs. |
 | `memory_evolution_status` | Track how a doc's A-MEM metadata evolved over time. |
 | `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
 | `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
@@ -658,6 +658,14 @@ echo "user query" | clawmem surface --context --stdin
 
 # IO6b: per-session bootstrap injection (pipe session ID on stdin)
 echo "session-id" | clawmem surface --bootstrap --stdin
+```
+
+### Enrichment Commands
+
+```bash
+clawmem reindex --enrich        # Full A-MEM pipeline on ALL docs (entity extraction,
+                                # link generation, memory evolution). Use after major upgrades.
+                                # Without --enrich, reindex only refreshes metadata for changed docs.
 ```
 
 ### Analysis Commands
