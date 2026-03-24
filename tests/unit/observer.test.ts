@@ -81,8 +81,46 @@ describe("parseObservationXml", () => {
     expect(obs!.filesModified).toHaveLength(2);
   });
 
+  it("parses skill observation fields", () => {
+    const xml = `
+      <type>skill_usage</type>
+      <title>Used humanizer-pro</title>
+      <skill_name>humanizer-pro</skill_name>
+      <quality_score>0.85</quality_score>
+    `;
+    const obs = parseObservationXml(xml);
+    expect(obs).toBeDefined();
+    expect(obs!.skillName).toBe("humanizer-pro");
+    expect(obs!.qualityScore).toBeCloseTo(0.85, 2);
+  });
+
+  it("clamps quality_score to 0-1 range", () => {
+    const xml = `
+      <type>skill_failure</type>
+      <title>Skill failed</title>
+      <skill_name>test-skill</skill_name>
+      <quality_score>1.5</quality_score>
+      <failure_reason>wrong_output</failure_reason>
+    `;
+    const obs = parseObservationXml(xml);
+    expect(obs).toBeDefined();
+    expect(obs!.qualityScore).toBeLessThanOrEqual(1.0);
+    expect(obs!.failureReason).toBe("wrong_output");
+  });
+
+  it("ignores skill fields for non-skill types", () => {
+    const xml = `
+      <type>decision</type>
+      <title>Some Decision</title>
+      <skill_name>should-be-ignored</skill_name>
+    `;
+    const obs = parseObservationXml(xml);
+    expect(obs).toBeDefined();
+    expect(obs!.skillName).toBeUndefined();
+  });
+
   it("handles all valid observation types", () => {
-    const types = ["decision", "bugfix", "feature", "refactor", "discovery", "change"];
+    const types = ["decision", "bugfix", "feature", "refactor", "discovery", "change", "skill_usage", "skill_failure"] as const;
     for (const type of types) {
       const xml = `<type>${type}</type><title>Test ${type}</title>`;
       const obs = parseObservationXml(xml);

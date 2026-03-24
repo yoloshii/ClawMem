@@ -10,7 +10,7 @@ function makeInput(sessionId?: string): HookInput {
   return {
     prompt: "",
     sessionId: sessionId || `sess-${Date.now()}`,
-    hookName: "session-bootstrap",
+    hookEventName: "session-bootstrap",
   };
 }
 

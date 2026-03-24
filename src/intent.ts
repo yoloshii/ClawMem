@@ -10,7 +10,7 @@
 
 import type { Database } from "bun:sqlite";
 import { createHash } from "crypto";
-import type { LlamaCpp } from "./llm.ts";
+import type { LLM } from "./llm.ts";
 
 export type IntentType = 'WHY' | 'WHEN' | 'ENTITY' | 'WHAT';
 
@@ -179,7 +179,7 @@ function classifyIntentHeuristic(query: string): IntentResult {
  */
 export async function classifyIntent(
   query: string,
-  llm: LlamaCpp,
+  llm: LLM,
   db: Database
 ): Promise<IntentResult> {
   // Check cache first (1 hour TTL)
@@ -268,7 +268,7 @@ export type QueryClause = {
  */
 export async function decomposeQuery(
   query: string,
-  llm: LlamaCpp,
+  llm: LLM,
   db: Database,
   sessionContext?: string
 ): Promise<QueryClause[]> {

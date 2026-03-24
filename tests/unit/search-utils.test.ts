@@ -4,10 +4,10 @@ import { reciprocalRankFusion, type RankedResult } from "../../src/search-utils.
 function makeRanked(file: string, score: number = 1.0): RankedResult {
   return {
     file,
-    score,
-    text: `content of ${file}`,
+    displayPath: file,
     title: file,
-    source: "fts",
+    body: `content of ${file}`,
+    score,
   };
 }
 

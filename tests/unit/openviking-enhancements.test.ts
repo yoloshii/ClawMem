@@ -220,14 +220,13 @@ describe("co-activation boost in applyCompositeScoring", () => {
     body: "content",
     score,
     source: "fts" as const,
-    memoryType: "factual",
-    contentType: "general",
-    pinned: 0,
-    snoozedUntil: null,
+    contentType: "note",
+    pinned: false,
     confidence: 0.8,
     accessCount: 1,
-    domain: null,
-    workstream: null,
+    qualityScore: 0.5,
+    duplicateCount: 1,
+    revisionCount: 1,
   });
 
   it("boosts lower-ranked results that co-activate with top results", () => {

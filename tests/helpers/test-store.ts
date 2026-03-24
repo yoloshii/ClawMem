@@ -51,7 +51,7 @@ export function seedDocuments(store: Store, docs: SeedDoc[]): number[] {
       // Apply optional metadata
       if (doc.contentType || doc.confidence !== undefined || doc.qualityScore !== undefined) {
         const sets: string[] = [];
-        const vals: unknown[] = [];
+        const vals: (string | number | null)[] = [];
         if (doc.contentType) { sets.push("content_type = ?"); vals.push(doc.contentType); }
         if (doc.confidence !== undefined) { sets.push("confidence = ?"); vals.push(doc.confidence); }
         if (doc.qualityScore !== undefined) { sets.push("quality_score = ?"); vals.push(doc.qualityScore); }

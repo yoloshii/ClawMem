@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "bun:test";
+import { describe, it, expect, beforeEach, mock } from "bun:test";
 import { classifyIntent } from "../../src/intent.ts";
 import { createTestStore } from "../helpers/test-store.ts";
 import { createMockLLM } from "../helpers/mock-llm.ts";
@@ -33,7 +33,7 @@ describe("classifyIntent with DB caching", () => {
   it("falls back to heuristic when LLM fails", async () => {
     const llm = createMockLLM();
     // Make LLM throw
-    llm.generate = async () => { throw new Error("LLM unavailable"); };
+    llm.generate = mock(async () => { throw new Error("LLM unavailable"); });
     // "explain the approach" is ambiguous (WHAT, low confidence)
     const result = await classifyIntent("explain the approach", llm, store.db);
     expect(result.intent).toBe("WHAT");
@@ -54,7 +54,7 @@ describe("classifyIntent with DB caching", () => {
   it("uses LLM for ambiguous queries when heuristic confidence < 0.8", async () => {
     const llm = createMockLLM();
     // Configure LLM to return a valid intent
-    llm.generate = async () => ({ text: "ENTITY", model: "mock", done: true });
+    llm.generate = mock(async () => ({ text: "ENTITY", model: "mock", done: true }));
     // "tell me about the project" has no strong heuristic signal
     const result = await classifyIntent("tell me about the project", llm, store.db);
     // Either heuristic WHAT (0.6) or LLM-refined ENTITY (0.85)

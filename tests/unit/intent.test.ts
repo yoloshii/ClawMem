@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, mock } from "bun:test";
 import { classifyIntent, getIntentWeights } from "../../src/intent.ts";
 import { createTestStore } from "../helpers/test-store.ts";
 import { createMockLLM } from "../helpers/mock-llm.ts";
@@ -156,7 +156,7 @@ describe("classifyIntent — caching", () => {
   it("falls back to heuristic when LLM fails", async () => {
     const store = createTestStore();
     const llm = createMockLLM();
-    llm.generate = async () => { throw new Error("LLM down"); };
+    llm.generate = mock(async () => { throw new Error("LLM down"); });
     // "explain something" → ambiguous, should try LLM, fall back to heuristic
     const r = await classifyIntent("tell me about the project", llm, store.db);
     expect(r.intent).toBeDefined();

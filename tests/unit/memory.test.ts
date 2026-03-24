@@ -283,6 +283,8 @@ function makeEnrichedResult(overrides: Partial<EnrichedResult> = {}): EnrichedRe
     collectionName: "test",
     bodyLength: 500,
     source: "fts",
+    duplicateCount: 1,
+    revisionCount: 1,
     ...overrides,
   };
 }

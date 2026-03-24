@@ -44,7 +44,7 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 
 ### v0.2.0 Enhancements
 
-- **Entity resolution + co-occurrence graph** — LLM entity extraction during A-MEM enrichment, canonical normalization via FTS5 + Levenshtein fuzzy matching, co-occurrence tracking, entity graph traversal for ENTITY intent queries
+- **Entity resolution + co-occurrence graph** — LLM entity extraction with quality filters, type-agnostic canonical resolution within [compatibility buckets](docs/internals/entity-resolution.md) (extensible type vocabulary), IDF-based entity edge scoring, co-occurrence tracking, entity graph traversal for ENTITY intent queries
 - **MPFP graph retrieval** — Multi-Path Fact Propagation with meta-path patterns per intent, hop-synchronized edge cache, Forward Push with α=0.15 teleport probability. Replaces single-beam traversal for causal/entity/temporal queries.
 - **Temporal query extraction** — regex-based date range extraction from natural language queries ("last week", "March 2026"), wired as WHERE filters into BM25 and vector search
 - **4-way parallel retrieval** — temporal proximity and entity graph channels added as parallel RRF legs in `query` tool (Tier 3 only), alongside existing BM25 + vector channels

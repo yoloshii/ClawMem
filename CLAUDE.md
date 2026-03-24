@@ -89,7 +89,7 @@ curl http://host:8090/v1/models
 | `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input. Default fits EmbeddingGemma (2048 tokens). Set to `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier: Free 100000, Paid 2000000, Premium 50000000. |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). Only sent when URL contains `openai.com`. |
-| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
+| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM, and entity extraction. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. For better entity extraction quality, point at a 7B+ model or cloud API during `reindex --enrich` (see `docs/internals/entity-resolution.md`). |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups. |
 | `CLAWMEM_VAULTS` | (none) | JSON map of vault name → SQLite path for multi-vault mode. E.g. `{"work":"~/.cache/clawmem/work.sqlite"}` |
@@ -485,7 +485,7 @@ The `memory_relations` table is populated by multiple independent sources:
 | Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP tool or watcher (.beads/ change) | Queries `bd` CLI (Dolt backend). Maps beads deps: blocks→causal, discovered-from→supporting, relates-to→semantic, plus conditional-blocks→causal, caused-by→causal, supersedes→supporting. Metadata: `{origin: "beads"}`. |
 | `buildTemporalBackbone()` | temporal | `build_graphs` MCP tool (manual) | Creation-order edges between all active docs. |
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP tool (manual) | Pure cosine similarity. PK collision: `INSERT OR IGNORE` means A-MEM semantic edges take precedence if they exist first. |
-| Entity co-occurrence graph | entity | A-MEM enrichment (indexing) | LLM entity extraction → canonical normalization (FTS5 + Levenshtein) → `entity_mentions` + `entity_cooccurrences` tables. Feeds ENTITY intent queries and MPFP `[entity, semantic]` patterns. |
+| Entity co-occurrence graph | entity | A-MEM enrichment (indexing) | LLM entity extraction → quality filters (title/length/blocklist/location validation) → type-agnostic canonical resolution within compatibility buckets (person, org, location, tech=project/service/tool/concept) → `entity_mentions` + `entity_cooccurrences` tables. Entity edges use IDF-based specificity scoring. Feeds ENTITY intent queries and MPFP `[entity, semantic]` patterns. |
 | `consolidated_observations` | supporting | Consolidation worker (background) | 3-tier consolidation: facts → observations → mental models. Observations track `proof_count`, `trend` (STABLE/STRENGTHENING/WEAKENING/STALE), and source links. |
 
 **Edge collision:** Both `generateMemoryLinks()` and `buildSemanticGraph()` insert `relation_type='semantic'`. PK is `(source_id, target_id, relation_type)` — first writer wins.
@@ -662,7 +662,7 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 ## Integration Notes
 
 - **Memory nudge (v0.2.0):** Every N prompts (default 15) without a lifecycle MCP tool call (`memory_pin`/`memory_forget`/`memory_snooze`), context-surfacing appends `<vault-nudge>` prompting proactive memory management. Counter resets on lifecycle tool use. Configure via `CLAWMEM_NUDGE_INTERVAL` (0 to disable).
-- **Entity resolution (v0.2.0):** A-MEM enrichment now extracts named entities via LLM, resolves to canonical forms using `entities_fts` + Levenshtein fuzzy matching, and tracks co-occurrence. Entity graph traversal available for ENTITY intent queries via `intent_search`.
+- **Entity resolution (v0.2.0+):** A-MEM enrichment extracts named entities via LLM, resolves to canonical forms using FTS5 + Levenshtein fuzzy matching with **type-agnostic compatibility buckets** (person, org, location stay separate; project/service/tool/concept merge freely as "tech" bucket). Quality filters reject title-as-entity, long names, template placeholders, and invalid locations. Entity edges use IDF-based specificity scoring (rare entities create edges; ubiquitous entities alone cannot). See `docs/internals/entity-resolution.md` for customization (extending type vocabulary and buckets).
 - QMD retrieval (BM25, vector, RRF, rerank, query expansion) is forked into ClawMem. Do not call standalone QMD tools.
 - SAME (composite scoring), MAGMA (intent + graph), A-MEM (self-evolving notes) layer on top of QMD substrate.
 - Three `llama-server` instances (embedding, LLM, reranker) on local or remote GPU. Wrapper defaults to `localhost:8088/8089/8090`.

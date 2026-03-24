@@ -9,7 +9,7 @@
 
 import type { Database } from "bun:sqlite";
 import { createHash } from "crypto";
-import type { LlamaCpp } from "./llm.ts";
+import type { LLM } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 
 // =============================================================================
@@ -78,6 +78,77 @@ function similarityRatio(a: string, b: string): number {
 }
 
 // =============================================================================
+// Quality Filters
+// =============================================================================
+
+const ENTITY_BLOCKLIST = new Set([
+  'entity name', 'entity type', 'description', 'example',
+  'name', 'type', 'value', 'item',
+  'exampletool', 'jane smith', // prompt examples the LLM echoes
+]);
+
+/**
+ * Check if an extracted entity is low quality and should be rejected.
+ * Catches: title-as-entity, long names, template placeholders, heading labels.
+ */
+function isLowQualityEntity(name: string, type: string, docTitle: string): boolean {
+  const normalized = name.toLowerCase().trim();
+  const normalizedTitle = docTitle.toLowerCase().trim();
+
+  // Exact or near-exact title match (Levenshtein > 0.85)
+  if (normalizedTitle.length > 0 && similarityRatio(normalized, normalizedTitle) > 0.85) return true;
+
+  // Too long — likely a title or sentence fragment
+  if (name.length > 60) return true;
+
+  // Template placeholders / generic words
+  if (ENTITY_BLOCKLIST.has(normalized)) return true;
+
+  // Heading labels (trailing colon)
+  if (name.endsWith(':')) return true;
+
+  // Location low-trust: if type is location, validate it
+  if (type === 'location' && !isValidLocation(name)) return true;
+
+  return false;
+}
+
+/**
+ * Validate that a location entity is actually geographic / infrastructure.
+ * Rejects long non-geographic names that the LLM mistyped as location.
+ */
+function isValidLocation(name: string): boolean {
+  // IP addresses
+  if (/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(name)) return true;
+  // VM identifiers (e.g., "VM 202", "VM 200")
+  if (/^VM\s+\d+/i.test(name)) return true;
+  // Positive-signal only — no length-based or FQDN fallback
+  return false;
+}
+
+// =============================================================================
+// Compatibility Buckets (for type-agnostic canonical resolution)
+// =============================================================================
+
+// Each bucket contains types that are semantically interchangeable for merging.
+// Types in the same bucket can merge; cross-bucket merges are rejected.
+// The 'tech' bucket captures the common LLM confusion between project/service/tool/concept.
+// Unknown types default to their own isolated bucket (no false merges).
+const ENTITY_BUCKETS: Record<string, string> = {
+  person: 'person',
+  org: 'org',
+  location: 'location',
+  project: 'tech',
+  service: 'tech',
+  tool: 'tech',
+  concept: 'tech',
+};
+
+function getEntityBucket(type: string): string {
+  return ENTITY_BUCKETS[type] ?? type; // unknown types form their own bucket
+}
+
+// =============================================================================
 // Entity ID Generation
 // =============================================================================
 
@@ -99,7 +170,7 @@ function makeEntityId(name: string, type: string, vault: string = 'default'): st
  * Returns a list of (name, type) pairs.
  */
 export async function extractEntities(
-  llm: LlamaCpp,
+  llm: LLM,
   title: string,
   content: string
 ): Promise<ExtractedEntity[]> {
@@ -113,15 +184,16 @@ Content:
 ${truncated}
 
 Return ONLY valid JSON array:
-[
-  {"name": "Entity Name", "type": "person|project|service|tool|concept|org|location"}
-]
+[{"name": "...", "type": "person|project|service|tool|concept|org|location"}]
 
 Rules:
 - Only include specific, named entities (not generic concepts like "database" or "testing")
 - Normalize names: "VM 202" not "vm202", "ClawMem" not "clawmem"
-- 3-15 entities maximum
+- 0-10 entities. Return empty array [] if no specific entities found
 - Include the most specific type for each entity
+- Do NOT extract the document's title as an entity
+- Do NOT extract heading labels, section names, or sentence fragments
+- Only extract entities that could meaningfully appear in OTHER documents
 Return ONLY the JSON array. /no_think`;
 
   try {
@@ -135,7 +207,7 @@ Return ONLY the JSON array. /no_think`;
     const parsed = extractJsonFromLLM(result.text) as ExtractedEntity[] | null;
     if (!Array.isArray(parsed)) return [];
 
-    // Validate and filter
+    // Validate, filter, and quality-check
     return parsed
       .filter(e =>
         typeof e.name === 'string' &&
@@ -144,7 +216,8 @@ Return ONLY the JSON array. /no_think`;
         e.name.length <= 100 &&
         ['person', 'project', 'service', 'tool', 'concept', 'org', 'location'].includes(e.type)
       )
-      .slice(0, 15);
+      .filter(e => !isLowQualityEntity(e.name, e.type, title))
+      .slice(0, 10);
   } catch (err) {
     console.log(`[entity] LLM extraction failed:`, err);
     return [];
@@ -159,7 +232,13 @@ Return ONLY the JSON array. /no_think`;
  * Resolve an entity name to its canonical form.
  * Uses FTS5 candidate lookup + Levenshtein fuzzy matching.
  *
- * Scoped per vault (via vault parameter) to prevent cross-vault false merges.
+ * Type-agnostic within compatibility buckets:
+ * - person: only merges with person
+ * - org: only merges with org
+ * - location: only merges with location
+ * - tech (project/service/tool/concept): merges freely within bucket
+ *
+ * Scoped per vault to prevent cross-vault false merges.
  *
  * @returns entity_id of canonical match, or null if no match (new entity)
  */
@@ -171,34 +250,41 @@ export function resolveEntityCanonical(
   threshold: number = 0.75
 ): string | null {
   const normalizedName = name.toLowerCase().trim();
+  const inputBucket = getEntityBucket(type);
 
-  // Step 1: FTS5 candidate lookup — join to entity_nodes for vault scoping
+  // Use lower threshold for person names (enables "Andre (Dre) Konrad" ↔ "Dre Konrad")
+  const effectiveThreshold = inputBucket === 'person' ? 0.65 : threshold;
+
+  // Step 1: FTS5 candidate lookup — type-agnostic, vault-scoped
   let candidates: { entity_id: string; name: string; entity_type: string }[] = [];
   try {
     candidates = db.prepare(`
       SELECT f.entity_id, f.name, f.entity_type
       FROM entities_fts f
       JOIN entity_nodes e ON e.entity_id = f.entity_id
-      WHERE entities_fts MATCH ? AND f.entity_type = ? AND e.vault = ?
+      WHERE entities_fts MATCH ? AND e.vault = ?
       LIMIT 20
-    `).all(normalizedName.split(/\s+/).map(w => `"${w}"`).join(' OR '), type, vault) as typeof candidates;
+    `).all(normalizedName.split(/\s+/).map(w => `"${w}"`).join(' OR '), vault) as typeof candidates;
   } catch {
     // FTS5 match may fail on special chars — fall back to LIKE on entity_nodes directly
     candidates = db.prepare(`
       SELECT entity_id, name, entity_type
       FROM entity_nodes
-      WHERE LOWER(name) LIKE ? AND entity_type = ? AND vault = ?
+      WHERE LOWER(name) LIKE ? AND vault = ?
       LIMIT 20
-    `).all(`%${normalizedName}%`, type, vault) as typeof candidates;
+    `).all(`%${normalizedName}%`, vault) as typeof candidates;
   }
 
   if (candidates.length === 0) return null;
 
-  // Step 2: Fuzzy rank candidates by Levenshtein similarity
+  // Step 2: Fuzzy rank candidates, filtering by bucket compatibility
   let bestMatch: { entity_id: string; score: number } | null = null;
   for (const candidate of candidates) {
+    // Reject cross-bucket matches (e.g., don't merge "Andrea" person with "Andrea" project)
+    if (getEntityBucket(candidate.entity_type) !== inputBucket) continue;
+
     const score = similarityRatio(normalizedName, candidate.name.toLowerCase());
-    if (score >= threshold && (!bestMatch || score > bestMatch.score)) {
+    if (score >= effectiveThreshold && (!bestMatch || score > bestMatch.score)) {
       bestMatch = { entity_id: candidate.entity_id, score };
     }
   }
@@ -362,7 +448,7 @@ function clearDocEntityState(db: Database, docId: number): void {
  */
 export async function enrichDocumentEntities(
   db: Database,
-  llm: LlamaCpp,
+  llm: LLM,
   docId: number,
   vault: string = 'default'
 ): Promise<number> {
@@ -444,8 +530,11 @@ export async function enrichDocumentEntities(
         return 0; // Another worker already committed this exact enrichment
       }
 
-      // Clear old derived state if re-enriching (content changed)
-      if (txState || existingState) {
+      // Clear old derived state if re-enriching (content changed or state was externally wiped)
+      const hasOldMentions = db.prepare(
+        `SELECT 1 FROM entity_mentions WHERE doc_id = ? LIMIT 1`
+      ).get(docId);
+      if (txState || existingState || hasOldMentions) {
         clearDocEntityState(db, docId);
       }
 
@@ -459,31 +548,90 @@ export async function enrichDocumentEntities(
         return 0;
       }
 
-      // Now mutate counters — one upsert per unique canonical ID (no inflation)
+      // Mutate counters using precomputed canonical IDs (no redundant re-resolution)
       const resolvedIds: string[] = [];
       for (const { entity, canonicalId } of resolvedPairs) {
-        const entityId = upsertEntity(db, entity.name, entity.type, vault);
-        resolvedIds.push(entityId);
-        recordEntityMention(db, entityId, docId, entity.name);
+        // Check if canonical entity already exists
+        const existing = db.prepare(
+          `SELECT entity_id FROM entity_nodes WHERE entity_id = ?`
+        ).get(canonicalId) as { entity_id: string } | undefined;
+
+        if (existing) {
+          // Existing canonical — increment count
+          db.prepare(`
+            UPDATE entity_nodes SET mention_count = mention_count + 1, last_seen = datetime('now')
+            WHERE entity_id = ?
+          `).run(canonicalId);
+        } else {
+          // New entity — insert
+          db.prepare(`
+            INSERT OR IGNORE INTO entity_nodes (entity_id, entity_type, name, description, created_at, mention_count, last_seen, vault)
+            VALUES (?, ?, ?, NULL, datetime('now'), 1, datetime('now'), ?)
+          `).run(canonicalId, entity.type, entity.name, vault);
+          try {
+            db.prepare(`
+              INSERT OR IGNORE INTO entities_fts (entity_id, name, entity_type)
+              VALUES (?, ?, ?)
+            `).run(canonicalId, entity.name.toLowerCase(), entity.type);
+          } catch { /* FTS insert non-fatal */ }
+        }
+
+        resolvedIds.push(canonicalId);
+        recordEntityMention(db, canonicalId, docId, entity.name);
       }
 
-      // Step 4: Track co-occurrences (deduplicated by canonical ID)
-      trackCoOccurrences(db, resolvedIds);
+      // Step 4: Track co-occurrences (deduplicate resolvedIds to prevent self-pairs)
+      const uniqueResolvedIds = [...new Set(resolvedIds)];
+      trackCoOccurrences(db, uniqueResolvedIds);
 
-      // Step 5: Create entity edges in memory_relations
+      // Step 5: Create entity edges with IDF-based specificity scoring
+      // Rare entities justify edges; ubiquitous entities alone cannot
+      const totalDocs = (db.prepare(`SELECT COUNT(*) as cnt FROM documents WHERE active = 1`).get() as { cnt: number }).cnt;
+
+      // Collect candidate target docs and their shared entities
+      const targetEntityMap = new Map<number, string[]>(); // docId → [entityIds]
       for (const entityId of resolvedIds) {
         const otherDocs = db.prepare(`
           SELECT doc_id FROM entity_mentions
           WHERE entity_id = ? AND doc_id != ?
-          LIMIT 10
+          LIMIT 20
         `).all(entityId, docId) as { doc_id: number }[];
 
         for (const other of otherDocs) {
-          db.prepare(`
-            INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
-            VALUES (?, ?, 'entity', 0.7, ?, datetime('now'))
-          `).run(docId, other.doc_id, JSON.stringify({ entity: entityId }));
+          const existing = targetEntityMap.get(other.doc_id) || [];
+          existing.push(entityId);
+          targetEntityMap.set(other.doc_id, existing);
         }
+      }
+
+      // Compute IDF per entity (cache for this enrichment)
+      const entityIdf = new Map<string, number>();
+      for (const entityId of resolvedIds) {
+        if (!entityIdf.has(entityId)) {
+          const docFreq = (db.prepare(
+            `SELECT COUNT(DISTINCT doc_id) as cnt FROM entity_mentions WHERE entity_id = ?`
+          ).get(entityId) as { cnt: number }).cnt;
+          entityIdf.set(entityId, Math.log((totalDocs + 1) / (docFreq + 1)));
+        }
+      }
+
+      // Create edges only when max entity IDF exceeds threshold
+      const idfThreshold = 3.0; // ln-based: filters entities in >5% of docs (e.g., 13+ docs in 262-doc corpus)
+      for (const [targetDocId, sharedEntities] of targetEntityMap) {
+        const maxIdf = Math.max(...sharedEntities.map(eid => entityIdf.get(eid) || 0));
+        if (maxIdf < idfThreshold) continue; // Skip — only ubiquitous entities shared
+
+        // Weight: IDF specificity + shared-count bonus (multi-entity overlap outranks single)
+        const sharedBonus = Math.min(0.15, 0.05 * (sharedEntities.length - 1));
+        const weight = Math.min(1.0, 0.3 + 0.12 * maxIdf + sharedBonus);
+        const bestEntity = sharedEntities.reduce((best, eid) =>
+          (entityIdf.get(eid) || 0) > (entityIdf.get(best) || 0) ? eid : best
+        );
+
+        db.prepare(`
+          INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
+          VALUES (?, ?, 'entity', ?, ?, datetime('now'))
+        `).run(docId, targetDocId, weight, JSON.stringify({ entity: bestEntity, shared: sharedEntities.length }));
       }
 
       // Persist enrichment state LAST — only after all derived data written

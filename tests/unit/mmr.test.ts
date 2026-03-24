@@ -20,6 +20,8 @@ function makeScoredResult(overrides: Partial<ScoredResult> & { filepath: string;
     bodyLength: overrides.body.length,
     source: "fts" as const,
     recencyScore: 0.8,
+    duplicateCount: 1,
+    revisionCount: 1,
     ...overrides,
   };
 }
