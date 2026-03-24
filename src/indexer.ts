@@ -37,7 +37,7 @@ export interface IndexStats {
 // Exclusion Rules
 // =============================================================================
 
-const EXCLUDED_DIRS = new Set([
+export const EXCLUDED_DIRS = new Set([
   "_PRIVATE",
   ".clawmem",
   ".git",

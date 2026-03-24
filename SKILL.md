@@ -642,6 +642,15 @@ Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
   -> Default hook timeout is 8s (since v0.1.1). If you have an older install, re-run
      `clawmem setup hooks`. If persistent, restart the watcher: `systemctl --user restart
      clawmem-watcher.service`. Healthy memory is under 100MB — if 400MB+, restart clears it.
+
+Symptom: WSL hangs or becomes unresponsive during long sessions / watcher has 100K+ FDs
+  -> Pre-v0.2.3: fs.watch(recursive: true) registered inotify watches on EVERY subdirectory,
+     including excluded dirs (gits/, node_modules/, .git/). Broad collection paths like
+     ~/Projects with 67K subdirs exhausted inotify limits.
+  -> v0.2.3 fix: watcher walks dir trees at startup, skips excluded subtrees, watches
+     non-excluded dirs individually. 500-dir cap per collection path.
+  -> Diagnosis: `ls /proc/$(pgrep -f "clawmem.*watch")/fd | wc -l` — healthy < 15K.
+  -> If still high: narrow broad collection paths. See docs/troubleshooting.md.
 ```
 
 ---
