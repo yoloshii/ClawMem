@@ -642,6 +642,9 @@ Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
   -> Default hook timeout is 8s (since v0.1.1). If you have an older install, re-run
      `clawmem setup hooks`. If persistent, restart the watcher: `systemctl --user restart
      clawmem-watcher.service`. Healthy memory is under 100MB — if 400MB+, restart clears it.
+  -> v0.2.4 fix: hook's SQLite busy_timeout was 500ms — too tight. During A-MEM enrichment
+     or heavy indexing, watcher write locks exceed 500ms, causing SQLITE_BUSY. Raised to
+     5000ms (matches MCP server). Still completes within the 8s outer timeout.
 
 Symptom: WSL hangs or becomes unresponsive during long sessions / watcher has 100K+ FDs
   -> Pre-v0.2.3: fs.watch(recursive: true) registered inotify watches on EVERY subdirectory,

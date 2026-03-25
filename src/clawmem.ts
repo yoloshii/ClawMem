@@ -772,7 +772,7 @@ async function cmdSurface(args: string[]) {
   if (!input) process.exit(0);
 
   // Open store: writable for both (context-surfacing writes dedupe data)
-  const s = createStore(undefined, { busyTimeout: 500 });
+  const s = createStore(undefined, { busyTimeout: 5000 });
 
   try {
     if (isBootstrap) {
