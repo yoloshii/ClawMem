@@ -172,7 +172,7 @@ Pin a memory for permanent prioritization (+0.3 composite boost).
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `query` | string | required | Search query to find the memory |
+| `query` | string | required | Search query or path to find the memory |
 | `unpin` | boolean | false | Set true to unpin |
 | `vault` | string | — | Named vault |
 
@@ -182,7 +182,7 @@ Temporarily hide a memory from context surfacing.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `query` | string | required | Search query to find the memory |
+| `query` | string | required | Search query or path to find the memory |
 | `until` | string | — | ISO date (e.g., `2026-04-01`). Omit to unsnooze. |
 | `vault` | string | — | Named vault |
 
@@ -192,9 +192,11 @@ Permanently deactivate a memory.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `query` | string | required | Search query to find the memory |
+| `query` | string | required | Search query or path to find the memory |
 | `confirm` | boolean | true | False = preview only |
 | `vault` | string | — | Named vault |
+
+**Search behavior (v0.2.6+, all three tools):** Query matching cascades through four strategies: exact path match → BM25 full-text → title-token overlap → vector similarity. This prevents "No matching memory found" errors when the document exists but BM25 fails to match (e.g., too many AND'd terms). Path-like queries (containing `/` or ending in `.md`) try direct path matching first. `memory_forget` requires higher confidence to act — ambiguous matches return candidates instead of mutating.
 
 ## Lifecycle
 

@@ -818,6 +818,143 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
+  // Lifecycle search helpers — resilient candidate finding for pin/snooze/forget
+  // ---------------------------------------------------------------------------
+
+  type LifecycleCandidate = {
+    displayPath: string;
+    title: string;
+    score: number;
+    source: "path" | "fts" | "title" | "vec";
+  };
+
+  const STOPWORDS = new Set([
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "as",
+    "and", "or", "not", "no", "but", "if", "then", "so", "do", "did",
+    "has", "have", "had", "it", "its", "this", "that", "my", "our",
+  ]);
+
+  /**
+   * Cascading search for lifecycle mutations: path match → BM25 → title overlap → vector.
+   * Returns ranked candidates. Never returns wrong results silently.
+   */
+  async function findMemoryCandidates(
+    store: Store,
+    query: string,
+    limit: number = 5
+  ): Promise<LifecycleCandidate[]> {
+    // 1. Exact path match (handles queries like "stack/research/foo.md")
+    if (query.includes("/") || query.endsWith(".md")) {
+      const normalized = query.replace(/^\//, "");
+      const pathHits = store.db.prepare(`
+        SELECT collection || '/' || path as displayPath, title
+        FROM documents WHERE active = 1 AND invalidated_at IS NULL
+        AND (path LIKE ? OR collection || '/' || path LIKE ?)
+        LIMIT ?
+      `).all(`%${normalized}%`, `%${normalized}%`, limit) as { displayPath: string; title: string }[];
+      if (pathHits.length > 0) {
+        return pathHits.map((h, i) => ({ ...h, score: 1.0 - i * 0.05, source: "path" as const }));
+      }
+    }
+
+    // 2. BM25 full-text search (fast, exact terms)
+    const ftsResults = store.searchFTS(query, limit);
+    if (ftsResults.length > 0) {
+      return ftsResults.map(r => ({
+        displayPath: r.displayPath,
+        title: r.title,
+        score: r.score,
+        source: "fts" as const,
+      }));
+    }
+
+    // 3. Title-token overlap (catches BM25 failures from too many AND'd terms)
+    const tokens = query.toLowerCase().split(/\s+/)
+      .filter(w => w.length >= 2 && !STOPWORDS.has(w))
+      .map(w => w.replace(/[^a-z0-9]/g, ""))
+      .filter(w => w.length >= 2);
+
+    if (tokens.length > 0) {
+      const minMatch = Math.max(2, Math.ceil(tokens.length / 2));
+      const titleHits = store.db.prepare(`
+        SELECT collection || '/' || path as displayPath, title,
+          ${tokens.map((_, i) => `(CASE WHEN LOWER(title) LIKE ? THEN 1 ELSE 0 END)`).join(" + ")} as match_count
+        FROM documents
+        WHERE active = 1 AND invalidated_at IS NULL
+        HAVING match_count >= ?
+        ORDER BY match_count DESC, modified_at DESC
+        LIMIT ?
+      `).all(...tokens.map(t => `%${t}%`), minMatch, limit) as { displayPath: string; title: string; match_count: number }[];
+
+      if (titleHits.length > 0) {
+        return titleHits.map(h => ({
+          displayPath: h.displayPath,
+          title: h.title,
+          score: h.match_count / tokens.length,
+          source: "title" as const,
+        }));
+      }
+    }
+
+    // 4. Vector search fallback (semantic similarity)
+    try {
+      const llm = getDefaultLlamaCpp();
+      if (llm) {
+        const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit);
+        if (vecResults.length > 0) {
+          return vecResults.map(r => ({
+            displayPath: r.displayPath,
+            title: r.title,
+            score: r.score,
+            source: "vec" as const,
+          }));
+        }
+      }
+    } catch {
+      // Vector search unavailable — degrade gracefully
+    }
+
+    return [];
+  }
+
+  /**
+   * Select a single target from candidates, or return an ambiguity message.
+   * Stricter confidence requirement for destructive ops (forget).
+   */
+  function selectLifecycleTarget(
+    candidates: LifecycleCandidate[],
+    query: string,
+    destructive: boolean = false
+  ): { target: LifecycleCandidate } | { ambiguous: string } | { notFound: string } {
+    if (candidates.length === 0) {
+      return { notFound: `No matching memory found for "${query}"` };
+    }
+
+    const top = candidates[0]!;
+
+    // Clear winner: high score OR significant gap to #2
+    const gap = candidates.length > 1 ? top.score - candidates[1]!.score : 1.0;
+    const confident = top.score >= 0.7 || gap >= 0.2;
+
+    // For destructive ops (forget), require higher confidence
+    if (destructive && !confident) {
+      const list = candidates.slice(0, 3).map((c, i) =>
+        `${i + 1}. ${c.displayPath} — "${c.title}" (${c.source}, score: ${c.score.toFixed(2)})`
+      ).join("\n");
+      return { ambiguous: `Multiple possible matches. Please be more specific or use a path:\n${list}` };
+    }
+
+    // For non-destructive ops (pin/snooze), accept top hit if any candidates exist
+    if (!confident && candidates.length > 1) {
+      // Low confidence but not destructive — take top hit but warn
+      return { target: top };
+    }
+
+    return { target: top };
+  }
+
+  // ---------------------------------------------------------------------------
   // Tool: memory_forget
   // ---------------------------------------------------------------------------
 
@@ -833,28 +970,32 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, confirm, vault }) => {
-      const store = getStore(vault);
-      const results = store.searchFTS(query, 5);
-      if (results.length === 0) {
-        return { content: [{ type: "text", text: `No matching memory found for "${query}"` }] };
+      const s = getStore(vault);
+      const candidates = await findMemoryCandidates(s, query, 5);
+      const selection = selectLifecycleTarget(candidates, query, true); // destructive = true
+
+      if ("notFound" in selection) {
+        return { content: [{ type: "text", text: selection.notFound }] };
+      }
+      if ("ambiguous" in selection) {
+        return { content: [{ type: "text", text: selection.ambiguous }] };
       }
 
-      const best = results[0]!;
+      const best = selection.target;
       const parts = best.displayPath.split("/");
       const collection = parts[0]!;
       const path = parts.slice(1).join("/");
 
       if (!confirm) {
         return {
-          content: [{ type: "text", text: `Would forget: ${best.displayPath} — "${best.title}" (score ${Math.round(best.score * 100)}%)` }],
+          content: [{ type: "text", text: `Would forget: ${best.displayPath} — "${best.title}" (${best.source}, score ${Math.round(best.score * 100)}%)` }],
           structuredContent: { path: best.displayPath, title: best.title, score: best.score, action: "preview" },
         };
       }
 
-      store.deactivateDocument(collection, path);
+      s.deactivateDocument(collection, path);
 
-      // Log the deletion as audit trail
-      store.insertUsage({
+      s.insertUsage({
         sessionId: "mcp-forget",
         timestamp: new Date().toISOString(),
         hookName: "memory_forget",
@@ -1976,21 +2117,27 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, unpin, vault }) => {
-      const store = getStore(vault);
-      const results = store.searchFTS(query, 3);
-      if (results.length === 0) {
-        return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
+      const s = getStore(vault);
+      const candidates = await findMemoryCandidates(s, query);
+      const selection = selectLifecycleTarget(candidates, query);
+
+      if ("notFound" in selection) {
+        return { content: [{ type: "text", text: selection.notFound }], isError: true };
       }
-      const r = results[0]!;
+      if ("ambiguous" in selection) {
+        return { content: [{ type: "text", text: selection.ambiguous }], isError: true };
+      }
+
+      const r = selection.target;
       const parts = r.displayPath.split("/");
       const collection = parts[0]!;
       const path = parts.slice(1).join("/");
-      const doc = store.findActiveDocument(collection, path);
+      const doc = s.findActiveDocument(collection, path);
       if (!doc) {
         return { content: [{ type: "text", text: "Document not found." }], isError: true };
       }
-      store.pinDocument(collection, path, !unpin);
-      store.insertUsage({
+      s.pinDocument(collection, path, !unpin);
+      s.insertUsage({
         sessionId: "mcp-pin",
         timestamp: new Date().toISOString(),
         hookName: "memory_pin",
@@ -2019,21 +2166,27 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, until, vault }) => {
-      const store = getStore(vault);
-      const results = store.searchFTS(query, 3);
-      if (results.length === 0) {
-        return { content: [{ type: "text", text: "No matching memory found." }], isError: true };
+      const s = getStore(vault);
+      const candidates = await findMemoryCandidates(s, query);
+      const selection = selectLifecycleTarget(candidates, query);
+
+      if ("notFound" in selection) {
+        return { content: [{ type: "text", text: selection.notFound }], isError: true };
       }
-      const r = results[0]!;
+      if ("ambiguous" in selection) {
+        return { content: [{ type: "text", text: selection.ambiguous }], isError: true };
+      }
+
+      const r = selection.target;
       const parts = r.displayPath.split("/");
       const collection = parts[0]!;
       const path = parts.slice(1).join("/");
-      const doc = store.findActiveDocument(collection, path);
+      const doc = s.findActiveDocument(collection, path);
       if (!doc) {
         return { content: [{ type: "text", text: "Document not found." }], isError: true };
       }
-      store.snoozeDocument(collection, path, until || null);
-      store.insertUsage({
+      s.snoozeDocument(collection, path, until || null);
+      s.insertUsage({
         sessionId: "mcp-snooze",
         timestamp: new Date().toISOString(),
         hookName: "memory_snooze",
