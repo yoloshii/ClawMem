@@ -878,11 +878,12 @@ This is the recommended entry point for ALL memory queries.`,
     if (tokens.length > 0) {
       const minMatch = Math.max(2, Math.ceil(tokens.length / 2));
       const titleHits = store.db.prepare(`
-        SELECT collection || '/' || path as displayPath, title,
-          ${tokens.map((_, i) => `(CASE WHEN LOWER(title) LIKE ? THEN 1 ELSE 0 END)`).join(" + ")} as match_count
-        FROM documents
-        WHERE active = 1 AND invalidated_at IS NULL
-        HAVING match_count >= ?
+        SELECT displayPath, title, match_count FROM (
+          SELECT collection || '/' || path as displayPath, title, modified_at,
+            ${tokens.map(() => `(CASE WHEN LOWER(title) LIKE ? THEN 1 ELSE 0 END)`).join(" + ")} as match_count
+          FROM documents
+          WHERE active = 1 AND invalidated_at IS NULL
+        ) WHERE match_count >= ?
         ORDER BY match_count DESC, modified_at DESC
         LIMIT ?
       `).all(...tokens.map(t => `%${t}%`), minMatch, limit) as { displayPath: string; title: string; match_count: number }[];
