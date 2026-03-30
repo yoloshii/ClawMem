@@ -243,7 +243,46 @@ export function readTranscript(
   roleFilter?: "user" | "assistant"
 ): TranscriptMessage[] {
   try {
-    const content = require("fs").readFileSync(transcriptPath, "utf-8");
+    const fs = require("fs");
+    const stat = fs.statSync(transcriptPath);
+    let content: string;
+
+    // For large transcripts (>10MB), read backwards in chunks until we have enough lines
+    if (stat.size > 10 * 1024 * 1024) {
+      const chunkSize = 2 * 1024 * 1024; // 2MB chunks
+      const maxChunks = 5; // Up to 10MB of tail
+      const targetLines = lastN * 3; // Overshoot — not all lines are role messages
+      const buffers: Buffer[] = [];
+      let totalRead = 0;
+
+      // Accumulate raw Buffers (decode once after assembly to avoid UTF-8 boundary corruption)
+      const fd = fs.openSync(transcriptPath, "r");
+      try {
+        for (let chunk = 0; chunk < maxChunks; chunk++) {
+          const readSize = Math.min(chunkSize, stat.size - totalRead);
+          if (readSize <= 0) break;
+          const offset = Math.max(0, stat.size - totalRead - readSize);
+          const buf = Buffer.alloc(readSize);
+          fs.readSync(fd, buf, 0, readSize, offset);
+          buffers.unshift(buf);
+          totalRead += readSize;
+
+          // Check line count on decoded text to see if we have enough
+          const decoded = Buffer.concat(buffers).toString("utf-8");
+          if (decoded.split("\n").length >= targetLines) break;
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      const assembled = Buffer.concat(buffers).toString("utf-8");
+      // Drop first partial line (we likely started mid-line)
+      const firstNewline = assembled.indexOf("\n");
+      content = firstNewline > 0 ? assembled.slice(firstNewline + 1) : assembled;
+    } else {
+      content = fs.readFileSync(transcriptPath, "utf-8");
+    }
+
     const lines = content.split("\n").filter((l: string) => l.trim());
     const messages: TranscriptMessage[] = [];
 
@@ -284,7 +323,7 @@ export function readTranscript(
 }
 
 /**
- * Validate a transcript path (security: must be absolute, .jsonl, regular file, <50MB).
+ * Validate a transcript path (security: must be absolute, .jsonl, regular file, <1GB).
  */
 export function validateTranscriptPath(path: string | undefined): string | null {
   if (!path) return null;
@@ -294,7 +333,7 @@ export function validateTranscriptPath(path: string | undefined): string | null 
   try {
     const stat = require("fs").statSync(path);
     if (!stat.isFile()) return null;
-    if (stat.size > 50 * 1024 * 1024) return null; // 50MB limit
+    if (stat.size > 1024 * 1024 * 1024) return null; // 1GB sanity limit (readTranscript tail-reads large files)
     return path;
   } catch {
     return null;
