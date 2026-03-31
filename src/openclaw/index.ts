@@ -10,7 +10,7 @@
  * Architecture per GPT 5.4 High review:
  * - Prompt-aware retrieval goes through before_prompt_build (has the user prompt)
  * - Post-turn extraction goes through ContextEngine.afterTurn() (has messages[])
- * - Compaction goes through ContextEngine.compact() → precompact-extract → delegate to legacy
+ * - Compaction goes through ContextEngine.compact() → precompact-extract → delegate to runtime
  * - assemble() is minimal pass-through (retrieval already injected via hook)
  */
 
@@ -109,24 +109,14 @@ const clawmemPlugin = {
 
       let context = "";
 
-      // On first turn: run session-bootstrap for profile + handoff + decisions + stale
+      // On first turn: consume cached bootstrap context from engine.bootstrap()
+      // (avoids duplicate session-bootstrap hook invocation)
       if (isFirstTurn) {
         surfacedSessions.add(sessionId);
 
-        const bootstrapResult = await execHook(cfg, "session-bootstrap", {
-          session_id: sessionId,
-        });
-
-        if (bootstrapResult.exitCode === 0) {
-          const parsed = parseHookOutput(bootstrapResult.stdout);
-          // Session-bootstrap outputs context directly to stdout (not via hookSpecificOutput)
-          // It uses the system_message field for SessionStart hooks
-          const bootstrapContext = (parsed?.systemMessage as string) || "";
-          if (bootstrapContext) {
-            context += bootstrapContext + "\n\n";
-          }
-        } else {
-          logger.warn(`clawmem: session-bootstrap failed: ${bootstrapResult.stderr}`);
+        const bootstrapContext = engine.takeBootstrapContext(sessionId);
+        if (bootstrapContext) {
+          context += bootstrapContext + "\n\n";
         }
       }
 
@@ -168,6 +158,7 @@ const clawmemPlugin = {
     ) => {
       // Cleanup tracked state
       surfacedSessions.delete(event.sessionId);
+      engine.clearSession(event.sessionId);
       logger.info?.(`clawmem: session ended ${event.sessionId} (${event.messageCount} messages)`);
     });
 
@@ -192,22 +183,12 @@ const clawmemPlugin = {
       ]);
 
       surfacedSessions.delete(ctx.sessionId);
+      engine.clearSession(ctx.sessionId);
     });
 
-    // ----- Plugin Hook: before_compaction -----
-    // Fire precompact-extract before compaction starts (additional safety — compact()
-    // also runs it, but before_compaction fires earlier in the pipeline)
-    api.on("before_compaction", async (
-      event: { sessionFile?: string; messageCount: number },
-      ctx: { sessionId?: string }
-    ) => {
-      if (!event.sessionFile || !ctx.sessionId) return;
-
-      await execHook(cfg, "precompact-extract", {
-        session_id: ctx.sessionId,
-        transcript_path: event.sessionFile,
-      });
-    });
+    // NOTE: before_compaction hook removed — precompact-extract now fires only
+    // in engine.compact() before delegating to the runtime compactor. This avoids
+    // the duplicate invocation that previously existed.
 
     // ----- Register Tools -----
     if (cfg.enableTools) {

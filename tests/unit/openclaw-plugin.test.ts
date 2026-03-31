@@ -127,34 +127,39 @@ describe("ClawMemContextEngine", () => {
     expect(result.estimatedTokens).toBe(0);
   });
 
-  test("compact returns not-compacted (delegates to legacy)", async () => {
-    // This will fail to shell out but should fail-open
+  test("compact delegates to runtime (fails gracefully without OpenClaw SDK)", async () => {
+    // Without OpenClaw SDK, delegateCompactionToRuntime import fails → fail-safe
     const result = await engine.compact({
       sessionId: "test-session",
       sessionFile: "/tmp/nonexistent.jsonl",
     });
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
     expect(result.compacted).toBe(false);
-    expect(result.reason).toBe("clawmem-precompact-only");
+    expect(result.reason).toContain("delegation-failed");
   });
 
-  test("bootstrap tracks session", async () => {
-    expect(engine.isBootstrapped("test-1")).toBe(false);
+  test("takeBootstrapContext returns undefined when no cached context", () => {
+    expect(engine.takeBootstrapContext("nonexistent")).toBeUndefined();
+  });
+
+  test("clearSession removes cached bootstrap context", async () => {
+    // bootstrap() will fail to shell out but won't cache anything
     await engine.bootstrap({
       sessionId: "test-1",
       sessionFile: "/tmp/nonexistent.jsonl",
     });
-    expect(engine.isBootstrapped("test-1")).toBe(true);
+    // No context cached (hook failed), but clearSession should not throw
+    engine.clearSession("test-1");
+    expect(engine.takeBootstrapContext("test-1")).toBeUndefined();
   });
 
-  test("dispose clears state", async () => {
+  test("dispose clears all state", async () => {
     await engine.bootstrap({
       sessionId: "test-1",
       sessionFile: "/tmp/nonexistent.jsonl",
     });
-    expect(engine.isBootstrapped("test-1")).toBe(true);
     await engine.dispose();
-    expect(engine.isBootstrapped("test-1")).toBe(false);
+    expect(engine.takeBootstrapContext("test-1")).toBeUndefined();
   });
 
   test("afterTurn skips heartbeat turns", async () => {

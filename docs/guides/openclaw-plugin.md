@@ -18,8 +18,8 @@ The plugin uses a hybrid approach — ContextEngine methods for lifecycle manage
 |-----------|------|
 | `before_prompt_build` hook | Prompt-aware retrieval (context-surfacing + session-bootstrap on first turn) |
 | `ContextEngine.afterTurn()` | Decision extraction, handoff generation, feedback loop (parallel) |
-| `ContextEngine.compact()` | Pre-compaction state preservation (delegates real compaction to legacy engine) |
-| `ContextEngine.bootstrap()` | Session bookkeeping |
+| `ContextEngine.compact()` | Pre-compaction state preservation, then delegates to OpenClaw runtime compactor |
+| `ContextEngine.bootstrap()` | Session registration + caches bootstrap context for first-turn injection |
 | `ContextEngine.assemble()` | Pass-through (retrieval done in hook, not here) |
 | Agent tools | 5 retrieval tools registered with OpenClaw via REST API: search, get, session_log, timeline, similar. The full [REST API](../reference/rest-api.md) exposes additional endpoints (lifecycle, graph traversal, mutations, export, etc.) accessible via HTTP but not registered as agent tools. |
 
@@ -27,10 +27,18 @@ The plugin uses a hybrid approach — ContextEngine methods for lifecycle manage
 
 The ContextEngine interface alone can't handle all ClawMem operations:
 
-- `assemble()` receives history and token budget but **not the current user prompt** — so it can't do prompt-aware retrieval
-- `bootstrap()` can't inject context into the prompt — its return type doesn't support it
+- `assemble()` now receives `prompt` (since v2026.3.28), but retrieval is currently implemented in the `before_prompt_build` hook for historical reasons. Future versions may migrate retrieval to `assemble()`.
+- `bootstrap()` can't inject context into the prompt — its return type doesn't support it. ClawMem caches bootstrap output and injects it via the prompt hook on the first turn.
 
-The `before_prompt_build` plugin hook solves both: it has access to the prompt and can inject context directly.
+The `before_prompt_build` plugin hook provides access to the prompt and can inject context directly.
+
+### Compaction delegation (v0.3.0+)
+
+ClawMem does not own a compaction algorithm — it uses OpenClaw's built-in runtime compactor. The `compact()` method:
+1. Runs `precompact-extract` to preserve state (decisions, file paths, open questions)
+2. Delegates actual compaction to OpenClaw via `delegateCompactionToRuntime()` from `openclaw/plugin-sdk/core`
+
+This is required since OpenClaw v2026.3.28 — returning `compacted: false` with `ownsCompaction: false` no longer triggers implicit legacy compaction fallback.
 
 ## Configuration
 

@@ -592,6 +592,10 @@ openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/
 
 **Tradeoffs:** Redundant recall but 10-15% context window waste from duplicate facts.
 
+### Compaction (v0.3.0+, required for OpenClaw v2026.3.28+)
+
+`compact()` delegates to OpenClaw's runtime compactor via `delegateCompactionToRuntime()`. Previous versions returned `compacted: false` expecting legacy fallback — that fallback no longer exists. Without this fix, OpenClaw sessions never compact and context grows unbounded.
+
 ---
 
 ## Troubleshooting
@@ -701,7 +705,7 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs. Only runs if MCP process stays alive long enough (every 5min).
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
 - HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
-- OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction.
+- OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction + runtime delegation (v0.3.0+, required for OpenClaw v2026.3.28+).
 
 ## Tool Selection (one-liner)
 
