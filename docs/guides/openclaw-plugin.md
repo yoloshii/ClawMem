@@ -16,7 +16,7 @@ The plugin uses a hybrid approach — ContextEngine methods for lifecycle manage
 
 | Component | Role |
 |-----------|------|
-| `before_prompt_build` hook | Prompt-aware retrieval (context-surfacing + session-bootstrap on first turn) |
+| `before_prompt_build` hook | Prompt-aware retrieval (context-surfacing every turn + cached bootstrap context on first turn) |
 | `ContextEngine.afterTurn()` | Decision extraction, handoff generation, feedback loop (parallel) |
 | `ContextEngine.compact()` | Pre-compaction state preservation, then delegates to OpenClaw runtime compactor |
 | `ContextEngine.bootstrap()` | Session registration + caches bootstrap context for first-turn injection |
