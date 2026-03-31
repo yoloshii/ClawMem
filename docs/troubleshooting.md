@@ -162,6 +162,25 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
   **Stop hooks** (`decision-extractor`, `handoff-generator`, `feedback-loop`) default to 10s because they run LLM inference (observer model). These run at session end, so latency doesn't block the user. Increasing them to 15-20s is safe if your observer model is slow.
 
+**"Stop hook error: Failed with non-blocking status code: No stderr output"**
+- Claude Code expects all hooks (including Stop hooks) to output valid JSON to stdout. A hook that exits 0 but produces **no stdout** is treated as an error — "non-blocking status code" means exit 0, "no stderr output" means Claude Code has no error message to show.
+- This typically happens with custom Stop hooks (not ClawMem's built-in hooks, which always output `{"continue":true,"suppressOutput":false}`). If you add your own Stop hook alongside ClawMem's, every code path must output JSON — including early returns, error handling, and default/fallback paths.
+- Common pattern that causes this:
+  ```bash
+  # BAD — exits 0 with no stdout on the early-return path
+  if [[ -z "$some_var" ]]; then
+      exit 0
+  fi
+
+  # GOOD — always output JSON
+  OK='{"continue":true,"suppressOutput":false}'
+  if [[ -z "$some_var" ]]; then
+      echo "$OK"; exit 0
+  fi
+  ```
+- If you have a Stop hook that blocks the agent (outputs `{"continue":false}`), use `{"continue":false,"stopReason":"..."}` to provide context.
+- **Diagnosis:** Expand the Stop hooks output (ctrl+o) to see which hooks ran. Test each hook manually: `echo '{"transcriptPath":"/path/to/transcript.jsonl","sessionId":"test"}' | bash ~/.claude/scripts/your-hook.sh` — verify it outputs JSON.
+
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively. Common causes:
   - Prompt too short (< 20 chars), starts with `/`, or matches the heartbeat/greeting filter

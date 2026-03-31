@@ -105,6 +105,31 @@ The `context-surfacing` hook suppresses duplicate prompts using SHA-256 hashing 
 
 The Stop-event hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`) use `saveMemory()` which enforces a 30-minute normalized content hash dedup window, preventing duplicate observations across concurrent or rapid sessions.
 
+## Adding custom hooks alongside ClawMem
+
+If you add your own hooks to `~/.claude/settings.json` alongside ClawMem's (e.g., a custom Stop hook for context management), every code path in your script must output valid JSON to stdout. Claude Code treats a hook that exits 0 with no stdout as an error.
+
+Use this pattern:
+
+```bash
+#!/bin/bash
+OK='{"continue":true,"suppressOutput":false}'
+input=$(cat)
+
+# Every early return must output JSON
+transcript=$(echo "$input" | jq -r '.transcriptPath // empty')
+if [[ -z "$transcript" ]]; then
+    echo "$OK"; exit 0
+fi
+
+# ... your logic ...
+
+# Default path must also output JSON
+echo "$OK"
+```
+
+ClawMem's built-in hooks handle this automatically. This only applies to custom scripts you add to the same hook events.
+
 ## Profile integration
 
 `context-surfacing` reads `CLAWMEM_PROFILE` to configure its token budget, max results, vector timeout, minimum score threshold, and deep escalation (query expansion + reranking on the `deep` profile). See [Tuning context-surfacing with profiles](../concepts/hooks-vs-mcp.md#tuning-context-surfacing-with-profiles).
