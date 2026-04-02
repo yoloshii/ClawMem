@@ -77,19 +77,13 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## Hooks
 
-**"UserPromptSubmit hook error" or "Stop hook error" (intermittent)**
-
-The most common cause (v0.3.1 fix): **shell `timeout` wrappers** (e.g., `timeout 10 clawmem hook ...`) killing the process with exit 124. When the shell `timeout` command kills a hook, it exits with code 124 and no stderr — Claude Code reports "Failed with non-blocking status code: No stderr output". This affects **all** hook events, not just Stop hooks.
-
-- Fix: Remove shell `timeout` from all hook commands and use Claude Code's native `timeout` property instead. Run `clawmem setup hooks` to reinstall with correct config (v0.3.1+), or manually update `~/.claude/settings.json` — see [setup-hooks](guides/setup-hooks.md).
-- The native `timeout` property (in seconds) is handled gracefully by Claude Code's hook runner without producing spurious errors.
-
-If the error persists after removing shell `timeout` wrappers, check these other causes:
-
-- **SQLite contention** (v0.1.6 fix): the watcher processed all `.jsonl` file changes, triggering database locks. Fixed: watcher now only processes `.beads/*.jsonl`.
-- **WAL bloat** (v0.1.8 fix): the watcher's long-lived connection prevented WAL auto-checkpointing (observed 77MB+). Fixed: `PRAGMA wal_checkpoint(PASSIVE)` every 5 minutes.
-- **busy_timeout too tight** (v0.2.4 fix): hook's SQLite `busy_timeout` was 500ms — too tight during A-MEM enrichment. Raised to 5000ms.
-- **Watcher state bloat**: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). Healthy is under 100MB, bloated is 400MB+.
+**"UserPromptSubmit hook error" (intermittent)**
+- SQLite contention between the watcher and the context-surfacing hook. During active conversations, Claude Code writes rapidly to session transcript `.jsonl` files. Prior to v0.1.6, the watcher processed all `.jsonl` file changes (not just Beads `.beads/*.jsonl`), triggering database opens and brief write locks on every transcript update. If the context-surfacing hook fired during a lock, it exceeded its timeout.
+- Fixed in v0.1.6: The watcher now only processes `.jsonl` files within `.beads/` directories (Dolt backend). Claude Code transcript `.jsonl` files are ignored entirely, eliminating the main source of lock contention and memory bloat.
+- If you still see this error on v0.1.6+: the watcher's long-lived database connection can prevent SQLite WAL auto-checkpointing, allowing the WAL file to grow unbounded (observed 77MB+). A large WAL forces every concurrent reader (hooks, MCP) to traverse the entire log, amplifying contention under load. Fixed in v0.1.8: the watcher now runs `PRAGMA wal_checkpoint(PASSIVE)` every 5 minutes to keep the WAL small.
+- If the error persists after v0.1.8: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). Check `systemctl --user status clawmem-watcher.service` for memory usage — healthy is under 100MB, bloated is 400MB+.
+- **v0.2.4 fix:** Hook's SQLite `busy_timeout` was 500ms — too tight. During A-MEM enrichment or heavy indexing, the watcher can hold write locks for 500ms+, causing the hook's DB open to fail with SQLITE_BUSY. Raised to 5000ms (matches MCP server). The hook's 8s outer timeout still leaves 3s for actual work after a 5s busy wait.
+- **v0.3.1 fix:** Shell `timeout` wrappers (e.g., `timeout 8 clawmem hook context-surfacing`) kill the process with exit 124 and no stderr — Claude Code reports "Failed with non-blocking status code: No stderr output". This affects all hook events (UserPromptSubmit, Stop, SessionStart, PreCompact), not just Stop hooks. Fix: Remove shell `timeout` from all hook commands and use Claude Code's native `timeout` property instead. Run `clawmem setup hooks` to reinstall with correct config (v0.3.1+), or manually update `~/.claude/settings.json` — see [setup-hooks](guides/setup-hooks.md).
 
 **Watcher memory bloat (400MB+)**
 - The watcher accumulates memory when processing high-frequency file change events. The most common trigger was Claude Code session transcript `.jsonl` files changing on every keystroke during active conversations. Each event opened the database briefly, and over hours of active use, memory grew to 400-800MB.
