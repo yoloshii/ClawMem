@@ -529,7 +529,8 @@ async function cmdList(args: string[]) {
   for (const r of rows) {
     const date = r.modified_at?.slice(0, 10) || "-";
     const type = r.content_type || "note";
-    const title = r.title ? (r.title.length > 60 ? r.title.slice(0, 57) + "..." : r.title) : r.path;
+    const raw = r.title || r.path;
+    const title = raw.length > 60 ? raw.slice(0, 57) + "..." : raw;
     console.log(`  ${c.dim}${r.docid}${c.reset}  ${date}  ${c.dim}[${type}]${c.reset}  ${r.collection}  ${title}`);
   }
   console.log(`\n${rows.length} document${rows.length !== 1 ? "s" : ""} shown.`);
@@ -2299,7 +2300,7 @@ ${c.bold}Search:${c.reset}
   clawmem query <query> [-n N]         Hybrid + rerank (best)
 
 ${c.bold}Memory:${c.reset}
-  clawmem list [-n N] [-c collection]  Browse recent documents (--json for machine output)
+  clawmem list [-n/--limit N] [-c col]  Browse recent documents (--json for machine output)
   clawmem budget [--session ID]        Token utilization
   clawmem log [--last N]               Session history
   clawmem profile                      Show user profile
