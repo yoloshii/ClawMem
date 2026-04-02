@@ -689,7 +689,9 @@ clawmem reindex --enrich        # Full A-MEM pipeline on ALL docs (entity extrac
 ```bash
 clawmem list [-n N] [-c col]    # Browse recent documents (--json for machine output)
 clawmem reflect [N]             # Cross-session reflection (last N days, default 14)
+                                # Recurring themes, antipatterns, co-activation clusters
 clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
+                                # Jaccard similarity within same collection
 ```
 
 
