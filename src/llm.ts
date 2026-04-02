@@ -290,6 +290,9 @@ export class LlamaCpp implements LLM {
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
+  // Cache remote server reachability to avoid retrying on every call within a process
+  private remoteEmbedDown = false;
+  private remoteLlmDown = false;
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
@@ -563,13 +566,14 @@ export class LlamaCpp implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Remote server or cloud API — preferred path
-    if (this.remoteEmbedUrl) {
+    if (this.remoteEmbedUrl && !this.remoteEmbedDown) {
       const extraParams = this.getCloudEmbedParams(!!options.isQuery);
       const result = await this.embedRemote(text, extraParams);
       if (result) return result;
       // Cloud providers don't fall back — if API key is set, the user chose cloud
       if (this.isCloudEmbedding()) return null;
-      // Local server unreachable — fall through to in-process fallback
+      // Local server unreachable — cache failure and fall through to in-process fallback
+      this.remoteEmbedDown = true;
       console.error("[embed] Remote server unreachable, falling back to in-process embedding");
     }
 
@@ -586,14 +590,15 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     // Remote server or cloud API
-    if (this.remoteEmbedUrl) {
+    if (this.remoteEmbedUrl && !this.remoteEmbedDown) {
       const extraParams = this.getCloudEmbedParams(false);
       const results = await this.embedRemoteBatch(texts, extraParams);
       // If we got at least one result, remote is working
       if (results.some(r => r !== null)) return results;
       // Cloud providers don't fall back
       if (this.isCloudEmbedding()) return results;
-      // Local server unreachable — fall through to in-process fallback
+      // Local server unreachable — cache failure and fall through to in-process fallback
+      this.remoteEmbedDown = true;
       console.error("[embed] Remote server unreachable, falling back to in-process embedding");
     }
 
@@ -800,11 +805,15 @@ export class LlamaCpp implements LLM {
     const temperature = options.temperature ?? 0;
 
     // Remote LLM server (GPU) — preferred path
-    if (this.remoteLlmUrl) {
-      return this.generateRemote(prompt, maxTokens, temperature, options.signal);
+    if (this.remoteLlmUrl && !this.remoteLlmDown) {
+      const result = await this.generateRemote(prompt, maxTokens, temperature, options.signal);
+      if (result) return result;
+      // Remote server unreachable — cache failure and fall through to in-process fallback
+      this.remoteLlmDown = true;
+      console.error("[generate] Remote server unreachable, falling back to in-process generation");
     }
 
-    // Local fallback via node-llama-cpp (CPU)
+    // Local fallback via node-llama-cpp (CPU/Metal)
     await this.ensureGenerateModel();
 
     const context = await this.generateModel!.createContext();
@@ -939,8 +948,13 @@ Output:`;
     const intent = options.intent;
 
     // Remote LLM path — no grammar constraint, parse output instead
-    if (this.remoteLlmUrl) {
-      return this.expandQueryRemote(query, includeLexical, context, intent);
+    if (this.remoteLlmUrl && !this.remoteLlmDown) {
+      const result = await this.expandQueryRemote(query, includeLexical, context, intent);
+      // expandQueryRemote returns passthrough on failure, but local grammar-constrained
+      // path produces better quality — fall through if remote returned raw passthrough
+      if (result.length > 0 && result[0].text !== query) return result;
+      this.remoteLlmDown = true;
+      console.error("[expandQuery] Remote failed, falling back to in-process expansion");
     }
 
     const llama = await this.ensureLlama();
