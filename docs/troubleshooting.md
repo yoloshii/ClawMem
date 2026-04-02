@@ -77,12 +77,19 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## Hooks
 
-**"UserPromptSubmit hook error" (intermittent)**
-- SQLite contention between the watcher and the context-surfacing hook. During active conversations, Claude Code writes rapidly to session transcript `.jsonl` files. Prior to v0.1.6, the watcher processed all `.jsonl` file changes (not just Beads `.beads/*.jsonl`), triggering database opens and brief write locks on every transcript update. If the context-surfacing hook fired during a lock, it exceeded its timeout.
-- Fixed in v0.1.6: The watcher now only processes `.jsonl` files within `.beads/` directories (Dolt backend). Claude Code transcript `.jsonl` files are ignored entirely, eliminating the main source of lock contention and memory bloat.
-- If you still see this error on v0.1.6+: the watcher's long-lived database connection can prevent SQLite WAL auto-checkpointing, allowing the WAL file to grow unbounded (observed 77MB+). A large WAL forces every concurrent reader (hooks, MCP) to traverse the entire log, amplifying contention under load. Fixed in v0.1.8: the watcher now runs `PRAGMA wal_checkpoint(PASSIVE)` every 5 minutes to keep the WAL small.
-- If the error persists after v0.1.8: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). Check `systemctl --user status clawmem-watcher.service` for memory usage — healthy is under 100MB, bloated is 400MB+.
-- **v0.2.4 fix:** Hook's SQLite `busy_timeout` was 500ms — too tight. During A-MEM enrichment or heavy indexing, the watcher can hold write locks for 500ms+, causing the hook's DB open to fail with SQLITE_BUSY. Raised to 5000ms (matches MCP server). The hook's 8s outer timeout still leaves 3s for actual work after a 5s busy wait.
+**"UserPromptSubmit hook error" or "Stop hook error" (intermittent)**
+
+The most common cause (v0.3.1 fix): **shell `timeout` wrappers** (e.g., `timeout 10 clawmem hook ...`) killing the process with exit 124. When the shell `timeout` command kills a hook, it exits with code 124 and no stderr — Claude Code reports "Failed with non-blocking status code: No stderr output". This affects **all** hook events, not just Stop hooks.
+
+- Fix: Remove shell `timeout` from all hook commands and use Claude Code's native `timeout` property instead. Run `clawmem setup hooks` to reinstall with correct config (v0.3.1+), or manually update `~/.claude/settings.json` — see [setup-hooks](guides/setup-hooks.md).
+- The native `timeout` property (in seconds) is handled gracefully by Claude Code's hook runner without producing spurious errors.
+
+If the error persists after removing shell `timeout` wrappers, check these other causes:
+
+- **SQLite contention** (v0.1.6 fix): the watcher processed all `.jsonl` file changes, triggering database locks. Fixed: watcher now only processes `.beads/*.jsonl`.
+- **WAL bloat** (v0.1.8 fix): the watcher's long-lived connection prevented WAL auto-checkpointing (observed 77MB+). Fixed: `PRAGMA wal_checkpoint(PASSIVE)` every 5 minutes.
+- **busy_timeout too tight** (v0.2.4 fix): hook's SQLite `busy_timeout` was 500ms — too tight during A-MEM enrichment. Raised to 5000ms.
+- **Watcher state bloat**: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). Healthy is under 100MB, bloated is 400MB+.
 
 **Watcher memory bloat (400MB+)**
 - The watcher accumulates memory when processing high-frequency file change events. The most common trigger was Claude Code session transcript `.jsonl` files changing on every keystroke during active conversations. Each event opened the database briefly, and over hours of active use, memory grew to 400-800MB.
@@ -147,11 +154,15 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
   - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
   - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.
 - **Why not keep models warm?** Claude Code hooks spawn a fresh process per invocation (by design — hooks are shell commands). There is no persistent process between hook calls. The MCP server does keep models warm via a 5-minute inactivity timer, but that only benefits MCP tool calls, not hooks.
-- **Adjusting hook timeouts.** If you're using in-process Metal/Vulkan and hooks are timing out intermittently, you can increase the timeout in `~/.claude/settings.json`. Edit the `command` field for the affected hook — the number after `timeout` is the limit in seconds:
+- **Adjusting hook timeouts.** If you're using in-process Metal/Vulkan and hooks are timing out intermittently, you can increase the timeout in `~/.claude/settings.json`. Use the native `timeout` property (in seconds), not a shell `timeout` wrapper:
   ```json
-  "command": "timeout 12 /path/to/clawmem hook context-surfacing"
+  {
+    "type": "command",
+    "command": "/path/to/clawmem hook context-surfacing",
+    "timeout": 12
+  }
   ```
-  Or re-run `clawmem setup hooks` after editing the timeout constant in the source.
+  Or re-run `clawmem setup hooks` (v0.3.1+) which generates correct config automatically.
 
   **Tradeoffs of longer timeouts:**
 
@@ -164,7 +175,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
   The timeout applies per invocation. A slow first prompt (cold start) doesn't mean subsequent prompts will be slow — Bun caches modules after the first load, and `node-llama-cpp` model files are cached on disk after the first download. Subsequent prompts in the same session are typically faster.
 
-  **Stop hooks** (`decision-extractor`, `handoff-generator`, `feedback-loop`) default to 10s because they run LLM inference (observer model). These run at session end, so latency doesn't block the user. Increasing them to 15-20s is safe if your observer model is slow.
+  **Stop hooks** (`decision-extractor`, `handoff-generator`, `feedback-loop`) default to 30s (v0.3.1+, was 10s prior) because they run LLM inference (observer model). These run at session end, so latency doesn't block the user.
 
 **"Stop hook error: Failed with non-blocking status code: No stderr output"**
 - Claude Code expects all hooks (including Stop hooks) to output valid JSON to stdout. A hook that exits 0 but produces **no stdout** is treated as an error — "non-blocking status code" means exit 0, "no stderr output" means Claude Code has no error message to show.
