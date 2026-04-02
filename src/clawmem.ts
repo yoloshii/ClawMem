@@ -461,6 +461,80 @@ async function cmdStatus() {
   }
 }
 
+async function cmdList(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      num: { type: "string", short: "n", default: "10" },
+      limit: { type: "string" }, // alias for --num (matches issue request)
+      collection: { type: "string", short: "c" },
+      json: { type: "boolean", default: false },
+    },
+    allowPositionals: false,
+  });
+
+  const limit = parseInt(values.limit || values.num!, 10);
+  if (isNaN(limit) || limit < 1) die("--num must be a positive integer");
+
+  const s = getStore();
+  const col = values.collection || null;
+
+  const rows = s.db.prepare(`
+    SELECT
+      substr(hash, 1, 6) AS docid,
+      title,
+      collection,
+      path,
+      content_type,
+      modified_at,
+      confidence,
+      access_count
+    FROM documents
+    WHERE active = 1
+      AND invalidated_at IS NULL
+      AND (? IS NULL OR collection = ?)
+    ORDER BY COALESCE(modified_at, created_at) DESC, id DESC
+    LIMIT ?
+  `).all(col, col, limit) as {
+    docid: string;
+    title: string | null;
+    collection: string;
+    path: string;
+    content_type: string | null;
+    modified_at: string | null;
+    confidence: number | null;
+    access_count: number | null;
+  }[];
+
+  if (rows.length === 0) {
+    console.log(col ? `No documents in collection "${col}".` : "No documents in vault.");
+    return;
+  }
+
+  if (values.json) {
+    console.log(JSON.stringify(rows.map(r => ({
+      docid: r.docid,
+      title: r.title || null,
+      collection: r.collection,
+      path: r.path,
+      contentType: r.content_type || "note",
+      modifiedAt: r.modified_at || null,
+      confidence: r.confidence ?? 1.0,
+      accessCount: r.access_count ?? 0,
+    })), null, 2));
+    return;
+  }
+
+  console.log(`${c.bold}Recent documents${col ? ` (${col})` : ""}:${c.reset}\n`);
+  for (const r of rows) {
+    const date = r.modified_at?.slice(0, 10) || "-";
+    const type = r.content_type || "note";
+    const title = r.title ? (r.title.length > 60 ? r.title.slice(0, 57) + "..." : r.title) : r.path;
+    console.log(`  ${c.dim}${r.docid}${c.reset}  ${date}  ${c.dim}[${type}]${c.reset}  ${r.collection}  ${title}`);
+  }
+  console.log(`\n${rows.length} document${rows.length !== 1 ? "s" : ""} shown.`);
+}
+
 async function cmdSearch(args: string[]) {
   const { values, positionals } = parseArgs({
     args,
@@ -1626,6 +1700,9 @@ async function main() {
       case "status":
         await cmdStatus();
         break;
+      case "list":
+        await cmdList(subArgs);
+        break;
       case "search":
         await cmdSearch(subArgs);
         break;
@@ -2222,6 +2299,7 @@ ${c.bold}Search:${c.reset}
   clawmem query <query> [-n N]         Hybrid + rerank (best)
 
 ${c.bold}Memory:${c.reset}
+  clawmem list [-n N] [-c collection]  Browse recent documents (--json for machine output)
   clawmem budget [--session ID]        Token utilization
   clawmem log [--last N]               Session history
   clawmem profile                      Show user profile
