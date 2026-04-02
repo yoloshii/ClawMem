@@ -16,9 +16,9 @@ This installs hooks into `~/.claude/settings.json`:
 | `curator-nudge` | SessionStart | 5s | Surface maintenance suggestions |
 | `postcompact-inject` | SessionStart | 5s | Re-inject state after compaction |
 | `precompact-extract` | PreCompact | 5s | Preserve state before compaction |
-| `decision-extractor` | Stop | 10s | Extract observations from conversation |
-| `handoff-generator` | Stop | 10s | Summarize session for continuity |
-| `feedback-loop` | Stop | 10s | Track referenced notes, boost confidence |
+| `decision-extractor` | Stop | 30s | Extract observations from conversation |
+| `handoff-generator` | Stop | 30s | Summarize session for continuity |
+| `feedback-loop` | Stop | 30s | Track referenced notes, boost confidence |
 
 ## Manual install (full reference)
 
@@ -30,37 +30,44 @@ If you prefer to configure hooks manually instead of running `setup hooks`, add 
     "UserPromptSubmit": [
       {
         "type": "command",
-        "command": "timeout 8 /path/to/clawmem hook context-surfacing"
+        "command": "/path/to/clawmem hook context-surfacing",
+        "timeout": 8
       }
     ],
     "SessionStart": [
       {
         "type": "command",
-        "command": "timeout 5 /path/to/clawmem hook curator-nudge"
+        "command": "/path/to/clawmem hook curator-nudge",
+        "timeout": 5
       },
       {
         "type": "command",
-        "command": "timeout 5 /path/to/clawmem hook postcompact-inject"
+        "command": "/path/to/clawmem hook postcompact-inject",
+        "timeout": 5
       }
     ],
     "PreCompact": [
       {
         "type": "command",
-        "command": "timeout 5 /path/to/clawmem hook precompact-extract"
+        "command": "/path/to/clawmem hook precompact-extract",
+        "timeout": 5
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "timeout 10 /path/to/clawmem hook decision-extractor"
+        "command": "/path/to/clawmem hook decision-extractor",
+        "timeout": 30
       },
       {
         "type": "command",
-        "command": "timeout 10 /path/to/clawmem hook handoff-generator"
+        "command": "/path/to/clawmem hook handoff-generator",
+        "timeout": 30
       },
       {
         "type": "command",
-        "command": "timeout 10 /path/to/clawmem hook feedback-loop"
+        "command": "/path/to/clawmem hook feedback-loop",
+        "timeout": 30
       }
     ]
   }
@@ -87,17 +94,21 @@ To add them, append to the `SessionStart` array in the config above:
 ```json
 {
   "type": "command",
-  "command": "timeout 5 /path/to/clawmem hook session-bootstrap"
+  "command": "/path/to/clawmem hook session-bootstrap",
+  "timeout": 5
 },
 {
   "type": "command",
-  "command": "timeout 5 /path/to/clawmem hook staleness-check"
+  "command": "/path/to/clawmem hook staleness-check",
+  "timeout": 5
 }
 ```
 
-## Timeout wrappers
+## Timeouts
 
-All default hooks use `timeout` wrappers (5s for SessionStart/PreCompact hooks, 8s for context-surfacing, 10s for LLM-based Stop hooks). This prevents hung GPU services from blocking the agent.
+All hooks use Claude Code's native `timeout` property (in seconds). Stop hooks use 30s to allow LLM inference to complete; other hooks use 5-8s.
+
+**Do not use shell `timeout` wrappers** (e.g., `timeout 10 clawmem hook ...`). When shell `timeout` kills a process, it exits with code 124 and no stderr, which Claude Code reports as "Stop hook error: Failed with non-blocking status code: No stderr output". The native `timeout` property is handled gracefully by Claude Code's hook runner.
 
 ## Deduplication
 

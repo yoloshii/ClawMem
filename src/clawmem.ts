@@ -970,11 +970,15 @@ async function cmdSetupHooks(args: string[]) {
       Stop: ["decision-extractor", "handoff-generator", "feedback-loop"],
     };
 
+    // Use Claude Code's native timeout property instead of shell `timeout` wrapper.
+    // Shell `timeout` kills the process with SIGTERM (exit 124) which produces
+    // "Stop hook error: Failed with non-blocking status code" in Claude Code.
+    // Native timeout is handled gracefully by the hook runner.
     const timeouts: Record<string, number> = {
       UserPromptSubmit: 8,
       SessionStart: 5,
       PreCompact: 5,
-      Stop: 10,
+      Stop: 30, // LLM-based extraction hooks need more time
     };
 
     for (const [event, hooks] of Object.entries(hookConfig)) {
@@ -987,12 +991,13 @@ async function cmdSetupHooks(args: string[]) {
 
       const timeout = timeouts[event] || 5;
 
-      // Add new entries with timeout wrappers
+      // Add new entries with native timeout property
       settings.hooks[event].push({
         matcher: "",
         hooks: hooks.map(name => ({
           type: "command",
-          command: `timeout ${timeout} ${binPath} hook ${name}`,
+          command: `${binPath} hook ${name}`,
+          timeout,
         })),
       });
     }

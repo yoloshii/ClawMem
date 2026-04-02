@@ -120,9 +120,13 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 **Quick recovery:** `systemctl --user restart clawmem-watcher.service` — clears accumulated state, resets memory. Safe to do at any time; the watcher re-discovers its watch targets on startup.
 
+**"Stop hook error: Failed with non-blocking status code: No stderr output"**
+- Caused by shell `timeout` wrappers (e.g., `timeout 10 clawmem hook ...`) killing the process with exit 124 before LLM inference completes. The Stop hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`) call an LLM which routinely takes 8-15s with real transcripts.
+- Fix: Remove shell `timeout` from hook commands and use Claude Code's native `timeout` property instead. Run `clawmem setup hooks` to reinstall with correct config (v0.3.0+), or manually update `~/.claude/settings.json` — see [setup-hooks](guides/setup-hooks.md).
+
 **Hooks hang or timeout**
-- GPU services are unreachable, causing embedding/LLM calls to block until the timeout wrapper kills the process.
-- Fix: Check GPU connectivity (`curl http://host:8088/health`). Hook timeouts are 8s for context-surfacing, 5s for SessionStart/PreCompact hooks, 10s for Stop hooks. See [setup-hooks](guides/setup-hooks.md) for the full table.
+- GPU services are unreachable, causing embedding/LLM calls to block until timeout.
+- Fix: Check GPU connectivity (`curl http://host:8088/health`). Hook timeouts are 8s for context-surfacing, 5s for SessionStart/PreCompact hooks, 30s for Stop hooks. See [setup-hooks](guides/setup-hooks.md) for the full table.
 
 **Hooks slow or near timeout (4-6s per invocation)**
 - Each hook spawns a fresh Bun process. If the hook path requires `node-llama-cpp` (in-process models), the native addon import alone costs ~3.5s, leaving very little headroom in the 8s timeout for actual search and scoring.
