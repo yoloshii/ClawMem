@@ -615,6 +615,7 @@ clawmem profile                                 Show user profile
 clawmem profile rebuild                         Force profile rebuild
 clawmem update-context                          Regenerate per-folder CLAUDE.md
 
+clawmem list [-n/--limit N] [-c col] [--json]   Browse recent documents
 clawmem budget [--session ID]                   Token utilization
 clawmem log [--last N]                          Session history
 clawmem hook <name>                             Manual hook trigger
