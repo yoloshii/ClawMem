@@ -87,17 +87,21 @@ export function extractTitle(content: string, filename: string): string {
 // =============================================================================
 
 export function parseDocument(content: string, relativePath: string): { body: string; meta: DocumentMeta } {
+  // gray-matter coerces YAML values: `title: 2023-09-27` → Date, `title: true` → boolean.
+  // All frontmatter fields must be runtime-checked to prevent SQLite binding errors.
+  const str = (v: unknown): string | undefined =>
+    typeof v === "string" ? v || undefined : undefined;
   try {
     const { data, content: body } = matter(content);
     return {
       body,
       meta: {
-        title: data.title as string | undefined,
+        title: str(data.title),
         tags: Array.isArray(data.tags) ? data.tags.map(String) : undefined,
-        domain: data.domain as string | undefined,
-        workstream: data.workstream as string | undefined,
-        content_type: (data.content_type as ContentType) || inferContentType(relativePath),
-        review_by: data.review_by as string | undefined,
+        domain: str(data.domain),
+        workstream: str(data.workstream),
+        content_type: (str(data.content_type) as ContentType) || inferContentType(relativePath),
+        review_by: str(data.review_by),
       },
     };
   } catch {
@@ -233,7 +237,7 @@ export async function indexCollection(
 
         // Content changed — update
         const { body, meta } = parseDocument(content, relativePath);
-        const title = meta.title || extractTitle(body, relativePath);
+        const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
 
         store.insertContent(docHash, body, now);
@@ -265,7 +269,7 @@ export async function indexCollection(
         ).get(collectionName, relativePath) as { id: number; hash: string } | null;
 
         const { body, meta } = parseDocument(content, relativePath);
-        const title = meta.title || extractTitle(body, relativePath);
+        const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
         const contentType = meta.content_type || inferContentType(relativePath);
 

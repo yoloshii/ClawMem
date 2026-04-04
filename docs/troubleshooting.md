@@ -224,6 +224,15 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - The 5 agent tools (search, get, session_log, timeline, similar) require the REST API. Verify it's running and accessible from the OpenClaw process.
 - Check plugin config: `enableTools` must be `true` and `servePort` must match the running server port (default 7438).
 
+## Indexing
+
+**`clawmem update` crashes with "Binding expected string, TypedArray, boolean, number, bigint or null"**
+- YAML frontmatter values are auto-coerced by `gray-matter` (via `js-yaml`): `title: 2023-09-27` becomes a JS `Date` object, `title: true` becomes a boolean, `title: null` stays null. Bun's SQLite driver rejects `Date` objects as bind parameters, crashing the indexer.
+- Affects any field parsed from frontmatter: `title`, `domain`, `workstream`, `content_type`, `review_by`.
+- Common in Obsidian vaults where bare dates or booleans appear in YAML.
+- Fixed in v0.4.2: `parseDocument()` runtime-checks all frontmatter string fields. Defense-in-depth guards in `insertDocument()`, `updateDocument()`, and `reactivateDocument()`.
+- If on an older version: quote YAML values as strings (`title: "2023-09-27"`) as a workaround.
+
 ## General
 
 **"Unknown vault" error**

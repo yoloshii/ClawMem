@@ -1583,10 +1583,12 @@ export function insertDocument(
   createdAt: string,
   modifiedAt: string
 ): void {
+  // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
+  const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   db.prepare(`
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt);
 }
 
 // =============================================================================
@@ -1915,8 +1917,9 @@ export function reactivateDocument(
   hash: string,
   modifiedAt: string
 ): void {
+  const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   db.prepare(`UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+    .run(safeTitle, hash, modifiedAt, documentId);
 }
 
 /**
@@ -1943,8 +1946,9 @@ export function updateDocument(
   hash: string,
   modifiedAt: string
 ): void {
+  const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+    .run(safeTitle, hash, modifiedAt, documentId);
 }
 
 /**

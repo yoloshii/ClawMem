@@ -620,6 +620,13 @@ Symptom: reindex --force after v0.2.0 upgrade shows no entity extraction
   → `--force` alone only refreshes A-MEM notes (keywords, tags, context). `--enrich`
     is needed after major upgrades that add new enrichment stages.
 
+Symptom: `clawmem update` crashes with "Binding expected string, TypedArray, boolean, number, bigint or null"
+  → YAML frontmatter values like `title: 2023-09-27` or `title: true` are coerced by gray-matter
+    into Date objects or booleans. Bun's SQLite driver rejects these as bind parameters.
+  → Fixed v0.4.2: `parseDocument()` runtime-checks all frontmatter fields via `str()` helper.
+    Defense-in-depth `safeTitle` guards in `insertDocument`/`updateDocument`/`reactivateDocument`.
+  → Affects: title, domain, workstream, content_type, review_by — any field gray-matter can coerce.
+
 Symptom: CLI reindex/update falls back to node-llama-cpp Vulkan (not GPU server)
   → GPU env vars only in systemd drop-in, not in wrapper script. CLI invocations missed them.
   → Fixed 2026-02-12: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
