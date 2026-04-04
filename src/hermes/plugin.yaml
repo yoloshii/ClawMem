@@ -1,0 +1,10 @@
+name: clawmem
+version: 1.0.0
+description: "ClawMem — on-device hybrid memory with composite scoring, graph traversal, and lifecycle management. Requires clawmem binary and optionally clawmem serve."
+external_dependencies:
+  - name: clawmem
+    install: "See https://github.com/yoloshii/ClawMem#install"
+    check: "clawmem --version"
+hooks:
+  - on_session_end
+  - on_pre_compress

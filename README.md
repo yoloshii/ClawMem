@@ -85,6 +85,7 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — for hooks + MCP integration
 - [OpenClaw](https://github.com/openclawai/openclaw) — for ContextEngine plugin integration
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — for MemoryProvider plugin integration
 - [bd CLI](https://github.com/dolthub/dolt) v0.58.0+ — for Beads issue tracker sync (only if using Beads)
 
 ### Install from npm (recommended)
