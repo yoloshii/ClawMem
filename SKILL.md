@@ -657,6 +657,12 @@ Symptom: reindex --force crashes with UNIQUE constraint
   -> Force deactivates rows but UNIQUE(collection, path) doesn't discriminate by active flag.
   -> Fixed: indexer.ts reactivates inactive rows instead of inserting.
 
+Symptom: `clawmem update` crashes with "Binding expected string, TypedArray, boolean, number, bigint or null"
+  -> YAML frontmatter values like `title: 2023-09-27` or `title: true` are coerced by gray-matter
+     into Date objects or booleans. Bun's SQLite driver rejects these as bind parameters.
+  -> Fixed v0.4.2: `parseDocument()` runtime-checks all frontmatter fields via `str()` helper.
+  -> Affects: title, domain, workstream, content_type, review_by.
+
 Symptom: CLI reindex/update falls back to node-llama-cpp
   -> GPU env vars only in systemd drop-in, not in wrapper script.
   -> Fixed: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
