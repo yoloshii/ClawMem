@@ -598,6 +598,30 @@ openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/
 
 ---
 
+## Hermes Agent Integration
+
+### Install
+
+Copy or symlink `src/hermes/` into `hermes-agent/plugins/memory/clawmem/`. Set `memory.provider: clawmem` in Hermes config.
+
+### How it works
+
+Plugin implements Hermes's `MemoryProvider` ABC:
+- `prefetch()` — context-surfacing hook (automatic per turn)
+- `on_session_end()` — extraction hooks in parallel (decision-extractor, handoff-generator, feedback-loop)
+- `on_pre_compress()` — precompact-extract (side effect only)
+- 5 agent tools via REST: `clawmem_retrieve`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
+
+### Key difference from OpenClaw/Claude Code
+
+Hermes passes turn pairs, not transcript files. The plugin maintains its own JSONL transcript at `$HERMES_HOME/clawmem-transcripts/<session_id>.jsonl` so ClawMem hooks can read it.
+
+### Requirements
+
+`clawmem` binary on PATH + `clawmem serve` running (external) or `CLAWMEM_SERVE_MODE=managed`. Python 3.10+.
+
+---
+
 ## Troubleshooting
 
 ```
@@ -707,6 +731,7 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
 - HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
 - OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction + runtime delegation (v0.3.0+, required for OpenClaw v2026.3.28+).
+- Hermes Agent MemoryProvider plugin: `src/hermes/` — Python plugin for Hermes's memory system. Shell-out hooks for lifecycle (prefetch, extraction, precompact), REST API for tools. Plugin-managed transcript JSONL bridges Hermes turn pairs to ClawMem file format. Shares vault with Claude Code and OpenClaw.
 
 ## Tool Selection (one-liner)
 

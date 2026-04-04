@@ -1,14 +1,14 @@
-# ClawMem — Context engine for Claude Code and OpenClaw agents
+# ClawMem — Context engine for Claude Code, OpenClaw, and Hermes agents
 
 <p align="center">
   <img src="docs/clawmem_hero.jpg" alt="ClawMem" width="100%">
 </p>
 
-**On-device memory for Claude Code and AI agents.** Retrieval-augmented search, hooks, and an MCP server in a single local system. No API keys, no cloud dependencies.
+**On-device memory for Claude Code, OpenClaw, Hermes, and AI agents.** Retrieval-augmented search, hooks, and an MCP server in a single local system. No API keys, no cloud dependencies.
 
 ClawMem fuses recent research into a retrieval-augmented memory layer that agents actually use. The hybrid architecture combines [QMD](https://github.com/tobi/qmd)-derived multi-signal retrieval (BM25 + vector search + reciprocal rank fusion + query expansion + cross-encoder reranking), [SAME](https://github.com/sgx-labs/statelessagent)-inspired composite scoring (recency decay, confidence, content-type half-lives, co-activation reinforcement), [MAGMA](https://arxiv.org/abs/2501.13956)-style intent classification with multi-graph traversal (semantic, temporal, and causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes that enrich documents with keywords, tags, and causal links between entries. Pattern extraction from [Engram](https://github.com/Gentleman-Programming/engram) adds deduplication windows, frequency-based durability scoring, and temporal navigation.
 
-Integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client including OpenClaw), or a native OpenClaw ContextEngine plugin. All paths write to the same local SQLite vault. A decision captured during a Claude Code session shows up immediately when an OpenClaw agent picks up the same project.
+Integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client), a native OpenClaw ContextEngine plugin, or a Hermes Agent MemoryProvider plugin. All paths write to the same local SQLite vault. A decision captured during a Claude Code session shows up immediately when an OpenClaw or Hermes agent picks up the same project.
 
 TypeScript on Bun. MIT License.
 
@@ -40,7 +40,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Auto-routes queries** via `memory_retrieve` — classifies intent and dispatches to the optimal search backend
 - **Syncs project issues** from Beads issue trackers into searchable memory
 
-Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, or as an OpenClaw ContextEngine plugin. Both modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
+Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, as an OpenClaw ContextEngine plugin, or as a Hermes Agent MemoryProvider plugin. All modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
 
 ### v0.2.0 Enhancements
 
@@ -119,7 +119,7 @@ After installing, here's the full journey from zero to working memory:
 | **3. Download models** | Get the GGUF files for your chosen stack | `wget` from HuggingFace, or let `node-llama-cpp` auto-download the QMD native models on first use | [Embedding](#embedding), [LLM Server](#llm-server), [Reranker Server](#reranker-server) |
 | **4. Start services** | Run GPU servers (if using dedicated GPU) and background services | `llama-server` for each model. systemd units for watcher + embed timer. | [systemd services](docs/guides/systemd-services.md) |
 | **5. Decide what to index** | Add collections for your projects, notes, research, and domain docs | `clawmem collection add ~/project --name project` | The more relevant markdown you index, the better retrieval works. See [building a rich context field](docs/introduction.md#building-a-rich-context-field). |
-| **6. Connect your agent** | Hook into Claude Code, OpenClaw, or any MCP client | `clawmem setup hooks && clawmem setup mcp` for Claude Code. `clawmem setup openclaw` for OpenClaw. | [Integration](#integration) |
+| **6. Connect your agent** | Hook into Claude Code, OpenClaw, Hermes, or any MCP client | `clawmem setup hooks && clawmem setup mcp` for Claude Code. `clawmem setup openclaw` for OpenClaw. Copy `src/hermes/` to Hermes plugins for Hermes. | [Integration](#integration) |
 | **7. Verify** | Confirm everything is working | `clawmem doctor` (full health check) or `clawmem status` (quick index stats) | [Verify Installation](#verify-installation) |
 
 **Fastest path:** Step 1 alone gets you a working system with in-process CPU/GPU inference and default models — no manual model downloads or service configuration needed. Steps 2-4 are optional upgrades for better performance. Steps 5-6 are where you customize what gets indexed and how your agent connects.
@@ -204,9 +204,48 @@ openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 
 **Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 28 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
 
-#### Dual-Mode Operation
+#### Hermes Agent
 
-Both integrations share the same SQLite vault by default. Claude Code and OpenClaw can run simultaneously - decisions captured in one runtime are immediately available in the other, giving agents persistent shared memory across sessions and platforms. WAL mode + busy_timeout handles concurrent access.
+ClawMem integrates as a native MemoryProvider plugin — Hermes's pluggable interface for agent memory. Same automatic retrieval and extraction, delivered through Hermes's memory lifecycle instead of Claude Code hooks.
+
+**Install:**
+
+```bash
+# Copy or symlink the plugin into Hermes's plugin directory
+cp -r /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+
+# Or symlink for development
+ln -s /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+```
+
+**Configure** in your Hermes profile's `.env` or environment:
+```bash
+CLAWMEM_BIN=/path/to/clawmem          # Path to clawmem binary (or ensure it's on PATH)
+CLAWMEM_SERVE_PORT=7438                # REST API port (default: 7438)
+CLAWMEM_SERVE_MODE=external            # "external" (you run clawmem serve) or "managed" (plugin manages it)
+CLAWMEM_PROFILE=balanced               # speed | balanced | deep
+```
+
+Then set `memory.provider: clawmem` in your Hermes `config.yaml`, or run `hermes memory setup` to configure interactively.
+
+**What the plugin provides:**
+
+- **`prefetch()`** — prompt-aware retrieval via `context-surfacing` hook (automatic every turn)
+- **`on_session_end()`** — decision extraction, handoff generation, feedback loop (parallel)
+- **`on_pre_compress()`** — pre-compaction state preservation
+- **`session-bootstrap`** — session registration + first-turn context injection
+- **5 agent tools** — `clawmem_retrieve`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
+- **Plugin-managed transcript** — maintains its own JSONL transcript for ClawMem hooks
+
+**Requirements:** `clawmem` binary on PATH and `clawmem serve` running (external mode) or the plugin starts it automatically (managed mode). Python 3.10+. No pip dependencies beyond Hermes itself (uses `urllib` for REST calls, `httpx` optional for better performance).
+
+**Alternative:** Hermes also has built-in MCP client support. You can add ClawMem as an MCP server in Hermes's `config.yaml` under `mcp_servers` for tool-only access. But this misses the lifecycle hooks (prefetch, session_end, pre_compress), so the native plugin is recommended.
+
+See [Hermes plugin guide](docs/guides/hermes-plugin.md) for architecture details, lifecycle mapping, and troubleshooting.
+
+#### Multi-Framework Operation
+
+All three integrations share the same SQLite vault by default. Claude Code, OpenClaw, and Hermes can run simultaneously — decisions captured in one runtime are immediately available in the others, giving agents persistent shared memory across sessions and platforms. WAL mode + busy_timeout handles concurrent access.
 
 #### Multi-Vault (Optional)
 
@@ -1021,6 +1060,24 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 ./bin/clawmem bootstrap ~/.openclaw/workspace --name workspace
 ```
 
+#### Hermes-Specific
+
+```bash
+# Hermes uses ~/.hermes/ as its home directory
+./bin/clawmem bootstrap ~/.hermes --name hermes-home
+
+# Install the memory provider plugin
+cp -r src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+
+# Start clawmem serve (external mode)
+clawmem serve --port 7438 &
+
+# Configure Hermes to use ClawMem
+# In your Hermes config.yaml:
+#   memory:
+#     provider: clawmem
+```
+
 ## Dependencies
 
 | Package | Purpose |
@@ -1046,7 +1103,7 @@ Built on the shoulders of:
 - [Beads](https://github.com/steveyegge/beads) — Dolt-backed issue tracker for AI agents
 - [claude-mem](https://github.com/thedotmack/claude-mem) — Claude Code memory integration reference
 - [Engram](https://github.com/Gentleman-Programming/engram) — observation dedup window, topic-key upsert pattern, temporal timeline navigation, duplicate metadata scoring signals
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — memory nudge system (periodic lifecycle tool prompting)
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — MemoryProvider plugin integration, memory nudge system (periodic lifecycle tool prompting)
 - [Hindsight](https://github.com/vectorize-io/hindsight) — entity resolution, MPFP graph traversal, temporal extraction, 3-tier consolidation, observation invalidation, 4-way parallel retrieval
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
