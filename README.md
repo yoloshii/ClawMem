@@ -18,7 +18,8 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 
 - **Surfaces relevant context** on every prompt (context-surfacing hook)
 - **Bootstraps sessions** with your profile, latest handoff, recent decisions, and stale notes
-- **Captures decisions** from session transcripts using a local GGUF observer model
+- **Captures decisions, preferences, milestones, and problems** from session transcripts using a local GGUF observer model
+- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`
 - **Generates handoffs** at session end so the next session can pick up where you left off
 - **Learns what matters** via a feedback loop that boosts referenced notes and decays unused ones
 - **Guards against prompt injection** in surfaced content
@@ -643,6 +644,7 @@ clawmem collection list                         List collections
 clawmem collection remove <name>                Remove a collection
 
 clawmem update [--pull] [--embed]               Incremental re-scan
+clawmem mine <dir> [-c name] [--embed]         Import conversation exports (Claude, ChatGPT, Slack)
 clawmem embed [-f]                              Generate fragment embeddings
 clawmem reindex [--force]                       Full re-index
 clawmem watch                                   File watcher daemon
@@ -759,7 +761,7 @@ Hooks installed by `clawmem setup hooks`:
 | `postcompact-inject` | SessionStart | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
 | `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory |
-| `decision-extractor` | Stop | GGUF observer extracts structured decisions, infers causal links, detects contradictions with prior decisions |
+| `decision-extractor` | Stop | GGUF observer extracts structured observations (decisions, preferences, milestones, problems, bugfixes, features, refactors, discoveries), infers causal links, detects contradictions with prior decisions |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation + usage relations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
 
@@ -813,15 +815,19 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 | Type | Half-life | Baseline | Notes |
 |---|---|---|---|
 | `decision` | ∞ | 0.85 | Never decays |
+| `preference` | ∞ | 0.80 | Never decays — user preferences are durable facts |
 | `hub` | ∞ | 0.80 | Never decays |
+| `antipattern` | ∞ | 0.75 | Never decays — accumulated negative patterns persist |
+| `problem` | 60 days | 0.75 | High priority but resolves over time |
 | `research` | 90 days | 0.70 | |
+| `milestone` | 60 days | 0.70 | Important at the time, fades as project moves forward |
 | `project` | 120 days | 0.65 | |
 | `handoff` | 30 days | 0.60 | Fast decay — most recent matters |
+| `conversation` | 45 days | 0.55 | Imported chat exchanges |
 | `progress` | 45 days | 0.50 | |
 | `note` | 60 days | 0.50 | Default |
-| `antipattern` | ∞ | 0.75 | Never decays — accumulated negative patterns persist |
 
-Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, note, project) lose 5% confidence per week without access (attention decay). Decision/hub/research/antipattern are exempt.
+Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access (attention decay). Decision/preference/hub/research/antipattern are exempt.
 
 **Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision/correction keywords, and frontmatter richness. Applied as `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
 
@@ -868,7 +874,7 @@ Documents are split into semantic fragments (sections, lists, code blocks, front
 
 ### Local Observer Agent
 
-Uses the LLM server (shared with query expansion and intent classification) to extract structured observations from session transcripts: type, title, facts, narrative, concepts, files read/modified. Falls back to regex patterns if the model is unavailable.
+Uses the LLM server (shared with query expansion and intent classification) to extract structured observations from session transcripts. Observation types: `decision`, `bugfix`, `feature`, `refactor`, `discovery`, `change`, `preference`, `milestone`, `problem`. Each observation includes title, facts, narrative, concepts, and files read/modified. Preferences, milestones, and problems get first-class content_type treatment with dedicated confidence baselines and half-lives instead of being flattened to generic "observation". Falls back to regex patterns if the model is unavailable.
 
 ### User Profile
 
@@ -943,7 +949,7 @@ title: "Document Title"
 tags: [tag1, tag2]
 domain: "infrastructure"
 workstream: "project-name"
-content_type: "decision"   # decision|hub|research|project|handoff|progress|note
+content_type: "decision"   # decision|preference|hub|research|project|handoff|conversation|progress|note
 review_by: "2026-03-01"
 ---
 ```

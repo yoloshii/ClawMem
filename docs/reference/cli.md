@@ -23,10 +23,26 @@ clawmem collection remove <name>               # Remove a collection
 ```bash
 clawmem update                  # Index all collections (BM25 only)
 clawmem update --embed          # Index + embed in one pass
+clawmem mine <dir>              # Import conversation exports (Claude, ChatGPT, Slack)
+clawmem mine <dir> -c convos    # Import with custom collection name
+clawmem mine <dir> --embed      # Import + embed in one pass
+clawmem mine <dir> --dry-run    # Preview without importing
 clawmem reindex                 # Force re-scan all collections
 clawmem embed                   # Embed all un-embedded fragments
 clawmem embed --force           # Re-embed everything (clears existing vectors)
 ```
+
+### Conversation Import
+
+`clawmem mine` normalizes and imports conversation exports from multiple AI chat formats:
+
+- **Claude Code JSONL** — session transcripts (`.jsonl`)
+- **Claude.ai JSON** — flat messages or privacy export with `chat_messages`
+- **ChatGPT JSON** — `conversations.json` with mapping tree
+- **Slack JSON** — 2-party DM exports
+- **Plain text** — files with `User:`/`Assistant:` markers
+
+Each user+assistant exchange pair becomes one indexed document with `content_type: conversation`. Files are chunked, written to a temporary staging directory, indexed through the standard pipeline (including A-MEM enrichment), then staging is cleaned up.
 
 ## Search (CLI)
 

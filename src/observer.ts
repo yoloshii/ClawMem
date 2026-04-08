@@ -15,7 +15,7 @@ import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
 // =============================================================================
 
 export type Observation = {
-  type: "decision" | "bugfix" | "feature" | "refactor" | "discovery" | "change";
+  type: "decision" | "bugfix" | "feature" | "refactor" | "discovery" | "change" | "preference" | "milestone" | "problem";
   title: string;
   facts: string[];
   narrative: string;
@@ -51,7 +51,7 @@ const OBSERVATION_SYSTEM_PROMPT = `You are an observer analyzing a coding sessio
 For each significant action, decision, or discovery, output an <observation> XML element.
 
 <observation>
-  <type>one of: decision, bugfix, feature, refactor, discovery, change</type>
+  <type>one of: decision, bugfix, feature, refactor, discovery, change, preference, milestone, problem</type>
   <title>Brief descriptive title (max 80 chars)</title>
   <facts>
     <fact>Individual atomic fact</fact>
@@ -69,7 +69,12 @@ Rules:
 - Each fact should be a standalone, atomic piece of information
 - The narrative should explain WHY something was done, not just WHAT
 - Only include files that were explicitly mentioned in the transcript
-- If no significant observations, output nothing`;
+- If no significant observations, output nothing
+
+Type guidance:
+- preference: user expresses a preference, habit, or way of working (e.g., "don't use subagents for this", "I prefer single PRs")
+- milestone: significant completion point, version release, deployment, or phase transition
+- problem: persistent issue, recurring bug, architectural limitation, or unresolved blocker`;
 
 const SUMMARY_SYSTEM_PROMPT = `You are a session summarizer. Analyze this coding session transcript and output a structured summary.
 
@@ -118,6 +123,7 @@ function prepareTranscript(messages: TranscriptMessage[]): string {
 
 const VALID_OBSERVATION_TYPES = new Set([
   "decision", "bugfix", "feature", "refactor", "discovery", "change",
+  "preference", "milestone", "problem",
 ]);
 
 const VALID_CONCEPTS = new Set([

@@ -12,9 +12,13 @@
 export const HALF_LIVES: Record<string, number> = {
   handoff: 30,
   progress: 45,
+  conversation: 45,
+  problem: 60,
+  milestone: 60,
   note: 60,
   research: 90,
   project: 120,
+  preference: Infinity,
   decision: Infinity,
   hub: Infinity,
 };
@@ -25,10 +29,14 @@ export const HALF_LIVES: Record<string, number> = {
 
 export const TYPE_BASELINES: Record<string, number> = {
   decision: 0.85,
+  preference: 0.80,
   hub: 0.80,
+  problem: 0.75,
   research: 0.70,
+  milestone: 0.70,
   project: 0.65,
   handoff: 0.60,
+  conversation: 0.55,
   progress: 0.50,
   note: 0.50,
 };
@@ -37,7 +45,7 @@ export const TYPE_BASELINES: Record<string, number> = {
 // Content Type Inference
 // =============================================================================
 
-export type ContentType = "decision" | "hub" | "research" | "project" | "handoff" | "progress" | "note";
+export type ContentType = "decision" | "preference" | "hub" | "research" | "project" | "handoff" | "conversation" | "progress" | "milestone" | "problem" | "note";
 
 export function inferContentType(path: string, explicitType?: string): ContentType {
   if (explicitType && explicitType in TYPE_BASELINES) return explicitType as ContentType;
@@ -48,6 +56,7 @@ export function inferContentType(path: string, explicitType?: string): ContentTy
   if (lower.includes("research") || lower.includes("investigation") || lower.includes("analysis")) return "research";
   if (lower.includes("project") || lower.includes("epic") || lower.includes("initiative")) return "project";
   if (lower.includes("handoff") || lower.includes("handover") || lower.includes("session")) return "handoff";
+  if (lower.includes("conversation") || lower.includes("convo") || lower.includes("chat") || lower.includes("transcript")) return "conversation";
   if (lower.includes("progress") || lower.includes("status") || lower.includes("standup") || lower.includes("changelog")) return "progress";
   return "note";
 }
@@ -65,7 +74,7 @@ export type MemoryType = "episodic" | "semantic" | "procedural";
  * - procedural: how-to, patterns, workflows (actionable)
  */
 export function inferMemoryType(path: string, contentType: string, body?: string): MemoryType {
-  if (["handoff", "progress"].includes(contentType)) return "episodic";
+  if (["handoff", "progress", "conversation"].includes(contentType)) return "episodic";
   if (["decision", "hub", "research"].includes(contentType)) return "semantic";
   if (body && /\b(step\s+\d|workflow|recipe|how\s+to|procedure|runbook|playbook)\b/i.test(body)) return "procedural";
   if (path.includes("sop") || path.includes("runbook") || path.includes("playbook")) return "procedural";
@@ -141,7 +150,7 @@ export function confidenceScore(
   // Attention decay: reduce confidence if not accessed recently (5% per week)
   // Only apply to episodic/progress content — skip for durable types (decision, hub, research)
   // Also skip if last_accessed_at was backfilled from modified_at (no real access yet)
-  const DECAY_EXEMPT_TYPES = new Set(["decision", "hub", "research", "antipattern"]);
+  const DECAY_EXEMPT_TYPES = new Set(["decision", "hub", "research", "antipattern", "preference"]);
   let attentionDecay = 1.0;
   if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
     const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;

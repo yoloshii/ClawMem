@@ -435,16 +435,16 @@ compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenc
 
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
-| decision, hub | ∞ | Never decay |
+| decision, preference, hub | ∞ | Never decay |
 | antipattern | ∞ | Never decay — accumulated negative patterns persist |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
-| note | 60 days | Default |
-| progress | 45 days | Faster decay |
+| problem, milestone, note | 60 days | Default |
+| conversation, progress | 45 days | Faster decay |
 | handoff | 30 days | Fast — recent matters most |
 
 Half-lives extend up to 3× for frequently-accessed memories (access reinforcement decays over 90 days).
-Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research/antipattern are exempt.
+Attention decay: non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision/preference/hub/research/antipattern are exempt.
 
 ## Indexing & Graph Building
 

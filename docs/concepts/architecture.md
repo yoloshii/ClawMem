@@ -53,7 +53,7 @@ Each indexed file becomes a document with:
 | `title` | Extracted from first heading or filename |
 | `hash` | SHA-256 of content (canonical identity) |
 | `docid` | First 6 hex chars of hash (for human reference) |
-| `content_type` | Auto-detected: decision, note, handoff, progress, research, hub, antipattern, project |
+| `content_type` | Auto-detected: decision, preference, note, handoff, conversation, progress, research, hub, antipattern, project, milestone, problem |
 | `quality_score` | 0.0-1.0 based on length, structure, headings, lists, decision keywords, frontmatter |
 | `confidence` | Starts at 0.5, adjusted by contradiction detection and feedback |
 | `pinned` | Manual boost flag (+0.3 composite score) |

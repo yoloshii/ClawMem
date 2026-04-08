@@ -335,7 +335,11 @@ export async function decisionExtractor(
         const doc = store.findActiveDocument("_clawmem", obsPath);
         if (doc) {
           store.updateDocumentMeta(doc.id, {
-            content_type: obs.type === "decision" ? "decision" : "observation",
+            content_type: obs.type === "decision" ? "decision"
+              : obs.type === "preference" ? "preference"
+              : obs.type === "milestone" ? "milestone"
+              : obs.type === "problem" ? "problem"
+              : "observation",
             confidence: 0.80,
           });
           store.updateObservationFields(obsPath, "_clawmem", {

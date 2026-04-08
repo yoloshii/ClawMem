@@ -235,6 +235,101 @@ async function cmdUpdate(args: string[]) {
   }
 }
 
+async function cmdMine(args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      collection: { type: "string", short: "c" },
+      embed: { type: "boolean", default: false },
+      "dry-run": { type: "boolean", default: false },
+    },
+    allowPositionals: true,
+  });
+
+  const dir = positionals[0];
+  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run]");
+  const absDir = pathResolve(dir);
+  if (!existsSync(absDir)) die(`Directory not found: ${absDir}`);
+
+  const { scanConversationDir, normalizeFile, chunkConversation } = await import("./normalize.ts");
+
+  console.log(`${c.cyan}Scanning for conversation files${c.reset} in ${absDir}`);
+  const files = scanConversationDir(absDir);
+  if (files.length === 0) die("No conversation files found (.json, .jsonl, .txt, .md)");
+  console.log(`  Found ${files.length} candidate files`);
+
+  // Normalize and chunk
+  let totalChunks = 0;
+  let totalConversations = 0;
+  const allChunks: { title: string; body: string; sourcePath: string; chunkIndex: number }[] = [];
+
+  for (const file of files) {
+    const conv = normalizeFile(file);
+    if (!conv) continue;
+    totalConversations++;
+
+    const chunks = chunkConversation(conv);
+    if (chunks.length === 0) continue;
+
+    console.log(`  ${c.green}✓${c.reset} ${conv.source} (${conv.format}, ${conv.messages.length} messages → ${chunks.length} chunks)`);
+    for (const chunk of chunks) {
+      chunk.sourcePath = file.replace(absDir + "/", "");
+    }
+    allChunks.push(...chunks);
+    totalChunks += chunks.length;
+  }
+
+  if (totalConversations === 0) die("No conversation files could be parsed");
+  console.log(`\n${c.bold}Parsed:${c.reset} ${totalConversations} conversations → ${totalChunks} exchange chunks`);
+
+  if (values["dry-run"]) {
+    console.log(`${c.yellow}Dry run — no changes made${c.reset}`);
+    return;
+  }
+
+  // Write chunks as markdown to a staging directory (outside source tree), then index
+  const collectionName = values.collection || "conversations";
+  const { tmpdir } = await import("os");
+  const stagingDir = pathResolve(tmpdir(), `clawmem-mine-${Date.now()}`);
+  mkdirSync(stagingDir, { recursive: true });
+
+  const { rmSync } = await import("fs");
+  try {
+    const writePromises: Promise<number>[] = [];
+    for (const chunk of allChunks) {
+      const safeSource = chunk.sourcePath.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
+      const filename = `${safeSource}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+      const esc = (s: string) => s.replace(/"/g, '\\"');
+      const frontmatter = [
+        "---",
+        `title: "${esc(chunk.title)}"`,
+        `content_type: conversation`,
+        `source: "${esc(chunk.sourcePath)}"`,
+        "---",
+        "",
+        chunk.body,
+      ].join("\n");
+      writePromises.push(Bun.write(pathResolve(stagingDir, filename), frontmatter));
+    }
+    await Promise.all(writePromises);
+
+    // Index through existing pipeline
+    const s = getStore();
+    console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
+    const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md");
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged`);
+
+    if (values.embed) {
+      console.log();
+      await cmdEmbed([]);
+    } else {
+      console.log(`\nRun ${c.cyan}clawmem embed${c.reset} to generate embeddings for the imported conversations`);
+    }
+  } finally {
+    rmSync(stagingDir, { recursive: true, force: true });
+  }
+}
+
 async function cmdEmbed(args: string[]) {
   const { values } = parseArgs({
     args,
@@ -1695,6 +1790,9 @@ async function main() {
       case "update":
         await cmdUpdate(subArgs);
         break;
+      case "mine":
+        await cmdMine(subArgs);
+        break;
       case "embed":
         await cmdEmbed(subArgs);
         break;
@@ -2289,6 +2387,7 @@ ${c.bold}Setup:${c.reset}
 
 ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
+  clawmem mine <dir> [-c name] [--embed]  Import conversation exports (Claude, ChatGPT, Slack)
   clawmem embed [-f]                   Generate fragment embeddings
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon

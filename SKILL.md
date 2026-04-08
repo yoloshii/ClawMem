@@ -442,12 +442,12 @@ compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceSc
 
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
-| decision, hub | infinity | Never decay |
+| decision, preference, hub | infinity | Never decay |
 | antipattern | infinity | Never decay — accumulated negative patterns persist |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
-| note | 60 days | Default |
-| progress | 45 days | Faster decay |
+| problem, milestone, note | 60 days | Default |
+| conversation, progress | 45 days | Faster decay |
 | handoff | 30 days | Fast — recent matters most |
 
 Half-lives extend up to 3x for frequently-accessed memories (access reinforcement decays over 90 days).
