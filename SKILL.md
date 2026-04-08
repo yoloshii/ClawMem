@@ -566,6 +566,7 @@ When `decision-extractor` detects a new decision contradicting an old one, the o
 - Do NOT pin everything — pin is for persistent high-priority items.
 - Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it.
 - Do NOT run `build_graphs` after every reindex — A-MEM creates per-doc links automatically.
+- Do NOT run `clawmem mine` autonomously — it is a bulk ingestion command. Suggest it to the user when they mention old conversation exports, but let them run it.
 
 ---
 
