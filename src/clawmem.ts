@@ -410,6 +410,9 @@ async function cmdEmbed(args: string[]) {
 
     const fragments = splitDocument(body, frontmatter);
     const docStart = Date.now();
+    const prevTotalFragments = totalFragments;
+    const prevFailedFragments = failedFragments;
+    let seq0Succeeded = false;
     console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
 
     if (isCloudEmbed) {
@@ -463,6 +466,7 @@ async function cmdEmbed(args: string[]) {
                 result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
               );
               totalFragments++;
+              if (seq === 0) seq0Succeeded = true;
             } else {
               failedFragments++;
             }
@@ -491,6 +495,7 @@ async function cmdEmbed(args: string[]) {
               result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
             );
             totalFragments++;
+            if (seq === 0) seq0Succeeded = true;
             if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
               console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) ${fragMs}ms [${text.length} chars]`);
             }
@@ -503,6 +508,18 @@ async function cmdEmbed(args: string[]) {
           console.error(`${c.yellow}Warning: failed to embed fragment ${seq} (${frag.type}) of ${path}: ${err}${c.reset}`);
         }
       }
+    }
+
+    // Track embed state per document — seq=0 (primary) must succeed for synced status
+    const docFragsOk = totalFragments - prevTotalFragments;
+    const docFragsFail = failedFragments - prevFailedFragments;
+    if (seq0Succeeded) {
+      s.markEmbedSynced(hash);
+    } else if (docFragsOk === 0 && docFragsFail > 0) {
+      s.markEmbedFailed(hash, "all fragments failed");
+    } else {
+      // seq=0 failed but some later fragments succeeded — mark failed so seq=0 gets retried
+      s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
     }
 
     embedded++;

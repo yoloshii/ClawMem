@@ -31,7 +31,7 @@ Exponential decay based on document age and content type half-life:
 
 | Content type | Half-life | Behavior |
 |-------------|-----------|----------|
-| decision, preference, hub | Infinite | Never decay |
+| decision, deductive, preference, hub | Infinite | Never decay |
 | antipattern | Infinite | Never decay |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
@@ -47,7 +47,7 @@ Starts at 0.5 for new documents. Adjusted by:
 
 - **Contradiction detection** — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered
 - **Feedback loop** — referenced notes get confidence boosts
-- **Attention decay** — non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision, preference, hub, research, and antipattern types are exempt.
+- **Attention decay** — non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision, deductive, preference, hub, research, and antipattern types are exempt.
 
 ### Quality multiplier (0.7 - 1.3)
 

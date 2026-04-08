@@ -20,6 +20,7 @@ export const HALF_LIVES: Record<string, number> = {
   project: 120,
   preference: Infinity,
   decision: Infinity,
+  deductive: Infinity,
   hub: Infinity,
 };
 
@@ -29,6 +30,7 @@ export const HALF_LIVES: Record<string, number> = {
 
 export const TYPE_BASELINES: Record<string, number> = {
   decision: 0.85,
+  deductive: 0.85,
   preference: 0.80,
   hub: 0.80,
   problem: 0.75,
@@ -45,7 +47,7 @@ export const TYPE_BASELINES: Record<string, number> = {
 // Content Type Inference
 // =============================================================================
 
-export type ContentType = "decision" | "preference" | "hub" | "research" | "project" | "handoff" | "conversation" | "progress" | "milestone" | "problem" | "note";
+export type ContentType = "decision" | "deductive" | "preference" | "hub" | "research" | "project" | "handoff" | "conversation" | "progress" | "milestone" | "problem" | "note";
 
 export function inferContentType(path: string, explicitType?: string): ContentType {
   if (explicitType && explicitType in TYPE_BASELINES) return explicitType as ContentType;
@@ -75,7 +77,7 @@ export type MemoryType = "episodic" | "semantic" | "procedural";
  */
 export function inferMemoryType(path: string, contentType: string, body?: string): MemoryType {
   if (["handoff", "progress", "conversation"].includes(contentType)) return "episodic";
-  if (["decision", "hub", "research"].includes(contentType)) return "semantic";
+  if (["decision", "deductive", "hub", "research"].includes(contentType)) return "semantic";
   if (body && /\b(step\s+\d|workflow|recipe|how\s+to|procedure|runbook|playbook)\b/i.test(body)) return "procedural";
   if (path.includes("sop") || path.includes("runbook") || path.includes("playbook")) return "procedural";
   if (contentType === "antipattern") return "semantic";
@@ -150,7 +152,7 @@ export function confidenceScore(
   // Attention decay: reduce confidence if not accessed recently (5% per week)
   // Only apply to episodic/progress content — skip for durable types (decision, hub, research)
   // Also skip if last_accessed_at was backfilled from modified_at (no real access yet)
-  const DECAY_EXEMPT_TYPES = new Set(["decision", "hub", "research", "antipattern", "preference"]);
+  const DECAY_EXEMPT_TYPES = new Set(["decision", "deductive", "hub", "research", "antipattern", "preference"]);
   let attentionDecay = 1.0;
   if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
     const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;

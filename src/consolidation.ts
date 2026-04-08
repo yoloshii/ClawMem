@@ -1,17 +1,21 @@
 /**
  * ClawMem Consolidation Worker
  *
- * Two-phase background worker:
+ * Three-phase background worker:
  * 1. A-MEM backfill: enriches documents missing memory notes
  * 2. 3-tier consolidation: synthesizes clusters of related observations
  *    into higher-order consolidated observations with proof counts and trends
+ * 3. Deductive synthesis: combines related recent observations into
+ *    first-class deductive documents with source provenance
  *
  * Pattern H from ENHANCEMENT-PLAN.md (source: Hindsight consolidator.py)
+ * Deductive synthesis inspired by Honcho's Dreamer deduction specialist.
  */
 
 import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
+import { hashContent } from "./indexer.ts";
 
 // =============================================================================
 // Types
@@ -114,6 +118,11 @@ async function tick(store: Store, llm: LlamaCpp): Promise<void> {
     // Phase 2: Observation consolidation (every 6th tick, ~30 min at default interval)
     if (tickCount % 6 === 0) {
       await consolidateObservations(store, llm);
+    }
+
+    // Phase 3: Deductive synthesis (every 3rd tick, ~15 min at default interval)
+    if (tickCount % 3 === 0) {
+      await generateDeductiveObservations(store, llm);
     }
   } catch (err) {
     console.error("[consolidation] Tick failed:", err);
@@ -373,6 +382,308 @@ function updateTrends(store: Store): void {
       store.db.prepare(`UPDATE consolidated_observations SET trend = ? WHERE id = ?`).run(newTrend, obs.id);
     }
   }
+}
+
+// =============================================================================
+// Phase 3: Deductive Observation Synthesis
+// =============================================================================
+
+/**
+ * Find pairs/groups of recent high-confidence observations that can be combined
+ * into higher-level deductive conclusions. Creates first-class documents with
+ * content_type='deductive' and source_doc_ids provenance.
+ *
+ * Only considers decision/preference/milestone/problem observations from the
+ * last 7 days that haven't already been used as sources for deductions.
+ */
+async function generateDeductiveObservations(store: Store, llm: LlamaCpp): Promise<number> {
+  // Find recent high-value observations not yet used in deductions
+  const DEDUCTIVE_TYPES = ['decision', 'preference', 'milestone', 'problem'];
+  const recentObs = store.db.prepare(`
+    SELECT d.id, d.title, d.facts, d.narrative, d.observation_type, d.content_type,
+           d.collection, d.path, d.modified_at
+    FROM documents d
+    WHERE d.active = 1
+      AND d.content_type IN (${DEDUCTIVE_TYPES.map(() => '?').join(',')})
+      AND d.observation_type IS NOT NULL
+      AND d.facts IS NOT NULL
+      AND d.modified_at >= datetime('now', '-7 days')
+      AND d.id NOT IN (
+        SELECT value FROM (
+          SELECT json_each.value as value
+          FROM documents dd, json_each(dd.source_doc_ids)
+          WHERE dd.content_type = 'deductive' AND dd.active = 1
+        )
+      )
+    ORDER BY d.modified_at DESC
+    LIMIT 20
+  `).all(...DEDUCTIVE_TYPES) as {
+    id: number; title: string; facts: string; narrative: string;
+    observation_type: string; content_type: string; collection: string;
+    path: string; modified_at: string;
+  }[];
+
+  if (recentObs.length < 2) return 0;
+
+  // Build context for LLM
+  const obsText = recentObs.map((o, i) =>
+    `[${i + 1}] (${o.content_type}/${o.observation_type}) "${o.title}"\n   Facts: ${(o.facts || '').slice(0, 300)}\n   Narrative: ${(o.narrative || '').slice(0, 200)}`
+  ).join('\n\n');
+
+  const prompt = `You are analyzing recent observations from a developer's work sessions. Find logical deductions that can be drawn by combining 2-3 observations.
+
+A deduction combines facts from different observations into a NEW conclusion that isn't stated in any single observation alone.
+
+Observations:
+${obsText}
+
+For each valid deduction:
+1. State the conclusion clearly (1-2 sentences)
+2. List the premises (which observations support it)
+3. List the source indices (1-indexed)
+
+Return ONLY valid JSON array:
+[
+  {
+    "conclusion": "Clear deductive statement",
+    "premises": ["Premise from obs 1", "Premise from obs 3"],
+    "source_indices": [1, 3]
+  }
+]
+
+Rules:
+- Each deduction MUST combine 2+ different observations (not restate a single one)
+- Only include conclusions with genuine logical basis
+- Maximum 3 deductions
+- If no valid deductions exist, return []
+Return ONLY the JSON array. /no_think`;
+
+  const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 500 });
+  if (!result?.text) return 0;
+
+  const parsed = extractJsonFromLLM(result.text) as Array<{
+    conclusion: string;
+    premises: string[];
+    source_indices: number[];
+  }> | null;
+
+  if (!Array.isArray(parsed)) return 0;
+
+  let created = 0;
+  const timestamp = new Date().toISOString();
+  const dateStr = timestamp.slice(0, 10);
+
+  for (const deduction of parsed) {
+    if (!deduction.conclusion || !Array.isArray(deduction.source_indices) || deduction.source_indices.length < 2) continue;
+
+    const sourceDocIds = deduction.source_indices
+      .filter(i => i >= 1 && i <= recentObs.length)
+      .map(i => recentObs[i - 1]!.id);
+
+    if (sourceDocIds.length < 2) continue;
+
+    // Check for duplicate deduction (Jaccard on conclusion text)
+    const existingDedups = store.db.prepare(`
+      SELECT id, title FROM documents
+      WHERE content_type = 'deductive' AND active = 1
+      ORDER BY created_at DESC LIMIT 20
+    `).all() as { id: number; title: string }[];
+
+    const conclusionWords = new Set(deduction.conclusion.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+    const isDuplicate = existingDedups.some(d => {
+      const titleWords = new Set(d.title.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+      const intersection = [...conclusionWords].filter(w => titleWords.has(w)).length;
+      const union = new Set([...conclusionWords, ...titleWords]).size;
+      return union > 0 && intersection / union > 0.5;
+    });
+
+    if (isDuplicate) continue;
+
+    // Build the deductive document
+    const premisesText = (deduction.premises || []).map(p => `- ${p}`).join('\n');
+    const sourceRefs = sourceDocIds.map(id => {
+      const obs = recentObs.find(o => o.id === id);
+      return obs ? `- "${obs.title}" (${obs.content_type})` : `- doc#${id}`;
+    }).join('\n');
+
+    const body = [
+      `---`,
+      `content_type: deductive`,
+      `tags: [auto-deduced, consolidation]`,
+      `---`,
+      ``,
+      `# ${deduction.conclusion.slice(0, 80)}`,
+      ``,
+      deduction.conclusion,
+      ``,
+      `## Premises`,
+      ``,
+      premisesText,
+      ``,
+      `## Sources`,
+      ``,
+      sourceRefs,
+      ``,
+    ].join('\n');
+
+    const dedPath = `deductions/${dateStr}-${sourceDocIds.join('-')}.md`;
+    const hash = hashContent(body);
+
+    try {
+      store.insertContent(hash, body, timestamp);
+      store.insertDocument("_clawmem", dedPath, deduction.conclusion.slice(0, 80), hash, timestamp, timestamp);
+
+      const doc = store.findActiveDocument("_clawmem", dedPath);
+      if (doc) {
+        store.updateDocumentMeta(doc.id, {
+          content_type: "deductive",
+          confidence: 0.85,
+        });
+        store.updateObservationFields(dedPath, "_clawmem", {
+          observation_type: "deductive",
+          facts: JSON.stringify(deduction.premises || []),
+          narrative: deduction.conclusion,
+        });
+        // Store source provenance
+        store.db.prepare(`UPDATE documents SET source_doc_ids = ? WHERE id = ?`)
+          .run(JSON.stringify(sourceDocIds), doc.id);
+
+        // Create supporting edges in memory_relations
+        for (const sourceId of sourceDocIds) {
+          try {
+            store.db.prepare(`
+              INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
+              VALUES (?, ?, 'supporting', 0.85, datetime('now'))
+            `).run(sourceId, doc.id);
+          } catch { /* non-fatal */ }
+        }
+
+        created++;
+        console.log(`[deductive] Created: "${deduction.conclusion.slice(0, 60)}..." from ${sourceDocIds.length} sources`);
+      }
+    } catch (err) {
+      console.error(`[deductive] Failed to create deduction:`, err);
+    }
+  }
+
+  return created;
+}
+
+/**
+ * Manually trigger deductive synthesis (for CLI or MCP tool).
+ */
+export async function runDeductiveSynthesis(
+  store: Store,
+  llm: LlamaCpp,
+): Promise<{ created: number }> {
+  const created = await generateDeductiveObservations(store, llm);
+  return { created };
+}
+
+// =============================================================================
+// Surprisal Scoring (k-NN density anomaly detection)
+// =============================================================================
+
+export interface SurprisalResult {
+  docId: number;
+  title: string;
+  path: string;
+  collection: string;
+  contentType: string;
+  avgNeighborDistance: number;  // higher = more anomalous
+  neighborCount: number;
+}
+
+/**
+ * Compute surprisal scores for observation documents using k-NN average
+ * neighbor distance in embedding space. High-surprisal observations are
+ * anomalous — they don't fit existing patterns and deserve curator attention.
+ *
+ * Uses sqlite-vec's built-in KNN query (vec0 virtual table) for efficiency.
+ * Only scores documents that have embeddings (content_vectors + vectors_vec).
+ */
+export function computeSurprisalScores(
+  store: Store,
+  options?: { collection?: string; limit?: number; k?: number; minScore?: number }
+): SurprisalResult[] {
+  const k = options?.k ?? 5;
+  const limit = options?.limit ?? 20;
+  const minScore = options?.minScore ?? 0;
+
+  // Get observation documents with embeddings (seq=0 = primary fragment)
+  let sql = `
+    SELECT d.id, d.title, d.path, d.collection, d.content_type,
+           cv.hash || '_0' as hash_seq
+    FROM documents d
+    JOIN content_vectors cv ON d.hash = cv.hash AND cv.seq = 0
+    WHERE d.active = 1
+      AND d.observation_type IS NOT NULL
+  `;
+  const params: any[] = [];
+  if (options?.collection) {
+    sql += ` AND d.collection = ?`;
+    params.push(options.collection);
+  }
+  sql += ` ORDER BY d.modified_at DESC LIMIT 100`;
+
+  const docs = store.db.prepare(sql).all(...params) as {
+    id: number; title: string; path: string; collection: string;
+    content_type: string; hash_seq: string;
+  }[];
+
+  if (docs.length < k + 1) return []; // Not enough docs for meaningful k-NN
+
+  // For each doc, query its k nearest neighbors and compute average distance
+  const results: SurprisalResult[] = [];
+
+  // Check if vectors_vec exists
+  const vecTable = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!vecTable) return [];
+
+  for (const doc of docs) {
+    try {
+      // Get this doc's embedding from vectors_vec
+      const vecRow = store.db.prepare(
+        `SELECT embedding FROM vectors_vec WHERE hash_seq = ?`
+      ).get(doc.hash_seq) as { embedding: Float32Array | number[] } | null;
+
+      if (!vecRow?.embedding) continue;
+
+      // Query k+1 nearest neighbors (first result is the doc itself)
+      const neighbors = store.db.prepare(`
+        SELECT distance
+        FROM vectors_vec
+        WHERE embedding MATCH ?
+        ORDER BY distance
+        LIMIT ?
+      `).all(vecRow.embedding, k + 1) as { distance: number }[];
+
+      // Skip the first result (self, distance ≈ 0) and compute average
+      const nonSelf = neighbors.filter(n => n.distance > 0.001);
+      if (nonSelf.length === 0) continue;
+
+      const avgDist = nonSelf.reduce((sum, n) => sum + n.distance, 0) / nonSelf.length;
+
+      if (avgDist >= minScore) {
+        results.push({
+          docId: doc.id,
+          title: doc.title,
+          path: doc.path,
+          collection: doc.collection,
+          contentType: doc.content_type,
+          avgNeighborDistance: avgDist,
+          neighborCount: nonSelf.length,
+        });
+      }
+    } catch {
+      // Skip docs that fail vector lookup (missing embedding, dimension mismatch)
+      continue;
+    }
+  }
+
+  // Sort by surprisal (highest first) and limit
+  results.sort((a, b) => b.avgNeighborDistance - a.avgNeighborDistance);
+  return results.slice(0, limit);
 }
 
 // =============================================================================

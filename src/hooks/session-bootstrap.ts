@@ -260,10 +260,11 @@ function getCurrentFocus(
   cutoff.setDate(cutoff.getDate() - DECISION_LOOKBACK_DAYS);
   const cutoffStr = cutoff.toISOString();
 
-  // Gather recent decisions, preferences, and active problems
+  // Gather recent decisions, preferences, active problems, and deductive insights
   const decisions = store.getDocumentsByType("decision", 10);
   const preferences = store.getDocumentsByType("preference", 5);
   const problems = store.getDocumentsByType("problem", 5);
+  const deductions = store.getDocumentsByType("deductive", 5);
 
   // Rank by: pinned first, then recency, then access_count
   const now = Date.now();
@@ -285,7 +286,11 @@ function getCurrentFocus(
   // Preferences are durable — no date filter, just rank
   const rankedPrefs = [...preferences].sort((a, b) => rankDoc(b) - rankDoc(a));
 
-  if (recentDecisions.length === 0 && rankedPrefs.length === 0 && activeProblems.length === 0) {
+  const recentDeductions = deductions
+    .filter(d => d.modifiedAt >= cutoffStr)
+    .sort((a, b) => rankDoc(b) - rankDoc(a));
+
+  if (recentDecisions.length === 0 && rankedPrefs.length === 0 && activeProblems.length === 0 && recentDeductions.length === 0) {
     return null;
   }
 
@@ -332,6 +337,19 @@ function getCurrentFocus(
     for (const d of rankedPrefs) {
       if (charCount >= maxChars) break;
       const entry = `- ${d.title}`;
+      lines.push(entry);
+      paths.push(`${d.collection}/${d.path}`);
+      charCount += entry.length + 2;
+    }
+  }
+
+  // Cross-session deductions (derived insights with source provenance)
+  if (recentDeductions.length > 0) {
+    lines.push("**Derived Insights:**");
+    charCount += 24;
+    for (const d of recentDeductions) {
+      if (charCount >= maxChars) break;
+      const entry = `- ${d.title} (${d.modifiedAt.slice(0, 10)})`;
       lines.push(entry);
       paths.push(`${d.collection}/${d.path}`);
       charCount += entry.length + 2;

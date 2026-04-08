@@ -823,6 +823,7 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 | Type | Half-life | Baseline | Notes |
 |---|---|---|---|
 | `decision` | ∞ | 0.85 | Never decays |
+| `deductive` | ∞ | 0.85 | Never decays — cross-session derived insights with source provenance |
 | `preference` | ∞ | 0.80 | Never decays — user preferences are durable facts |
 | `hub` | ∞ | 0.80 | Never decays |
 | `antipattern` | ∞ | 0.75 | Never decays — accumulated negative patterns persist |
@@ -835,7 +836,7 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 | `progress` | 45 days | 0.50 | |
 | `note` | 60 days | 0.50 | Default |
 
-Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access (attention decay). Decision/preference/hub/research/antipattern are exempt.
+Content types are inferred from frontmatter or file path patterns. Half-lives extend up to 3× for frequently-accessed memories (access reinforcement, decays over 90 days). Non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access (attention decay). Decision/deductive/preference/hub/research/antipattern are exempt.
 
 **Quality scoring:** Each document gets a `quality_score` (0.0–1.0) computed during indexing based on length, structure (headings, lists), decision/correction keywords, and frontmatter richness. Applied as `qualityMultiplier = 0.7 + 0.6 × qualityScore` (range: 0.7× penalty to 1.3× boost).
 
@@ -1119,6 +1120,7 @@ Built on the shoulders of:
 - [Engram](https://github.com/Gentleman-Programming/engram) — observation dedup window, topic-key upsert pattern, temporal timeline navigation, duplicate metadata scoring signals
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) — MemoryProvider plugin integration, memory nudge system (periodic lifecycle tool prompting)
 - [Hindsight](https://github.com/vectorize-io/hindsight) — entity resolution, MPFP graph traversal, temporal extraction, 3-tier consolidation, observation invalidation, 4-way parallel retrieval
+- [Honcho](https://github.com/plastic-labs/honcho) — deductive observation synthesis patterns, surprisal-based anomaly scoring concept, embed-state self-healing, retrieval separation (raw vs derived)
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [MemPalace](https://github.com/milla-jovovich/mempalace) — conversation import patterns, broadened observation taxonomy (preference/milestone/problem), session-bootstrap synthesis
 - [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms

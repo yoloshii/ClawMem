@@ -544,6 +544,10 @@ function initializeDatabase(db: Database): void {
     ["skill_name", "ALTER TABLE documents ADD COLUMN skill_name TEXT"],
     ["obs_quality_score", "ALTER TABLE documents ADD COLUMN obs_quality_score REAL"],
     ["failure_reason", "ALTER TABLE documents ADD COLUMN failure_reason TEXT"],
+    ["source_doc_ids", "ALTER TABLE documents ADD COLUMN source_doc_ids TEXT"],
+    ["embed_state", "ALTER TABLE documents ADD COLUMN embed_state TEXT DEFAULT 'pending'"],
+    ["embed_error", "ALTER TABLE documents ADD COLUMN embed_error TEXT"],
+    ["embed_attempts", "ALTER TABLE documents ADD COLUMN embed_attempts INTEGER DEFAULT 0"],
   ];
   for (const [col, sql] of obsMigrations) {
     if (!colNames.has(col)) {
@@ -906,6 +910,11 @@ export type Store = {
   pinDocument: (collection: string, path: string, pinned: boolean) => void;
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
+  // Embed state tracking
+  markEmbedSynced: (hash: string) => void;
+  markEmbedFailed: (hash: string, error: string) => void;
+  getEmbedStats: () => { pending: number; synced: number; failed: number };
+
   // Beads integration
   syncBeadsIssues: (projectDir: string) => Promise<{ synced: number; created: number; newDocIds: number[] }>;
   detectBeadsProject: (cwd: string) => string | null;
@@ -1077,6 +1086,24 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getStaleDocuments: (beforeDate: string) => getStaleDocumentsFn(db, beforeDate),
     pinDocument: (collection: string, path: string, pinned: boolean) => pinDocumentFn(db, collection, path, pinned),
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
+
+    // Embed state tracking
+    markEmbedSynced: (hash: string) => {
+      db.prepare(`UPDATE documents SET embed_state = 'synced' WHERE hash = ? AND active = 1`).run(hash);
+    },
+    markEmbedFailed: (hash: string, error: string) => {
+      db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ?, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(error, hash);
+    },
+    getEmbedStats: () => {
+      const stats = db.prepare(`
+        SELECT
+          SUM(CASE WHEN embed_state = 'pending' OR embed_state IS NULL THEN 1 ELSE 0 END) as pending,
+          SUM(CASE WHEN embed_state = 'synced' THEN 1 ELSE 0 END) as synced,
+          SUM(CASE WHEN embed_state = 'failed' THEN 1 ELSE 0 END) as failed
+        FROM documents WHERE active = 1
+      `).get() as { pending: number; synced: number; failed: number };
+      return { pending: stats.pending || 0, synced: stats.synced || 0, failed: stats.failed || 0 };
+    },
 
     // Beads integration
     syncBeadsIssues: (projectDir: string) => syncBeadsIssues(db, projectDir),
@@ -2924,12 +2951,17 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Returns hashes that have no content_vectors row with fragment_type set.
  */
 export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string }[] {
+  // Select docs that either have no fragments at all OR are missing the primary (seq=0) fragment.
+  // The seq=0 embedding is critical — surprisal scoring, semantic graph, and health checks depend on it.
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.fragment_type IS NOT NULL
-    WHERE d.active = 1 AND v.hash IS NULL
+    LEFT JOIN content_vectors v0 ON d.hash = v0.hash AND v0.seq = 0
+    WHERE d.active = 1
+      AND (v.hash IS NULL OR v0.hash IS NULL)
+      AND COALESCE(d.embed_attempts, 0) < 3
     GROUP BY d.hash
   `).all() as { hash: string; body: string; path: string; title: string; collection: string }[];
 }
@@ -2941,6 +2973,8 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
 export function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  // Reset embed state so failed docs get retried after force re-embed
+  try { db.exec(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = 0 WHERE active = 1`); } catch { /* column may not exist yet */ }
   vecTableDimsCache.delete(db);
 }
 

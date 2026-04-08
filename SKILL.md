@@ -451,7 +451,7 @@ compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceSc
 
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
-| decision, preference, hub | infinity | Never decay |
+| decision, deductive, preference, hub | infinity | Never decay |
 | antipattern | infinity | Never decay — accumulated negative patterns persist |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |

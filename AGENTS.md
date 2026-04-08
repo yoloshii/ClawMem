@@ -250,7 +250,7 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + recent decisions (400) + antipatterns (150) + vault context (200) → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. Reindexes auto-memory collection. |
-| `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/agent/observations/`, infers causal links, detects contradictions with prior decisions |
+| `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/agent/observations/`, infers causal links, detects contradictions, extracts SPO triples from decision/preference/milestone/problem facts. Background consolidation worker synthesizes deductive observations from related facts (Phase 3, every ~15 min). |
 | `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/agent/handoffs/` |
 | `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence, records usage relations + co-activations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
 
@@ -447,7 +447,7 @@ compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenc
 
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
-| decision, preference, hub | ∞ | Never decay |
+| decision, deductive, preference, hub | ∞ | Never decay |
 | antipattern | ∞ | Never decay — accumulated negative patterns persist |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
@@ -456,7 +456,7 @@ compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenc
 | handoff | 30 days | Fast — recent matters most |
 
 Half-lives extend up to 3× for frequently-accessed memories (access reinforcement decays over 90 days).
-Attention decay: non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision/preference/hub/research/antipattern are exempt.
+Attention decay: non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision/deductive/preference/hub/research/antipattern are exempt.
 
 ## Indexing & Graph Building
 
@@ -499,6 +499,7 @@ The `memory_relations` table is populated by multiple independent sources:
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP tool (manual) | Pure cosine similarity. PK collision: `INSERT OR IGNORE` means A-MEM semantic edges take precedence if they exist first. |
 | Entity co-occurrence graph | entity | A-MEM enrichment (indexing) | LLM entity extraction → quality filters (title/length/blocklist/location validation) → type-agnostic canonical resolution within compatibility buckets (person, org, location, tech=project/service/tool/concept) → `entity_mentions` + `entity_cooccurrences` tables. Entity edges use IDF-based specificity scoring. Feeds ENTITY intent queries and MPFP `[entity, semantic]` patterns. |
 | `consolidated_observations` | supporting | Consolidation worker (background) | 3-tier consolidation: facts → observations → mental models. Observations track `proof_count`, `trend` (STABLE/STRENGTHENING/WEAKENING/STALE), and source links. |
+| Deductive synthesis | supporting | Consolidation worker Phase 3 (background, every ~15 min) | Combines 2-3 related recent observations (decision/preference/milestone/problem, last 7 days) into `content_type='deductive'` documents with `source_doc_ids` provenance. First-class searchable docs with ∞ half-life. |
 
 **Edge collision:** Both `generateMemoryLinks()` and `buildSemanticGraph()` insert `relation_type='semantic'`. PK is `(source_id, target_id, relation_type)` — first writer wins.
 

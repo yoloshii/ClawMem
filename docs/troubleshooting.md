@@ -30,6 +30,10 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - On CPU-only systems (no Metal, no Vulkan), in-process inference is significantly slower and less reliable than a dedicated GPU server. Systems with GPU acceleration (Metal/Vulkan) handle these models well in-process.
 - Fix: Run llama-server on a GPU. Even a low-end NVIDIA card handles 1.7B models.
 
+**Some documents never get embedded (stuck after multiple sweeps)**
+- Documents with 3+ failed embedding attempts are skipped by the embed timer to prevent infinite retry loops. Run `clawmem embed --force` (which calls `clearAllEmbeddings()`) to reset all embed state and retry everything. Check `getEmbedStats()` via MCP `status` tool for pending/synced/failed counts.
+- If the primary fragment (seq=0) fails but later fragments succeed, the document is marked `failed` and retried — seq=0 is required for surprisal scoring, semantic graph, and health checks.
+
 **Vector search returns no results but BM25 works**
 - Missing embeddings. The watcher indexes but does NOT embed.
 - Fix: Run `clawmem embed` or wait for the daily embed timer.
