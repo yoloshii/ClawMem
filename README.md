@@ -310,9 +310,9 @@ ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. Al
 | LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
 
-The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp` (auto-downloads the QMD native models on first use, uses Metal/Vulkan/CPU depending on hardware). With GPU acceleration this is fast; on CPU-only it is significantly slower. ClawMem always works either way, but **if you're running dedicated GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up** — otherwise a crashed server silently degrades without warning.
+The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable (transport error like ECONNREFUSED/ETIMEDOUT), ClawMem sets a 60-second cooldown and falls back to in-process inference via `node-llama-cpp` (auto-downloads the QMD native models on first use, uses Metal/Vulkan/CPU depending on hardware). HTTP errors (400/500) and user-cancelled requests do not trigger cooldown — the remote server is retried normally on the next call. With GPU acceleration the fallback is fast; on CPU-only it is significantly slower. ClawMem always works either way, but **if you're running dedicated GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up**.
 
-To prevent silent fallback and fail fast instead, set `CLAWMEM_NO_LOCAL_MODELS=true`.
+To prevent fallback and fail fast instead, set `CLAWMEM_NO_LOCAL_MODELS=true`.
 
 #### Remote GPU (optional)
 
