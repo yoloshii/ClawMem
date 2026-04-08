@@ -10,12 +10,18 @@
  */
 
 import type { Store } from "../store.ts";
+import { resolveStore } from "../store.ts";
+import { listVaults } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeEmptyOutput,
   readTranscript,
   validateTranscriptPath,
 } from "../hooks.ts";
+import {
+  segmentTranscriptIntoTurns,
+  attributeRecallReferences,
+} from "../recall-attribution.ts";
 
 // =============================================================================
 // Handler
@@ -129,6 +135,33 @@ export async function feedbackLoop(
     // Non-critical — don't block feedback loop on utility tracking errors
   }
 
+  // Recall tracking: per-turn attribution using transcript segmentation.
+  // Reads full transcript, segments into turns, zips with context_usage rows,
+  // checks references per-turn rather than session-globally.
+  try {
+    const allMessages = readTranscript(transcriptPath, 500);
+    const turns = segmentTranscriptIntoTurns(allMessages);
+    const usages = store.getUsageForSession(sessionId);
+
+    // General vault attribution
+    attributeRecallReferences(store, sessionId, usages, turns);
+
+    // Cross-vault: attribute recall events in any configured named vaults.
+    // Each vault has its own context_usage rows (mirrored during context-surfacing).
+    const vaultNames = listVaults();
+    for (const vaultName of vaultNames) {
+      try {
+        const vaultStore = resolveStore(vaultName);
+        const vaultUsages = vaultStore.getUsageForSession(sessionId);
+        if (vaultUsages.length > 0) {
+          attributeRecallReferences(vaultStore, sessionId, vaultUsages, turns);
+        }
+      } catch { /* vault unavailable — skip */ }
+    }
+  } catch {
+    // Non-critical — don't block feedback loop on recall tracking errors
+  }
+
   // Silent return — feedback loop doesn't inject context
   return makeEmptyOutput("feedback-loop");
 }
@@ -190,6 +223,13 @@ function trackUtilitySignals(
     );
   }
 }
+
+// =============================================================================
+// Reference Detection
+// =============================================================================
+
+// Recall attribution logic is in src/recall-attribution.ts
+// (attributeRecallReferences, segmentTranscriptIntoTurns)
 
 // =============================================================================
 // Reference Detection

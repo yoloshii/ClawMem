@@ -99,3 +99,22 @@ See [graph traversal](../internals/graph-traversal.md) for edge types, traversal
 | Tier 3 | MCP tools (agent-initiated) | 1 tool call | ~10% — escalation only |
 
 See [Hooks vs MCP](hooks-vs-mcp.md) for details.
+
+## Recall tracking
+
+ClawMem tracks which documents are surfaced by retrieval, which queries surfaced them, and whether the assistant actually cited them. This data feeds lifecycle decisions (pin/snooze candidates) and provides empirical signals beyond raw search relevance.
+
+The `recall_events` table is an append-only log. Each time context-surfacing injects documents, it writes one event per injected doc with the query hash, search score, session ID, and turn index. The `feedback-loop` hook later marks which events were actually referenced in the assistant's response, using per-turn transcript segmentation to attribute references to specific turns rather than the session globally.
+
+The `recall_stats` table is a derived summary recomputed by the consolidation worker. It tracks per-document:
+
+| Signal | Description |
+|--------|-------------|
+| `recall_count` | Total times surfaced |
+| `unique_queries` | Distinct query contexts (cross-domain generality) |
+| `recall_days` | Distinct calendar days surfaced (spaced vs binge frequency) |
+| `diversity_score` | `min(1, max(unique_queries, recall_days) / 5)` |
+| `spacing_score` | Multi-day spread: log-scaled day count + calendar span |
+| `negative_count` | Surfaced but not referenced (noise signal) |
+
+`lifecycle_status` uses these signals to surface pin candidates (high diversity + spacing + recall count) and snooze candidates (high recall count with mostly negative signals).

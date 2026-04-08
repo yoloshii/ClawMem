@@ -301,6 +301,10 @@ function initializeDatabase(db: Database): void {
   sqliteVec.load(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  // Set generous busy_timeout during DDL — concurrent Stop hooks (decision-extractor,
+  // handoff-generator, feedback-loop) all run initializeDatabase simultaneously.
+  // 15s is well within the 30s Stop hook timeout. Reset to normal after DDL completes.
+  db.exec("PRAGMA busy_timeout = 15000");
 
   // Drop legacy tables that are now managed in YAML
   db.exec(`DROP TABLE IF EXISTS path_contexts`);
@@ -491,10 +495,17 @@ function initializeDatabase(db: Database): void {
       hook_name TEXT NOT NULL,
       injected_paths TEXT NOT NULL DEFAULT '[]',
       estimated_tokens INTEGER NOT NULL DEFAULT 0,
-      was_referenced INTEGER NOT NULL DEFAULT 0
+      was_referenced INTEGER NOT NULL DEFAULT 0,
+      turn_index INTEGER NOT NULL DEFAULT 0
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_context_usage_session ON context_usage(session_id)`);
+
+  // Migration: add turn_index to existing context_usage
+  const cuCols = db.prepare("PRAGMA table_info(context_usage)").all() as { name: string }[];
+  if (!cuCols.some(c => c.name === "turn_index")) {
+    try { db.exec(`ALTER TABLE context_usage ADD COLUMN turn_index INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  }
 
   // Hook prompt dedupe: suppress duplicate/heartbeat prompts to reduce GPU churn.
   db.exec(`
@@ -785,6 +796,64 @@ function initializeDatabase(db: Database): void {
   `);
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_intent_cache_time ON intent_classifications(cached_at)`);
+
+  // Recall tracking: append-only event log for every doc surfaced by retrieval
+  // usage_id is informational (no FK) — links to context_usage.id in the same vault
+  // but may reference a different vault's row in cross-vault scenarios.
+  // Cross-vault linkage uses session_id + turn_index instead.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS recall_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id INTEGER NOT NULL,
+      query_hash TEXT NOT NULL,
+      search_score REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      usage_id INTEGER,
+      turn_index INTEGER NOT NULL DEFAULT 0,
+      surfaced_at TEXT NOT NULL DEFAULT (datetime('now')),
+      was_referenced INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    )
+  `);
+  // Migration: add usage_id + turn_index columns to existing recall_events tables
+  const reCols = db.prepare("PRAGMA table_info(recall_events)").all() as { name: string }[];
+  const reColNames = new Set(reCols.map(c => c.name));
+  if (!reColNames.has("usage_id")) {
+    try { db.exec(`ALTER TABLE recall_events ADD COLUMN usage_id INTEGER`); } catch { /* exists */ }
+  }
+  if (!reColNames.has("turn_index")) {
+    try { db.exec(`ALTER TABLE recall_events ADD COLUMN turn_index INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_usage ON recall_events(usage_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_doc ON recall_events(doc_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_session ON recall_events(session_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_surfaced ON recall_events(surfaced_at)`);
+
+  // Recall stats: derived summary recomputed by background worker
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS recall_stats (
+      doc_id INTEGER PRIMARY KEY,
+      recall_count INTEGER NOT NULL DEFAULT 0,
+      unique_queries INTEGER NOT NULL DEFAULT 0,
+      recall_days INTEGER NOT NULL DEFAULT 0,
+      total_score REAL NOT NULL DEFAULT 0,
+      max_score REAL NOT NULL DEFAULT 0,
+      first_recalled_at TEXT,
+      last_recalled_at TEXT,
+      diversity_score REAL NOT NULL DEFAULT 0,
+      spacing_score REAL NOT NULL DEFAULT 0,
+      negative_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Migration: add contradict_confidence to memory_relations
+  const mrCols = db.prepare("PRAGMA table_info(memory_relations)").all() as { name: string }[];
+  const mrColNames = new Set(mrCols.map(c => c.name));
+  if (!mrColNames.has("contradict_confidence")) {
+    try { db.exec(`ALTER TABLE memory_relations ADD COLUMN contradict_confidence REAL`); } catch { /* column exists */ }
+  }
 }
 
 
@@ -898,7 +967,7 @@ export type Store = {
   getRecentSessions: (limit: number) => SessionRecord[];
 
   // SAME: Context usage tracking
-  insertUsage: (usage: UsageRecord) => void;
+  insertUsage: (usage: UsageRecord) => number;
   getUsageForSession: (sessionId: string) => UsageRow[];
   markUsageReferenced: (id: number) => void;
 
@@ -944,6 +1013,13 @@ export type Store = {
   queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[];
   getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
 
+  // Recall tracking
+  insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean }[]) => number;
+  recomputeRecallStats: () => number;
+  getRecallStats: (docId: number) => RecallStatsRow | null;
+  getRecallStatsAll: (minRecallCount?: number) => RecallStatsRow[];
+  markRecallEventsReferenced: (sessionId: string, docIds: number[]) => void;
+
   // Co-activation tracking
   recordCoActivation: (paths: string[]) => void;
   getCoActivated: (path: string, limit?: number) => { path: string; count: number }[];
@@ -987,9 +1063,9 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA query_only = ON");
   }
-  if (opts?.busyTimeout !== undefined) {
-    db.exec(`PRAGMA busy_timeout = ${opts.busyTimeout}`);
-  }
+  // Reset busy_timeout to operational value after DDL init (which uses 15s).
+  // Default 5000ms for normal operations — callers can override via opts.
+  db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
 
   return {
     db,
@@ -1075,7 +1151,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getRecentSessions: (limit: number) => getRecentSessionsFn(db, limit),
 
     // SAME: Context usage tracking
-    insertUsage: (usage: UsageRecord) => insertUsageFn(db, usage),
+    insertUsage: (usage: UsageRecord) => insertUsageFn(db, usage) as number,
     getUsageForSession: (sessionId: string) => getUsageForSessionFn(db, sessionId),
     markUsageReferenced: (id: number) => markUsageReferencedFn(db, id),
 
@@ -1216,6 +1292,165 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     },
 
     // Co-activation tracking
+    // Recall tracking: batch insert surfacing events
+    insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean }[]) => {
+      if (events.length === 0) return 0;
+      const stmt = db.prepare(`
+        INSERT INTO recall_events (doc_id, query_hash, search_score, session_id, usage_id, turn_index, surfaced_at, was_referenced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const now = new Date().toISOString();
+      const tx = db.transaction(() => {
+        for (const e of events) {
+          stmt.run(e.docId, e.queryHash, e.searchScore, e.sessionId, e.usageId ?? null, e.turnIndex ?? 0, now, e.wasReferenced ? 1 : 0);
+        }
+      });
+      tx();
+      return events.length;
+    },
+
+    // Recall tracking: recompute derived stats from events
+    // Uses SQL GROUP BY for aggregation (O(1) queries), then JS for diversity/spacing formulas
+    recomputeRecallStats: () => {
+      const aggregated = db.prepare(`
+        SELECT
+          doc_id,
+          COUNT(*) AS recall_count,
+          COUNT(DISTINCT query_hash) AS unique_queries,
+          COUNT(DISTINCT date(surfaced_at, 'utc')) AS recall_days,
+          SUM(search_score) AS total_score,
+          MAX(search_score) AS max_score,
+          SUM(CASE WHEN was_referenced = 0 THEN 1 ELSE 0 END) AS negative_count,
+          MIN(surfaced_at) AS first_recalled_at,
+          MAX(surfaced_at) AS last_recalled_at,
+          GROUP_CONCAT(DISTINCT date(surfaced_at, 'utc')) AS day_list
+        FROM recall_events
+        GROUP BY doc_id
+      `).all() as {
+        doc_id: number; recall_count: number; unique_queries: number; recall_days: number;
+        total_score: number; max_score: number; negative_count: number;
+        first_recalled_at: string; last_recalled_at: string; day_list: string;
+      }[];
+
+      if (aggregated.length === 0) return 0;
+
+      const upsert = db.prepare(`
+        INSERT INTO recall_stats (doc_id, recall_count, unique_queries, recall_days, total_score, max_score,
+          first_recalled_at, last_recalled_at, diversity_score, spacing_score, negative_count, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+          recall_count = excluded.recall_count,
+          unique_queries = excluded.unique_queries,
+          recall_days = excluded.recall_days,
+          total_score = excluded.total_score,
+          max_score = excluded.max_score,
+          first_recalled_at = excluded.first_recalled_at,
+          last_recalled_at = excluded.last_recalled_at,
+          diversity_score = excluded.diversity_score,
+          spacing_score = excluded.spacing_score,
+          negative_count = excluded.negative_count,
+          updated_at = excluded.updated_at
+      `);
+
+      const now = new Date().toISOString();
+      const tx = db.transaction(() => {
+        for (const row of aggregated) {
+          // Diversity: clamped max(uniqueQueries, recallDays) / 5
+          const diversityScore = Math.min(1, Math.max(row.unique_queries, row.recall_days) / 5);
+
+          // Spacing: multi-day spread
+          let spacingScore = 0;
+          if (row.recall_days > 1 && row.day_list) {
+            const days = row.day_list.split(",").sort();
+            const spacing = Math.min(1, Math.log1p(days.length - 1) / Math.log1p(4));
+            const firstDay = new Date(days[0]! + "T00:00:00Z").getTime();
+            const lastDay = new Date(days[days.length - 1]! + "T00:00:00Z").getTime();
+            const spanDays = Math.max(0, (lastDay - firstDay) / (24 * 60 * 60 * 1000));
+            const span = Math.min(1, spanDays / 7);
+            spacingScore = Math.min(1, 0.55 * spacing + 0.45 * span);
+          } else if (row.recall_days === 1) {
+            spacingScore = 0.2;
+          }
+
+          upsert.run(
+            row.doc_id, row.recall_count, row.unique_queries, row.recall_days,
+            row.total_score, row.max_score,
+            row.first_recalled_at, row.last_recalled_at,
+            diversityScore, spacingScore, row.negative_count, now
+          );
+        }
+      });
+      tx();
+      return aggregated.length;
+    },
+
+    getRecallStats: (docId: number) => {
+      const row = db.prepare(`SELECT * FROM recall_stats WHERE doc_id = ?`).get(docId) as any;
+      if (!row) return null;
+      return {
+        docId: row.doc_id,
+        recallCount: row.recall_count,
+        uniqueQueries: row.unique_queries,
+        recallDays: row.recall_days,
+        totalScore: row.total_score,
+        maxScore: row.max_score,
+        firstRecalledAt: row.first_recalled_at,
+        lastRecalledAt: row.last_recalled_at,
+        diversityScore: row.diversity_score,
+        spacingScore: row.spacing_score,
+        negativeCount: row.negative_count,
+        updatedAt: row.updated_at,
+      } as RecallStatsRow;
+    },
+
+    getRecallStatsAll: (minRecallCount: number = 1) => {
+      return (db.prepare(`
+        SELECT rs.*, d.collection, d.path, d.title
+        FROM recall_stats rs
+        JOIN documents d ON rs.doc_id = d.id
+        WHERE rs.recall_count >= ? AND d.active = 1
+        ORDER BY rs.recall_count DESC
+      `).all(minRecallCount) as any[]).map(row => ({
+        docId: row.doc_id,
+        recallCount: row.recall_count,
+        uniqueQueries: row.unique_queries,
+        recallDays: row.recall_days,
+        totalScore: row.total_score,
+        maxScore: row.max_score,
+        firstRecalledAt: row.first_recalled_at,
+        lastRecalledAt: row.last_recalled_at,
+        diversityScore: row.diversity_score,
+        spacingScore: row.spacing_score,
+        negativeCount: row.negative_count,
+        updatedAt: row.updated_at,
+        collection: row.collection,
+        path: row.path,
+        title: row.title,
+      } as RecallStatsRow));
+    },
+
+    markRecallEventsReferenced: (sessionId: string, docIds: number[]) => {
+      if (docIds.length === 0) return;
+      // Mark only the LATEST event per doc in this session, not all events.
+      // This preserves negative signals: if a doc was surfaced across 5 prompts
+      // but only cited once, 4 events stay was_referenced=0 (genuine negatives).
+      const stmt = db.prepare(`
+        UPDATE recall_events SET was_referenced = 1
+        WHERE id = (
+          SELECT id FROM recall_events
+          WHERE session_id = ? AND doc_id = ?
+          ORDER BY surfaced_at DESC
+          LIMIT 1
+        )
+      `);
+      const tx = db.transaction(() => {
+        for (const docId of docIds) {
+          stmt.run(sessionId, docId);
+        }
+      });
+      tx();
+    },
+
     recordCoActivation: (paths: string[]) => {
       if (paths.length < 2) return;
       const now = new Date().toISOString();
@@ -1451,6 +1686,7 @@ export type UsageRecord = {
   injectedPaths: string[];
   estimatedTokens: number;
   wasReferenced: number;
+  turnIndex?: number;
 };
 
 export type UsageRow = {
@@ -1461,6 +1697,26 @@ export type UsageRow = {
   injectedPaths: string;
   estimatedTokens: number;
   wasReferenced: number;
+  turnIndex: number;
+};
+
+export type RecallStatsRow = {
+  docId: number;
+  recallCount: number;
+  uniqueQueries: number;
+  recallDays: number;
+  totalScore: number;
+  maxScore: number;
+  firstRecalledAt: string | null;
+  lastRecalledAt: string | null;
+  diversityScore: number;
+  spacingScore: number;
+  negativeCount: number;
+  updatedAt: string;
+  // Joined from documents (only populated by getRecallStatsAll)
+  collection?: string;
+  path?: string;
+  title?: string;
 };
 
 export type DocumentRow = {
@@ -3647,19 +3903,22 @@ function getRecentSessionsFn(db: Database, limit: number): SessionRecord[] {
 // SAME: Context Usage Tracking
 // =============================================================================
 
-function insertUsageFn(db: Database, usage: UsageRecord): void {
+function insertUsageFn(db: Database, usage: UsageRecord): number {
   db.prepare(`
-    INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths), usage.estimatedTokens, usage.wasReferenced);
+    INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths), usage.estimatedTokens, usage.wasReferenced, usage.turnIndex ?? 0);
+  // Return the rowid of the just-inserted row for recall event linkage
+  const row = db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
+  return row.id;
 }
 
 function getUsageForSessionFn(db: Database, sessionId: string): UsageRow[] {
   return db.prepare(`
     SELECT id, session_id AS sessionId, timestamp, hook_name AS hookName,
            injected_paths AS injectedPaths, estimated_tokens AS estimatedTokens,
-           was_referenced AS wasReferenced
-    FROM context_usage WHERE session_id = ? ORDER BY timestamp
+           was_referenced AS wasReferenced, turn_index AS turnIndex
+    FROM context_usage WHERE session_id = ? ORDER BY turn_index, timestamp
   `).all(sessionId) as UsageRow[];
 }
 

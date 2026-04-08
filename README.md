@@ -85,7 +85,7 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 **Optional integrations:**
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — for hooks + MCP integration
-- [OpenClaw](https://github.com/openclawai/openclaw) — for ContextEngine plugin integration
+- [OpenClaw](https://github.com/openclaw/openclaw) — for ContextEngine plugin integration
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) — for MemoryProvider plugin integration
 - [bd CLI](https://github.com/dolthub/dolt) v0.58.0+ — for Beads issue tracker sync (only if using Beads)
 
@@ -885,6 +885,17 @@ Documents are split into semantic fragments (sections, lists, code blocks, front
 
 Uses the LLM server (shared with query expansion and intent classification) to extract structured observations from session transcripts. Observation types: `decision`, `bugfix`, `feature`, `refactor`, `discovery`, `change`, `preference`, `milestone`, `problem`. Each observation includes title, facts, narrative, concepts, and files read/modified. Preferences, milestones, and problems get first-class content_type treatment with dedicated confidence baselines and half-lives instead of being flattened to generic "observation". Falls back to regex patterns if the model is unavailable.
 
+### Recall Tracking
+
+Empirical tracking of which documents are surfaced by retrieval, which queries surfaced them, and whether the assistant actually cited them. Provides signals beyond raw search relevance for lifecycle decisions:
+
+- **Per-query diversity**: docs surfaced by multiple distinct queries have proven cross-domain relevance
+- **Multi-day spacing**: docs surfaced across separate calendar days (spaced frequency) are more valuable than binge recalls in one session
+- **Negative signals**: docs surfaced frequently but rarely referenced are noise candidates for snooze
+- **Per-turn attribution**: feedback-loop segments the transcript into turns and attributes references to specific context-surfacing invocations, not the session globally
+
+Data feeds `lifecycle_status` (pin/snooze candidate reports) and `lifecycle_sweep` (recall-based recommendations). Adapted from [OpenClaw](https://github.com/openclaw/openclaw) dreaming promotion patterns.
+
 ### User Profile
 
 Two-tier auto-curated profile extracted from your decisions and hub documents:
@@ -1124,6 +1135,7 @@ Built on the shoulders of:
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
 - [MemPalace](https://github.com/milla-jovovich/mempalace) — conversation import patterns, broadened observation taxonomy (preference/milestone/problem), session-bootstrap synthesis
 - [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
+- [OpenClaw](https://github.com/openclaw/openclaw) — recall tracking patterns (per-query diversity, multi-day spacing, negative signal tracking, promotion scoring) extracted from the dreaming memory consolidation system
 - [OpenViking](https://github.com/volcengine/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
 - [QMD](https://github.com/tobi/qmd) — search backend (BM25 + vectors + RRF + reranking)
 - [SAME](https://github.com/sgx-labs/statelessagent) — agent memory concepts (recency decay, confidence scoring, session tracking)

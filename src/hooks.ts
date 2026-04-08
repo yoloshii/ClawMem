@@ -385,23 +385,28 @@ export function logInjection(
   sessionId: string,
   hookName: string,
   injectedPaths: string[],
-  estimatedTokens: number
-): void {
+  estimatedTokens: number,
+  turnIndex?: number
+): number {
   try {
-    store.insertUsage({
+    const usageId = store.insertUsage({
       sessionId,
       timestamp: new Date().toISOString(),
       hookName,
       injectedPaths,
       estimatedTokens,
       wasReferenced: 0,
+      turnIndex,
     });
 
     // Record co-activation for all injected paths (E3)
     if (injectedPaths.length >= 2) {
       store.recordCoActivation(injectedPaths);
     }
+
+    return usageId;
   } catch {
     // Non-fatal: don't crash hook if usage logging fails
+    return -1;
   }
 }

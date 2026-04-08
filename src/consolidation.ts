@@ -124,6 +124,17 @@ async function tick(store: Store, llm: LlamaCpp): Promise<void> {
     if (tickCount % 3 === 0) {
       await generateDeductiveObservations(store, llm);
     }
+
+    // Phase 4: Recall stats recomputation (every tick — lightweight SQL aggregation)
+    try {
+      const updated = store.recomputeRecallStats();
+      if (updated > 0) {
+        console.log(`[consolidation] Phase 4: recomputed recall_stats for ${updated} docs`);
+      }
+    } catch (err) {
+      // Non-critical — recall stats are informational, not retrieval-blocking
+      console.error("[consolidation] Phase 4 recall stats failed:", err);
+    }
   } catch (err) {
     console.error("[consolidation] Tick failed:", err);
   } finally {

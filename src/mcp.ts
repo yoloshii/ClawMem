@@ -2277,6 +2277,11 @@ This is the recommended entry point for ALL memory queries.`,
       const config = loadConfig();
       const policy = config.lifecycle;
 
+      // Recall tracking summary
+      const recallStats = store.getRecallStatsAll(1);
+      const highDiversity = recallStats.filter(r => r.diversityScore >= 0.4 && r.spacingScore >= 0.5 && r.recallCount >= 3);
+      const highNoise = recallStats.filter(r => r.recallCount >= 5 && r.negativeCount > r.recallCount * 0.8);
+
       const lines = [
         `Active: ${stats.active}`,
         `Archived (auto): ${stats.archived}`,
@@ -2285,6 +2290,10 @@ This is the recommended entry point for ALL memory queries.`,
         `Snoozed: ${stats.snoozed}`,
         `Never accessed: ${stats.neverAccessed}`,
         `Oldest access: ${stats.oldestAccess?.slice(0, 10) || "n/a"}`,
+        "",
+        `Recall tracking: ${recallStats.length} docs tracked`,
+        `  Pin candidates (high diversity+spacing): ${highDiversity.length}`,
+        `  Snooze candidates (surfaced often, rarely referenced): ${highNoise.length}`,
         "",
         `Policy: ${policy ? `archive after ${policy.archive_after_days}d, purge after ${policy.purge_after_days ?? "never"}, dry_run=${policy.dry_run}` : "none configured"}`,
       ];
@@ -2322,7 +2331,29 @@ This is the recommended entry point for ALL memory queries.`,
         const lines = candidates.map(c =>
           `- ${c.collection}/${c.path} (${c.content_type}, modified ${c.modified_at.slice(0, 10)}, accessed ${c.last_accessed_at?.slice(0, 10) || "never"})`
         );
-        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s):\n${lines.join("\n") || "(none)"}` }] };
+
+        // Recall-based recommendations
+        const recallStats = store.getRecallStatsAll(3);
+        const pinCandidates = recallStats.filter(r => r.diversityScore >= 0.4 && r.spacingScore >= 0.5 && r.recallCount >= 3);
+        const snoozeCandidates = recallStats.filter(r => r.recallCount >= 5 && r.negativeCount > r.recallCount * 0.8);
+
+        const recallLines: string[] = [];
+        if (pinCandidates.length > 0) {
+          recallLines.push("", "Pin candidates (high diversity, multi-day spread, recall≥3):");
+          for (const r of pinCandidates.slice(0, 5)) {
+            const label = r.collection && r.path ? `${r.collection}/${r.path}` : `doc#${r.docId}`;
+            recallLines.push(`  - ${label} (recalls=${r.recallCount}, queries=${r.uniqueQueries}, days=${r.recallDays}, diversity=${r.diversityScore.toFixed(2)}, spacing=${r.spacingScore.toFixed(2)})`);
+          }
+        }
+        if (snoozeCandidates.length > 0) {
+          recallLines.push("", "Snooze candidates (surfaced often, rarely referenced):");
+          for (const r of snoozeCandidates.slice(0, 5)) {
+            const label = r.collection && r.path ? `${r.collection}/${r.path}` : `doc#${r.docId}`;
+            recallLines.push(`  - ${label} (recalls=${r.recallCount}, referenced=${r.recallCount - r.negativeCount}, noise_ratio=${(r.negativeCount / r.recallCount * 100).toFixed(0)}%)`);
+          }
+        }
+
+        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s):\n${lines.join("\n") || "(none)"}${recallLines.join("\n")}` }] };
       }
 
       const archived = store.archiveDocuments(candidates.map(c => c.id));

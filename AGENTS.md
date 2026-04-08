@@ -252,7 +252,7 @@ ClawMem hooks handle ~90% of retrieval automatically. Agent-initiated MCP calls 
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions → writes `precompact-state.md` to auto-memory. Query-aware decision ranking. Reindexes auto-memory collection. |
 | `decision-extractor` | Stop | — | LLM extracts observations → `_clawmem/agent/observations/`, infers causal links, detects contradictions, extracts SPO triples from decision/preference/milestone/problem facts. Background consolidation worker synthesizes deductive observations from related facts (Phase 3, every ~15 min). |
 | `handoff-generator` | Stop | — | LLM summarizes session → `_clawmem/agent/handoffs/` |
-| `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence, records usage relations + co-activations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
+| `feedback-loop` | Stop | — | tracks referenced notes → boosts confidence, records usage relations + co-activations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation), per-turn recall attribution (marks which surfaced docs were cited in which turn) |
 
 **Default behavior:** Read injected `<vault-context>` first. If sufficient, answer immediately.
 

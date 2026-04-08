@@ -46,6 +46,8 @@ src/
   collections.ts     Collection configuration loader
   validation.ts      Input validation helpers
   normalize.ts       Conversation format normalizer (Claude, ChatGPT, Slack, plain text)
+  recall-buffer.ts   Recall event writing (direct SQLite write during context-surfacing)
+  recall-attribution.ts  Per-turn reference attribution (transcript segmentation + usage linkage)
   limits.ts          Constants (max path length, query length)
   errors.ts          Error types
   promptguard.ts     Prompt injection sanitization

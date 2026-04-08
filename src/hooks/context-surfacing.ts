@@ -30,6 +30,7 @@ import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
 import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
+import { writeRecallEvents, hashQuery } from "../recall-buffer.ts";
 
 // =============================================================================
 // Config
@@ -69,18 +70,44 @@ export async function contextSurfacing(
   input: HookInput
 ): Promise<HookOutput> {
   let prompt = input.prompt?.trim();
-  if (!prompt || prompt.length < MIN_PROMPT_LENGTH) return makeEmptyOutput("context-surfacing");
+
+  // Compute turn_index FIRST, before any early returns.
+  // Every transcript-visible early return must log an empty context_usage row
+  // to keep turn_index aligned with transcript turns for per-turn attribution.
+  if (input.sessionId) {
+    try {
+      let turnIndex = 0;
+      try {
+        const existing = store.db.prepare(
+          `SELECT COUNT(*) as cnt FROM context_usage WHERE session_id = ? AND hook_name = 'context-surfacing'`
+        ).get(input.sessionId) as { cnt: number };
+        turnIndex = existing.cnt;
+      } catch { /* fallback to 0 */ }
+      (input as any)._turnIndex = turnIndex;
+    } catch { /* non-fatal */ }
+  }
+
+  if (!prompt || prompt.length < MIN_PROMPT_LENGTH) {
+    logEmptyTurn(store, input);
+    return makeEmptyOutput("context-surfacing");
+  }
 
   // Bound query length to prevent DoS on search indices
   if (prompt.length > MAX_QUERY_LENGTH) prompt = prompt.slice(0, MAX_QUERY_LENGTH);
 
-  // Skip slash commands
-  if (prompt.startsWith("/")) return makeEmptyOutput("context-surfacing");
+  // Skip slash commands — log empty turn for alignment
+  if (prompt.startsWith("/")) {
+    logEmptyTurn(store, input);
+    return makeEmptyOutput("context-surfacing");
+  }
 
   // Adaptive retrieval gate: skip greetings, shell commands, affirmations, etc.
-  if (shouldSkipRetrieval(prompt)) return makeEmptyOutput("context-surfacing");
+  if (shouldSkipRetrieval(prompt)) {
+    logEmptyTurn(store, input);
+    return makeEmptyOutput("context-surfacing");
+  }
 
-  // Heartbeat / duplicate suppression (IO4)
+  // Heartbeat / duplicate suppression (IO4) — NOT transcript-visible user turns
   if (isHeartbeatPrompt(prompt)) return makeEmptyOutput("context-surfacing");
   if (wasPromptSeenRecently(store, "context-surfacing", prompt)) {
     return makeEmptyOutput("context-surfacing");
@@ -157,7 +184,7 @@ export async function contextSurfacing(
     }
   }
 
-  if (results.length === 0) return makeEmptyOutput("context-surfacing");
+  if (results.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
 
   // Budget-aware deep escalation (deep profile only):
   // If the fast path finished quickly and found results, spend remaining time budget
@@ -215,7 +242,7 @@ export async function contextSurfacing(
     !FILTERED_PATHS.some(p => r.displayPath.includes(p))
   );
 
-  if (results.length === 0) return makeEmptyOutput("context-surfacing");
+  if (results.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
 
   // Filter out snoozed documents
   const now = new Date();
@@ -231,7 +258,7 @@ export async function contextSurfacing(
     return true;
   });
 
-  if (results.length === 0) return makeEmptyOutput("context-surfacing");
+  if (results.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
 
   // Deduplicate by filepath (keep best score per path)
   const deduped = new Map<string, SearchResult>();
@@ -273,7 +300,7 @@ export async function contextSurfacing(
       : 0;
 
     // Activation floor: if even the best result is too weak, bail entirely
-    if (bestScore < profile.activationFloor) return makeEmptyOutput("context-surfacing");
+    if (bestScore < profile.activationFloor) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
 
     const adaptiveMin = Math.max(bestScore * profile.minScoreRatio, profile.absoluteFloor);
     scored = allScored.filter(r => r.compositeScore >= adaptiveMin);
@@ -282,7 +309,7 @@ export async function contextSurfacing(
     scored = allScored.filter(r => r.compositeScore >= minScore);
   }
 
-  if (scored.length === 0) return makeEmptyOutput("context-surfacing");
+  if (scored.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
 
   // Spreading activation (E11): boost results co-activated with top HOT results
   if (scored.length > 3) {
@@ -325,11 +352,62 @@ export async function contextSurfacing(
   // Build context within token budget (profile-driven)
   const { context, paths, tokens } = buildContext(scored, prompt, tokenBudget);
 
-  if (!context) return makeEmptyOutput("context-surfacing");
+  if (!context) {
+    logEmptyTurn(store, input);
+    return makeEmptyOutput("context-surfacing");
+  }
 
-  // Log the injection
+  // Use pre-computed turn_index from top of function
   if (input.sessionId) {
-    logInjection(store, input.sessionId, "context-surfacing", paths, tokens);
+    const turnIndex = (input as any)._turnIndex ?? 0;
+
+    // Log the injection — returns usage_id for recall event linkage
+    const usageId = logInjection(store, input.sessionId, "context-surfacing", paths, tokens, turnIndex);
+
+    // Record recall events ONLY for docs that made it into the injected context
+    // (post-budget). Docs trimmed by token budget were never seen by the model.
+    // Each event links to its context_usage row via usage_id + turn_index.
+    // Multi-vault: route docs to origin vault's store. Mirror context_usage there too.
+    try {
+      const qHash = hashQuery(prompt);
+      const injectedSet = new Set(paths);
+      const injectedScored = scored.filter(r => injectedSet.has(r.displayPath));
+
+      // Group by vault origin (undefined = general vault)
+      const byVault = new Map<string | undefined, typeof injectedScored>();
+      for (const r of injectedScored) {
+        const vault = (r as any)._fromVault as string | undefined;
+        let group = byVault.get(vault);
+        if (!group) { group = []; byVault.set(vault, group); }
+        group.push(r);
+      }
+
+      const validUsageId = usageId > 0 ? usageId : undefined;
+      for (const [vault, docs] of byVault) {
+        const mappedDocs = docs.map(r => ({ displayPath: r.displayPath, searchScore: r.compositeScore }));
+        if (!vault) {
+          writeRecallEvents(store, input.sessionId, qHash, mappedDocs, validUsageId, turnIndex);
+        } else {
+          try {
+            const vaultStore = resolveStore(vault);
+            // Mirror context_usage row into named vault for correct FK + attribution
+            const vaultPaths = docs.map(r => r.displayPath);
+            const vaultUsageId = vaultStore.insertUsage({
+              sessionId: input.sessionId,
+              timestamp: new Date().toISOString(),
+              hookName: "context-surfacing",
+              injectedPaths: vaultPaths,
+              estimatedTokens: 0,
+              wasReferenced: 0,
+              turnIndex,
+            });
+            writeRecallEvents(vaultStore, input.sessionId, qHash, mappedDocs, vaultUsageId > 0 ? vaultUsageId : undefined, turnIndex);
+          } catch { /* vault unavailable — skip */ }
+        }
+      }
+    } catch {
+      // Non-critical — don't block context surfacing on recall tracking errors
+    }
   }
 
   // Routing hint: detect query intent signals and prepend a tool routing directive
@@ -350,6 +428,19 @@ export async function contextSurfacing(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/**
+ * Log an empty context_usage row for a skipped turn.
+ * Keeps turn_index aligned with transcript turns so per-turn recall
+ * attribution doesn't drift when some prompts are gated.
+ */
+function logEmptyTurn(store: Store, input: HookInput): void {
+  if (!input.sessionId) return;
+  try {
+    const turnIndex = (input as any)._turnIndex ?? 0;
+    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex);
+  } catch { /* non-fatal */ }
+}
 
 /**
  * Detect causal/temporal/discovery signals in the prompt and return a
