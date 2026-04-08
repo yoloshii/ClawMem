@@ -354,6 +354,7 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 - Do NOT pin everything — pin is for persistent high-priority items, not temporary boosting.
 - Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it naturally.
 - Do NOT run `build_graphs` after every reindex — A-MEM creates per-doc links automatically. Only after bulk ingestion or when `intent_search` returns weak graph results.
+- Do NOT run `clawmem mine` autonomously — it is a bulk ingestion command (same category as `update`/`reindex`). Suggest it to the user when they mention old conversation exports, but let them run it. Bulk import has disk/embedding cost implications that need user consent.
 
 ## Tool Selection (one-liner)
 
