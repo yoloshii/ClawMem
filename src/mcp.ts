@@ -1919,6 +1919,61 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: kg_query (SPO Knowledge Graph)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "kg_query",
+    {
+      title: "Knowledge Graph Query",
+      description: "Query the knowledge graph for an entity's relationships. Returns structured facts with temporal validity (valid_from/valid_to). Use for 'what does X relate to?', 'what was true about X on date Y?', 'who/what is connected to X?'.",
+      inputSchema: {
+        entity: z.string().describe("Entity name or ID to query"),
+        as_of: z.string().optional().describe("Date filter (YYYY-MM-DD) — only facts valid at this date"),
+        direction: z.enum(["outgoing", "incoming", "both"]).optional().default("both").describe("Relationship direction"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
+    },
+    async ({ entity, as_of, direction, vault }) => {
+      const store = getStore(vault);
+
+      const entityResults = store.searchEntities(entity, 1);
+      const entityId = entityResults.length > 0
+        ? entityResults[0]!.entity_id
+        : entity.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+      const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction });
+      const stats = store.getTripleStats();
+
+      if (triples.length === 0) {
+        return {
+          content: [{ type: "text", text: `No knowledge graph facts found for "${entity}". The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current).` }],
+        };
+      }
+
+      const lines = [`Knowledge graph for "${entity}" (${triples.length} fact${triples.length === 1 ? '' : 's'}):\n`];
+
+      for (const t of triples) {
+        const validity = t.current ? "current" : `ended ${t.validTo}`;
+        const from = t.validFrom ? ` (since ${t.validFrom})` : "";
+        const conf = Math.round(t.confidence * 100);
+        lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]`);
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join('\n') }],
+        structuredContent: {
+          entity,
+          direction,
+          as_of: as_of ?? null,
+          facts: triples,
+          stats,
+        },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: memory_evolution_status (A-MEM)
   // ---------------------------------------------------------------------------
 
@@ -2404,6 +2459,99 @@ This is the recommended entry point for ALL memory queries.`,
           isError: true,
         };
       }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: diary_write
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "diary_write",
+    {
+      title: "Write Diary Entry",
+      description: "Write to the agent's diary. Use for recording important events, decisions, or observations in environments without hook support. Entries are stored as memories and are searchable.",
+      inputSchema: {
+        entry: z.string().describe("Diary entry text"),
+        topic: z.string().optional().default("general").describe("Topic tag (e.g., 'technical', 'user_facts', 'session')"),
+        agent: z.string().optional().default("agent").describe("Agent name writing the entry"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
+    },
+    async ({ entry, topic, agent, vault }) => {
+      const store = getStore(vault);
+      const now = new Date();
+      const dateStr = now.toISOString().slice(0, 10);
+      const timeStr = now.toISOString().slice(11, 19).replace(/:/g, "");
+      const ms = String(now.getMilliseconds()).padStart(3, "0");
+      const diaryPath = `diary/${dateStr}-${timeStr}${ms}-${topic}.md`;
+      const body = `---\ntitle: "${entry.slice(0, 80).replace(/"/g, '\\"')}"\ncontent_type: note\ntags: [diary, ${topic}]\ndomain: "${agent}"\n---\n\n${entry}`;
+
+      const result = store.saveMemory({
+        collection: "_clawmem",
+        path: diaryPath,
+        title: entry.slice(0, 80),
+        body,
+        contentType: "note",
+        confidence: 0.7,
+        semanticPayload: `${diaryPath}::${entry}`,
+      });
+
+      return {
+        content: [{ type: "text", text: `Diary entry saved (${result.action}, doc #${result.docId})` }],
+        structuredContent: { action: result.action, docId: result.docId, path: diaryPath },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: diary_read
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "diary_read",
+    {
+      title: "Read Diary Entries",
+      description: "Read recent diary entries. Use to review past observations and events recorded by the agent.",
+      inputSchema: {
+        last_n: z.number().optional().default(10).describe("Number of recent entries to return"),
+        agent: z.string().optional().describe("Filter by agent name"),
+        vault: z.string().optional().describe("Named vault (omit for default vault)"),
+      },
+    },
+    async ({ last_n, agent, vault }) => {
+      const store = getStore(vault);
+      const params: any[] = [];
+      let agentFilter = "";
+      if (agent) {
+        agentFilter = "AND d.domain = ?";
+        params.push(agent);
+      }
+      params.push(last_n);
+
+      const rows = store.db.prepare(`
+        SELECT d.id, d.path, d.title, d.modified_at as modifiedAt, d.domain
+        FROM documents d
+        WHERE d.active = 1 AND d.collection = '_clawmem' AND d.path LIKE 'diary/%'
+        ${agentFilter}
+        ORDER BY d.modified_at DESC
+        LIMIT ?
+      `).all(...params) as any[];
+
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: "No diary entries found." }] };
+      }
+
+      const lines = [`Diary (${rows.length} entries):\n`];
+      for (const row of rows) {
+        const agentLabel = row.domain ? ` [${row.domain}]` : "";
+        lines.push(`${row.modifiedAt.slice(0, 16)}${agentLabel} ${row.title}`);
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join('\n') }],
+        structuredContent: { entries: rows },
+      };
     }
   );
 

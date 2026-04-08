@@ -18,8 +18,12 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - The llama-server endpoint is unreachable while `CLAWMEM_NO_LOCAL_MODELS=true`.
 - Fix: Start the llama-server instance. Or set `CLAWMEM_NO_LOCAL_MODELS=false` for in-process fallback.
 
-**Unexpectedly slow inference (silent in-process fallback)**
-- If a llama-server instance crashes or is unreachable, ClawMem silently falls back to in-process inference via `node-llama-cpp`. With GPU acceleration (Metal on Apple Silicon, Vulkan on supported hardware), the fallback is fast for these small models. On CPU-only systems (no Metal, no Vulkan), inference is significantly slower. There is no visible warning either way.
+**"Remote LLM in cooldown, falling back to in-process generation"**
+- A transport failure (ECONNREFUSED, ETIMEDOUT) triggered a 60-second cooldown on the remote LLM server. During cooldown, `generate()` and `expandQuery()` use local node-llama-cpp. Remote is retried automatically after cooldown expires. HTTP errors (400, 500) and AbortError do NOT trigger cooldown — remote is retried on the next call.
+- Fix: Start the llama-server. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent local fallback (returns null / passthrough instead).
+
+**Unexpectedly slow inference (in-process fallback)**
+- When a remote llama-server is unreachable, ClawMem falls back to in-process inference via `node-llama-cpp` (logged as cooldown message). With GPU acceleration (Metal on Apple Silicon, Vulkan on supported hardware), the fallback is fast. On CPU-only systems, inference is significantly slower.
 - Fix: Run GPU servers via [systemd services](guides/systemd-services.md) with `Restart=on-failure`. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back.
 
 **Query expansion always fails or returns garbage**

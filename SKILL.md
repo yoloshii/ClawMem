@@ -242,9 +242,15 @@ Once escalated, route by query type:
 4. Chain tracing -> find_causal_links(docid, direction="both", depth=5)
    Traverses causal edges between _clawmem/agent/observations/ docs.
 
-5. Memory debugging -> memory_evolution_status(docid)
+5. Entity facts -> kg_query(entity, as_of?, direction?)
+   Structured SPO triples with temporal validity. Different from intent_search:
+   - kg_query: "what does ClawMem relate to?" -> returns structured facts (subject-predicate-object)
+   - intent_search: "why did we choose ClawMem?" -> returns documents with causal reasoning
+   Use kg_query for entity lookup, intent_search for causal chains.
 
-6. Temporal context -> timeline(docid, before=5, after=5, same_collection=false)
+6. Memory debugging -> memory_evolution_status(docid)
+
+7. Temporal context -> timeline(docid, before=5, after=5, same_collection=false)
    Shows what was created/modified before and after a document.
    Use after search to understand chronological neighborhood.
 ```
@@ -277,6 +283,9 @@ Once escalated, route by query type:
 | `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
 | `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
 | `vault_sync` | Index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories. |
+| `kg_query` | Query SPO knowledge graph for entity relationships with temporal validity. Uses entity resolution. |
+| `diary_write` | Write diary entry. Use proactively in non-hooked environments. Do NOT use in Claude Code. |
+| `diary_read` | Read recent diary entries. Filter by agent name. |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |
 | `lifecycle_sweep` | Run lifecycle policies: archive stale docs. Defaults to dry_run (preview only). |
 | `lifecycle_restore` | Restore auto-archived documents. Filter by query, collection, or all. Does NOT restore manually forgotten docs. |
@@ -567,6 +576,8 @@ When `decision-extractor` detects a new decision contradicting an old one, the o
 - Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it.
 - Do NOT run `build_graphs` after every reindex — A-MEM creates per-doc links automatically.
 - Do NOT run `clawmem mine` autonomously — it is a bulk ingestion command. Suggest it to the user when they mention old conversation exports, but let them run it.
+- Do NOT use `diary_write` in Claude Code — hooks capture this automatically. Diary is for non-hooked environments only (Hermes, Gemini, plain MCP).
+- Do NOT use `kg_query` for causal "why" questions — use `intent_search` or `memory_retrieve`. `kg_query` returns structured entity facts (SPO triples), not reasoning chains.
 
 ---
 

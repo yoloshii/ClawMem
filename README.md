@@ -176,7 +176,7 @@ ClawMem integrates via hooks (`settings.json`) and an MCP stdio server. Hooks ha
 
 ```bash
 clawmem setup hooks    # Install lifecycle hooks (SessionStart, UserPromptSubmit, Stop, PreCompact)
-clawmem setup mcp      # Register MCP server in ~/.claude.json (28 tools)
+clawmem setup mcp      # Register MCP server in ~/.claude.json (31 tools)
 ```
 
 **Automatic (90%):** `context-surfacing` injects relevant memory on every prompt. `postcompact-inject` re-injects state after compaction. `decision-extractor`, `handoff-generator`, `feedback-loop` capture session state on stop.
@@ -203,7 +203,7 @@ Disable OpenClaw's native memory and `memory-lancedb` auto-recall/capture to avo
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
-**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 28 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
 
 #### Hermes Agent
 
@@ -473,7 +473,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 ### MCP Server
 
-ClawMem exposes 28 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
+ClawMem exposes 31 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
 
 **Claude Code (automatic):**
 
@@ -678,7 +678,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (28)
+## MCP Tools (31)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
@@ -715,6 +715,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `build_graphs` | Build temporal and/or semantic graphs from document corpus |
 | `find_causal_links` | Trace decision chains: "what led to X", "how we got from A to B". Follow up `intent_search` with this tool on a top result to walk the full causal chain. Traverses causes / caused_by / both up to N hops with depth-annotated reasoning. |
+| `kg_query` | Query the SPO knowledge graph: "what does X relate to?", "what was true about X when?". Returns temporal entity-relationship triples with validity windows. Uses entity resolution for lookup. |
 | `memory_evolution_status` | Show how a document's A-MEM metadata evolved over time |
 | `timeline` | Show the temporal neighborhood around a document — what was created/modified before and after it. Progressive disclosure: search → timeline (context) → get (full content). Supports same-collection scoping and session correlation. |
 
@@ -730,6 +731,13 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
 | `vault_sync` | Index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories. |
+
+### Agent Diary
+
+| Tool | Description |
+|---|---|
+| `diary_write` | Write a diary entry. Use for recording important events, decisions, or observations in environments without hook support. Stored as searchable memories. |
+| `diary_read` | Read recent diary entries. Filter by agent name. |
 
 ### Memory Management & Lifecycle
 
@@ -1112,6 +1120,7 @@ Built on the shoulders of:
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) — MemoryProvider plugin integration, memory nudge system (periodic lifecycle tool prompting)
 - [Hindsight](https://github.com/vectorize-io/hindsight) — entity resolution, MPFP graph traversal, temporal extraction, 3-tier consolidation, observation invalidation, 4-way parallel retrieval
 - [MAGMA](https://arxiv.org/abs/2501.13956) — multi-graph memory agent
+- [MemPalace](https://github.com/milla-jovovich/mempalace) — conversation import patterns, broadened observation taxonomy (preference/milestone/problem), session-bootstrap synthesis
 - [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) — retrieval gate, length normalization, MMR diversity, access reinforcement algorithms
 - [OpenViking](https://github.com/volcengine/OpenViking) — query decomposition patterns, collection-scoped retrieval, transaction-safe indexing
 - [QMD](https://github.com/tobi/qmd) — search backend (BM25 + vectors + RRF + reranking)

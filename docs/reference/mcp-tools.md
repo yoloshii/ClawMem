@@ -298,3 +298,39 @@ Index markdown from a directory into a named vault.
 | `collection_name` | string | vault name | Collection name in the vault |
 
 Restricted-path validation rejects sensitive directories (`/etc/`, `/root/`, `.ssh`, `.env`, `credentials`, `.aws`, `.kube`).
+
+### kg_query
+
+Query the SPO knowledge graph for an entity's temporal relationships.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `entity` | string | required | Entity name or ID |
+| `as_of` | string | — | Date filter (YYYY-MM-DD) — only facts valid at this date |
+| `direction` | enum | `both` | `outgoing`, `incoming`, or `both` |
+| `vault` | string | — | Named vault |
+
+Uses entity resolution (FTS search) first, falls back to slug normalization. Returns triples with subject, predicate, object, valid_from, valid_to, confidence, and current status.
+
+### diary_write
+
+Write to the agent's diary. For non-hooked environments where hooks don't capture session context automatically.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `entry` | string | required | Diary entry text |
+| `topic` | string | `general` | Topic tag (e.g., 'technical', 'user_facts', 'session') |
+| `agent` | string | `agent` | Agent name writing the entry |
+| `vault` | string | — | Named vault |
+
+Entries stored via `saveMemory()` with ms-resolution paths to prevent dedup of rapid writes.
+
+### diary_read
+
+Read recent diary entries.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `last_n` | number | 10 | Number of entries to return |
+| `agent` | string | — | Filter by agent name |
+| `vault` | string | — | Named vault |

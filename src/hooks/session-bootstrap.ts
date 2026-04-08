@@ -78,13 +78,13 @@ export async function sessionBootstrap(
     }
   }
 
-  // 2. Recent decisions
-  const decisionSection = getRecentDecisions(store, DECISION_TOKEN_BUDGET);
-  if (decisionSection) {
-    const tokens = estimateTokens(decisionSection.text);
+  // 2. Current focus (recent preferences + active problems)
+  const focusSection = getCurrentFocus(store, DECISION_TOKEN_BUDGET);
+  if (focusSection) {
+    const tokens = estimateTokens(focusSection.text);
     if (totalTokens + tokens <= TOTAL_TOKEN_BUDGET) {
-      sections.push(decisionSection.text);
-      paths.push(...decisionSection.paths);
+      sections.push(focusSection.text);
+      paths.push(...focusSection.paths);
       totalTokens += tokens;
     }
   }
@@ -252,38 +252,90 @@ function extractSection(body: string, sectionName: string): string | null {
   return text.length > 10 ? `**${sectionName}:**\n${text}` : null;
 }
 
-function getRecentDecisions(
+function getCurrentFocus(
   store: Store,
   maxTokens: number
 ): { text: string; paths: string[] } | null {
-  const decisions = store.getDocumentsByType("decision", 5);
-  if (decisions.length === 0) return null;
-
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - DECISION_LOOKBACK_DAYS);
   const cutoffStr = cutoff.toISOString();
 
-  // Filter to recent decisions
-  const recent = decisions.filter(d => d.modifiedAt >= cutoffStr);
-  if (recent.length === 0) return null;
+  // Gather recent decisions, preferences, and active problems
+  const decisions = store.getDocumentsByType("decision", 10);
+  const preferences = store.getDocumentsByType("preference", 5);
+  const problems = store.getDocumentsByType("problem", 5);
+
+  // Rank by: pinned first, then recency, then access_count
+  const now = Date.now();
+  const rankDoc = (d: any) => {
+    const pinBoost = d.pinned ? 1000 : 0;
+    const daysSince = (now - new Date(d.modifiedAt).getTime()) / 86400000;
+    const recencyScore = Math.max(0, 100 - daysSince * 5); // 0-100, loses 5 per day
+    const accessScore = (d.accessCount ?? 0) * 2;
+    return pinBoost + recencyScore + accessScore;
+  };
+
+  const recentDecisions = decisions
+    .filter(d => d.modifiedAt >= cutoffStr)
+    .sort((a, b) => rankDoc(b) - rankDoc(a));
+
+  const activeProblems = problems
+    .filter(d => d.modifiedAt >= cutoffStr && (d.confidence ?? 0.5) > 0.2);
+
+  // Preferences are durable — no date filter, just rank
+  const rankedPrefs = [...preferences].sort((a, b) => rankDoc(b) - rankDoc(a));
+
+  if (recentDecisions.length === 0 && rankedPrefs.length === 0 && activeProblems.length === 0) {
+    return null;
+  }
 
   const maxChars = maxTokens * 4;
-  const lines: string[] = ["### Recent Decisions"];
+  const lines: string[] = ["### Current Focus"];
   const paths: string[] = [];
-  let charCount = 25; // header
+  let charCount = 20;
 
-  for (const d of recent) {
-    if (charCount >= maxChars) break;
-    let body = store.getDocumentBody({ filepath: `${d.collection}/${d.path}`, displayPath: `${d.collection}/${d.path}` } as any);
-    if (body) body = sanitizeSnippet(body);
-    if (body === "[content filtered for security]") continue;
-    const snippet = body ? smartTruncate(body, 200) : d.title;
-    const entry = `- **${d.title}** (${d.modifiedAt.slice(0, 10)})\n  ${snippet}`;
-    const entryLen = entry.length;
-    if (charCount + entryLen > maxChars && lines.length > 1) break;
-    lines.push(entry);
-    paths.push(`${d.collection}/${d.path}`);
-    charCount += entryLen;
+  // Active problems first (high priority)
+  if (activeProblems.length > 0) {
+    lines.push("**Active Problems:**");
+    charCount += 22;
+    for (const d of activeProblems) {
+      if (charCount >= maxChars) break;
+      const entry = `- ${d.title} (${d.modifiedAt.slice(0, 10)})`;
+      lines.push(entry);
+      paths.push(`${d.collection}/${d.path}`);
+      charCount += entry.length + 2;
+    }
+  }
+
+  // Recent decisions
+  if (recentDecisions.length > 0) {
+    lines.push("**Recent Decisions:**");
+    charCount += 24;
+    for (const d of recentDecisions) {
+      if (charCount >= maxChars) break;
+      let body = store.getDocumentBody({ filepath: `${d.collection}/${d.path}`, displayPath: `${d.collection}/${d.path}` } as any);
+      if (body) body = sanitizeSnippet(body);
+      if (body === "[content filtered for security]") continue;
+      const snippet = body ? smartTruncate(body, 200) : d.title;
+      const entry = `- **${d.title}** (${d.modifiedAt.slice(0, 10)})\n  ${snippet}`;
+      if (charCount + entry.length > maxChars && lines.length > 2) break;
+      lines.push(entry);
+      paths.push(`${d.collection}/${d.path}`);
+      charCount += entry.length;
+    }
+  }
+
+  // User preferences (compact — title only, they're durable context)
+  if (rankedPrefs.length > 0) {
+    lines.push("**Preferences:**");
+    charCount += 18;
+    for (const d of rankedPrefs) {
+      if (charCount >= maxChars) break;
+      const entry = `- ${d.title}`;
+      lines.push(entry);
+      paths.push(`${d.collection}/${d.path}`);
+      charCount += entry.length + 2;
+    }
   }
 
   return lines.length > 1 ? { text: lines.join("\n"), paths } : null;
@@ -299,12 +351,15 @@ function getStaleNotes(
 
   if (stale.length === 0) return null;
 
+  // Rank by confidence descending — higher confidence notes are more important to review
+  const ranked = [...stale].sort((a, b) => (b.confidence ?? 0.5) - (a.confidence ?? 0.5));
+
   const maxChars = maxTokens * 4;
   const lines: string[] = ["### Notes to Review"];
   const paths: string[] = [];
   let charCount = 25;
 
-  for (const d of stale.slice(0, 5)) {
+  for (const d of ranked.slice(0, 5)) {
     const entry = `- ${d.title} (${d.collection}/${d.path}) — last modified ${d.modifiedAt.slice(0, 10)}`;
     if (charCount + entry.length > maxChars && lines.length > 1) break;
     lines.push(entry);

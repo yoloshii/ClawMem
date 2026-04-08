@@ -84,7 +84,9 @@ BM25 uses SQLite's FTS5 extension with prefix matching. Vector search uses the `
 
 ClawMem maintains a `memory_relations` table of typed edges between documents: semantic, supporting, contradicts, causal, and temporal. These edges let `intent_search` answer "why" and "what led to" questions by following chains across documents rather than relying on keyword or vector similarity alone.
 
-Most edges are created automatically. When new documents are indexed, A-MEM finds vector neighbors and uses the LLM to classify relationships (semantic, supporting, contradicts). When `decision-extractor` runs after each response, it infers causal links between observations. The `build_graphs` MCP tool adds temporal backbone edges (creation-order) and bulk semantic edges — run it after large ingestion batches, not after routine indexing.
+A separate `entity_triples` table stores structured SPO (Subject-Predicate-Object) facts with temporal validity (`valid_from`/`valid_to`). Triples are extracted automatically from observation facts by `decision-extractor` — only from decision, preference, milestone, and problem observations to avoid noise. Query via `kg_query(entity)` for structured entity relationships.
+
+Most edges are created automatically. When new documents are indexed, A-MEM finds vector neighbors and uses the LLM to classify relationships (semantic, supporting, contradicts). When `decision-extractor` runs after each response, it infers causal links between observations and extracts SPO triples from facts. The `build_graphs` MCP tool adds temporal backbone edges (creation-order) and bulk semantic edges — run it after large ingestion batches, not after routine indexing.
 
 See [graph traversal](../internals/graph-traversal.md) for edge types, traversal mechanics, and beam search details.
 

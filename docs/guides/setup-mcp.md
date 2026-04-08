@@ -28,7 +28,7 @@ Add to your MCP client config:
 
 ## What it exposes
 
-The MCP server registers 28 tools:
+The MCP server registers 31 tools:
 
 **Retrieval** — `memory_retrieve`, `query`, `search`, `vsearch`, `intent_search`, `query_plan`
 
@@ -41,6 +41,10 @@ The MCP server registers 28 tools:
 **Maintenance** — `status`, `reindex`, `index_stats`, `build_graphs`, `profile`, `beads_sync`
 
 **Vault** — `list_vaults`, `vault_sync`
+
+**Knowledge Graph** — `kg_query`
+
+**Diary** — `diary_write`, `diary_read`
 
 **Workflow** — `__IMPORTANT` (read-first instructions for agents)
 

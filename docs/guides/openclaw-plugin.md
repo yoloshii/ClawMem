@@ -95,7 +95,7 @@ For cross-machine setups where one runtime is on a different host:
 | Method | How | Latency | Full feature set |
 |--------|-----|---------|-----------------|
 | **REST API** | Run `clawmem serve --port 7438` on the vault host. Remote agents call HTTP endpoints. | ~5-20ms per call | Search, retrieval, lifecycle, graph traversal. No hooks (hooks are local-only). |
-| **MCP over SSE** | Run the MCP server as an SSE transport instead of stdio. Configure the remote MCP client (Claude Code, OpenClaw, etc.) to connect via SSE URL. | ~5-20ms per call | All 28 MCP tools. No hooks. |
+| **MCP over SSE** | Run the MCP server as an SSE transport instead of stdio. Configure the remote MCP client (Claude Code, OpenClaw, etc.) to connect via SSE URL. | ~5-20ms per call | All 31 MCP tools. No hooks. |
 
 In both cases, hooks (context-surfacing, decision-extractor, etc.) only run on the machine where the vault lives. Remote agents get tool access but not automatic context injection.
 

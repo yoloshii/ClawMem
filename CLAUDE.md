@@ -307,9 +307,15 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 4. Chain tracing → find_causal_links(docid, direction="both", depth=5)
    Traverses causal edges between _clawmem/agent/observations/ docs (from decision-extractor).
 
-5. Memory debugging → memory_evolution_status(docid)
+5. Entity facts → kg_query(entity, as_of?, direction?)
+   Structured SPO triples with temporal validity. Different from intent_search:
+   - kg_query: "what does ClawMem relate to?" → returns structured facts (subject-predicate-object)
+   - intent_search: "why did we choose ClawMem?" → returns documents with causal reasoning
+   Use kg_query for entity lookup, intent_search for causal chains.
 
-6. Temporal context → timeline(docid, before=5, after=5, same_collection=false)
+6. Memory debugging → memory_evolution_status(docid)
+
+7. Temporal context → timeline(docid, before=5, after=5, same_collection=false)
    Shows what was created/modified before and after a document.
    Use after search to understand chronological neighborhood.
 ```
@@ -327,6 +333,9 @@ All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculativ
 - `timeline(docid, before=5, after=5, same_collection=false)` — temporal neighborhood around a document. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation.
 - `list_vaults()` — show configured vault names and paths. Empty in single-vault mode (default).
 - `vault_sync(vault, content_root, pattern?, collection_name?)` — index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories (`/etc/`, `/root/`, `.ssh`, `.env`, `credentials`, etc.).
+- `kg_query(entity, as_of?, direction?)` — query the SPO knowledge graph for an entity's relationships. Returns temporal triples with validity windows. USE THIS for "what does X relate to?", "what was true about X in January?". Uses entity resolution for lookup.
+- `diary_write(entry, topic?, agent?)` — write a diary entry. USE PROACTIVELY in non-hooked environments (Hermes, Gemini, plain MCP) for recording important events and decisions. Do NOT use in Claude Code (hooks handle this automatically).
+- `diary_read(last_n?, agent?)` — read recent diary entries.
 
 ### Multi-Vault
 
@@ -355,6 +364,8 @@ Pin, snooze, and forget are **manual MCP tools** — not automated. The agent sh
 - Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it naturally.
 - Do NOT run `build_graphs` after every reindex — A-MEM creates per-doc links automatically. Only after bulk ingestion or when `intent_search` returns weak graph results.
 - Do NOT run `clawmem mine` autonomously — it is a bulk ingestion command (same category as `update`/`reindex`). Suggest it to the user when they mention old conversation exports, but let them run it. Bulk import has disk/embedding cost implications that need user consent.
+- Do NOT use `diary_write` in Claude Code — hooks (`decision-extractor`, `handoff-generator`) capture this automatically. Diary is for non-hooked environments only (Hermes, Gemini, plain MCP clients).
+- Do NOT use `kg_query` for causal "why" questions — use `intent_search` or `memory_retrieve`. `kg_query` returns structured entity facts (SPO triples), not reasoning chains.
 
 ## Tool Selection (one-liner)
 
@@ -563,6 +574,12 @@ User Query → Intent Classification (WHY/WHEN/ENTITY/WHAT)
 Symptom: "Local model download blocked" error
   → llama-server endpoint unreachable while CLAWMEM_NO_LOCAL_MODELS=true.
   → Fix: Start the llama-server instance. Or set CLAWMEM_NO_LOCAL_MODELS=false for in-process fallback.
+
+Symptom: "[generate] Remote LLM in cooldown, falling back to in-process generation"
+  → Remote LLM server had a transport failure (ECONNREFUSED/ETIMEDOUT). ClawMem set a 60s cooldown
+    and is using local node-llama-cpp. Remote will be retried after cooldown expires.
+  → Not an error if you expect local fallback. If you want remote only: ensure llama-server is running,
+    or set CLAWMEM_NO_LOCAL_MODELS=true to get null instead of slow local inference.
 
 Symptom: Query expansion always fails / returns garbage
   → On CPU-only systems, in-process inference is significantly slower and less reliable. Systems with GPU acceleration (Metal/Vulkan) handle these models well in-process.

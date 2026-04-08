@@ -24,6 +24,10 @@ Most edges are created automatically during indexing (A-MEM link generation) and
 | **`buildTemporalBackbone()`** | temporal | `build_graphs` MCP tool (manual). Creation-order edges between all active docs. |
 | **`buildSemanticGraph()`** | semantic | `build_graphs` MCP tool (manual). Pure cosine similarity between embeddings. |
 
+### SPO knowledge graph (entity_triples)
+
+Separate from `memory_relations`, the `entity_triples` table stores structured Subject-Predicate-Object facts with temporal validity (`valid_from`/`valid_to`). Triples are extracted from observation facts by `decision-extractor` — only from decision, preference, milestone, and problem types. Query via `kg_query(entity)` MCP tool. This is not used by `adaptiveTraversal()` — it serves a different purpose (structured entity lookup vs document graph traversal).
+
 ### Edge collision
 
 Both `generateMemoryLinks()` and `buildSemanticGraph()` insert `semantic` edges. The primary key is `(source_id, target_id, relation_type)` — first writer wins (`INSERT OR IGNORE`). A-MEM edges take precedence if they exist.

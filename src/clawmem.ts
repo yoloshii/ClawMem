@@ -1868,6 +1868,9 @@ async function main() {
       case "curate":
         await cmdCurate(subArgs);
         break;
+      case "diary":
+        await cmdDiary(subArgs);
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -2207,6 +2210,99 @@ interface CuratorReport {
   actions: string[];
 }
 
+async function cmdDiary(args: string[]) {
+  const subCmd = args[0];
+  const subArgs = args.slice(1);
+
+  switch (subCmd) {
+    case "write": {
+      const { values, positionals } = parseArgs({
+        args: subArgs,
+        options: {
+          topic: { type: "string", short: "t", default: "general" },
+          agent: { type: "string", short: "a", default: "user" },
+        },
+        allowPositionals: true,
+      });
+
+      const entry = positionals.join(" ");
+      if (!entry) die("Usage: clawmem diary write <entry text> [-t topic] [-a agent-name]");
+
+      const s = getStore();
+      const now = new Date();
+      const dateStr = now.toISOString().slice(0, 10);
+      const timeStr = now.toISOString().slice(11, 19).replace(/:/g, "");
+      const ms = String(now.getMilliseconds()).padStart(3, "0");
+      const diaryPath = `diary/${dateStr}-${timeStr}${ms}-${values.topic}.md`;
+      const body = [
+        "---",
+        `title: "${entry.slice(0, 80).replace(/"/g, '\\"')}"`,
+        `content_type: note`,
+        `tags: [diary, ${values.topic}]`,
+        `domain: "${values.agent}"`,
+        "---",
+        "",
+        entry,
+      ].join("\n");
+
+      const result = s.saveMemory({
+        collection: "_clawmem",
+        path: diaryPath,
+        title: entry.slice(0, 80),
+        body,
+        contentType: "note",
+        confidence: 0.7,
+        semanticPayload: `${diaryPath}::${entry}`,
+      });
+
+      console.log(`${c.green}✓${c.reset} Diary entry saved (${result.action}, doc #${result.docId})`);
+      break;
+    }
+
+    case "read": {
+      const { values } = parseArgs({
+        args: subArgs,
+        options: {
+          last: { type: "string", short: "n", default: "10" },
+          agent: { type: "string", short: "a" },
+        },
+        allowPositionals: false,
+      });
+
+      const limit = parseInt(values.last || "10", 10);
+      const s = getStore();
+
+      const rows = s.db.prepare(`
+        SELECT d.id, d.path, d.title, d.modified_at as modifiedAt, d.domain,
+               c.doc as body
+        FROM documents d
+        JOIN content c ON c.hash = d.hash
+        WHERE d.active = 1 AND d.collection = '_clawmem' AND d.path LIKE 'diary/%'
+        ${values.agent ? "AND d.domain = ?" : ""}
+        ORDER BY d.modified_at DESC
+        LIMIT ?
+      `).all(...(values.agent ? [values.agent, limit] : [limit])) as any[];
+
+      if (rows.length === 0) {
+        console.log("No diary entries found.");
+        break;
+      }
+
+      console.log(`${c.bold}Diary${c.reset} (${rows.length} entries)\n`);
+      for (const row of rows) {
+        const agent = row.domain ? ` [${row.domain}]` : "";
+        console.log(`${c.dim}${row.modifiedAt.slice(0, 16)}${c.reset}${agent} ${row.title}`);
+      }
+      break;
+    }
+
+    default:
+      console.log(`Usage:
+  clawmem diary write <entry> [-t topic] [-a agent]   Write diary entry
+  clawmem diary read [-n limit] [-a agent]            Read recent entries`);
+  }
+}
+
 async function cmdCurate(_args: string[]) {
   const s = getStore();
   const report: CuratorReport = {
@@ -2422,6 +2518,8 @@ ${c.bold}Intelligence:${c.reset}
   clawmem reflect [days]               Cross-session pattern analysis
   clawmem consolidate [--dry-run]      Merge duplicate low-confidence docs
   clawmem curate                       Automated maintenance (health, sweep, dedup, hygiene)
+  clawmem diary write <entry> [-t topic]  Write a diary entry (for non-hooked environments)
+  clawmem diary read [-n N] [-a agent]    Read recent diary entries
 
 ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server

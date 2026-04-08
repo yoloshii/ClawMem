@@ -45,6 +45,7 @@ src/
   indexer.ts         Collection scanner, document indexer
   collections.ts     Collection configuration loader
   validation.ts      Input validation helpers
+  normalize.ts       Conversation format normalizer (Claude, ChatGPT, Slack, plain text)
   limits.ts          Constants (max path length, query length)
   errors.ts          Error types
   promptguard.ts     Prompt injection sanitization

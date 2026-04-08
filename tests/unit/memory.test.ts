@@ -335,3 +335,76 @@ describe("applyCompositeScoring", () => {
     expect(scored[0]!.contentType).toBe("decision");
   });
 });
+
+// ─── New content types (v0.5.0) ─────────────────────────────────────
+
+describe("conversation content type", () => {
+  it("infers from path containing 'conversation'", () => {
+    expect(inferContentType("chats/conversation-2026-04-08.md")).toBe("conversation");
+  });
+
+  it("infers from path containing 'chat'", () => {
+    expect(inferContentType("exports/chat-export.md")).toBe("conversation");
+  });
+
+  it("infers from path containing 'transcript'", () => {
+    expect(inferContentType("logs/transcript-001.md")).toBe("conversation");
+  });
+
+  it("has 45-day half-life", () => {
+    expect(HALF_LIVES.conversation).toBe(45);
+  });
+
+  it("has 0.55 confidence baseline", () => {
+    expect(TYPE_BASELINES.conversation).toBe(0.55);
+  });
+
+  it("is classified as episodic", () => {
+    expect(inferMemoryType("chats/convo.md", "conversation")).toBe("episodic");
+  });
+});
+
+describe("preference content type", () => {
+  it("has infinite half-life", () => {
+    expect(HALF_LIVES.preference).toBe(Infinity);
+  });
+
+  it("has 0.80 confidence baseline", () => {
+    expect(TYPE_BASELINES.preference).toBe(0.80);
+  });
+
+  it("is accepted as explicit content_type", () => {
+    expect(inferContentType("any/path.md", "preference")).toBe("preference");
+  });
+});
+
+describe("milestone content type", () => {
+  it("has 60-day half-life", () => {
+    expect(HALF_LIVES.milestone).toBe(60);
+  });
+
+  it("has 0.70 confidence baseline", () => {
+    expect(TYPE_BASELINES.milestone).toBe(0.70);
+  });
+});
+
+describe("problem content type", () => {
+  it("has 60-day half-life", () => {
+    expect(HALF_LIVES.problem).toBe(60);
+  });
+
+  it("has 0.75 confidence baseline", () => {
+    expect(TYPE_BASELINES.problem).toBe(0.75);
+  });
+});
+
+describe("preference decay exemption", () => {
+  it("preference does not decay with attention", () => {
+    // preference should behave like decision — confidence stays high regardless of last access
+    const prefScore = confidenceScore("preference", "2026-01-01", 0, NOW, "2026-01-01");
+    const decisionScore = confidenceScore("decision", "2026-01-01", 0, NOW, "2026-01-01");
+    // Both decay-exempt, so both should NOT have attention decay applied
+    // (prefScore may differ from decisionScore due to different baselines, but neither should have attention penalty)
+    expect(prefScore).toBeGreaterThan(0.3); // not decayed to near-zero
+  });
+});

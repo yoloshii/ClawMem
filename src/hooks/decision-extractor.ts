@@ -374,6 +374,32 @@ export async function decisionExtractor(
         console.log(`[decision-extractor] Error in causal inference:`, err);
       }
     }
+
+    // Extract SPO triples from observation facts (preference/decision types get priority)
+    for (const obs of observations) {
+      if (!obs.facts || obs.facts.length === 0) continue;
+      for (const fact of obs.facts) {
+        const triple = extractTripleFromFact(fact, obs.type);
+        if (triple) {
+          try {
+            store.db.prepare(
+              "INSERT OR IGNORE INTO entity_nodes (entity_id, name, entity_type, created_at) VALUES (?, ?, ?, ?)"
+            ).run(triple.subjectId, triple.subject, "auto", new Date().toISOString());
+            if (triple.objectId) {
+              store.db.prepare(
+                "INSERT OR IGNORE INTO entity_nodes (entity_id, name, entity_type, created_at) VALUES (?, ?, ?, ?)"
+              ).run(triple.objectId, triple.object, "auto", new Date().toISOString());
+            }
+            store.addTriple(triple.subjectId, triple.predicate, triple.objectId, triple.objectId ? null : triple.object, {
+              confidence: obs.type === "decision" || obs.type === "preference" ? 0.9 : 0.7,
+              sourceFact: fact,
+            });
+          } catch {
+            // Triple insertion errors are non-fatal
+          }
+        }
+      }
+    }
   }
 
   // Extract decisions (observer-first, regex fallback)
@@ -662,4 +688,70 @@ function formatObservation(obs: Observation, dateStr: string, sessionId: string)
   }
 
   return lines.join("\n");
+}
+
+// =============================================================================
+// SPO Triple Extraction from Facts
+// =============================================================================
+
+type ExtractedTriple = {
+  subject: string;
+  subjectId: string;
+  predicate: string;
+  object: string;
+  objectId: string | null;
+};
+
+function toEntityId(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+}
+
+function extractTripleFromFact(fact: string, obsType: string): ExtractedTriple | null {
+  // Only extract from decision/preference/milestone/problem types — skip noisy bugfix/feature/change facts
+  if (!["decision", "preference", "milestone", "problem"].includes(obsType)) return null;
+
+  // Conservative verb patterns — only clear relational predicates
+  const verbPatterns = [
+    /^(.+?)\s+(chose|selected|switched to|migrated to|adopted)\s+(.+?)\.?$/i,
+    /^(.+?)\s+(deployed to|runs on|hosted on|installed on)\s+(.+?)\.?$/i,
+    /^(.+?)\s+(replaced|superseded|deprecated)\s+(.+?)\.?$/i,
+    /^(.+?)\s+(depends on|integrates with|connects to)\s+(.+?)\.?$/i,
+  ];
+
+  for (const pattern of verbPatterns) {
+    const match = fact.match(pattern);
+    if (match) {
+      const subject = match[1]!.trim();
+      const predicate = match[2]!.trim();
+      const object = match[3]!.trim();
+
+      // Reject subjects/objects that look like sentences rather than entity names
+      if (subject.length < 3 || object.length < 3 || subject.length > 60 || object.length > 60) continue;
+      if (subject.includes(",") || object.includes(",")) continue; // likely a clause, not an entity
+
+      return {
+        subject,
+        subjectId: toEntityId(subject),
+        predicate: predicate.toLowerCase().replace(/\s+/g, "_"),
+        object,
+        objectId: toEntityId(object),
+      };
+    }
+  }
+
+  // Preference facts only: "User prefers X" / "Prefers X"
+  if (obsType === "preference") {
+    const prefMatch = fact.match(/^(?:user\s+)?(?:prefers?|avoids?)\s+(.+?)\.?$/i);
+    if (prefMatch && prefMatch[1]!.trim().length > 2) {
+      return {
+        subject: "user",
+        subjectId: "user",
+        predicate: "prefers",
+        object: prefMatch[1]!.trim(),
+        objectId: null, // literal, not entity
+      };
+    }
+  }
+
+  return null;
 }

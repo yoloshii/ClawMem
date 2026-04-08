@@ -708,6 +708,31 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_cooccurrences_a ON entity_cooccurrences(entity_a)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_cooccurrences_b ON entity_cooccurrences(entity_b)`);
 
+  // SPO knowledge graph: temporal entity-relationship triples
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_triples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      subject_entity_id TEXT NOT NULL,
+      predicate TEXT NOT NULL,
+      object_entity_id TEXT,
+      object_literal TEXT,
+      valid_from TEXT,
+      valid_to TEXT,
+      confidence REAL DEFAULT 1.0,
+      source_doc_id INTEGER,
+      source_fact TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (subject_entity_id) REFERENCES entity_nodes(entity_id),
+      FOREIGN KEY (object_entity_id) REFERENCES entity_nodes(entity_id),
+      FOREIGN KEY (source_doc_id) REFERENCES documents(id)
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_subject ON entity_triples(subject_entity_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_object ON entity_triples(object_entity_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_predicate ON entity_triples(predicate)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_valid ON entity_triples(valid_from, valid_to)`);
+
   // Entity FTS5 for fuzzy name lookup
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id, name, entity_type)`);
 
@@ -904,6 +929,12 @@ export type Store = {
   searchEntities: (query: string, limit?: number) => { entity_id: string; name: string; type: string; mention_count: number; cooccurrence_count: number }[];
   getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => { docId: number; score: number; viaEntity: string }[];
 
+  // SPO knowledge graph
+  addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => number;
+  invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => number;
+  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[];
+  getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
+
   // Co-activation tracking
   recordCoActivation: (paths: string[]) => void;
   getCoActivated: (path: string, limit?: number) => { path: string; count: number }[];
@@ -1069,6 +1100,93 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     enrichDocumentEntities: (llm: any, docId: number, vault?: string) => enrichDocumentEntities(db, llm, docId, vault),
     searchEntities: (query: string, limit?: number) => searchEntities(db, query, limit),
     getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => getEntityGraphNeighbors(db, seedDocIds, limit),
+
+    // SPO knowledge graph
+    addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => {
+      const pred = predicate.toLowerCase().replace(/\s+/g, "_");
+      const now = new Date().toISOString();
+      const objClause = objectEntityId
+        ? "object_entity_id = ? AND object_literal IS NULL"
+        : "object_entity_id IS NULL AND object_literal = ?";
+      const objParam = objectEntityId ?? objectLiteral;
+      const existing = db.prepare(
+        `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
+      ).get(subjectEntityId, pred, objParam) as { id: number } | null;
+      if (existing) return existing.id;
+
+      const result = db.prepare(`
+        INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        subjectEntityId, pred, objectEntityId, objectLiteral,
+        options?.validFrom ?? null, options?.validTo ?? null,
+        options?.confidence ?? 1.0, options?.sourceDocId ?? null,
+        options?.sourceFact ?? null, now
+      );
+      return Number(result.lastInsertRowid);
+    },
+
+    invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => {
+      const pred = predicate.toLowerCase().replace(/\s+/g, "_");
+      const ended = endedDate || new Date().toISOString().slice(0, 10);
+      const objClause = objectEntityId
+        ? "object_entity_id = ? AND object_literal IS NULL"
+        : "object_entity_id IS NULL AND object_literal = ?";
+      const objParam = objectEntityId ?? objectLiteral;
+      const result = db.prepare(
+        `UPDATE entity_triples SET valid_to = ? WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
+      ).run(ended, subjectEntityId, pred, objParam);
+      return result.changes;
+    },
+
+    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => {
+      const direction = options?.direction ?? "both";
+      const asOf = options?.asOf;
+      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[] = [];
+
+      if (direction === "outgoing" || direction === "both") {
+        let query = `SELECT t.id, t.predicate, t.object_entity_id, t.object_literal, t.valid_from, t.valid_to, t.confidence,
+                      COALESCE(s.name, t.subject_entity_id) as sub_name, COALESCE(o.name, t.object_literal, t.object_entity_id) as obj_name
+                     FROM entity_triples t
+                     LEFT JOIN entity_nodes s ON t.subject_entity_id = s.entity_id
+                     LEFT JOIN entity_nodes o ON t.object_entity_id = o.entity_id
+                     WHERE t.subject_entity_id = ?`;
+        const params: any[] = [entityId];
+        if (asOf) {
+          query += " AND (t.valid_from IS NULL OR t.valid_from <= ?) AND (t.valid_to IS NULL OR t.valid_to >= ?)";
+          params.push(asOf, asOf);
+        }
+        for (const row of db.prepare(query).all(...params) as any[]) {
+          results.push({ id: row.id, direction: "outgoing", subject: row.sub_name, predicate: row.predicate, object: row.obj_name, validFrom: row.valid_from, validTo: row.valid_to, confidence: row.confidence, current: row.valid_to === null });
+        }
+      }
+
+      if (direction === "incoming" || direction === "both") {
+        let query = `SELECT t.id, t.predicate, t.valid_from, t.valid_to, t.confidence,
+                      COALESCE(s.name, t.subject_entity_id) as sub_name, COALESCE(o.name, t.object_literal, t.object_entity_id) as obj_name
+                     FROM entity_triples t
+                     LEFT JOIN entity_nodes s ON t.subject_entity_id = s.entity_id
+                     LEFT JOIN entity_nodes o ON t.object_entity_id = o.entity_id
+                     WHERE t.object_entity_id = ?`;
+        const params: any[] = [entityId];
+        if (asOf) {
+          query += " AND (t.valid_from IS NULL OR t.valid_from <= ?) AND (t.valid_to IS NULL OR t.valid_to >= ?)";
+          params.push(asOf, asOf);
+        }
+        for (const row of db.prepare(query).all(...params) as any[]) {
+          results.push({ id: row.id, direction: "incoming", subject: row.sub_name, predicate: row.predicate, object: row.obj_name, validFrom: row.valid_from, validTo: row.valid_to, confidence: row.confidence, current: row.valid_to === null });
+        }
+      }
+
+      return results;
+    },
+
+    getTripleStats: () => {
+      const total = (db.prepare("SELECT COUNT(*) as n FROM entity_triples").get() as any).n;
+      const current = (db.prepare("SELECT COUNT(*) as n FROM entity_triples WHERE valid_to IS NULL").get() as any).n;
+      const predicates = db.prepare("SELECT DISTINCT predicate FROM entity_triples ORDER BY predicate").all().map((r: any) => r.predicate);
+      return { totalTriples: total, currentFacts: current, expiredFacts: total - current, predicateTypes: predicates };
+    },
 
     // Co-activation tracking
     recordCoActivation: (paths: string[]) => {
@@ -1333,6 +1451,7 @@ export type DocumentRow = {
   confidence: number;
   accessCount: number;
   bodyLength: number;
+  pinned: number;
 };
 
 // =============================================================================
@@ -3560,7 +3679,7 @@ function getDocumentsByTypeFn(db: Database, contentType: string, limit: number =
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
-           LENGTH(c.doc) as bodyLength
+           LENGTH(c.doc) as bodyLength, d.pinned
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.content_type = ?

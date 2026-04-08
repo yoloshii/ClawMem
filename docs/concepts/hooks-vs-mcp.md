@@ -12,7 +12,7 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 | `postcompact-inject` | SessionStart (after compact) | 1200 tokens | Re-injects authoritative state after context window compaction. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
 | `precompact-extract` | PreCompact | — | Extracts decisions, file paths, and open questions before compaction. Writes `precompact-state.md`. |
-| `decision-extractor` | Stop | — | LLM extracts observations from the conversation. Infers causal links. Detects contradictions with prior decisions. |
+| `decision-extractor` | Stop | — | LLM extracts observations from the conversation. Infers causal links. Detects contradictions with prior decisions. Extracts SPO triples from decision/preference/milestone/problem facts. |
 | `handoff-generator` | Stop | — | LLM summarizes the session for cross-session continuity. |
 | `feedback-loop` | Stop | — | Tracks which notes were referenced. Boosts their confidence. |
 
@@ -91,10 +91,13 @@ Use `memory_retrieve(query)` — it auto-classifies the query and routes to the 
 | Why / what caused / decision | `intent_search` | Graph traversal finds causal chains query() can't |
 | Last session / yesterday | `session_log` | Session-specific data not in search index |
 | What else relates to X | `find_similar` | k-NN vector neighbors, not keyword overlap |
+| Entity facts / relationships | `kg_query` | Structured SPO triples, not document search |
 | Complex multi-topic | `query_plan` | Decomposes into typed parallel retrieval |
 | General recall | `query` | Full hybrid: BM25 + vector + expansion + reranking |
 | Keyword spot check | `search` | BM25 only, zero GPU cost |
 | Conceptual / fuzzy | `vsearch` | Vector only, semantic similarity |
+
+`diary_write` and `diary_read` are for non-hooked environments only (Hermes, Gemini, plain MCP clients). In Claude Code, hooks capture observations and handoffs automatically.
 
 ### Anti-patterns
 
@@ -102,6 +105,8 @@ Use `memory_retrieve(query)` — it auto-classifies the query and routes to the 
 - Do NOT re-search what's already in `<vault-context>`
 - Do NOT use `query()` for "why" questions — use `intent_search` or `memory_retrieve`
 - Do NOT use `query()` for session history — use `session_log`
+- Do NOT use `kg_query()` for causal "why" questions — use `intent_search`. `kg_query` returns structured facts, not reasoning chains
+- Do NOT use `diary_write` in Claude Code — hooks handle this automatically
 
 ## Why hooks handle 90%
 
