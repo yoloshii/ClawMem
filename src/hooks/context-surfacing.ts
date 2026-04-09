@@ -58,6 +58,17 @@ const NUDGE_INTERVAL = parseInt(process.env.CLAWMEM_NUDGE_INTERVAL || "15", 10);
 const LIFECYCLE_HOOK_NAMES = ["memory_pin", "memory_forget", "memory_snooze", "lifecycle-archive"];
 const NUDGE_TEXT = "You haven't managed memory recently. If vault-context is surfacing noise → snooze it. If a critical decision was just made → pin it. If stale knowledge appeared → forget it.";
 
+// Ext 6a: Context instruction + relationship snippets
+// The instruction is ALWAYS prepended when the hook emits context — it frames
+// the surfaced facts as background knowledge the agent already holds, reducing
+// prompt-level ambiguity. Relationship snippets are fetched from the vault
+// knowledge graph for edges where BOTH endpoints are in the surfaced doc set.
+const INSTRUCTION_TEXT = "Treat the following as background facts you already know unless the user corrects them.";
+const INSTRUCTION_XML = `<instruction>${INSTRUCTION_TEXT}</instruction>`;
+const INSTRUCTION_TOKEN_COST = estimateTokens(INSTRUCTION_XML);
+const RELATIONSHIPS_XML_OVERHEAD_TOKENS = estimateTokens("<relationships>\n\n</relationships>");
+const MAX_RELATION_SNIPPETS = 10;
+
 // File path patterns to extract from prompts (E13 replacement: file-aware UserPromptSubmit)
 const FILE_PATH_RE = /(?:^|\s)((?:\/[\w.@-]+)+(?:\.\w+)?|[\w.@-]+\.(?:ts|js|py|md|sh|yaml|yml|json|toml|rs|go|tsx|jsx|css|html))\b/g;
 
@@ -349,8 +360,13 @@ export async function contextSurfacing(
     }
   }
 
-  // Build context within token budget (profile-driven)
-  const { context, paths, tokens } = buildContext(scored, prompt, tokenBudget);
+  // Build context within token budget (profile-driven).
+  // Ext 6a: Reserve budget for the always-on instruction line so the final
+  // vault-context payload stays within `tokenBudget`. Relations are layered
+  // in afterward using whatever budget remains and are the first thing
+  // truncated when the payload would overflow.
+  const factsBudget = Math.max(0, tokenBudget - INSTRUCTION_TOKEN_COST);
+  const { context, paths, tokens } = buildContext(scored, prompt, factsBudget);
 
   if (!context) {
     logEmptyTurn(store, input);
@@ -417,9 +433,29 @@ export async function contextSurfacing(
   // Memory nudge: periodically remind agent to use lifecycle tools
   const nudge = NUDGE_INTERVAL > 0 ? shouldNudge(store) : null;
 
+  // Ext 6a: Enrich vault-context with instruction framing + optional
+  // relationship snippets sourced from memory_relations. Only edges where
+  // BOTH endpoints are in the surfaced doc set are included. The relations
+  // block is the first thing dropped when the payload would overflow budget.
+  //
+  // Budget accounting (Turn 11 fix): `tokens` from buildContext only sums per-
+  // entry bodies and misses both the `<facts>...</facts>` wrapper and the
+  // `\n\n---\n\n` separators between entries. Compute the wrapped-facts cost
+  // directly from the rendered string so the relationships block can never
+  // push the final `<vault-context>` inner payload past `tokenBudget`.
+  const surfacedDocIds = lookupSurfacedDocIds(store, paths);
+  const relationSnippets = fetchRelationSnippets(store, surfacedDocIds);
+  const factsBlockXml = `<facts>\n${context}\n</facts>`;
+  const factsWrappedTokens = estimateTokens(factsBlockXml);
+  const relationBudget = Math.max(
+    0,
+    tokenBudget - INSTRUCTION_TOKEN_COST - factsWrappedTokens
+  );
+  const vaultInner = buildVaultContextInner(context, relationSnippets, relationBudget);
+
   const parts: string[] = [];
   if (routingHint) parts.push(`<vault-routing>${routingHint}</vault-routing>`);
-  parts.push(`<vault-context>\n${context}\n</vault-context>`);
+  parts.push(`<vault-context>\n${vaultInner}\n</vault-context>`);
   if (nudge) parts.push(`<vault-nudge>${NUDGE_TEXT}</vault-nudge>`);
 
   return makeContextOutput("context-surfacing", parts.join("\n"));
@@ -520,6 +556,148 @@ function buildContext(
     paths,
     tokens: totalTokens,
   };
+}
+
+// =============================================================================
+// Ext 6a: Relationship snippets + instruction framing
+// =============================================================================
+
+/**
+ * Relationship snippet derived from a memory_relations edge whose source and
+ * target are both active documents currently surfaced by the context hook.
+ */
+export interface RelationSnippet {
+  sourceTitle: string;
+  targetTitle: string;
+  relationType: string;
+}
+
+/**
+ * Resolve surfaced display paths back to document ids so the relation query
+ * can filter memory_relations edges to the surfaced set. Silently drops paths
+ * that don't match an active row in the general vault (e.g. skill-vault paths
+ * or deactivated docs) — fail-open, never throws.
+ */
+export function lookupSurfacedDocIds(
+  store: Store,
+  displayPaths: string[]
+): number[] {
+  if (displayPaths.length === 0) return [];
+  try {
+    const placeholders = displayPaths.map(() => "?").join(",");
+    const rows = store.db
+      .prepare(
+        `SELECT id FROM documents
+         WHERE active = 1
+           AND (collection || '/' || path) IN (${placeholders})`
+      )
+      .all(...displayPaths) as Array<{ id: number }>;
+    return rows.map((r) => r.id);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch relationship snippets for edges where BOTH endpoints are in the
+ * surfaced doc set. Returns an empty list on empty input, zero/one surfaced
+ * docs, self-loops, or any DB error (fail-open, never throws). Results are
+ * ordered by relation weight DESC then recency so the most salient edges
+ * survive budget truncation.
+ */
+export function fetchRelationSnippets(
+  store: Store,
+  surfacedDocIds: number[],
+  limit: number = MAX_RELATION_SNIPPETS
+): RelationSnippet[] {
+  if (surfacedDocIds.length < 2) return [];
+  try {
+    const placeholders = surfacedDocIds.map(() => "?").join(",");
+    const rows = store.db
+      .prepare(
+        `SELECT mr.relation_type,
+                ds.title AS source_title,
+                dt.title AS target_title
+         FROM memory_relations mr
+         JOIN documents ds ON ds.id = mr.source_id AND ds.active = 1
+         JOIN documents dt ON dt.id = mr.target_id AND dt.active = 1
+         WHERE mr.source_id IN (${placeholders})
+           AND mr.target_id IN (${placeholders})
+           AND mr.source_id != mr.target_id
+         ORDER BY mr.weight DESC, mr.created_at DESC
+         LIMIT ?`
+      )
+      .all(...surfacedDocIds, ...surfacedDocIds, limit) as Array<{
+      relation_type: string;
+      source_title: string;
+      target_title: string;
+    }>;
+    return rows.map((r) => ({
+      sourceTitle: r.source_title,
+      targetTitle: r.target_title,
+      relationType: r.relation_type,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Render relationship snippets as bullet lines, sanitizing titles to block
+ * prompt-injection via metadata fields. Lines that become filtered-content
+ * markers after sanitization are dropped.
+ */
+export function renderRelationshipLines(
+  relations: RelationSnippet[]
+): string[] {
+  const FILTERED = "[content filtered for security]";
+  const out: string[] = [];
+  for (const r of relations) {
+    const src = sanitizeSnippet(r.sourceTitle);
+    const tgt = sanitizeSnippet(r.targetTitle);
+    if (src === FILTERED || tgt === FILTERED) continue;
+    out.push(`- ${src} --[${r.relationType}]--> ${tgt}`);
+  }
+  return out;
+}
+
+/**
+ * Assemble the inner body of <vault-context>: always instruction + facts,
+ * optionally relationships when at least one line fits in the remaining
+ * budget. Relationships are the first thing dropped — if the relationships
+ * XML wrapper alone would exceed `remainingBudgetTokens`, the whole block
+ * is omitted rather than emitting an empty wrapper.
+ */
+export function buildVaultContextInner(
+  factsBlock: string,
+  relations: RelationSnippet[],
+  remainingBudgetTokens: number
+): string {
+  const lines: string[] = [];
+  lines.push(INSTRUCTION_XML);
+  lines.push(`<facts>\n${factsBlock}\n</facts>`);
+
+  if (relations.length === 0 || remainingBudgetTokens <= 0) {
+    return lines.join("\n");
+  }
+
+  const relationLines = renderRelationshipLines(relations);
+  if (relationLines.length === 0) return lines.join("\n");
+
+  // The XML wrapper itself consumes tokens — if there's no room for even one
+  // line on top of the wrapper, drop the block entirely.
+  const fittedLines: string[] = [];
+  let used = RELATIONSHIPS_XML_OVERHEAD_TOKENS;
+  for (const line of relationLines) {
+    const lineTokens = estimateTokens(line + "\n");
+    if (used + lineTokens > remainingBudgetTokens) break;
+    fittedLines.push(line);
+    used += lineTokens;
+  }
+  if (fittedLines.length === 0) return lines.join("\n");
+
+  lines.push(`<relationships>\n${fittedLines.join("\n")}\n</relationships>`);
+  return lines.join("\n");
 }
 
 /**

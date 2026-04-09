@@ -8,7 +8,7 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 
 | Hook | Trigger | Budget | What it does |
 |------|---------|--------|-------------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML. |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML with three inner blocks: `<instruction>` (framing — always present), `<facts>` (the surfaced docs), and `<relationships>` (memory-graph edges between surfaced docs, v0.7.1). |
 | `postcompact-inject` | SessionStart (after compact) | 1200 tokens | Re-injects authoritative state after context window compaction. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
 | `precompact-extract` | PreCompact | — | Extracts decisions, file paths, and open questions before compaction. Writes `precompact-state.md`. |
@@ -23,8 +23,11 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 3. Search: vector (if profile enables it, with profile-driven timeout) + BM25 supplement
 4. Filter: exclude private paths, snoozed documents, noise
 5. Score: composite scoring (relevance + recency + confidence + quality)
-6. Build context within token budget
-7. Inject as `<vault-context>` XML in the prompt
+6. Build facts block within `tokenBudget - instructionCost` so the always-on `<instruction>` frame fits
+7. Fetch relationship snippets from `memory_relations` for edges where BOTH endpoints are in the surfaced doc set — these become a `<relationships>` block, the first thing dropped when the payload would overflow budget
+8. Inject as `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships></vault-context>` XML in the prompt
+
+The `<instruction>` frame tells the model to treat the surfaced facts as background knowledge it already holds unless the user corrects them, reducing prompt-level ambiguity about how to use the injected context. The `<relationships>` block exposes the vault's knowledge graph (semantic, supporting, contradicts, causal, temporal edges) directly in-prompt so the model can reason over document connections without having to call `intent_search`. Both additions landed in v0.7.1.
 
 ### Tuning context-surfacing with profiles
 

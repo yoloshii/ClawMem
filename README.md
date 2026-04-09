@@ -27,7 +27,10 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Traverses multi-graphs** (semantic, temporal, causal) via adaptive beam search
 - **Evolves memory metadata** as new documents create or refine connections
 - **Infers causal relationships** between facts extracted from session observations
-- **Detects contradictions** between new and prior decisions, auto-decaying superseded ones
+- **Detects contradictions** between new and prior decisions, auto-decaying superseded ones (with an additional merge-time contradiction gate in the consolidation worker that blocks cross-observation contradictions before they land, v0.7.1)
+- **Guards against cross-entity merges** during consolidation — name-aware dual-threshold merge safety compares entity anchors before merging similar observations, preventing "Alice decided X" from merging into "Bob decided X" (v0.7.1)
+- **Prevents context bleed in derived insights** — the Phase 3 deductive synthesis pipeline validates every draft against an anti-contamination wrapper (deterministic entity contamination check + LLM validator + dedupe) before writing cross-session deductive observations (v0.7.1)
+- **Frames surfaced facts as background knowledge** — `context-surfacing` wraps injected content in `<instruction>` + `<facts>` + `<relationships>` blocks, telling the model to treat facts as already-known and exposing memory-graph edges between surfaced docs directly in-prompt (v0.7.1)
 - **Scores document quality** using structure, keywords, and metadata richness signals
 - **Boosts co-accessed documents** — notes frequently surfaced together get retrieval reinforcement
 - **Decomposes complex queries** into typed retrieval clauses (BM25/vector/graph) for multi-topic questions
@@ -52,6 +55,16 @@ Runs fully local with no API keys and no cloud services. Integrates via Claude C
 - **3-tier consolidation** — facts to observations (auto-generated, with proof_count and trend enum) to mental models. Background worker synthesizes clusters of related observations into consolidated patterns.
 - **Observation invalidation** — soft invalidation (invalidated_at/invalidated_by/superseded_by columns). Observations with confidence ≤ 0.2 after contradiction are filtered from search results.
 - **Memory nudge** — periodic ephemeral `<vault-nudge>` injection prompting lifecycle tool use after N turns of inactivity. Configurable via `CLAWMEM_NUDGE_INTERVAL`.
+
+### v0.7.1 Safety Release
+
+Five independent safety gates around the consolidation pipeline and context surfacing, aimed at preventing contamination, cross-entity merges, and unchecked contradictions from landing in the vault. Every extraction ships with full unit + integration test coverage (+158 tests on top of the v0.7.0 baseline). See [consolidation safety](docs/concepts/architecture.md#consolidation-safety-v071) for the architectural walkthrough.
+
+- **Taxonomy cleanup** — standardized on the A-MEM `contradicts` (plural) convention across the entire codebase, eliminating silent query misses on the legacy singular form
+- **Name-aware merge safety** — the Phase 2 consolidation worker gate extracts entity anchors (via `entity_mentions`, with lexical proper-noun fallback) and runs dual-threshold normalized 3-gram cosine similarity before merging similar observations. Cross-entity merges are hard-rejected when anchor sets differ materially, preventing context bleed where "Alice decided X" merges into "Bob decided X". Thresholds are env-overridable (`CLAWMEM_MERGE_SCORE_NORMAL`=0.93, `_STRICT`=0.98). Dry-run mode via `CLAWMEM_MERGE_GUARD_DRY_RUN` for calibration.
+- **Contradiction-aware merge gate** — after the name-aware gate passes, a deterministic heuristic (negation asymmetry, number/date mismatch) plus an LLM check detect contradictory merges. Blocked merges route to `link` policy (insert new row + `contradicts` edge, default) or `supersede` policy (mark old row `status='inactive'`). Configurable via `CLAWMEM_CONTRADICTION_POLICY` and `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE`. Phase 3 deductive synthesis applies the same gate to deductive dedupe matches.
+- **Anti-contamination deductive synthesis** — every Phase 3 draft runs through a three-layer validator: deterministic pre-checks (empty conclusion, invalid source_indices, pool-only entity contamination via `entity_mentions`) + LLM validator (fail-open with `validatorFallbackAccepts` counter) + dedupe. Per-reason rejection stats exposed via `DeductiveSynthesisStats` so Phase 3 yield can be diagnosed without enabling extra logging.
+- **Context instruction + relationship snippets** — `context-surfacing` now always prepends an `<instruction>` block framing the surfaced facts as background knowledge the model already holds, and appends an optional `<relationships>` block listing memory-graph edges where BOTH endpoints are in the surfaced doc set. The relationships block is the first thing dropped when the payload would overflow `CLAWMEM_PROFILE`'s token budget, preserving facts-first behaviour while giving the model graph-level reasoning hooks directly in-prompt.
 
 ## Architecture
 
@@ -816,7 +829,7 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 - **Temporal** — chronological document ordering
 - **Causal** — LLM-inferred cause→effect from Observer facts + Beads `blocks`/`waits-for` deps
 - **Supporting** — LLM-analyzed document relationships + Beads `discovered-from` deps
-- **Contradicts** — LLM-analyzed document relationships
+- **Contradicts** — LLM-analyzed document relationships. Additional `contradicts` edges are inserted by the consolidation worker's merge-time contradiction gate (v0.7.1) when it blocks a Phase 2 merge under the `link` policy, and by Phase 3 deductive synthesis when a new draft contradicts a prior deductive observation.
 
 ### Content Type Scoring
 
@@ -848,7 +861,7 @@ Content types are inferred from frontmatter or file path patterns. Half-lives ex
 
 **Snooze:** Snoozed documents are filtered out of context surfacing until their snooze date. Use `memory_snooze` for temporary suppression.
 
-**Contradiction detection:** When `decision-extractor` identifies a new decision that contradicts a prior one, the old decision's confidence is automatically lowered (−0.25 for contradictions, −0.15 for updates). Superseded decisions naturally fade from context surfacing without manual intervention.
+**Contradiction detection:** When `decision-extractor` identifies a new decision that contradicts a prior one, the old decision's confidence is automatically lowered (−0.25 for contradictions, −0.15 for updates). Superseded decisions naturally fade from context surfacing without manual intervention. **v0.7.1 adds a second layer at the consolidation boundary:** before the background worker merges a new pattern into an existing consolidated observation, a deterministic heuristic (negation asymmetry, number/date mismatch) plus an LLM check detect contradictions. Blocked merges route to either `link` policy (both rows remain active + a `contradicts` edge is inserted, default) or `supersede` policy (old row marked `status='inactive'`). Configurable via `CLAWMEM_CONTRADICTION_POLICY` and `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE`.
 
 ## Features
 
@@ -935,6 +948,11 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
+| `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 consolidation merge-safety threshold when candidate and existing anchors align. Merges above this normalized 3-gram cosine score are allowed. |
+| `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold — fallback when anchor sets are ambiguous. |
+| `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration before enabling the gate. |
+| `CLAWMEM_CONTRADICTION_POLICY` | `link` | **v0.7.1.** Merge-time contradiction gate policy. `link` inserts a new row + `contradicts` edge (default). `supersede` marks the old row `status='inactive'`. |
+| `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | **v0.7.1.** Minimum combined heuristic + LLM confidence required before the contradiction gate blocks a merge. |
 
 ## Configuration
 

@@ -45,7 +45,7 @@ Half-lives extend up to 3x for frequently-accessed memories (access reinforcemen
 
 Starts at 0.5 for new documents. Adjusted by:
 
-- **Contradiction detection** — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered
+- **Contradiction detection** — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered. The consolidation worker applies an additional merge-time contradiction gate (v0.7.1): before merging a new pattern into an existing consolidated observation, it checks for contradictions via a deterministic heuristic plus an LLM confirmation. Contradictory merges are blocked and either linked via a `contradicts` edge (default) or supersede the old row with `status='inactive'` (see [consolidation safety](architecture.md#consolidation-safety-v071)).
 - **Feedback loop** — referenced notes get confidence boosts
 - **Attention decay** — non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision, deductive, preference, hub, research, and antipattern types are exempt.
 

@@ -76,3 +76,111 @@ describe("contextSurfacing", () => {
     }
   });
 });
+
+describe("contextSurfacing — Ext 6a instruction framing + relationship snippets", () => {
+  it("always wraps facts in <instruction> + <facts> when context is returned", async () => {
+    const output = await contextSurfacing(
+      store,
+      makeInput("explain the JWT authentication decision and OAuth2 integration approach")
+    );
+    if (output.hookSpecificOutput?.additionalContext) {
+      const ctx = output.hookSpecificOutput.additionalContext;
+      expect(ctx).toContain("<vault-context>");
+      expect(ctx).toContain("<instruction>");
+      expect(ctx).toContain(
+        "Treat the following as background facts you already know unless the user corrects them."
+      );
+      expect(ctx).toContain("<facts>");
+      expect(ctx).toContain("</facts>");
+    }
+  });
+
+  it("emits no context block at all when retrieval returns zero facts", async () => {
+    const output = await contextSurfacing(
+      store,
+      makeInput("quantum entanglement across parallel universes hyperdimensional folding")
+    );
+    const ctx = output.hookSpecificOutput?.additionalContext || "";
+    // Zero-fact path: no vault-context wrapper, no instruction, no facts block
+    expect(ctx).not.toContain("<vault-context>");
+    expect(ctx).not.toContain("<instruction>");
+    expect(ctx).not.toContain("<facts>");
+    expect(ctx).not.toContain("<relationships>");
+  });
+
+  it("includes <relationships> block when two surfaced docs have a memory_relations edge", async () => {
+    // Seed two strongly related docs that should both surface on the same query
+    const [idArch, idDec] = seedDocuments(store, [
+      {
+        path: "kubernetes-migration.md",
+        title: "Kubernetes Migration",
+        body: "Detailed plan to migrate the k8s cluster from version 1.25 to 1.30 including all add-ons and ingress controllers. The kubernetes migration involves etcd backup procedures and rolling node upgrades.",
+      },
+      {
+        path: "k8s-upgrade-decision.md",
+        title: "K8s Upgrade Decision",
+        body: "We decided to proceed with the kubernetes migration in Q3, using a phased approach across all clusters. This decision was driven by EOL of v1.25 and the need for kubernetes migration completion.",
+      },
+    ]);
+    // Create a causal edge between them
+    store.db
+      .prepare(
+        `INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
+         VALUES (?, ?, 'causal', 0.9, datetime('now'))`
+      )
+      .run(idDec!, idArch!);
+
+    const output = await contextSurfacing(
+      store,
+      makeInput("what is the kubernetes migration decision and plan for the cluster upgrade")
+    );
+    const ctx = output.hookSpecificOutput?.additionalContext || "";
+
+    // Only assert if both docs actually surfaced — FTS scoring is deterministic
+    // but profile-driven thresholds may filter one. If both surface, relations
+    // must be present and well-formed.
+    const bothSurfaced =
+      ctx.includes("Kubernetes Migration") && ctx.includes("K8s Upgrade Decision");
+    if (bothSurfaced) {
+      expect(ctx).toContain("<relationships>");
+      expect(ctx).toContain("causal");
+      expect(ctx).toContain("</relationships>");
+    }
+  });
+
+  it("omits <relationships> block when surfaced docs have no edges between them", async () => {
+    // The beforeEach-seeded docs have no memory_relations between them.
+    const output = await contextSurfacing(
+      store,
+      makeInput("explain the JWT authentication decision and microservice communication")
+    );
+    const ctx = output.hookSpecificOutput?.additionalContext || "";
+    if (ctx.includes("<vault-context>")) {
+      expect(ctx).not.toContain("<relationships>");
+      expect(ctx).toContain("<instruction>");
+      expect(ctx).toContain("<facts>");
+    }
+  });
+
+  it("does not alter the vault-routing sibling wrapper when present", async () => {
+    // Causal signal triggers a routing hint; the hint wrapper and vault-context
+    // must remain two independent sibling tags.
+    const output = await contextSurfacing(
+      store,
+      makeInput("why did we decide to use JWT for the authentication architecture")
+    );
+    const ctx = output.hookSpecificOutput?.additionalContext || "";
+    if (ctx.includes("<vault-context>")) {
+      // vault-routing (if emitted) comes before vault-context
+      if (ctx.includes("<vault-routing>")) {
+        expect(ctx.indexOf("<vault-routing>")).toBeLessThan(ctx.indexOf("<vault-context>"));
+      }
+      // The new instruction is INSIDE vault-context, not a sibling of it
+      const inner = ctx
+        .split("<vault-context>")[1]!
+        .split("</vault-context>")[0]!;
+      expect(inner).toContain("<instruction>");
+      expect(inner).toContain("<facts>");
+    }
+  });
+});

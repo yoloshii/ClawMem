@@ -87,6 +87,11 @@ curl http://host:8090/v1/models
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing. |
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
+| `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 merge-safety score threshold when candidate and existing anchors align. |
+| `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold (fallback when anchors are ambiguous). |
+| `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration. |
+| `CLAWMEM_CONTRADICTION_POLICY` | `link` | **v0.7.1.** How the merge-time contradiction gate handles a blocked merge. `link` (default) keeps both rows + inserts `contradicts` edge. `supersede` marks the old row `status='inactive'`. |
+| `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | **v0.7.1.** Minimum combined heuristic+LLM confidence required before the contradiction gate blocks a merge. |
 
 **Note:** The `bin/clawmem` wrapper sets all endpoint defaults. Always use the wrapper — never `bun run src/clawmem.ts` directly.
 
@@ -179,7 +184,7 @@ Hooks handle ~90% of retrieval. Zero agent effort.
 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate -> profile-driven hybrid search (vector if `useVector`, timeout from profile) -> FTS supplement -> file-aware search (E13) -> snooze filter -> noise filter -> spreading activation (E11) -> memory type diversification (E10) -> tiered injection (HOT/WARM/COLD) -> `<vault-context>` + optional `<vault-routing>` hint. Budget, max results, vector timeout, min score all driven by `CLAWMEM_PROFILE`. |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate -> profile-driven hybrid search (vector if `useVector`, timeout from profile) -> FTS supplement -> file-aware search (E13) -> snooze filter -> noise filter -> spreading activation (E11) -> memory type diversification (E10) -> tiered injection (HOT/WARM/COLD) -> `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships></vault-context>` (v0.7.1: instruction always prepended; relationships list memory-graph edges where BOTH endpoints are in the surfaced set; relationships truncated first when over budget) + optional `<vault-routing>` hint. Budget, max results, vector timeout, min score all driven by `CLAWMEM_PROFILE`. |
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
@@ -521,6 +526,8 @@ mcp__clawmem__vsearch(query, collection="name", compact=true)   # vector
 | Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP or watcher | Queries `bd` CLI (Dolt backend). |
 | `buildTemporalBackbone()` | temporal | `build_graphs` MCP (manual) | Creation-order edges. |
 | `buildSemanticGraph()` | semantic | `build_graphs` MCP (manual) | Pure cosine similarity. A-MEM edges take precedence (first-writer wins). |
+| `consolidated_observations` | supporting, contradicts | Consolidation worker (background) | **v0.7.1 safety gates:** Phase 2 name-aware merge gate (entity anchors + 3-gram cosine, dual-threshold `CLAWMEM_MERGE_SCORE_NORMAL`=0.93 / `_STRICT`=0.98) blocks cross-entity merges. Merge-time contradiction gate (heuristic + LLM) routes blocked merges to `link` (default, inserts `contradicts` edge) or `supersede` (old row `status='inactive'`) via `CLAWMEM_CONTRADICTION_POLICY`. |
+| Deductive synthesis | supporting, contradicts | Consolidation worker Phase 3 (every ~15 min) | Combines 2-3 related observations (decision/preference/milestone/problem, last 7 days) into `content_type='deductive'` docs. **v0.7.1 anti-contamination:** deterministic pre-checks (empty/invalid_indices/pool-only entity contamination) + LLM validator (fail-open, `validatorFallbackAccepts` counter) + dedupe. Per-reason rejection stats via `DeductiveSynthesisStats`. Contradictory dedupe matches linked via `contradicts` edges. |
 
 **Graph traversal asymmetry:** `adaptiveTraversal()` traverses all edge types outbound (source->target) but only `semantic` and `entity` inbound.
 
@@ -563,6 +570,13 @@ Permanently deactivates. Use sparingly — only when genuinely wrong or permanen
 ### Contradiction Auto-Resolution
 
 When `decision-extractor` detects a new decision contradicting an old one, the old decision's confidence is lowered automatically. No manual intervention needed.
+
+**v0.7.1 merge-time contradiction gate:** The consolidation worker adds a second layer at merge time. Before Phase 2 merges a new pattern into an existing consolidated observation, it runs a deterministic heuristic (negation asymmetry, number/date mismatch) followed by an LLM confirmation. When confidence crosses `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default 0.5), the merge is blocked and one of two policies applies via `CLAWMEM_CONTRADICTION_POLICY`:
+
+- `link` (default) — insert a new consolidated row and create a `contradicts` edge in `memory_relations`. Both remain queryable.
+- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit.
+
+Phase 3 deductive synthesis applies the same `contradicts` link for any draft that matches a prior deductive observation with conflicting content.
 
 ---
 

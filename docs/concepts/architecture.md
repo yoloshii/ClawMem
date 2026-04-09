@@ -90,6 +90,33 @@ Most edges are created automatically. When new documents are indexed, A-MEM find
 
 See [graph traversal](../internals/graph-traversal.md) for edge types, traversal mechanics, and beam search details.
 
+## Consolidation safety (v0.7.1)
+
+The background consolidation worker has three independent safety gates that prevent observation contamination, accidental cross-entity merges, and unchecked contradictions from landing in the vault.
+
+### Phase 2 — name-aware merge safety
+
+When the worker finds a candidate existing observation to merge a new pattern into, it runs a deterministic name-aware gate before updating. The gate extracts entity anchors from both the new and existing texts — first via `entity_mentions` (if the source docs are enriched), falling back to lexical proper-noun extraction — and compares them with normalized character 3-gram cosine similarity. When anchor sets differ materially (Jaccard ≤ 0.5), the merge is hard-rejected regardless of text similarity. Otherwise, a dual-threshold score applies: `CLAWMEM_MERGE_SCORE_NORMAL` (default `0.93`) for aligned anchors, `CLAWMEM_MERGE_SCORE_STRICT` (default `0.98`) as the strictest fallback. This prevents "Alice decided X" from merging into "Bob decided X" just because the predicate is identical. Set `CLAWMEM_MERGE_GUARD_DRY_RUN=true` to log rejections without enforcing them.
+
+### Phase 2 — contradiction-aware merge gate
+
+After the name-aware gate passes, the worker checks whether the new observation contradicts the existing one. A deterministic heuristic runs first (negation asymmetry, number/date mismatch), then an LLM check confirms. If the final confidence exceeds `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default `0.5`), the merge is blocked and one of two policies applies (controlled by `CLAWMEM_CONTRADICTION_POLICY`):
+
+- `link` (default) — insert a new `consolidated_observations` row and create a `contradicts` edge in `memory_relations` between the two rows. Both remain active and queryable.
+- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit.
+
+Phase 3 deductive synthesis applies the same `contradicts` link for any draft that matches a prior deductive observation with conflicting content.
+
+### Phase 3 — anti-contamination deductive synthesis
+
+Phase 3 synthesizes cross-session insights from recent observations into `content_type='deductive'` documents. The draft-generation LLM can produce drafts whose conclusion references entities that only appear in the candidate pool but not in the cited sources — a form of context bleed. Each draft runs through a three-layer validator:
+
+1. **Deterministic pre-checks** — reject empty conclusions; reject drafts whose `source_indices` don't resolve to at least two unique source docs; reject drafts whose conclusion names an entity (entity-aware via `entity_mentions`, lexical fallback via proper-noun extraction) that exists in the candidate pool but not in any cited source.
+2. **LLM validator** — a separate LLM call checks that the conclusion is genuinely supported by the cited source snippets. Fail-open: if the validator times out or returns malformed JSON, the draft is accepted and flagged via the `validatorFallbackAccepts` stat so operators can detect when the LLM path is effectively offline.
+3. **Dedupe** — accepted drafts are compared against recent deductive observations to prevent duplicates.
+
+Rejection reasons are tracked individually in `DeductiveSynthesisStats` (`contaminationRejects`, `invalidIndexRejects`, `unsupportedRejects`, `emptyRejects`, `dedupSkipped`, `validatorFallbackAccepts`) so Phase 3 yield can be diagnosed without enabling extra logging.
+
 ## Retrieval tiers
 
 | Tier | Mechanism | Agent effort | Coverage |

@@ -16,6 +16,18 @@ import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { hashContent } from "./indexer.ts";
+import { passesMergeSafety } from "./text-similarity.ts";
+import {
+  checkContradiction,
+  isActionableContradiction,
+  resolveContradictionPolicy,
+  type ContradictionResult,
+} from "./merge-guards.ts";
+import {
+  validateDeductiveDraft,
+  type DeductiveDraft,
+  type DocLike,
+} from "./deductive-guardrails.ts";
 
 // =============================================================================
 // Types
@@ -28,6 +40,62 @@ interface DocumentToEnrich {
 }
 
 export type TrendEnum = 'NEW' | 'STABLE' | 'STRENGTHENING' | 'WEAKENING' | 'STALE';
+
+/**
+ * Phase 3 deductive synthesis stats. Each counter is incremented at a
+ * specific decision point in `generateDeductiveObservations`, giving
+ * operators per-rejection-reason visibility into why drafts didn't land.
+ */
+export interface DeductiveSynthesisStats {
+  /** Final number of deductive documents written to disk + indexed */
+  created: number;
+  /** Recent observations passed to the draft-generation LLM */
+  considered: number;
+  /** Drafts returned by the draft-generation LLM (before validation) */
+  drafted: number;
+  /** Drafts accepted by validation (pre-dedupe count) */
+  accepted: number;
+  /** Drafts rejected by validation (sum of all reject reasons) */
+  rejected: number;
+  /** LLM `generate()` returned null (cooldown / remote down) — draft-gen + validation */
+  nullCalls: number;
+  /** Drafts rejected because the conclusion mentioned a non-source entity */
+  contaminationRejects: number;
+  /** Drafts rejected because sourceIndices didn't resolve to ≥2 unique source docs */
+  invalidIndexRejects: number;
+  /** Drafts rejected because the LLM validator said `accepted: false` */
+  unsupportedRejects: number;
+  /** Drafts rejected because the conclusion was empty/trivial */
+  emptyRejects: number;
+  /** Accepted drafts that were then skipped as deductive dedupe duplicates */
+  dedupSkipped: number;
+  /**
+   * Accepted drafts that went through the validator fail-open path
+   * (LLM null/throw/malformed JSON). These passed the deterministic
+   * pre-checks but were NOT affirmed by the LLM validator. A high
+   * ratio of this counter to `accepted` means the LLM path is
+   * effectively offline and deductions are only gated by the
+   * deterministic guardrails (empty, invalid_indices, contamination).
+   */
+  validatorFallbackAccepts: number;
+}
+
+function emptyDeductiveStats(considered: number = 0): DeductiveSynthesisStats {
+  return {
+    created: 0,
+    considered,
+    drafted: 0,
+    accepted: 0,
+    rejected: 0,
+    nullCalls: 0,
+    contaminationRejects: 0,
+    invalidIndexRejects: 0,
+    unsupportedRejects: 0,
+    emptyRejects: 0,
+    dedupSkipped: 0,
+    validatorFallbackAccepts: 0,
+  };
+}
 
 export interface ConsolidatedObservation {
   id: number;
@@ -294,23 +362,45 @@ Return ONLY the JSON array. /no_think`;
 
     if (sourceDocIds.length < 2) continue;
 
-    // Check for existing similar consolidated observation (avoid duplicates)
-    const existing = findSimilarConsolidation(store, pattern.observation, cluster.collection);
+    // Check for existing similar consolidated observation (avoid duplicates).
+    // Two-stage gate: Jaccard shortlist + name-aware merge safety (Ext 3).
+    const existing = findSimilarConsolidation(
+      store,
+      pattern.observation,
+      cluster.collection,
+      sourceDocIds
+    );
     if (existing) {
-      // Update existing: merge source docs, increment proof count
-      const existingSourceIds: number[] = JSON.parse(existing.source_doc_ids as unknown as string || '[]');
-      const mergedIds = [...new Set([...existingSourceIds, ...sourceDocIds])];
+      // Ext 2: contradiction gate. Before merging into an existing
+      // consolidation, check whether the new observation contradicts
+      // the existing one. On actionable contradiction we do NOT merge;
+      // instead we insert the new row as a separate consolidation and
+      // apply the configured policy (link or supersede).
+      const contradiction = await checkContradiction(
+        llm,
+        existing.observation,
+        pattern.observation,
+        `collection: ${cluster.collection}`
+      );
 
-      store.db.prepare(`
-        UPDATE consolidated_observations
-        SET proof_count = ?,
-            source_doc_ids = ?,
-            updated_at = datetime('now'),
-            observation = ?
-        WHERE id = ?
-      `).run(mergedIds.length, JSON.stringify(mergedIds), pattern.observation, existing.id);
-
-      console.log(`[consolidation] Updated observation #${existing.id}: proof_count=${mergedIds.length}`);
+      if (isActionableContradiction(contradiction)) {
+        applyContradictoryConsolidation(
+          store,
+          existing,
+          pattern.observation,
+          sourceDocIds,
+          cluster.collection,
+          contradiction
+        );
+      } else {
+        const { mergedIds } = mergeIntoExistingConsolidation(
+          store,
+          existing,
+          sourceDocIds,
+          pattern.observation
+        );
+        console.log(`[consolidation] Updated observation #${existing.id}: proof_count=${mergedIds.length}`);
+      }
     } else {
       // Insert new consolidated observation
       store.db.prepare(`
@@ -324,22 +414,132 @@ Return ONLY the JSON array. /no_think`;
 }
 
 /**
- * Find an existing consolidated observation similar to the given text.
- * Uses simple word overlap (Jaccard) to detect near-duplicates.
+ * Handle a contradictory Phase 2 merge attempt.
+ *
+ * Inserts the new observation as a separate active consolidation row and
+ * applies the resolved contradiction policy, atomically:
+ *
+ *  - **link** (default): old row stays active (`status='active'`); sets
+ *    `invalidated_by = newId` as a backlink so operators can find the
+ *    contradiction via `SELECT * FROM consolidated_observations WHERE
+ *    invalidated_by IS NOT NULL AND invalidated_at IS NULL`.
+ *  - **supersede**: sets `invalidated_at = now`, `invalidated_by = newId`,
+ *    `superseded_by = newId`, **AND `status = 'inactive'`** — the old
+ *    row stops surfacing via every consolidation reader (all of which
+ *    filter by `status = 'active'`). Subsequent recalls and merge
+ *    matches see only the new row.
+ *
+ * The INSERT + UPDATE pair runs inside a SQLite transaction so a
+ * failure on the UPDATE side rolls back the new row, preventing a
+ * dangling active consolidation with no backlink.
+ *
+ * Policy is resolved via `CLAWMEM_CONTRADICTION_POLICY=link|supersede`.
+ *
+ * Returns the new consolidation's id and the policy used.
  */
-function findSimilarConsolidation(
+export function applyContradictoryConsolidation(
+  store: Store,
+  existing: { id: number; observation: string; source_doc_ids: string },
+  newObservation: string,
+  newSourceDocIds: number[],
+  collection: string,
+  contradiction: ContradictionResult
+): { newId: number; policy: "link" | "supersede" } {
+  const policy = resolveContradictionPolicy();
+
+  let newId = 0;
+  const tx = store.db.transaction(() => {
+    // Insert the new consolidation as a separate active row
+    const insertResult = store.db
+      .prepare(
+        `INSERT INTO consolidated_observations
+           (observation, proof_count, source_doc_ids, trend, status, collection)
+         VALUES (?, ?, ?, 'NEW', 'active', ?)`
+      )
+      .run(
+        newObservation,
+        newSourceDocIds.length,
+        JSON.stringify(newSourceDocIds),
+        collection
+      );
+    newId = Number(insertResult.lastInsertRowid);
+
+    // Apply the policy to the old row
+    if (policy === "supersede") {
+      // Mark the old row as fully inactive so existing readers
+      // (filter on `status = 'active'`) stop surfacing it, and set
+      // all three invalidation columns for operator queries.
+      store.db
+        .prepare(
+          `UPDATE consolidated_observations
+           SET invalidated_at = datetime('now'),
+               invalidated_by = ?,
+               superseded_by = ?,
+               status = 'inactive'
+           WHERE id = ?`
+        )
+        .run(newId, newId, existing.id);
+    } else {
+      // link: old row stays active, set backlink only
+      store.db
+        .prepare(
+          `UPDATE consolidated_observations
+           SET invalidated_by = ?
+           WHERE id = ?`
+        )
+        .run(newId, existing.id);
+    }
+  });
+  tx();
+
+  console.log(
+    `[consolidation] contradiction detected (policy=${policy} source=${contradiction.source} ` +
+      `confidence=${contradiction.confidence.toFixed(2)}): ` +
+      `existing #${existing.id} + new #${newId} — reason="${contradiction.reason ?? ""}"`
+  );
+
+  return { newId, policy };
+}
+
+/**
+ * Find an existing consolidated observation similar to the given text.
+ *
+ * Two-stage gate (Ext 3 — name-aware merge safety):
+ *  1. Jaccard > 0.5 on long-word sets — cheap candidate shortlist
+ *  2. Name-aware dual-threshold merge safety gate — entity-first, lexical
+ *     fallback, strictest default when both sides have no anchors
+ *
+ * Returns the highest-scoring candidate that passes BOTH gates, or null
+ * when no candidate passes. Previously the function returned the first
+ * Jaccard hit, which allowed semantic-collision merges between topics
+ * sharing vocabulary but referring to different subjects (e.g. "Dan" vs
+ * "Dad"). The second gate blocks those.
+ *
+ * Respects `CLAWMEM_MERGE_GUARD_DRY_RUN=true` — in dry-run mode the gate
+ * logs its decision for each candidate but does NOT block the merge; the
+ * first Jaccard hit is returned (legacy behavior). Use during rollout to
+ * observe gate decisions before enforcement.
+ */
+export function findSimilarConsolidation(
   store: Store,
   observation: string,
-  collection: string
-): { id: number; source_doc_ids: string } | null {
+  collection: string,
+  candidateSourceDocIds: number[]
+): { id: number; observation: string; source_doc_ids: string } | null {
+  // ORDER BY id ASC makes "first shortlist hit" deterministic across
+  // SQLite plan changes — the dry-run legacy parity case relies on
+  // iterating rows in a stable insertion order.
   const existing = store.db.prepare(`
     SELECT id, observation, source_doc_ids
     FROM consolidated_observations
     WHERE status = 'active' AND collection = ?
+    ORDER BY id ASC
   `).all(collection) as { id: number; observation: string; source_doc_ids: string }[];
 
   const queryWords = new Set(observation.toLowerCase().split(/\s+/).filter(w => w.length > 3));
 
+  // Stage 1: Jaccard shortlist (broad candidate generation)
+  const shortlist: Array<{ row: typeof existing[number]; jaccard: number }> = [];
   for (const obs of existing) {
     const obsWords = new Set(obs.observation.toLowerCase().split(/\s+/).filter(w => w.length > 3));
     const intersection = [...queryWords].filter(w => obsWords.has(w)).length;
@@ -347,11 +547,128 @@ function findSimilarConsolidation(
     const jaccard = union > 0 ? intersection / union : 0;
 
     if (jaccard > 0.5) {
-      return { id: obs.id, source_doc_ids: obs.source_doc_ids };
+      shortlist.push({ row: obs, jaccard });
     }
   }
 
-  return null;
+  if (shortlist.length === 0) return null;
+
+  const dryRun = process.env.CLAWMEM_MERGE_GUARD_DRY_RUN === "true";
+
+  // Dry-run: preserve EXACT legacy behavior — return the first shortlist
+  // hit (the pre-Ext-3 code iterated the SELECT rows in order and returned
+  // on first Jaccard > 0.5), while still logging every candidate's gate
+  // decision for operator observation.
+  if (dryRun) {
+    for (const candidate of shortlist) {
+      const existingSourceIds = safeParseDocIds(candidate.row.source_doc_ids);
+      const result = passesMergeSafety(
+        store,
+        observation,
+        candidateSourceDocIds,
+        candidate.row.observation,
+        existingSourceIds
+      );
+      console.log(
+        `[consolidation] merge-safety[dry-run] id=${candidate.row.id} ` +
+        `jaccard=${candidate.jaccard.toFixed(2)} ` +
+        `score=${result.score.toFixed(3)} threshold=${result.threshold} ` +
+        `method=${result.method} accepted=${result.accepted} reason="${result.reason}"`
+      );
+    }
+    const first = shortlist[0]!;
+    return {
+      id: first.row.id,
+      observation: first.row.observation,
+      source_doc_ids: first.row.source_doc_ids,
+    };
+  }
+
+  // Stage 2: Merge safety gate — keep best candidate that passes
+  let best: { row: typeof existing[number]; gateScore: number } | null = null;
+  for (const candidate of shortlist) {
+    const existingSourceIds = safeParseDocIds(candidate.row.source_doc_ids);
+    const result = passesMergeSafety(
+      store,
+      observation,
+      candidateSourceDocIds,
+      candidate.row.observation,
+      existingSourceIds
+    );
+
+    if (!result.accepted) {
+      console.log(
+        `[consolidation] merge-safety rejected id=${candidate.row.id} ` +
+        `method=${result.method} score=${result.score.toFixed(3)} ` +
+        `threshold=${result.threshold} reason="${result.reason}"`
+      );
+      continue;
+    }
+
+    if (!best || result.score > best.gateScore) {
+      best = { row: candidate.row, gateScore: result.score };
+    }
+  }
+
+  if (!best) return null;
+  return {
+    id: best.row.id,
+    observation: best.row.observation,
+    source_doc_ids: best.row.source_doc_ids,
+  };
+}
+
+/**
+ * Safely parse a JSON array of doc IDs from a stored string column.
+ * Returns an empty array on any parse failure (null, empty string,
+ * malformed JSON, non-array JSON). Exported so tests can drive the
+ * exact parse path that the merge-update helper and findSimilarConsolidation
+ * both rely on.
+ */
+export function safeParseDocIds(raw: string | null | undefined): number[] {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? parsed.filter(x => typeof x === "number") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Merge a new set of source doc IDs into an existing consolidated
+ * observation row. Idempotent: deduplicates source IDs, updates proof
+ * count to the final de-duplicated size, refreshes observation text.
+ *
+ * Uses `safeParseDocIds` so a corrupted `source_doc_ids` value on the
+ * existing row (NULL, empty string, malformed JSON, non-array JSON)
+ * cannot crash the merge path. A corrupted existing row is treated as
+ * if it had no prior source IDs, and the merged list contains only the
+ * new IDs — recovering the row instead of losing the entire cluster.
+ *
+ * Extracted from `synthesizeCluster` so the update-path safety can be
+ * unit-tested directly (Ext 3 Low finding — review Turn 5).
+ */
+export function mergeIntoExistingConsolidation(
+  store: Store,
+  existing: { id: number; source_doc_ids: string },
+  newSourceDocIds: number[],
+  newObservation: string
+): { mergedIds: number[] } {
+  const existingSourceIds = safeParseDocIds(existing.source_doc_ids);
+  const mergedIds = [...new Set([...existingSourceIds, ...newSourceDocIds])];
+
+  store.db
+    .prepare(
+      `UPDATE consolidated_observations
+       SET proof_count = ?,
+           source_doc_ids = ?,
+           updated_at = datetime('now'),
+           observation = ?
+       WHERE id = ?`
+    )
+    .run(mergedIds.length, JSON.stringify(mergedIds), newObservation, existing.id);
+
+  return { mergedIds };
 }
 
 /**
@@ -407,7 +724,11 @@ function updateTrends(store: Store): void {
  * Only considers decision/preference/milestone/problem observations from the
  * last 7 days that haven't already been used as sources for deductions.
  */
-async function generateDeductiveObservations(store: Store, llm: LlamaCpp): Promise<number> {
+async function generateDeductiveObservations(
+  store: Store,
+  llm: LlamaCpp
+): Promise<DeductiveSynthesisStats> {
+  const stats = emptyDeductiveStats();
   // Find recent high-value observations not yet used in deductions
   const DEDUCTIVE_TYPES = ['decision', 'preference', 'milestone', 'problem'];
   const recentObs = store.db.prepare(`
@@ -434,7 +755,8 @@ async function generateDeductiveObservations(store: Store, llm: LlamaCpp): Promi
     path: string; modified_at: string;
   }[];
 
-  if (recentObs.length < 2) return 0;
+  stats.considered = recentObs.length;
+  if (recentObs.length < 2) return stats;
 
   // Build context for LLM
   const obsText = recentObs.map((o, i) =>
@@ -470,7 +792,11 @@ Rules:
 Return ONLY the JSON array. /no_think`;
 
   const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 500 });
-  if (!result?.text) return 0;
+  if (!result?.text) {
+    stats.nullCalls++;
+    console.log(`[deductive] draft-generation LLM null — skipping Phase 3 tick`);
+    return stats;
+  }
 
   const parsed = extractJsonFromLLM(result.text) as Array<{
     conclusion: string;
@@ -478,22 +804,115 @@ Return ONLY the JSON array. /no_think`;
     source_indices: number[];
   }> | null;
 
-  if (!Array.isArray(parsed)) return 0;
+  if (!Array.isArray(parsed)) return stats;
 
-  let created = 0;
+  stats.drafted = parsed.length;
+
   const timestamp = new Date().toISOString();
   const dateStr = timestamp.slice(0, 10);
 
   for (const deduction of parsed) {
-    if (!deduction.conclusion || !Array.isArray(deduction.source_indices) || deduction.source_indices.length < 2) continue;
+    if (!deduction.conclusion || !Array.isArray(deduction.source_indices) || deduction.source_indices.length < 2) {
+      stats.rejected++;
+      stats.invalidIndexRejects++;
+      continue;
+    }
 
-    const sourceDocIds = deduction.source_indices
-      .filter(i => i >= 1 && i <= recentObs.length)
-      .map(i => recentObs[i - 1]!.id);
+    const sourceDocIds = [...new Set(
+      deduction.source_indices
+        .filter(i => i >= 1 && i <= recentObs.length)
+        .map(i => recentObs[i - 1]!.id)
+    )];
 
-    if (sourceDocIds.length < 2) continue;
+    if (sourceDocIds.length < 2) {
+      stats.rejected++;
+      stats.invalidIndexRejects++;
+      continue;
+    }
 
-    // Check for duplicate deduction (Jaccard on conclusion text)
+    // Ext 1: Anti-contamination validation. Build the source doc
+    // subset from recentObs, then run the guardrails:
+    //  1. Deterministic pre-checks (non-trivial conclusion, ≥2 sources)
+    //  2. Entity-aware / lexical-fallback contamination scan
+    //  3. LLM validation/refinement with filtered evidence + relation
+    //     context — on null/malformed, fall back to deterministic accept
+    const sourceDocs: DocLike[] = sourceDocIds
+      .map(id => recentObs.find(o => o.id === id))
+      .filter((d): d is typeof recentObs[number] => Boolean(d))
+      .map(d => ({
+        id: d.id,
+        title: d.title,
+        facts: d.facts,
+        narrative: d.narrative,
+      }));
+
+    const draft: DeductiveDraft = {
+      conclusion: deduction.conclusion,
+      premises: deduction.premises ?? [],
+      sourceIndices: deduction.source_indices,
+    };
+
+    const validation = await validateDeductiveDraft(
+      store,
+      llm,
+      draft,
+      sourceDocs,
+      recentObs.map(r => ({
+        id: r.id,
+        title: r.title,
+        facts: r.facts,
+        narrative: r.narrative,
+      }))
+    );
+
+    if (!validation.accepted) {
+      stats.rejected++;
+      switch (validation.reason) {
+        case "contamination":
+          stats.contaminationRejects++;
+          console.log(
+            `[deductive] rejected for contamination (method=${validation.contaminationMethod}): ` +
+              `hits=${(validation.contaminationHits ?? []).join(",")} — ` +
+              `"${deduction.conclusion.slice(0, 60)}..."`
+          );
+          break;
+        case "invalid_indices":
+          stats.invalidIndexRejects++;
+          break;
+        case "unsupported":
+          stats.unsupportedRejects++;
+          console.log(
+            `[deductive] rejected as unsupported by LLM validator: ` +
+              `"${deduction.conclusion.slice(0, 60)}..."`
+          );
+          break;
+        case "empty":
+          stats.emptyRejects++;
+          break;
+      }
+      continue;
+    }
+
+    stats.accepted++;
+    if (validation.fallbackAccepted) {
+      stats.validatorFallbackAccepts++;
+    }
+    // Use validated (possibly LLM-refined) conclusion + premises from
+    // here on. This replaces the draft's original text for dedupe,
+    // persistence, and the sourceRefs block.
+    deduction.conclusion = validation.conclusion ?? deduction.conclusion;
+    deduction.premises = validation.premises ?? deduction.premises;
+
+    // Check for duplicate deduction (Jaccard on conclusion text) →
+    // contradiction gate (Ext 2). Evaluate ALL near-duplicates, not
+    // just the first one, so the decision is order-independent:
+    //
+    //  - If ANY existing deduction is a non-contradictory duplicate,
+    //    skip the new deduction (something already says this).
+    //  - Else if ANY existing deduction is an actionable contradiction,
+    //    KEEP the new deduction and link to EVERY contradictory match
+    //    via `contradicts` relations.
+    //  - Else (no Jaccard matches at all) → insert as new.
     const existingDedups = store.db.prepare(`
       SELECT id, title FROM documents
       WHERE content_type = 'deductive' AND active = 1
@@ -501,14 +920,43 @@ Return ONLY the JSON array. /no_think`;
     `).all() as { id: number; title: string }[];
 
     const conclusionWords = new Set(deduction.conclusion.toLowerCase().split(/\s+/).filter(w => w.length > 3));
-    const isDuplicate = existingDedups.some(d => {
+    const jaccardDuplicates = existingDedups.filter(d => {
       const titleWords = new Set(d.title.toLowerCase().split(/\s+/).filter(w => w.length > 3));
       const intersection = [...conclusionWords].filter(w => titleWords.has(w)).length;
       const union = new Set([...conclusionWords, ...titleWords]).size;
       return union > 0 && intersection / union > 0.5;
     });
 
-    if (isDuplicate) continue;
+    const contradictoryDuplicates: { id: number; confidence: number; reason?: string }[] = [];
+    let hasNonContradictoryDuplicate = false;
+    for (const candidate of jaccardDuplicates) {
+      const contradiction = await checkContradiction(
+        llm,
+        candidate.title,
+        deduction.conclusion,
+        "deductive synthesis phase"
+      );
+      if (isActionableContradiction(contradiction)) {
+        contradictoryDuplicates.push({
+          id: candidate.id,
+          confidence: contradiction.confidence,
+          reason: contradiction.reason,
+        });
+      } else {
+        hasNonContradictoryDuplicate = true;
+        // Don't break — keep scanning to give operator full log coverage,
+        // but we already know we'll skip.
+      }
+    }
+
+    // Skip rule: if ANY non-contradictory duplicate exists, the new
+    // deduction is redundant regardless of any contradictions.
+    if (hasNonContradictoryDuplicate) {
+      stats.dedupSkipped++;
+      continue;
+    }
+    // Otherwise we either have no matches (fall through to insert as new)
+    // or only contradictory matches (insert + link).
 
     // Build the deductive document
     const premisesText = (deduction.premises || []).map(p => `- ${p}`).join('\n');
@@ -569,7 +1017,34 @@ Return ONLY the JSON array. /no_think`;
           } catch { /* non-fatal */ }
         }
 
-        created++;
+        // Ext 2: If we kept this deduction because it contradicts one
+        // or more existing deductive docs, link them ALL via
+        // `contradicts` relations so operators can find every conflict
+        // via `SELECT * FROM memory_relations WHERE relation_type = 'contradicts'`.
+        // Uses the A-MEM convention plural form (P0-enforced).
+        if (contradictoryDuplicates.length > 0) {
+          const relStmt = store.db.prepare(
+            `INSERT OR IGNORE INTO memory_relations
+               (source_id, target_id, relation_type, weight, contradict_confidence, metadata, created_at)
+             VALUES (?, ?, 'contradicts', 0, ?, ?, datetime('now'))`
+          );
+          for (const contra of contradictoryDuplicates) {
+            try {
+              relStmt.run(
+                doc.id,
+                contra.id,
+                contra.confidence,
+                JSON.stringify({ reason: contra.reason ?? "" })
+              );
+              console.log(
+                `[deductive] contradiction linked: new #${doc.id} contradicts existing #${contra.id} ` +
+                  `(confidence=${contra.confidence.toFixed(2)})`
+              );
+            } catch { /* non-fatal — the deduction itself still landed */ }
+          }
+        }
+
+        stats.created++;
         console.log(`[deductive] Created: "${deduction.conclusion.slice(0, 60)}..." from ${sourceDocIds.length} sources`);
       }
     } catch (err) {
@@ -577,7 +1052,7 @@ Return ONLY the JSON array. /no_think`;
     }
   }
 
-  return created;
+  return stats;
 }
 
 /**
@@ -586,9 +1061,8 @@ Return ONLY the JSON array. /no_think`;
 export async function runDeductiveSynthesis(
   store: Store,
   llm: LlamaCpp,
-): Promise<{ created: number }> {
-  const created = await generateDeductiveObservations(store, llm);
-  return { created };
+): Promise<DeductiveSynthesisStats> {
+  return await generateDeductiveObservations(store, llm);
 }
 
 // =============================================================================
