@@ -95,6 +95,19 @@ A second, longer-interval consolidation worker that keeps Phase 2 + Phase 3 runn
 
 Adds +56 tests (13 worker-lease + 35 maintenance unit + 8 maintenance integration) on top of the v0.7.2 baseline.
 
+### v0.8.1 Multi-Turn Prior-Query Lookback
+
+`context-surfacing` now builds its retrieval query from the current prompt plus up to two recent same-session prior prompts, so a short follow-up turn ("do the same for X", "explain the rationale") can still inherit the vocabulary of earlier turns. The raw prompt is persisted in a new nullable `context_usage.query_text` column so future hook ticks can reconstitute the multi-turn query from the DB. See [multi-turn lookback](docs/concepts/architecture.md#multi-turn-prior-query-lookback-v081) for the full walkthrough.
+
+- **Additive schema migration** — new nullable `query_text TEXT` column on `context_usage`, guarded by `PRAGMA table_info`. Pre-v0.8.1 stores get the column added on first open; ad-hoc stores that skip the migration path degrade transparently via a feature-detect WeakMap so `insertUsageFn` never writes a column that doesn't exist.
+- **Discovery path only** — the multi-turn query feeds vector search, BM25, and query expansion. Cross-encoder reranking continues to use the RAW current prompt so relevance scoring is not diluted by older turns, and composite scoring / snippet extraction / dedupe / routing-hint detection all remain on the raw prompt as well.
+- **Privacy-conscious persistence split** — gated skip paths (slash commands, `MIN_PROMPT_LENGTH`, `shouldSkipRetrieval`, heartbeat dedupe) do NOT persist their raw text because those turns are not meaningful user questions and carry a higher sensitivity profile. Post-retrieval empty paths (empty result set, threshold blocked, budget blocked) DO persist so a follow-up turn can still inherit the intent even when the current turn surfaced nothing.
+- **Current-first truncation** — the combined query is clamped to 2000 chars with the current prompt preserved verbatim at the head. Older priors are dropped first when the budget runs out. If the current prompt alone already exceeds the cap, priors are omitted entirely and the current prompt is truncated.
+- **SQL-level self-match guard** — duplicate submits of the same prompt are filtered out of the lookback SELECT via `AND query_text != ?` so a retry burst cannot eat into the 2-prior budget and leave the lookback window underfilled.
+- **10-minute max age, session-scoped** — priors older than 10 minutes or from a different `session_id` are invisible to the lookback. All fallback paths (missing column, DB error, no matching rows) return the current prompt unchanged — the hook never throws on lookback failures.
+
+Adds +27 tests (22 unit + 5 integration) on top of the v0.8.0 baseline.
+
 ## Architecture
 
 <p align="center">
@@ -1187,6 +1200,7 @@ Built on the shoulders of:
 - [QMD](https://github.com/tobi/qmd) — search backend (BM25 + vectors + RRF + reranking)
 - [SAME](https://github.com/sgx-labs/statelessagent) — agent memory concepts (recency decay, confidence scoring, session tracking)
 - [supermemory](https://github.com/supermemoryai/clawdbot-supermemory) — hook patterns and context surfacing ideas
+- [Thoth](https://github.com/siddsachar/Thoth) — anti-contamination deductive synthesis, contradiction-aware + name-aware merge gates, post-import conversation fact extraction, quiet-window heavy maintenance lane with worker leases, context instruction framing, relationship snippets, multi-turn prior-query lookback
 
 ## Roadmap
 

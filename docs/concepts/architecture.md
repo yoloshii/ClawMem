@@ -283,6 +283,84 @@ SELECT json_extract(metrics_json, '$.selector') AS selector, COUNT(*)
 
 The heavy lane operates on whatever `Store` it is handed. `createStore(path)` maps 1:1 to a single SQLite vault, so `context_usage` counts and `recall_stats` ordering are both inherently scoped to the current vault via `store.db` — no per-vault predicate is needed in the queries. Multi-vault mode (running the heavy lane across multiple stores from a single process) is explicitly out of scope for v0.8.0 and would require extending `HeavyMaintenanceConfig` with an explicit vault list plus a per-vault lease name.
 
+## Multi-turn prior-query lookback (v0.8.1)
+
+A single-prompt retrieval query is wrong when the user's current turn is short. "Do the same thing for X", "Explain that in more depth", and "Now talk about refresh tokens in the same design" are all legitimate questions whose intent lives in the *previous* turn, not the current one. v0.8.1 teaches `context-surfacing` to build its retrieval query from the current prompt plus up to two recent same-session prior prompts, so short follow-up turns inherit the vocabulary of earlier turns. Everything else (composite scoring, snippet extraction, reranking, dedupe, routing hints, recall attribution) continues to use the raw current prompt unchanged — only the discovery path sees the multi-turn query.
+
+The helper lives in `src/hooks/context-surfacing.ts` and is backed by a new nullable `query_text` column on `context_usage`.
+
+### Additive schema migration
+
+```sql
+ALTER TABLE context_usage ADD COLUMN query_text TEXT;
+```
+
+Guarded with `PRAGMA table_info(context_usage)` the same way the existing `turn_index` migration is. Stores created before v0.8.1 pick up the column on first open. A WeakMap `contextUsageHasQueryTextCache` records the column presence per `Database` instance at migration time so `insertUsageFn` can pick the correct INSERT shape without running `PRAGMA table_info` on every write. Ad-hoc stores that construct a `Database` outside `createStore()` default the cache to `false` and fall back to the pre-v0.8.1 7-column INSERT shape — the new code never writes a column that doesn't exist.
+
+### Privacy-conscious persistence split
+
+Raw prompt text has privacy implications. Two classes of `logEmptyTurn` call site exist in `contextSurfacing`, and they get different treatment:
+
+- **Pre-retrieval gates** — slash commands (`prompt.startsWith("/")`), too-short prompts (`< MIN_PROMPT_LENGTH`), `shouldSkipRetrieval` hits (greetings, shell commands, affirmations), and `wasPromptSeenRecently` / `isHeartbeatPrompt` dedupe. These are not meaningful user questions and carry a higher sensitivity profile (they often contain incidental tool output or noise). They write a `context_usage` row with `query_text = NULL` to keep `turn_index` aligned with the transcript but not persist the raw text.
+- **Post-retrieval empty paths** — empty result set, all results in `FILTERED_PATHS`, all results snoozed, activation floor not met, adaptive threshold filter, and empty `buildContext`. These are legitimate user questions that simply didn't match anything. They write a row with `query_text = prompt` so a follow-up turn ("try again" / "what about Y") can still use the intent via multi-turn lookback.
+
+The happy path (successful injection) also persists `query_text = prompt`.
+
+### Retrieval query construction
+
+`buildMultiTurnSurfacingQuery(store, sessionId, currentQuery, lookback=2, maxAgeMinutes=10, maxChars=2000)` fetches recent `query_text` rows via:
+
+```sql
+SELECT query_text FROM context_usage
+ WHERE session_id = ?
+   AND hook_name = 'context-surfacing'
+   AND timestamp > ?
+   AND query_text IS NOT NULL
+   AND query_text != ''
+   AND query_text != ?     -- SQL-level self-match guard
+ ORDER BY id DESC
+ LIMIT ?
+```
+
+The ISO 8601 cutoff is computed in JS and bound as a parameter (same lesson as v0.8.0's `countRecentContextUsages` fix — `datetime('now', ...)` returns a space-separated format that sorts wrong against the `T`-separated ISO 8601 timestamps written by `new Date().toISOString()`).
+
+The self-match filter lives in SQL because pushing it into application code under a `LIMIT lookback + 1` under-fills the window when multiple duplicate rows of the current prompt share the session. Example: `[current, current, prior1, prior2]` with app-level filtering would return only 3 rows, drop both duplicates, and leave just `prior1` in the result — half the lookback budget wasted. With the SQL inequality, every returned row is a valid non-self prior by construction and the `LIMIT = lookback` exactly matches the budget.
+
+Fallback paths: missing `sessionId`, empty current prompt, missing `query_text` column on a pre-migration schema (SELECT throws → caught), and any other DB error all return the current prompt unchanged. The function never throws.
+
+### Current-first truncation
+
+The combined query format is:
+
+```
+<current prompt>
+
+<newest prior>
+
+<older prior>
+```
+
+(blank lines between segments). If the assembled string exceeds `maxChars` (default 2000), the algorithm drops older priors one at a time rather than truncating the head. The current prompt is **always** present verbatim in the result so the user's actual question anchors the retrieval. Only when the current prompt alone already exceeds `maxChars` (rare, because the handler enforces `MAX_QUERY_LENGTH` earlier) does the function return the truncated current prompt with priors omitted entirely.
+
+### Which retrieval stages use the combined query
+
+| Stage | Query used | Rationale |
+|---|---|---|
+| `searchVec` | combined | Discovery — inherit prior-turn vocabulary |
+| `searchFTS` (fast path) | combined | Discovery |
+| `searchFTS` (expanded variants) | combined | Discovery — expansion already reads from the combined query |
+| `expandQuery` | combined | The LLM expansion benefits from context |
+| File-path FTS supplements | raw current | File names live in the current prompt only; priors would pollute this channel |
+| Cross-encoder rerank | **raw current** | Rerank asks "how well does this doc match the user's current question" — diluting with older turns blurs the final ordering |
+| Composite scoring | raw current | Recency intent / content-type weighting is per-current-turn |
+| Snippet extraction | raw current | Highlighting should point at the user's current question |
+| Routing hint detection | raw current | "why did we decide X" is about the current turn's intent |
+| `hashQuery` for recall attribution | raw current | Each event should attribute to the specific turn that surfaced it |
+| `wasPromptSeenRecently` dedupe | raw current | Dedupe key is about the actual submitted text |
+| `isHeartbeatPrompt` check | raw current | Heartbeat detection runs on the raw input |
+
+This split keeps multi-turn lookback a discovery-only enhancement and ensures every downstream signal that depends on "what did the user actually type right now" continues to see exactly that.
+
 ## Retrieval tiers
 
 | Tier | Mechanism | Agent effort | Coverage |

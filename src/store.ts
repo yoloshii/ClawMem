@@ -496,16 +496,35 @@ function initializeDatabase(db: Database): void {
       injected_paths TEXT NOT NULL DEFAULT '[]',
       estimated_tokens INTEGER NOT NULL DEFAULT 0,
       was_referenced INTEGER NOT NULL DEFAULT 0,
-      turn_index INTEGER NOT NULL DEFAULT 0
+      turn_index INTEGER NOT NULL DEFAULT 0,
+      query_text TEXT
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_context_usage_session ON context_usage(session_id)`);
 
   // Migration: add turn_index to existing context_usage
-  const cuCols = db.prepare("PRAGMA table_info(context_usage)").all() as { name: string }[];
+  let cuCols = db.prepare("PRAGMA table_info(context_usage)").all() as { name: string }[];
   if (!cuCols.some(c => c.name === "turn_index")) {
     try { db.exec(`ALTER TABLE context_usage ADD COLUMN turn_index INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+    cuCols = db.prepare("PRAGMA table_info(context_usage)").all() as { name: string }[];
   }
+
+  // v0.8.1 Ext 6b: add nullable query_text column to existing context_usage
+  // so multi-turn lookback can persist the raw prompt alongside turn_index.
+  // The column is nullable and defaults to NULL — pre-migration rows are
+  // treated as "no prior query" by buildMultiTurnSurfacingQuery, preserving
+  // the current-prompt-only fallback for any session that predates v0.8.1.
+  if (!cuCols.some(c => c.name === "query_text")) {
+    try { db.exec(`ALTER TABLE context_usage ADD COLUMN query_text TEXT`); } catch { /* exists */ }
+  }
+  // Cache the column presence for insertUsageFn so it can build the INSERT
+  // statement without running PRAGMA table_info on every write path.
+  contextUsageHasQueryTextCache.set(
+    db,
+    db.prepare("PRAGMA table_info(context_usage)")
+      .all()
+      .some((c) => (c as { name: string }).name === "query_text"),
+  );
 
   // Hook prompt dedupe: suppress duplicate/heartbeat prompts to reduce GPU churn.
   db.exec(`
@@ -894,6 +913,12 @@ function initializeDatabase(db: Database): void {
 
 // Per-database dimension cache (WeakMap keyed by db object — no collisions for in-memory DBs)
 const vecTableDimsCache = new WeakMap<Database, number>();
+
+// v0.8.1 Ext 6b: per-database cache for the query_text column presence on
+// context_usage. Set once at migration time so insertUsageFn can pick the
+// correct INSERT shape without running PRAGMA on every write. Falls back
+// to `false` (safe — equivalent to pre-migration behavior) when absent.
+const contextUsageHasQueryTextCache = new WeakMap<Database, boolean>();
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (vecTableDimsCache.get(db) === dimensions) return;
@@ -1722,6 +1747,13 @@ export type UsageRecord = {
   estimatedTokens: number;
   wasReferenced: number;
   turnIndex?: number;
+  /**
+   * v0.8.1 Ext 6b: raw user prompt for this turn. Written when the caller
+   * wants the row to be usable for multi-turn lookback retrieval. Persisted
+   * via `insertUsageFn` only when the `query_text` column is present on
+   * `context_usage` (pre-migration stores degrade to "no prior query").
+   */
+  queryText?: string;
 };
 
 export type UsageRow = {
@@ -3939,10 +3971,33 @@ function getRecentSessionsFn(db: Database, limit: number): SessionRecord[] {
 // =============================================================================
 
 function insertUsageFn(db: Database, usage: UsageRecord): number {
-  db.prepare(`
-    INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths), usage.estimatedTokens, usage.wasReferenced, usage.turnIndex ?? 0);
+  // v0.8.1 Ext 6b: write query_text when the column is present AND the
+  // caller provided one. The column presence is cached at migration time
+  // in contextUsageHasQueryTextCache — missing entries default to false
+  // so ad-hoc DBs constructed outside createStore() degrade gracefully
+  // to the pre-v0.8.1 INSERT shape.
+  const hasQueryText = contextUsageHasQueryTextCache.get(db) ?? false;
+  if (hasQueryText) {
+    db.prepare(`
+      INSERT INTO context_usage
+        (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index, query_text)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      usage.sessionId,
+      usage.timestamp,
+      usage.hookName,
+      JSON.stringify(usage.injectedPaths),
+      usage.estimatedTokens,
+      usage.wasReferenced,
+      usage.turnIndex ?? 0,
+      usage.queryText ?? null,
+    );
+  } else {
+    db.prepare(`
+      INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths), usage.estimatedTokens, usage.wasReferenced, usage.turnIndex ?? 0);
+  }
   // Return the rowid of the just-inserted row for recall event linkage
   const row = db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
   return row.id;

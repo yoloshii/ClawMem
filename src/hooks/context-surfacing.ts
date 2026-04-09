@@ -69,6 +69,19 @@ const INSTRUCTION_TOKEN_COST = estimateTokens(INSTRUCTION_XML);
 const RELATIONSHIPS_XML_OVERHEAD_TOKENS = estimateTokens("<relationships>\n\n</relationships>");
 const MAX_RELATION_SNIPPETS = 10;
 
+// Ext 6b: Multi-turn prior-query lookback
+// The retrieval query is built from the current prompt plus up to
+// MULTI_TURN_LOOKBACK recent same-session prior prompts within
+// MULTI_TURN_MAX_AGE_MINUTES. The combined query is clamped to
+// MULTI_TURN_MAX_CHARS with newest content preserved first — so the
+// current prompt is always the first N chars even when older priors
+// would otherwise push it out. All other hook signals (scoring,
+// composite recency intent, recall attribution, routing hints)
+// continue to use the raw current prompt.
+const MULTI_TURN_LOOKBACK = 2;
+const MULTI_TURN_MAX_AGE_MINUTES = 10;
+const MULTI_TURN_MAX_CHARS = 2000;
+
 // File path patterns to extract from prompts (E13 replacement: file-aware UserPromptSubmit)
 const FILE_PATH_RE = /(?:^|\s)((?:\/[\w.@-]+)+(?:\.\w+)?|[\w.@-]+\.(?:ts|js|py|md|sh|yaml|yml|json|toml|rs|go|tsx|jsx|css|html))\b/g;
 
@@ -133,12 +146,25 @@ export async function contextSurfacing(
   const isRecency = hasRecencyIntent(prompt);
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : profile.minScore;
 
+  // Ext 6b: Build the retrieval query from the current prompt plus up to
+  // MULTI_TURN_LOOKBACK recent same-session prior prompts. Used only for
+  // the discovery path (vector, FTS, query expansion, reranking) so that
+  // a short "do that" / "same for X" turn can inherit the vocabulary of
+  // earlier turns. All other prompt-dependent signals (recency intent,
+  // composite scoring, recall attribution, snippet highlighting, routing
+  // hints, dedupe, heartbeat check) continue to use the raw current
+  // prompt. If the session has no priors in the window, the helper
+  // returns the current prompt unchanged.
+  const retrievalQuery = input.sessionId
+    ? buildMultiTurnSurfacingQuery(store, input.sessionId, prompt)
+    : prompt;
+
   // Search: try vector first (if profile allows), fall back to BM25
   // When vector succeeds, also supplement with FTS for keyword-exact recall
   let results: SearchResult[] = [];
   if (profile.useVector) {
     try {
-      const vectorPromise = store.searchVec(prompt, DEFAULT_EMBED_MODEL, maxResults);
+      const vectorPromise = store.searchVec(retrievalQuery, DEFAULT_EMBED_MODEL, maxResults);
       const timeoutPromise = new Promise<SearchResult[]>((_, reject) =>
         setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout)
       );
@@ -149,11 +175,11 @@ export async function contextSurfacing(
   }
 
   if (results.length === 0) {
-    results = store.searchFTS(prompt, maxResults);
+    results = store.searchFTS(retrievalQuery, maxResults);
   } else {
     // Supplement vector results with FTS for keyword-exact matches (<10ms)
     const seen = new Set(results.map(r => r.filepath));
-    const ftsSupplemental = store.searchFTS(prompt, 5);
+    const ftsSupplemental = store.searchFTS(retrievalQuery, 5);
     for (const r of ftsSupplemental) {
       if (!seen.has(r.filepath)) {
         seen.add(r.filepath);
@@ -166,7 +192,7 @@ export async function contextSurfacing(
   if (getVaultPath("skill")) {
     try {
       const skillStore = resolveStore("skill");
-      const skillResults = skillStore.searchFTS(prompt, 5);
+      const skillResults = skillStore.searchFTS(retrievalQuery, 5);
       // Tag skill vault results for identification in output
       for (const r of skillResults) {
         (r as any)._fromVault = "skill";
@@ -178,7 +204,9 @@ export async function contextSurfacing(
   }
 
   // File-aware supplemental search (E13 replacement): extract file paths/names from prompt
-  // and run targeted FTS queries to surface file-specific vault context
+  // and run targeted FTS queries to surface file-specific vault context.
+  // File-path extraction stays on the raw current prompt so priors cannot
+  // pollute the file-specific discovery channel with stale filenames.
   const fileMatches = [...prompt.matchAll(FILE_PATH_RE)].map(m => m[1]!.trim()).filter(Boolean);
   if (fileMatches.length > 0) {
     const seen = new Set(results.map(r => r.filepath));
@@ -195,17 +223,23 @@ export async function contextSurfacing(
     }
   }
 
-  if (results.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
+  if (results.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
 
   // Budget-aware deep escalation (deep profile only):
   // If the fast path finished quickly and found results, spend remaining time budget
   // on query expansion (discovers new candidates) and cross-encoder reranking (reorders).
+  // Ext 6b: expansion + FTS variants use the multi-turn retrieval query so
+  // short current prompts still inherit prior-turn vocabulary. Reranking
+  // continues to use the RAW current prompt so relevance scoring is not
+  // diluted by older turns — the cross-encoder is asked "how well does
+  // this doc match the user's current question", not "how well does it
+  // match the last 10 minutes of questions".
   if (profile.deepEscalation && results.length >= 2) {
     const elapsed = Date.now() - startTime;
     if (elapsed < profile.escalationBudgetMs) {
       try {
         // Phase 1: Query expansion — discover candidates BM25+vector missed
-        const expanded = await store.expandQuery(prompt, DEFAULT_QUERY_MODEL);
+        const expanded = await store.expandQuery(retrievalQuery, DEFAULT_QUERY_MODEL);
         if (expanded.length > 0) {
           const seen = new Set(results.map(r => r.filepath));
           for (const eq of expanded.slice(0, 3)) {
@@ -253,7 +287,7 @@ export async function contextSurfacing(
     !FILTERED_PATHS.some(p => r.displayPath.includes(p))
   );
 
-  if (results.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
+  if (results.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
 
   // Filter out snoozed documents
   const now = new Date();
@@ -269,7 +303,7 @@ export async function contextSurfacing(
     return true;
   });
 
-  if (results.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
+  if (results.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
 
   // Deduplicate by filepath (keep best score per path)
   const deduped = new Map<string, SearchResult>();
@@ -311,7 +345,7 @@ export async function contextSurfacing(
       : 0;
 
     // Activation floor: if even the best result is too weak, bail entirely
-    if (bestScore < profile.activationFloor) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
+    if (bestScore < profile.activationFloor) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
 
     const adaptiveMin = Math.max(bestScore * profile.minScoreRatio, profile.absoluteFloor);
     scored = allScored.filter(r => r.compositeScore >= adaptiveMin);
@@ -320,7 +354,7 @@ export async function contextSurfacing(
     scored = allScored.filter(r => r.compositeScore >= minScore);
   }
 
-  if (scored.length === 0) { logEmptyTurn(store, input); return makeEmptyOutput("context-surfacing"); }
+  if (scored.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
 
   // Spreading activation (E11): boost results co-activated with top HOT results
   if (scored.length > 3) {
@@ -369,7 +403,7 @@ export async function contextSurfacing(
   const { context, paths, tokens } = buildContext(scored, prompt, factsBudget);
 
   if (!context) {
-    logEmptyTurn(store, input);
+    logEmptyTurn(store, input, prompt);
     return makeEmptyOutput("context-surfacing");
   }
 
@@ -377,8 +411,10 @@ export async function contextSurfacing(
   if (input.sessionId) {
     const turnIndex = (input as any)._turnIndex ?? 0;
 
-    // Log the injection — returns usage_id for recall event linkage
-    const usageId = logInjection(store, input.sessionId, "context-surfacing", paths, tokens, turnIndex);
+    // Log the injection — returns usage_id for recall event linkage.
+    // Ext 6b: persist the raw prompt as query_text so future turns in
+    // the same session can reconstitute a multi-turn retrieval query.
+    const usageId = logInjection(store, input.sessionId, "context-surfacing", paths, tokens, turnIndex, prompt);
 
     // Record recall events ONLY for docs that made it into the injected context
     // (post-budget). Docs trimmed by token budget were never seen by the model.
@@ -469,12 +505,21 @@ export async function contextSurfacing(
  * Log an empty context_usage row for a skipped turn.
  * Keeps turn_index aligned with transcript turns so per-turn recall
  * attribution doesn't drift when some prompts are gated.
+ *
+ * Ext 6b: `queryText` is optional. Callers that gated BEFORE the
+ * retrieval stage (slash commands, heartbeat dedupe, too-short prompts,
+ * `shouldSkipRetrieval`) pass nothing — those turns are not meaningful
+ * user questions and their raw text is not worth persisting for future
+ * multi-turn lookback. Callers that gated AFTER retrieval (empty result
+ * set, threshold filter, budget) pass the prompt so a follow-up turn
+ * can still reuse the intent even though the current turn surfaced
+ * nothing.
  */
-function logEmptyTurn(store: Store, input: HookInput): void {
+function logEmptyTurn(store: Store, input: HookInput, queryText?: string): void {
   if (!input.sessionId) return;
   try {
     const turnIndex = (input as any)._turnIndex ?? 0;
-    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex);
+    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex, queryText);
   } catch { /* non-fatal */ }
 }
 
@@ -698,6 +743,105 @@ export function buildVaultContextInner(
 
   lines.push(`<relationships>\n${fittedLines.join("\n")}\n</relationships>`);
   return lines.join("\n");
+}
+
+// =============================================================================
+// Ext 6b: Multi-turn prior-query lookback
+// =============================================================================
+
+/**
+ * Build the retrieval query from the current prompt plus up to `lookback`
+ * recent prior prompts from the same session within `maxAgeMinutes`.
+ *
+ * Returns the current prompt unchanged when:
+ *  - no `sessionId` (nothing to scope by)
+ *  - the `query_text` column is missing (pre-migration store)
+ *  - no prior rows within the window / all NULL
+ *  - any DB error (fail-open — never throws)
+ *
+ * The combined query format is
+ *   `<current>\n\n<newest prior>\n\n<older prior>...`
+ * truncated to `MULTI_TURN_MAX_CHARS` with **current content preserved
+ * first** — so even when older priors would push the current prompt
+ * past the char limit, the truncation drops the tail (older priors),
+ * not the head. This guarantees the retrieval query always contains the
+ * user's current question verbatim.
+ *
+ * Exported for direct unit testing.
+ */
+export function buildMultiTurnSurfacingQuery(
+  store: Store,
+  sessionId: string,
+  currentQuery: string,
+  lookback: number = MULTI_TURN_LOOKBACK,
+  maxAgeMinutes: number = MULTI_TURN_MAX_AGE_MINUTES,
+  maxChars: number = MULTI_TURN_MAX_CHARS,
+): string {
+  if (!sessionId || currentQuery.length === 0) return currentQuery;
+
+  let priors: string[] = [];
+  try {
+    // ISO 8601 cutoff computed in JS (same lesson as the v0.8.0
+    // countRecentContextUsages fix — datetime('now', ...) returns a
+    // space-separated string that sorts incorrectly against the
+    // T-separated ISO 8601 timestamps stored in context_usage).
+    const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000).toISOString();
+    // Self-match guard lives in SQL so a duplicate submit/retry cannot eat
+    // into the lookback budget. Turn 18 review found that filtering in
+    // application code with `LIMIT lookback + 1` under-fills when multiple
+    // prior rows carry the same text as the current prompt — the SELECT
+    // returned only `lookback + 1` rows and application-level skipping
+    // then dropped legitimate distinct priors along with the dupes.
+    // Pushing the inequality into WHERE means every returned row is a
+    // valid non-self prior and the LIMIT == lookback fits exactly.
+    const rows = store.db.prepare(
+      `SELECT query_text FROM context_usage
+        WHERE session_id = ?
+          AND hook_name = 'context-surfacing'
+          AND timestamp > ?
+          AND query_text IS NOT NULL
+          AND query_text != ''
+          AND query_text != ?
+        ORDER BY id DESC
+        LIMIT ?`,
+    ).all(sessionId, cutoff, currentQuery, lookback) as { query_text: string }[];
+
+    for (const row of rows) {
+      if (!row.query_text) continue;
+      priors.push(row.query_text);
+    }
+  } catch {
+    // query_text column may be missing on a pre-migration store, or
+    // the DB might be in a corrupted state — fall back to current-only.
+    return currentQuery;
+  }
+
+  if (priors.length === 0) return currentQuery;
+
+  // Assemble newest-first: current first, then newest prior, then older.
+  // The SQL already ordered rows DESC by id, so `priors[0]` is the newest.
+  const segments = [currentQuery, ...priors];
+  const combined = segments.join("\n\n");
+
+  if (combined.length <= maxChars) return combined;
+
+  // Over budget. Current query ALWAYS wins — include the full current
+  // prompt first, then add priors newest-first until the budget runs out.
+  // If the current prompt alone is already over budget, return it
+  // truncated (same as pre-v0.8.1 behavior — MAX_QUERY_LENGTH is
+  // enforced earlier in the handler so this branch is rare).
+  if (currentQuery.length >= maxChars) return currentQuery.slice(0, maxChars);
+
+  const parts: string[] = [currentQuery];
+  let used = currentQuery.length;
+  const separator = "\n\n";
+  for (const prior of priors) {
+    const cost = separator.length + prior.length;
+    if (used + cost > maxChars) break;
+    parts.push(prior);
+    used += cost;
+  }
+  return parts.join(separator);
 }
 
 /**

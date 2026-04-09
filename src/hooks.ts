@@ -379,6 +379,12 @@ export function smartTruncate(text: string, maxChars: number = 300): string {
 
 /**
  * Log a context injection to the usage tracking table.
+ *
+ * `queryText` (v0.8.1 Ext 6b) is the raw prompt for this turn. Persisted
+ * only when the caller passes it — logEmptyTurn-style skip paths omit it
+ * so gated turns (slash commands, heartbeats, noise) cannot leak raw
+ * prompt text into `context_usage.query_text`. Pre-migration stores
+ * transparently drop the column via `insertUsageFn`'s feature-detect.
  */
 export function logInjection(
   store: Store,
@@ -386,7 +392,8 @@ export function logInjection(
   hookName: string,
   injectedPaths: string[],
   estimatedTokens: number,
-  turnIndex?: number
+  turnIndex?: number,
+  queryText?: string
 ): number {
   try {
     const usageId = store.insertUsage({
@@ -397,6 +404,7 @@ export function logInjection(
       estimatedTokens,
       wasReferenced: 0,
       turnIndex,
+      queryText,
     });
 
     // Record co-activation for all injected paths (E3)
