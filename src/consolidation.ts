@@ -114,6 +114,50 @@ interface ObservationCluster {
   collection: string;
 }
 
+/**
+ * Phase 2 consolidation option bag (v0.8.0 Ext 5). All fields optional;
+ * omitting the bag reproduces pre-Ext-5 behavior exactly.
+ *
+ *  - `maxDocs`       override for the observation batch size (default 50)
+ *  - `guarded`       when true, force merge-safety enforcement regardless of
+ *                    the `CLAWMEM_MERGE_GUARD_DRY_RUN` env var. Heavy-lane
+ *                    callers pass this so experimenting operators cannot
+ *                    weaken the heavy-lane gate by toggling an env flag.
+ *  - `staleOnly`     when true, order observations by
+ *                    `recall_stats.last_recalled_at ASC` (with
+ *                    `documents.last_accessed_at` fallback) so least-recalled
+ *                    documents are processed first instead of most-recent.
+ *  - `candidateIds`  when non-empty, restricts the Phase 2 candidate set to
+ *                    exactly these document ids. Heavy lane uses this to
+ *                    plumb surprisal-selector output into consolidation so
+ *                    `useSurprisalSelector: true` actually feeds anomaly-first
+ *                    candidates instead of just relabeling the default batch.
+ */
+export interface ConsolidateOptions {
+  maxDocs?: number;
+  guarded?: boolean;
+  staleOnly?: boolean;
+  candidateIds?: number[];
+}
+
+/**
+ * Phase 3 deductive synthesis option bag (v0.8.0 Ext 5). All fields optional;
+ * omitting the bag reproduces pre-Ext-5 behavior exactly.
+ *
+ *  - `maxRecent`  override for the recent-observation window size (default 20)
+ *  - `guarded`    forward-compat marker; currently a no-op because the Phase 3
+ *                 deductive guardrails always enforce their deterministic
+ *                 pre-checks + LLM validator regardless of this flag
+ *  - `staleOnly`  when true, order candidate observations by
+ *                 `recall_stats.last_recalled_at ASC` with
+ *                 `documents.last_accessed_at` fallback
+ */
+export interface DeductiveOptions {
+  maxRecent?: number;
+  guarded?: boolean;
+  staleOnly?: boolean;
+}
+
 // =============================================================================
 // Worker State
 // =============================================================================
@@ -247,17 +291,71 @@ async function backfillAmem(store: Store, llm: LlamaCpp): Promise<void> {
 /**
  * Find clusters of related observations and synthesize into consolidated observations.
  * Runs per-collection to prevent cross-vault false merges.
+ *
+ * `opts` (v0.8.0 Ext 5) lets the heavy-maintenance lane override batch size,
+ * force merge-safety enforcement, and switch to stale-first ordering. The
+ * zero-arg call path (internal light-lane tick) preserves pre-Ext-5 behavior.
  */
-async function consolidateObservations(store: Store, llm: LlamaCpp): Promise<void> {
-  console.log("[consolidation] Starting observation consolidation");
+export async function consolidateObservations(
+  store: Store,
+  llm: LlamaCpp,
+  opts: ConsolidateOptions = {},
+): Promise<void> {
+  const maxDocs = opts.maxDocs && opts.maxDocs > 0 ? opts.maxDocs : 50;
+  const staleOnly = opts.staleOnly === true;
+  const guarded = opts.guarded === true;
+  const candidateIds = opts.candidateIds && opts.candidateIds.length > 0
+    ? opts.candidateIds
+    : null;
 
-  // Find observation-type documents not yet consolidated
+  // Early exit when caller passed candidateIds: [] explicitly. An empty
+  // array means "the selector found nothing" — not "select everything".
+  if (opts.candidateIds && opts.candidateIds.length === 0) {
+    console.log("[consolidation] Empty candidateIds array — nothing to consolidate");
+    return;
+  }
+
+  console.log(
+    `[consolidation] Starting observation consolidation (maxDocs=${maxDocs}, ` +
+      `staleOnly=${staleOnly}, guarded=${guarded}, ` +
+      `candidateIds=${candidateIds ? candidateIds.length : "null"})`,
+  );
+
+  // Base SELECT — observation-type docs not yet consolidated.
+  // Stale-first ordering joins recall_stats.last_recalled_at ASC with a
+  // documents.last_accessed_at fallback so long-unseen docs bubble up first.
+  // Default ordering (modified_at DESC) preserves pre-Ext-5 light-lane semantics.
+  const orderBy = staleOnly
+    ? `ORDER BY
+         d.collection,
+         COALESCE(rs.last_recalled_at, d.last_accessed_at, d.modified_at) ASC,
+         d.modified_at ASC`
+    : `ORDER BY d.collection, d.modified_at DESC`;
+
+  const joinClause = staleOnly
+    ? `LEFT JOIN recall_stats rs ON rs.doc_id = d.id`
+    : ``;
+
+  // When candidateIds is provided, restrict the SELECT to those docs. This
+  // is how the heavy lane plumbs surprisal-selector output into Phase 2:
+  // select anomaly-first IDs via computeSurprisalScores, then ask
+  // consolidateObservations to limit its pattern detection to that subset.
+  const candidateFilter = candidateIds
+    ? `AND d.id IN (${candidateIds.map(() => "?").join(",")})`
+    : ``;
+
+  const sqlParams: (number | string)[] = candidateIds
+    ? [...candidateIds, maxDocs]
+    : [maxDocs];
+
   const observations = store.db.prepare(`
     SELECT d.id, d.title, d.facts, d.amem_context as context, d.modified_at, d.collection
     FROM documents d
+    ${joinClause}
     WHERE d.active = 1
       AND d.content_type = 'observation'
       AND d.facts IS NOT NULL
+      ${candidateFilter}
       AND d.id NOT IN (
         SELECT value FROM (
           SELECT json_each.value as value
@@ -265,9 +363,9 @@ async function consolidateObservations(store: Store, llm: LlamaCpp): Promise<voi
           WHERE co.status = 'active'
         )
       )
-    ORDER BY d.collection, d.modified_at DESC
-    LIMIT 50
-  `).all() as { id: number; title: string; facts: string; context: string; modified_at: string; collection: string }[];
+    ${orderBy}
+    LIMIT ?
+  `).all(...sqlParams) as { id: number; title: string; facts: string; context: string; modified_at: string; collection: string }[];
 
   if (observations.length === 0) {
     console.log("[consolidation] No unconsolidated observations found");
@@ -288,7 +386,7 @@ async function consolidateObservations(store: Store, llm: LlamaCpp): Promise<voi
     if (cluster.docs.length < 2) continue; // Need at least 2 observations to consolidate
 
     try {
-      await synthesizeCluster(store, llm, cluster);
+      await synthesizeCluster(store, llm, cluster, { guarded });
     } catch (err) {
       console.error(`[consolidation] Failed to consolidate cluster for ${collection}:`, err);
     }
@@ -302,11 +400,15 @@ async function consolidateObservations(store: Store, llm: LlamaCpp): Promise<voi
 
 /**
  * Synthesize a cluster of observations into consolidated observations using LLM.
+ *
+ * `opts.guarded` (v0.8.0 Ext 5) forces merge-safety enforcement inside
+ * `findSimilarConsolidation` regardless of `CLAWMEM_MERGE_GUARD_DRY_RUN`.
  */
 async function synthesizeCluster(
   store: Store,
   llm: LlamaCpp,
-  cluster: ObservationCluster
+  cluster: ObservationCluster,
+  opts: { guarded?: boolean } = {},
 ): Promise<void> {
   const docsText = cluster.docs.map((d, i) =>
     `${i + 1}. [${d.modified_at}] "${d.title}"\n   Facts: ${d.facts?.slice(0, 300) || 'none'}\n   Context: ${d.context?.slice(0, 200) || 'none'}`
@@ -364,11 +466,13 @@ Return ONLY the JSON array. /no_think`;
 
     // Check for existing similar consolidated observation (avoid duplicates).
     // Two-stage gate: Jaccard shortlist + name-aware merge safety (Ext 3).
+    // `guarded` forces gate enforcement when the heavy lane calls us.
     const existing = findSimilarConsolidation(
       store,
       pattern.observation,
       cluster.collection,
-      sourceDocIds
+      sourceDocIds,
+      opts.guarded === true,
     );
     if (existing) {
       // Ext 2: contradiction gate. Before merging into an existing
@@ -524,7 +628,8 @@ export function findSimilarConsolidation(
   store: Store,
   observation: string,
   collection: string,
-  candidateSourceDocIds: number[]
+  candidateSourceDocIds: number[],
+  forceEnforce: boolean = false,
 ): { id: number; observation: string; source_doc_ids: string } | null {
   // ORDER BY id ASC makes "first shortlist hit" deterministic across
   // SQLite plan changes — the dry-run legacy parity case relies on
@@ -553,7 +658,12 @@ export function findSimilarConsolidation(
 
   if (shortlist.length === 0) return null;
 
-  const dryRun = process.env.CLAWMEM_MERGE_GUARD_DRY_RUN === "true";
+  // `forceEnforce` (v0.8.0 Ext 5) lets the heavy lane override the env
+  // `CLAWMEM_MERGE_GUARD_DRY_RUN` so operators can experiment with dry-run
+  // in the light lane without weakening heavy-lane guarantees.
+  const dryRun = forceEnforce
+    ? false
+    : process.env.CLAWMEM_MERGE_GUARD_DRY_RUN === "true";
 
   // Dry-run: preserve EXACT legacy behavior — return the first shortlist
   // hit (the pre-Ext-3 code iterated the SELECT rows in order and returned
@@ -723,18 +833,38 @@ function updateTrends(store: Store): void {
  *
  * Only considers decision/preference/milestone/problem observations from the
  * last 7 days that haven't already been used as sources for deductions.
+ *
+ * `opts` (v0.8.0 Ext 5):
+ *  - `maxRecent`  override batch size (default 20)
+ *  - `staleOnly`  order by recall_stats.last_recalled_at ASC with
+ *                 documents.last_accessed_at fallback instead of
+ *                 modified_at DESC
+ *  - `guarded`    forward-compat marker — no-op in v0.8.0 because the Phase 3
+ *                 guardrails always enforce their gates regardless
  */
-async function generateDeductiveObservations(
+export async function generateDeductiveObservations(
   store: Store,
-  llm: LlamaCpp
+  llm: LlamaCpp,
+  opts: DeductiveOptions = {},
 ): Promise<DeductiveSynthesisStats> {
+  const maxRecent = opts.maxRecent && opts.maxRecent > 0 ? opts.maxRecent : 20;
+  const staleOnly = opts.staleOnly === true;
   const stats = emptyDeductiveStats();
   // Find recent high-value observations not yet used in deductions
   const DEDUCTIVE_TYPES = ['decision', 'preference', 'milestone', 'problem'];
+
+  const orderBy = staleOnly
+    ? `ORDER BY COALESCE(rs.last_recalled_at, d.last_accessed_at, d.modified_at) ASC, d.modified_at ASC`
+    : `ORDER BY d.modified_at DESC`;
+  const joinClause = staleOnly
+    ? `LEFT JOIN recall_stats rs ON rs.doc_id = d.id`
+    : ``;
+
   const recentObs = store.db.prepare(`
     SELECT d.id, d.title, d.facts, d.narrative, d.observation_type, d.content_type,
            d.collection, d.path, d.modified_at
     FROM documents d
+    ${joinClause}
     WHERE d.active = 1
       AND d.content_type IN (${DEDUCTIVE_TYPES.map(() => '?').join(',')})
       AND d.observation_type IS NOT NULL
@@ -747,9 +877,9 @@ async function generateDeductiveObservations(
           WHERE dd.content_type = 'deductive' AND dd.active = 1
         )
       )
-    ORDER BY d.modified_at DESC
-    LIMIT 20
-  `).all(...DEDUCTIVE_TYPES) as {
+    ${orderBy}
+    LIMIT ?
+  `).all(...DEDUCTIVE_TYPES, maxRecent) as {
     id: number; title: string; facts: string; narrative: string;
     observation_type: string; content_type: string; collection: string;
     path: string; modified_at: string;

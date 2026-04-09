@@ -39,6 +39,7 @@ import { classifyIntent, decomposeQuery, extractTemporalConstraint, type IntentT
 import { adaptiveTraversal, mergeTraversalResults, mpfpTraversal } from "./graph-traversal.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
+import { startHeavyMaintenanceWorker, type HeavyMaintenanceConfig } from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
 import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
 
@@ -2604,10 +2605,42 @@ This is the recommended entry point for ALL memory queries.`,
     startConsolidationWorker(store, llm, intervalMs);
   }
 
+  // v0.8.0 Ext 5: Start heavy-maintenance worker if enabled. Runs on a
+  // longer interval than the light lane, only inside a configurable quiet
+  // window, and gated by context_usage query-rate so interactive sessions
+  // are never starved. Off by default.
+  let stopHeavyLane: (() => void) | null = null;
+  if (Bun.env.CLAWMEM_HEAVY_LANE === "true") {
+    const llm = getDefaultLlamaCpp();
+    const cfg: HeavyMaintenanceConfig = {
+      intervalMs: Bun.env.CLAWMEM_HEAVY_LANE_INTERVAL
+        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_INTERVAL, 10)
+        : undefined,
+      windowStartHour: Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_START
+        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_START, 10)
+        : null,
+      windowEndHour: Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_END
+        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_END, 10)
+        : null,
+      maxContextUsagesPer10m: Bun.env.CLAWMEM_HEAVY_LANE_MAX_USAGES
+        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_MAX_USAGES, 10)
+        : undefined,
+      staleObservationLimit: Bun.env.CLAWMEM_HEAVY_LANE_OBS_LIMIT
+        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_OBS_LIMIT, 10)
+        : undefined,
+      staleDeductiveLimit: Bun.env.CLAWMEM_HEAVY_LANE_DED_LIMIT
+        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_DED_LIMIT, 10)
+        : undefined,
+      useSurprisalSelector: Bun.env.CLAWMEM_HEAVY_LANE_SURPRISAL === "true",
+    };
+    stopHeavyLane = startHeavyMaintenanceWorker(store, llm, cfg);
+  }
+
   // Signal handlers for graceful shutdown
   process.on("SIGINT", () => {
     console.error("\n[mcp] Received SIGINT, shutting down...");
     stopConsolidationWorker();
+    if (stopHeavyLane) stopHeavyLane();
     closeAllStores();
     process.exit(0);
   });
@@ -2615,6 +2648,7 @@ This is the recommended entry point for ALL memory queries.`,
   process.on("SIGTERM", () => {
     console.error("\n[mcp] Received SIGTERM, shutting down...");
     stopConsolidationWorker();
+    if (stopHeavyLane) stopHeavyLane();
     closeAllStores();
     process.exit(0);
   });

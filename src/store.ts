@@ -854,6 +854,41 @@ function initializeDatabase(db: Database): void {
   if (!mrColNames.has("contradict_confidence")) {
     try { db.exec(`ALTER TABLE memory_relations ADD COLUMN contradict_confidence REAL`); } catch { /* column exists */ }
   }
+
+  // v0.8.0 Ext 5: Heavy maintenance lane journal. Every scheduled attempt
+  // writes one row — including skips — so operators can reconstruct why a
+  // lane did or did not run on any tick.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS maintenance_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lane TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      selected_count INTEGER NOT NULL DEFAULT 0,
+      processed_count INTEGER NOT NULL DEFAULT 0,
+      created_count INTEGER NOT NULL DEFAULT 0,
+      updated_count INTEGER NOT NULL DEFAULT 0,
+      rejected_count INTEGER NOT NULL DEFAULT 0,
+      null_call_count INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT,
+      metrics_json TEXT
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_maintenance_runs_lane_started ON maintenance_runs(lane, started_at DESC)`);
+
+  // v0.8.0 Ext 5: DB-backed worker lease table for multi-process exclusivity
+  // on the heavy lane. Lease holders fence via random token; expired leases
+  // are reclaimed via atomic upsert inside a transaction.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS worker_leases (
+      worker_name TEXT PRIMARY KEY,
+      lease_token TEXT NOT NULL,
+      acquired_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    )
+  `);
 }
 
 

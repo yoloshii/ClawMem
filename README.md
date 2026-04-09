@@ -43,6 +43,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Manages document lifecycle** — policy-driven archival sweeps with restore capability
 - **Auto-routes queries** via `memory_retrieve` — classifies intent and dispatches to the optimal search backend
 - **Syncs project issues** from Beads issue trackers into searchable memory
+- **Runs a quiet-window heavy maintenance lane** — a second consolidation worker, off by default behind `CLAWMEM_HEAVY_LANE=true`, that runs on a longer interval only inside a configurable hour window. Gated by `context_usage` query-rate so it never competes for CPU/GPU with interactive sessions, scoped exclusively via DB-backed `worker_leases`, stale-first by default with an optional surprisal selector, and journals every attempt in `maintenance_runs` for operator visibility (v0.8.0)
 
 Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, as an OpenClaw ContextEngine plugin, or as a Hermes Agent MemoryProvider plugin. All modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
 
@@ -79,6 +80,20 @@ Opt-in LLM pass that runs **after** `clawmem mine` finishes indexing an imported
 - **Split operator counters** — `llmFailures` counts actual LLM path failures (null, thrown, non-array JSON), while `docsWithNoFacts` counts docs where the LLM responded validly but returned zero structured facts. Previously these were conflated as `nullCalls`.
 
 Adds +63 tests (46 unit + 5 integration + 12 regression) on top of the v0.7.1 baseline.
+
+### v0.8.0 Quiet-Window Heavy Maintenance Lane
+
+A second, longer-interval consolidation worker that keeps Phase 2 + Phase 3 running on large vaults without starving interactive sessions. Off by default — set `CLAWMEM_HEAVY_LANE=true` to enable. The existing 5-minute light-lane worker is unchanged. See [heavy maintenance lane](docs/concepts/architecture.md#heavy-maintenance-lane-v080) for the architectural walkthrough.
+
+- **Quiet-window gating** — the heavy lane only runs inside the hours set by `CLAWMEM_HEAVY_LANE_WINDOW_START` / `CLAWMEM_HEAVY_LANE_WINDOW_END` (0-23). Supports midnight wraparound (e.g., 22→6). Null on either bound means "always in window".
+- **Query-rate gating via `context_usage`** — counts hook injections in the last 10 minutes and skips the tick when the rate exceeds `CLAWMEM_HEAVY_LANE_MAX_USAGES` (default 30). No new `query_activity` table; reuses v0.7.0 telemetry.
+- **DB-backed worker leases** — exclusivity enforced via a new `worker_leases` table with atomic `INSERT ... ON CONFLICT DO UPDATE ... WHERE expires_at <= ?` acquisition, random 16-byte fencing tokens, and TTL reclaim. Safe under multi-process contention; any SQLite error translates to a `lease_unavailable` skip rather than a thrown exception.
+- **Stale-first selection** — Phase 2 and Phase 3 reorder their candidate sets by `COALESCE(recall_stats.last_recalled_at, documents.last_accessed_at, documents.modified_at) ASC` so long-unseen docs bubble up first. Empty `recall_stats` falls through to access-time without erroring.
+- **Optional surprisal selector** — `CLAWMEM_HEAVY_LANE_SURPRISAL=true` plumbs k-NN anomaly-ranked doc ids (via the existing `computeSurprisalScores`) into Phase 2 as an explicit `candidateIds` filter. Degrades to stale-first on vaults without embeddings and logs `selector: 'surprisal-fallback-stale'` in the journal.
+- **`maintenance_runs` journal** — every scheduled attempt writes a row: `status` (`started`/`completed`/`failed`/`skipped`), `reason` for skips, selected/processed/created/null_call counts, and a `metrics_json` payload with selector type and full `DeductiveSynthesisStats` breakdown. Operators can reconstruct any lane decision without reading worker logs.
+- **Force-enforce merge gate** — the heavy lane passes `guarded: true` to `consolidateObservations`, which overrides `CLAWMEM_MERGE_GUARD_DRY_RUN` inside `findSimilarConsolidation` so experimenting operators cannot weaken heavy-lane enforcement via env flag.
+
+Adds +56 tests (13 worker-lease + 35 maintenance unit + 8 maintenance integration) on top of the v0.7.2 baseline.
 
 ## Architecture
 

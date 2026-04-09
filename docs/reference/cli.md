@@ -141,8 +141,16 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 | `CLAWMEM_VAULTS` | — | JSON map of vault name to SQLite path |
 | `CLAWMEM_API_TOKEN` | — | Bearer token for REST API auth |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction during indexing |
-| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background consolidation worker |
-| `CLAWMEM_CONSOLIDATION_INTERVAL` | `300000` | Worker interval in ms |
+| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background consolidation worker (light lane, 5-min interval) |
+| `CLAWMEM_CONSOLIDATION_INTERVAL` | `300000` | Light-lane worker interval in ms |
+| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance lane (second consolidation worker with DB-backed lease + stale-first batching + `maintenance_runs` journaling). See [heavy maintenance lane](../concepts/architecture.md#heavy-maintenance-lane-v080). |
+| `CLAWMEM_HEAVY_LANE_INTERVAL` | `1800000` | **v0.8.0.** Heavy-lane tick interval in ms (default 30 min, min 30 s). |
+| `CLAWMEM_HEAVY_LANE_WINDOW_START` | — | **v0.8.0.** Start hour (0-23) of the quiet window. Unset → no window. |
+| `CLAWMEM_HEAVY_LANE_WINDOW_END` | — | **v0.8.0.** End hour (0-23, exclusive). Supports midnight wrap (22→6). |
+| `CLAWMEM_HEAVY_LANE_MAX_USAGES` | `30` | **v0.8.0.** Max `context_usage` rows in the last 10 min before the heavy lane skips with `reason='query_rate_high'`. |
+| `CLAWMEM_HEAVY_LANE_OBS_LIMIT` | `100` | **v0.8.0.** Phase 2 stale-first observation batch size for the heavy lane. |
+| `CLAWMEM_HEAVY_LANE_DED_LIMIT` | `40` | **v0.8.0.** Phase 3 stale-first deductive candidate batch size for the heavy lane. |
+| `CLAWMEM_HEAVY_LANE_SURPRISAL` | `false` | **v0.8.0.** When `true`, seed Phase 2 with k-NN anomaly-ranked doc ids from `computeSurprisalScores` instead of stale-first ordering. Degrades to stale-first on vaults without embeddings. |
 | `INDEX_PATH` | `~/.cache/clawmem/index.sqlite` | Override default vault path |
 
 The `bin/clawmem` wrapper sets endpoint defaults. Always use it instead of `bun run src/clawmem.ts` directly.

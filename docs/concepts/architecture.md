@@ -169,6 +169,120 @@ All LLM failures, JSON parse errors, saveMemory collisions, and relation insert 
 
 Synthesis runs only when the user explicitly passes `--synthesize` — it is off by default because each pass drives one extra LLM call per conversation doc. Reruns over the same collection are safe: paths are stable, relation weights are monotone, saveMemory dedup collapses true duplicates.
 
+## Heavy maintenance lane (v0.8.0)
+
+The consolidation worker that ticks every 5 minutes (the "light lane") is tuned for interactive sessions — it backfills A-MEM notes on the newest three documents per tick and runs Phase 2 consolidation every 30 minutes and Phase 3 deductive synthesis every 15 minutes. On large vaults this keeps context-surfacing happy but is too slow to catch up on a multi-thousand-document backlog or to apply anomaly-first reviews to long-tail content. v0.8.0 adds a **second worker** — the **heavy maintenance lane** — that runs on a longer interval, only during configured quiet windows, with DB-backed exclusivity and stale-first batching. It is **off by default** and requires `CLAWMEM_HEAVY_LANE=true` to start. The light lane is unchanged.
+
+The heavy lane lives in `src/maintenance.ts`. Exclusivity is provided by `src/worker-lease.ts`. Schema additions are in `store.ts`: a `maintenance_runs` journal table and a `worker_leases` exclusivity table.
+
+### Why a second lane
+
+Running Phase 2/3 more aggressively in the light lane would starve interactive sessions. Running them only when the user is idle requires knowing when the user is idle — in v0.8.0 that signal is the existing `context_usage` table (the same v0.7.0 telemetry that `recall_events` feeds off). The heavy lane counts context injections in the last 10 minutes and skips when the rate exceeds its configured cap. No new `query_activity` table is needed.
+
+### Quiet-window gating
+
+Two knobs select when the heavy lane is allowed to fire:
+
+- **Hour window** — `CLAWMEM_HEAVY_LANE_WINDOW_START` and `_WINDOW_END` accept integer hours `0-23`. The lane runs when the current local hour is inside `[start, end)`. Midnight wraparound is supported: `start=22, end=6` means "10 PM through 6 AM". When either bound is unset (the default), the window check is skipped entirely.
+- **Query-rate cap** — `CLAWMEM_HEAVY_LANE_MAX_USAGES` caps the number of `context_usage` rows in the last 10 minutes. The default of 30 is conservative; raise it on vaults where many concurrent agents share a store. The query runs `SELECT COUNT(*) FROM context_usage WHERE timestamp > ?` with the cutoff computed in JS and bound as a parameter (the naive `datetime('now', '-10 minutes')` pattern returns a space-separated string that sorts incorrectly against the ISO 8601 `T`-separated timestamps that `context_usage.timestamp` is actually written with).
+
+Gate failures write a `maintenance_runs` row with `phase='gate'`, `status='skipped'`, and `reason='outside_window'` or `reason='query_rate_high'` so operators can tell whether the lane is being gated by the schedule or by actual activity.
+
+### Worker lease exclusivity
+
+Even when the gate passes, two processes sharing a vault could start heavy ticks simultaneously. v0.8.0 adds a `worker_leases` table and an atomic acquire path in `src/worker-lease.ts`:
+
+```sql
+INSERT INTO worker_leases (worker_name, lease_token, acquired_at, expires_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(worker_name) DO UPDATE SET
+  lease_token = excluded.lease_token,
+  acquired_at = excluded.acquired_at,
+  expires_at  = excluded.expires_at
+WHERE worker_leases.expires_at <= excluded.acquired_at
+```
+
+The `WHERE` clause on the upsert path only reclaims a row whose existing `expires_at` has passed, so a live lease blocks the conflict branch entirely and SQLite reports `changes=0`. The caller interprets `changes === 0` as "another worker holds it" and returns `{ acquired: false }`. A single statement means no SELECT-then-INSERT race window exists across processes — the old TurnArc-style `transaction(SELECT → if existing → UPDATE else INSERT)` pattern had a window where two callers could both observe "no row" and then one would hit a UNIQUE violation on its INSERT, which would throw instead of returning a cooperative "busy" result.
+
+Acquired leases return a random 16-byte hex fencing token. `releaseWorkerLease` deletes the row only when `worker_name = ? AND lease_token = ?`, so a lease that has been reclaimed by another worker after TTL expiry cannot be torn down by the original holder on its way out. The entire acquire path is wrapped in a `try/catch` that translates `SQLITE_BUSY` (pathological contention under heavy WAL pressure) and any other DB error into `{ acquired: false }` so the advertised non-throw contract holds for `shouldRunHeavyMaintenance`-style gates layered on top.
+
+A lease TTL of 10 minutes by default (`CLAWMEM_HEAVY_LANE_INTERVAL` / 3 or thereabouts) covers the worst-case duration of a Phase 2 + Phase 3 run; if a worker crashes mid-tick, the lease naturally expires and the next tick reclaims it.
+
+Failure to acquire the lease writes a `maintenance_runs` row with `status='skipped'` and `reason='lease_unavailable'`.
+
+### Stale-first selection
+
+The default light-lane Phase 2 SELECT orders by `modified_at DESC` so the most-recently-changed observations are consolidated first. That works for an interactive agent but neglects long-tail content whose consolidated patterns never get refreshed. The heavy lane passes `staleOnly: true` into `consolidateObservations`, which switches the SQL to:
+
+```sql
+SELECT d.id, d.title, d.facts, d.amem_context AS context, d.modified_at, d.collection
+  FROM documents d
+  LEFT JOIN recall_stats rs ON rs.doc_id = d.id
+ WHERE d.active = 1
+   AND d.content_type = 'observation'
+   AND d.facts IS NOT NULL
+   AND d.id NOT IN (
+     SELECT value FROM (
+       SELECT json_each.value AS value
+         FROM consolidated_observations co, json_each(co.source_doc_ids)
+        WHERE co.status = 'active'
+     )
+   )
+ ORDER BY d.collection,
+          COALESCE(rs.last_recalled_at, d.last_accessed_at, d.modified_at) ASC,
+          d.modified_at ASC
+ LIMIT ?
+```
+
+The `COALESCE` fallback chain is important: a fresh vault has an empty `recall_stats` table, so the ordering has to fall through to `documents.last_accessed_at` (which is backfilled from `modified_at` by the initial migration) and then to `documents.modified_at` itself. An empty `recall_stats` is a first-class case, not an error, and is covered by unit tests that explicitly assert valid stale ordering with zero `recall_stats` rows. The same switching logic applies to Phase 3's recent-observation SELECT when the heavy lane calls `generateDeductiveObservations({ staleOnly: true })`.
+
+### Surprisal selector (optional)
+
+Stale-first is a good default, but it is driven purely by access timestamps. An operator can instead ask the heavy lane to feed Phase 2 with k-NN anomaly-ranked doc ids by setting `CLAWMEM_HEAVY_LANE_SURPRISAL=true`. The heavy lane then calls `selectSurprisingObservationBatch(store, staleObservationLimit)` — a thin wrapper over the existing `computeSurprisalScores` from `consolidation.ts` — and passes the returned ids into `consolidateObservations` via a new `candidateIds` option. The Phase 2 SELECT then filters `AND d.id IN (?, ?, ...)` against exactly those ids.
+
+When the surprisal backend returns an empty array (no embeddings in the vault, `vectors_vec` missing, or the k-NN query yields fewer docs than `k+1`), the heavy lane **falls through to stale-first** rather than doing nothing. The `maintenance_runs.metrics_json` distinguishes the three cases via the `selector` field: `stale-first` (default), `surprisal` (selector returned a non-empty batch), or `surprisal-fallback-stale` (selector returned empty and the lane degraded gracefully). Empty `candidateIds` passed in explicitly is treated as "the selector found nothing" and short-circuits without hitting the LLM — distinct from `candidateIds: undefined` which means "select via the default ordering".
+
+### Guarded merge-safety enforcement
+
+The light lane respects `CLAWMEM_MERGE_GUARD_DRY_RUN=true` — when set, Phase 2 merge-safety gate rejections are logged but not enforced, giving operators a way to calibrate thresholds before switching the gate on. The heavy lane passes `guarded: true` into `consolidateObservations`, which is threaded down through `synthesizeCluster` into `findSimilarConsolidation(forceEnforce=true)`. With `forceEnforce=true`, the function ignores the dry-run env var and always enforces the name-aware dual-threshold gate. This means experimenting operators cannot weaken heavy-lane guarantees by toggling an env flag, while still keeping the light lane tunable for calibration runs.
+
+### Journal rows
+
+Every scheduled heavy-lane attempt writes rows to `maintenance_runs` via `insertMaintenanceRun` / `finalizeMaintenanceRun`:
+
+| Column | Meaning |
+|---|---|
+| `lane` | Always `heavy` for v0.8.0. The light-lane tick does not journal (would require a larger refactor). |
+| `phase` | `gate` (for skipped rows), `consolidate` (Phase 2), or `deductive` (Phase 3). |
+| `status` | `started` when the row is first written, `completed` on success, `failed` on exception, `skipped` when gating blocks the tick. |
+| `reason` | For skips: `outside_window`, `query_rate_high`, or `lease_unavailable`. For failures: `phase2_exception` or `phase3_exception`. |
+| `selected_count` | For Phase 2: the limit passed to the SELECT (or the surprisal batch size). For Phase 3: `DeductiveSynthesisStats.considered`. |
+| `processed_count` | Phase 3 only: `DeductiveSynthesisStats.drafted`. |
+| `created_count` | Phase 3 only: `DeductiveSynthesisStats.created`. |
+| `rejected_count` | Phase 3 only: `DeductiveSynthesisStats.rejected` (the sum of all reject reasons). |
+| `null_call_count` | Phase 3 only: `DeductiveSynthesisStats.nullCalls`. |
+| `metrics_json` | Phase 2: `{ selector, candidateCount? }`. Phase 3: the full `DeductiveSynthesisStats` breakdown (contamination rejects, invalid index rejects, unsupported rejects, empty rejects, dedupe skipped, validator fallback accepts). |
+| `started_at` / `finished_at` | Both ISO 8601 UTC. `finished_at` is null for rows that were never finalized because the process crashed between `insertMaintenanceRun` and `finalizeMaintenanceRun`. |
+
+Operators can use these rows to reconstruct any lane decision without reading worker logs:
+
+```sql
+-- Why did the lane skip the most recent tick?
+SELECT status, reason, started_at FROM maintenance_runs
+ WHERE lane = 'heavy' AND phase = 'gate'
+ ORDER BY started_at DESC LIMIT 5;
+
+-- What selector has the heavy lane been running?
+SELECT json_extract(metrics_json, '$.selector') AS selector, COUNT(*)
+  FROM maintenance_runs
+ WHERE lane = 'heavy' AND phase = 'consolidate' AND status = 'completed'
+ GROUP BY selector;
+```
+
+### Vault scoping
+
+The heavy lane operates on whatever `Store` it is handed. `createStore(path)` maps 1:1 to a single SQLite vault, so `context_usage` counts and `recall_stats` ordering are both inherently scoped to the current vault via `store.db` — no per-vault predicate is needed in the queries. Multi-vault mode (running the heavy lane across multiple stores from a single process) is explicitly out of scope for v0.8.0 and would require extending `HeavyMaintenanceConfig` with an explicit vault list plus a per-vault lease name.
+
 ## Retrieval tiers
 
 | Tier | Mechanism | Agent effort | Coverage |
