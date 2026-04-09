@@ -27,7 +27,7 @@ The plugin uses a hybrid approach — ContextEngine methods for lifecycle manage
 
 The ContextEngine interface alone can't handle all ClawMem operations:
 
-- `assemble()` now receives `prompt` and `model` (since OpenClaw v2026.3.22) and `availableTools` and `citationsMode` (since v2026.4.7), but retrieval is currently implemented in the `before_prompt_build` hook for historical reasons. Migrating retrieval to `assemble()` is planned but not yet done.
+- `assemble()` now receives `prompt` and `model` (since OpenClaw v2026.3.22) and `availableTools` and `citationsMode` (since v2026.4.7), but retrieval remains in the `before_prompt_build` hook by design. `assemble().systemPromptAddition` prepends to the system prompt, while `prependContext` prepends to the user prompt — different model semantics. Additionally, `systemPromptAddition` can be clobbered by other plugins returning `systemPrompt` from hooks. The hybrid approach is architecturally correct, not a workaround.
 - `bootstrap()` can't inject context into the prompt — its return type doesn't support it. ClawMem caches bootstrap output and injects it via the prompt hook on the first turn.
 
 The `before_prompt_build` plugin hook provides access to the prompt and can inject context directly.
