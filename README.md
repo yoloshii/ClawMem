@@ -223,6 +223,8 @@ clawmem embed             # Re-embed if upgrading embedding models (not needed f
 
 Routine patch updates (e.g. 0.2.0 → 0.2.1) do not require reindexing.
 
+For version-specific upgrade notes (opt-in features, optional cleanup steps, verification commands), see [docs/guides/upgrading.md](docs/guides/upgrading.md).
+
 ### Integration
 
 #### Claude Code
