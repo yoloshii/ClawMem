@@ -19,7 +19,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Surfaces relevant context** on every prompt (context-surfacing hook)
 - **Bootstraps sessions** with your profile, latest handoff, recent decisions, and stale notes
 - **Captures decisions, preferences, milestones, and problems** from session transcripts using a local GGUF observer model
-- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`
+- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`, with optional post-import LLM fact extraction (`--synthesize`) that pulls structured decisions / preferences / milestones / problems and cross-fact links out of otherwise full-text conversation dumps (v0.7.2)
 - **Generates handoffs** at session end so the next session can pick up where you left off
 - **Learns what matters** via a feedback loop that boosts referenced notes and decays unused ones
 - **Guards against prompt injection** in surfaced content
@@ -65,6 +65,20 @@ Five independent safety gates around the consolidation pipeline and context surf
 - **Contradiction-aware merge gate** — after the name-aware gate passes, a deterministic heuristic (negation asymmetry, number/date mismatch) plus an LLM check detect contradictory merges. Blocked merges route to `link` policy (insert new row + `contradicts` edge, default) or `supersede` policy (mark old row `status='inactive'`). Configurable via `CLAWMEM_CONTRADICTION_POLICY` and `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE`. Phase 3 deductive synthesis applies the same gate to deductive dedupe matches.
 - **Anti-contamination deductive synthesis** — every Phase 3 draft runs through a three-layer validator: deterministic pre-checks (empty conclusion, invalid source_indices, pool-only entity contamination via `entity_mentions`) + LLM validator (fail-open with `validatorFallbackAccepts` counter) + dedupe. Per-reason rejection stats exposed via `DeductiveSynthesisStats` so Phase 3 yield can be diagnosed without enabling extra logging.
 - **Context instruction + relationship snippets** — `context-surfacing` now always prepends an `<instruction>` block framing the surfaced facts as background knowledge the model already holds, and appends an optional `<relationships>` block listing memory-graph edges where BOTH endpoints are in the surfaced doc set. The relationships block is the first thing dropped when the payload would overflow `CLAWMEM_PROFILE`'s token budget, preserving facts-first behaviour while giving the model graph-level reasoning hooks directly in-prompt.
+
+### v0.7.2 Post-Import Conversation Synthesis
+
+Opt-in LLM pass that runs **after** `clawmem mine` finishes indexing an imported collection. Operates on the freshly imported `content_type='conversation'` documents and extracts structured knowledge facts (decisions / preferences / milestones / problems) plus cross-fact relations, writing each fact as a first-class searchable document alongside the raw conversation exchanges. See [post-import synthesis](docs/concepts/architecture.md#post-import-conversation-synthesis-v072) for the architectural walkthrough.
+
+- **New CLI flag** — `clawmem mine <dir> --synthesize [--synthesis-max-docs N]`. Off by default. When omitted, existing mine behaviour is byte-identical to v0.7.1.
+- **Two-pass pipeline** — Pass 1 extracts facts per conversation via the existing LLM, saves each via dedup-aware `saveMemory`, and populates a local alias map. Pass 2 resolves cross-fact links against the local map first, falling back to collection-scoped SQL lookup. Forward references (link to a fact extracted later in the same run) are resolved correctly.
+- **Idempotent reruns** — synthesized fact paths are a pure function of `(sourceDocId, slug(title), short sha256(normalizedTitle))`, so reruns over the same conversation batch hit the `saveMemory` update branch instead of creating parallel rows. Same-slug collisions are disambiguated by the stable hash suffix, not encounter order.
+- **Fail-closed link resolution** — when two different facts claim the same normalized title or alias, the resolver treats the link as ambiguous and counts it unresolved. Pre-existing docs with duplicate titles in the collection do not silently bind either.
+- **Weight-monotonic relation upsert** — `memory_relations` insert uses `ON CONFLICT DO UPDATE SET weight = MAX(weight, excluded.weight)`, which is idempotent on equal-weight reruns but still accepts stronger later evidence without double-counting.
+- **Non-fatal failure model** — any LLM failure, JSON parse error, saveMemory collision, or relation insert error is counted and logged, never re-thrown. Synthesis failure after `indexCollection` commits does not roll back the mine import.
+- **Split operator counters** — `llmFailures` counts actual LLM path failures (null, thrown, non-array JSON), while `docsWithNoFacts` counts docs where the LLM responded validly but returned zero structured facts. Previously these were conflated as `nullCalls`.
+
+Adds +63 tests (46 unit + 5 integration + 12 regression) on top of the v0.7.1 baseline.
 
 ## Architecture
 
@@ -657,7 +671,7 @@ clawmem collection list                         List collections
 clawmem collection remove <name>                Remove a collection
 
 clawmem update [--pull] [--embed]               Incremental re-scan
-clawmem mine <dir> [-c name] [--embed]         Import conversation exports (Claude, ChatGPT, Slack)
+clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (--synthesize runs post-import LLM fact extraction, v0.7.2)
 clawmem embed [-f]                              Generate fragment embeddings
 clawmem reindex [--force]                       Full re-index
 clawmem watch                                   File watcher daemon

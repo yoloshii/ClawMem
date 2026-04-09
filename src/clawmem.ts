@@ -242,12 +242,14 @@ async function cmdMine(args: string[]) {
       collection: { type: "string", short: "c" },
       embed: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
+      synthesize: { type: "boolean", default: false },
+      "synthesis-max-docs": { type: "string" },
     },
     allowPositionals: true,
   });
 
   const dir = positionals[0];
-  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run]");
+  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N]");
   const absDir = pathResolve(dir);
   if (!existsSync(absDir)) die(`Directory not found: ${absDir}`);
 
@@ -318,6 +320,32 @@ async function cmdMine(args: string[]) {
     console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
     const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md");
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged`);
+
+    // Ext 4 — post-import conversation synthesis (opt-in via --synthesize)
+    // Runs AFTER indexCollection has committed. Failure is non-fatal and never
+    // rolls back the mine import.
+    if (values.synthesize) {
+      const maxDocs = values["synthesis-max-docs"]
+        ? parseInt(values["synthesis-max-docs"] as string, 10)
+        : undefined;
+      console.log(`\n${c.cyan}Running post-import conversation synthesis${c.reset}`);
+      try {
+        const { runConversationSynthesis } = await import("./conversation-synthesis.ts");
+        const llm = getDefaultLlamaCpp();
+        const synthResult = await runConversationSynthesis(s, llm, {
+          collection: collectionName,
+          maxDocs: Number.isFinite(maxDocs) && (maxDocs as number) > 0 ? maxDocs : undefined,
+        });
+        console.log(
+          `  ${c.green}${synthResult.factsSaved}${c.reset} facts saved, ` +
+          `${c.green}${synthResult.linksResolved}${c.reset} links resolved, ` +
+          `${c.yellow}${synthResult.linksUnresolved}${c.reset} unresolved, ` +
+          `${c.dim}${synthResult.llmFailures} LLM failure(s), ${synthResult.docsWithNoFacts} docs with no facts${c.reset}`,
+        );
+      } catch (err) {
+        console.log(`  ${c.yellow}Synthesis failed (mine import preserved):${c.reset} ${err}`);
+      }
+    }
 
     if (values.embed) {
       console.log();
@@ -2500,7 +2528,7 @@ ${c.bold}Setup:${c.reset}
 
 ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
-  clawmem mine <dir> [-c name] [--embed]  Import conversation exports (Claude, ChatGPT, Slack)
+  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction
   clawmem embed [-f]                   Generate fragment embeddings
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon

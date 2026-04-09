@@ -117,6 +117,58 @@ Phase 3 synthesizes cross-session insights from recent observations into `conten
 
 Rejection reasons are tracked individually in `DeductiveSynthesisStats` (`contaminationRejects`, `invalidIndexRejects`, `unsupportedRejects`, `emptyRejects`, `dedupSkipped`, `validatorFallbackAccepts`) so Phase 3 yield can be diagnosed without enabling extra logging.
 
+## Post-import conversation synthesis (v0.7.2)
+
+`clawmem mine` imports raw chat exports (Claude Code, ChatGPT, Claude.ai, Slack, plain text) as `content_type='conversation'` full-text documents. Conversations preserve the narrative but rarely cluster well in retrieval — the same decision can appear across many turns and many conversations, and BM25 or vector search surfaces the prose rather than the structured claim underneath. The `--synthesize` opt-in flag adds a post-import LLM pass that walks the freshly indexed conversations and extracts first-class structured facts (decisions, preferences, milestones, problems) with cross-fact relations, writing them as searchable documents alongside the raw exchanges.
+
+The synthesis module is `src/conversation-synthesis.ts`. It runs **after** `indexCollection` has committed the raw conversation docs, and a failure inside the synthesis pipeline never rolls back the mine import — the raw conversations remain indexed.
+
+### Two-pass pipeline
+
+**Pass 1 — fact extraction.** For each conversation doc in the target collection (capped by `--synthesis-max-docs`, default 20), the pipeline:
+
+1. Sends the conversation body (truncated to 3000 chars) to the LLM with a strict extraction prompt. The prompt lists the four allowed `contentType` values (`decision`, `preference`, `milestone`, `problem`) and the six allowed `relationType` values (`semantic`, `supporting`, `contradicts`, `causal`, `temporal`, `entity`), and explicitly authorizes links that reference facts from **other** conversations in the same imported batch.
+2. Parses the response via `extractJsonFromLLM` (the same helper the A-MEM pipeline uses, robust to truncated arrays and markdown fences).
+3. Normalizes each fact: rejects empty titles, disallowed contentTypes, non-string facts/aliases entries, links with bad relation types, and clamps weights to `[0, 1]`.
+4. Writes each valid fact via dedup-aware `saveMemory` with a stable synthesized path:
+   ```
+   synthesized/<slug(title)>-src<sourceDocId>-<short sha256(normalized title)>.md
+   ```
+   The path is a pure function of `(sourceDocId, slug, hash(normalizedTitle))`. No encounter-order dependence. Same-slug collisions (`Use OAuth.` and `Use OAuth!` both slugify to `use-oauth`) are disambiguated by the stable hash suffix — reruns in different LLM order still pin each title to the same path, so `saveMemory`'s `UNIQUE(collection, path)` update branch is hit instead of creating parallel rows.
+5. Populates a local alias map: `Map<normalizedTitleOrAlias, Set<docId>>`. Each fact contributes its canonical title and every alias into the Set. If two different facts claim the same title or alias the Set accumulates multiple docIds and later becomes ambiguous.
+
+`extractFactsFromConversation` returns `ExtractedFact[] | null`. A `null` return discriminates "LLM path failed" (null response, thrown generate, non-array JSON) from a valid empty extraction `[]`. The orchestrator uses this to increment either `llmFailures` or `docsWithNoFacts` — two distinct operator counters that were previously conflated as `nullCalls`.
+
+**Pass 2 — link resolution.** Runs after Pass 1 finishes for every doc in the batch (skipped entirely in `--dry-run` mode). For each saved fact's `links[]`:
+
+1. `resolveLinkTarget` first checks the local map. If the entry maps to exactly one docId, that's the resolved target. If the set contains two or more distinct docIds, the link is treated as **ambiguous** and counted as unresolved — the resolver fails closed rather than silently binding to an arbitrary candidate.
+2. If the local map has no entry, the resolver falls back to a SQL lookup scoped to the same collection: `SELECT id FROM documents WHERE collection=? AND active=1 AND LOWER(TRIM(title))=? LIMIT 2`. If the result contains more than one row (two pre-existing docs with duplicate titles), the link is again treated as ambiguous.
+3. Self-referencing links (target resolves to the source fact's own docId) are skipped.
+4. Resolved links are inserted into `memory_relations` via a weight-monotonic upsert:
+   ```sql
+   INSERT INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
+   VALUES (?, ?, ?, ?, ?, ?)
+   ON CONFLICT(source_id, target_id, relation_type)
+   DO UPDATE SET weight = MAX(weight, excluded.weight)
+   ```
+   This policy is idempotent on equal-weight reruns (no inflation) but monotonically accepts stronger later evidence (a subsequent run that finds the same triple with higher weight updates the existing row; a subsequent run with lower weight leaves it untouched). The earlier `INSERT OR IGNORE` would have under-accumulated by discarding legitimate stronger evidence, and `store.insertRelation`'s `weight += excluded.weight` would have over-accumulated by inflating weights linearly with rerun count.
+
+### Failure model
+
+All LLM failures, JSON parse errors, saveMemory collisions, and relation insert errors are caught and counted, never re-thrown. The final `SynthesisResult` exposes seven counters:
+
+| Counter | Meaning |
+|---------|---------|
+| `docsScanned` | Conversations selected for extraction |
+| `factsExtracted` | Facts that passed validation (per fact across all docs) |
+| `factsSaved` | Facts where `saveMemory` returned `inserted` or `updated` (deduplicated is counted as extracted but not saved-new) |
+| `linksResolved` | Links that bound to a unique non-self target and landed in `memory_relations` |
+| `linksUnresolved` | Links that couldn't resolve (unknown target, ambiguous local, ambiguous SQL, self-reference) |
+| `llmFailures` | Docs where the LLM path failed — null, thrown, or non-array JSON |
+| `docsWithNoFacts` | Docs where the LLM responded validly but returned zero facts (or all candidates were rejected by normalize) |
+
+Synthesis runs only when the user explicitly passes `--synthesize` — it is off by default because each pass drives one extra LLM call per conversation doc. Reruns over the same collection are safe: paths are stable, relation weights are monotone, saveMemory dedup collapses true duplicates.
+
 ## Retrieval tiers
 
 | Tier | Mechanism | Agent effort | Coverage |

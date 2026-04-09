@@ -23,11 +23,13 @@ clawmem collection remove <name>               # Remove a collection
 ```bash
 clawmem update                  # Index all collections (BM25 only)
 clawmem update --embed          # Index + embed in one pass
-clawmem mine <dir>              # Import conversation exports (Claude, ChatGPT, Slack)
-clawmem mine <dir> -c convos    # Import with custom collection name
-clawmem mine <dir> --embed      # Import + embed in one pass
-clawmem mine <dir> --dry-run    # Preview without importing
-clawmem reindex                 # Force re-scan all collections
+clawmem mine <dir>                             # Import conversation exports (Claude, ChatGPT, Slack)
+clawmem mine <dir> -c convos                   # Import with custom collection name
+clawmem mine <dir> --embed                     # Import + embed in one pass
+clawmem mine <dir> --dry-run                   # Preview without importing
+clawmem mine <dir> --synthesize                # v0.7.2: import + post-import LLM fact extraction
+clawmem mine <dir> --synthesize --synthesis-max-docs 50   # Cap synthesis to first 50 conversations (default 20)
+clawmem reindex                                # Force re-scan all collections
 clawmem embed                   # Embed all un-embedded fragments
 clawmem embed --force           # Re-embed everything (clears existing vectors)
 ```
@@ -43,6 +45,17 @@ clawmem embed --force           # Re-embed everything (clears existing vectors)
 - **Plain text** — files with `User:`/`Assistant:` markers
 
 Each user+assistant exchange pair becomes one indexed document with `content_type: conversation`. Files are chunked, written to a temporary staging directory, indexed through the standard pipeline (including A-MEM enrichment), then staging is cleaned up.
+
+#### `--synthesize` (v0.7.2)
+
+Adds a post-import LLM fact extraction pass. After `indexCollection` commits the raw conversations, the synthesis pipeline walks the freshly imported docs and extracts structured facts (`decision`, `preference`, `milestone`, `problem`) plus cross-fact relations via a two-pass LLM pipeline. Each extracted fact is saved as a first-class searchable document alongside the raw conversation exchanges. Cross-fact links bind across conversations in the same batch — not just within a single conversation.
+
+- **Off by default.** Raw mine import semantics are byte-identical when `--synthesize` is omitted.
+- **Opt-in user consent required** — each pass drives one additional LLM call per conversation doc.
+- **`--synthesis-max-docs N`** caps the number of conversations scanned per run (default 20).
+- **Idempotent reruns** — synthesized fact paths are hash-stable, so rerunning over the same collection updates facts in place rather than creating parallel rows. Relation weights are monotone (`MAX(weight, excluded.weight)`).
+- **Non-fatal failures** — any LLM failure, JSON parse error, or relation insert error is counted and logged. Synthesis failure never rolls back the mine import.
+- See [post-import conversation synthesis](../concepts/architecture.md#post-import-conversation-synthesis-v072) for the full architectural walkthrough.
 
 ## Search (CLI)
 
