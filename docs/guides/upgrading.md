@@ -100,18 +100,19 @@ Running BOTH `clawmem watch` (with env vars) AND a per-session `clawmem mcp` (wi
 # Confirm watcher is running latest code
 systemctl --user status clawmem-watcher.service
 
-# After enabling the env vars + restart, watcher should log:
+# After enabling the env vars + restart, watcher should log both worker
+# startup banners. The exact intervals depend on the env vars you set —
+# defaults are 5-min light lane and 30-min heavy lane.
+journalctl --user -u clawmem-watcher.service -n 50 --no-pager | \
+  grep -E "Starting (consolidation|heavy)"
+# Expected:
 #   [watch] Starting consolidation worker (light lane, interval=...)
-#   [watch] Starting heavy maintenance lane worker
 #   [consolidation] Worker started
-#   [heavy-lane] Starting worker (interval=..., window=2-6, ...)
-journalctl --user -u clawmem-watcher.service -n 50 --no-pager
-
-# After the first quiet-window tick, journal should have rows
-sqlite3 -readonly ~/.cache/clawmem/index.sqlite \
-  "SELECT lane, phase, status, reason, started_at FROM maintenance_runs
-   WHERE lane = 'heavy' ORDER BY id DESC LIMIT 10"
+#   [watch] Starting heavy maintenance lane worker
+#   [heavy-lane] Starting worker (interval=..., window=..., ...)
 ```
+
+For the full operator guide — what to expect over the first hour, the per-usage-pattern tuning matrix, the complete monitoring query set, and rollback steps — see [docs/guides/systemd-services.md](systemd-services.md#background-maintenance-workers-v082).
 
 ---
 
