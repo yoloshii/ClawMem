@@ -1543,6 +1543,10 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Usage relation tracking — records relations between documents
     insertRelation: (fromDoc: number, toDoc: number, relType: string, weight: number = 1.0) => {
+      // v0.8.3 (§1.3): reject self-loops at the API boundary. A document
+      // relating to itself has no informational value for graph traversal
+      // and would pollute intent_search/find_similar neighborhoods.
+      if (fromDoc === toDoc) return;
       db.prepare(`
         INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
         VALUES (?, ?, ?, ?, ?)
@@ -4224,6 +4228,10 @@ export async function syncBeadsIssues(
     const targetRow = db.prepare(`SELECT doc_id FROM beads_issues WHERE beads_id = ?`).get(dep.target_id) as { doc_id: number } | undefined;
 
     if (sourceRow && targetRow) {
+      // v0.8.3 (§1.3): mirror of insertRelation self-loop guard. Beads can
+      // theoretically express a self-dependency (e.g. a `relates-to` edge
+      // from an issue to itself); skip those before they land in the graph.
+      if (sourceRow.doc_id === targetRow.doc_id) continue;
       db.prepare(`
         INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
         VALUES (?, ?, ?, 1.0, ?, ?)

@@ -361,6 +361,82 @@ describe("insertRelation", () => {
     ).get(d3.id, d4.id) as { weight: number };
     expect(rel.weight).toBe(3.0);
   });
+
+  // v0.8.3 §1.3 — self-loop guard at the API boundary.
+  //
+  // The primary fix is in `insertRelation` itself (store.ts:1545). A
+  // secondary mirror guard lives in the beads → memory_relations bridge
+  // inside `syncBeadsIssues` (store.ts:~4228). Since the bridge is
+  // entangled with file I/O (reads .beads/beads.jsonl, shells out to bd),
+  // a full integration test for the mirror guard would need a fixture
+  // project directory and a bd CLI mock — out of scope for this guard.
+  // The mirror guard is a single-line structural copy of the primary, so
+  // exhaustively testing the primary covers the guard pattern. Codex
+  // review in task #170 verifies both sites by inspection.
+
+  it("rejects self-loops (fromDoc === toDoc) — no row inserted", () => {
+    store.insertContent("rh_self1", "self doc", new Date().toISOString());
+    store.insertDocument("col", "self1.md", "Self1", "rh_self1", new Date().toISOString(), new Date().toISOString());
+    const self = store.findActiveDocument("col", "self1.md")!;
+
+    // Attempt to insert a self-loop — should be rejected silently by the guard
+    store.insertRelation(self.id, self.id, "semantic");
+    store.insertRelation(self.id, self.id, "usage");
+    store.insertRelation(self.id, self.id, "causal", 0.9);
+
+    const count = store.db.prepare(
+      "SELECT COUNT(*) as cnt FROM memory_relations WHERE source_id = ? AND target_id = ?"
+    ).get(self.id, self.id) as { cnt: number };
+
+    expect(count.cnt).toBe(0);
+  });
+
+  it("normal (non-self) relation still works after self-loop guard added — regression", () => {
+    store.insertContent("rh_norm1", "a", new Date().toISOString());
+    store.insertDocument("col", "norm1.md", "N1", "rh_norm1", new Date().toISOString(), new Date().toISOString());
+    store.insertContent("rh_norm2", "b", new Date().toISOString());
+    store.insertDocument("col", "norm2.md", "N2", "rh_norm2", new Date().toISOString(), new Date().toISOString());
+
+    const n1 = store.findActiveDocument("col", "norm1.md")!;
+    const n2 = store.findActiveDocument("col", "norm2.md")!;
+
+    // Mix self-loop (should be dropped) with valid relations — the guard must
+    // not spill over and reject legitimate pairs.
+    store.insertRelation(n1.id, n1.id, "semantic"); // dropped
+    store.insertRelation(n1.id, n2.id, "semantic"); // kept
+    store.insertRelation(n2.id, n2.id, "semantic"); // dropped
+    store.insertRelation(n2.id, n1.id, "semantic"); // kept (opposite direction)
+
+    const valid = store.db.prepare(
+      "SELECT source_id, target_id FROM memory_relations WHERE relation_type = 'semantic' ORDER BY source_id, target_id"
+    ).all() as { source_id: number; target_id: number }[];
+
+    expect(valid).toHaveLength(2);
+    expect(valid).toContainEqual({ source_id: n1.id, target_id: n2.id });
+    expect(valid).toContainEqual({ source_id: n2.id, target_id: n1.id });
+  });
+
+  it("self-loop guard does not interfere with conflict upsert on valid pair", () => {
+    store.insertContent("rh_up1", "u1", new Date().toISOString());
+    store.insertDocument("col", "up1.md", "U1", "rh_up1", new Date().toISOString(), new Date().toISOString());
+    store.insertContent("rh_up2", "u2", new Date().toISOString());
+    store.insertDocument("col", "up2.md", "U2", "rh_up2", new Date().toISOString(), new Date().toISOString());
+    const u1 = store.findActiveDocument("col", "up1.md")!;
+    const u2 = store.findActiveDocument("col", "up2.md")!;
+
+    // Interleave self-loops with repeated valid inserts — weight must still
+    // accumulate on the valid pair.
+    store.insertRelation(u1.id, u1.id, "usage", 5.0); // dropped
+    store.insertRelation(u1.id, u2.id, "usage", 1.0);
+    store.insertRelation(u1.id, u2.id, "usage", 1.0);
+    store.insertRelation(u2.id, u2.id, "usage", 5.0); // dropped
+    store.insertRelation(u1.id, u2.id, "usage", 1.0);
+
+    const rel = store.db.prepare(
+      "SELECT weight FROM memory_relations WHERE source_id = ? AND target_id = ? AND relation_type = 'usage'"
+    ).get(u1.id, u2.id) as { weight: number };
+    expect(rel.weight).toBe(3.0);
+  });
 });
 
 // ─── Facet-based merge policy ───────────────────────────────────────

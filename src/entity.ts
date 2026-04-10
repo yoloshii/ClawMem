@@ -162,19 +162,77 @@ function makeEntityId(name: string, type: string, vault: string = 'default'): st
 }
 
 // =============================================================================
+// Entity Cap (content-type-aware, §1.5 v0.8.3)
+// =============================================================================
+
+/**
+ * Per-content-type entity cap applied to LLM extraction output.
+ *
+ * Long-form content (research dumps, conversation synthesis, hub/index docs)
+ * legitimately mentions more distinct entities than short decision records or
+ * handoff notes. A flat cap of 10 silently dropped real entities on long-form
+ * documents. This map lets each content type keep its full entity set up to a
+ * type-appropriate ceiling, while short types stay tight to suppress LLM noise.
+ *
+ * Unknown or untyped documents fall through to the default cap of 10 (matches
+ * pre-v0.8.3 behavior — backward compatible for any caller that doesn't pass
+ * a contentType).
+ */
+const ENTITY_CAP_BY_TYPE: Record<string, number> = {
+  research: 15,       // long-form research dumps
+  hub: 12,            // architecture docs, indexes
+  conversation: 12,   // synthesized conversation exports
+  decision: 8,        // short decision records
+  deductive: 8,       // inferred observations
+  note: 8,            // session notes
+  handoff: 8,         // session handoffs
+  progress: 8,        // progress logs
+  project: 10,        // generic project content
+};
+
+/**
+ * Return the entity cap for a given content type. Falls back to 10 for
+ * undefined or unknown types (pre-v0.8.3 behavior).
+ *
+ * Input is trimmed + lowercased before lookup so values from hand-authored
+ * frontmatter or older imported docs (e.g. "Research", " conversation ") map
+ * cleanly to the canonical lowercase keys in `ENTITY_CAP_BY_TYPE`. The DB
+ * `documents.content_type` column is not normalized at the write boundary,
+ * so normalization has to happen here to avoid silent fall-through to the
+ * default cap of 10.
+ */
+export function entityCapForContentType(contentType?: string): number {
+  if (!contentType) return 10;
+  const key = contentType.trim().toLowerCase();
+  if (!key) return 10;
+  return ENTITY_CAP_BY_TYPE[key] ?? 10;
+}
+
+// =============================================================================
 // Entity Extraction (LLM-based)
 // =============================================================================
 
 /**
  * Extract named entities from document content using LLM.
  * Returns a list of (name, type) pairs.
+ *
+ * @param contentType Optional document content_type. When provided, caps the
+ *   returned entity list using `entityCapForContentType`. When omitted, uses
+ *   the default cap of 10 (backward compatible).
  */
 export async function extractEntities(
   llm: LLM,
   title: string,
-  content: string
+  content: string,
+  contentType?: string
 ): Promise<ExtractedEntity[]> {
   const truncated = content.slice(0, 2000);
+
+  // v0.8.3 (§1.5): compute the cap up front so we can thread it into BOTH
+  // the prompt ("0-N entities") and the post-LLM slice. Without the dynamic
+  // prompt, a compliant model stops at the hardcoded 10 even when we'd
+  // accept 15 — the slice becomes a no-op and §1.5 is only half-effective.
+  const cap = entityCapForContentType(contentType);
 
   const prompt = `Extract named entities from this document. Include people, projects, services, tools, organizations, and specific technical components.
 
@@ -189,7 +247,7 @@ Return ONLY valid JSON array:
 Rules:
 - Only include specific, named entities (not generic concepts like "database" or "testing")
 - Normalize names: "VM 202" not "vm202", "ClawMem" not "clawmem"
-- 0-10 entities. Return empty array [] if no specific entities found
+- 0-${cap} entities. Return empty array [] if no specific entities found
 - Include the most specific type for each entity
 - Do NOT extract the document's title as an entity
 - Do NOT extract heading labels, section names, or sentence fragments
@@ -217,7 +275,7 @@ Return ONLY the JSON array. /no_think`;
         ['person', 'project', 'service', 'tool', 'concept', 'org', 'location'].includes(e.type)
       )
       .filter(e => !isLowQualityEntity(e.name, e.type, title))
-      .slice(0, 10);
+      .slice(0, cap);
   } catch (err) {
     console.log(`[entity] LLM extraction failed:`, err);
     return [];
@@ -454,12 +512,14 @@ export async function enrichDocumentEntities(
 ): Promise<number> {
   try {
     // Get document content (snapshot for extraction)
+    // v0.8.3 (§1.5): fetch content_type so extractEntities can apply a
+    // content-type-aware cap instead of the flat slice(0, 10).
     const doc = db.prepare(`
-      SELECT d.title, c.doc as body
+      SELECT d.title, d.content_type, c.doc as body
       FROM documents d
       JOIN content c ON c.hash = d.hash
       WHERE d.id = ? AND d.active = 1
-    `).get(docId) as { title: string; body: string } | null;
+    `).get(docId) as { title: string; content_type: string | null; body: string } | null;
 
     if (!doc) {
       console.log(`[entity] Document ${docId} not found or inactive`);
@@ -478,8 +538,8 @@ export async function enrichDocumentEntities(
       return 0; // Same input, already enriched — skip
     }
 
-    // Step 1: Extract entities via LLM
-    const entities = await extractEntities(llm, doc.title, doc.body);
+    // Step 1: Extract entities via LLM (cap is content-type-aware as of v0.8.3 §1.5)
+    const entities = await extractEntities(llm, doc.title, doc.body, doc.content_type ?? undefined);
 
     // Recheck input hash before writing — abort if content changed during LLM call
     const recheckHash = db.prepare(`

@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.8.2**.
+Guide for upgrading between released versions. Current: **v0.8.3**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -21,7 +21,7 @@ Hooks (spawned fresh per Claude Code invocation) and the MCP stdio server (respa
 
 ### What auto-applies on first open
 
-All schema changes from v0.7.1 → v0.8.1 are additive and idempotent:
+All schema changes from v0.7.1 → v0.8.3 are additive and idempotent:
 
 - New tables via `CREATE TABLE IF NOT EXISTS`
 - New columns via `ALTER TABLE ADD COLUMN` wrapped in `try/catch`
@@ -36,8 +36,56 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - `clawmem reindex --enrich` — no new enrichment stages added
 - `clawmem build-graphs` — no new graph edge types
 - `clawmem setup hooks` — hook configuration is unchanged (no new hooks, no renamed hooks, no changed budgets)
-- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.2
+- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.3
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
+
+---
+
+## v0.8.2 → v0.8.3
+
+v0.8.3 is a drop-in patch release. No schema changes, no new env vars, no new dependencies. All changes are transparent behavior fixes that take effect automatically after upgrading the package and restarting any long-lived `clawmem` processes.
+
+### Quick path
+
+```bash
+bun update -g clawmem   # or: npm update -g clawmem
+# Or source install:
+cd ~/clawmem && git pull
+
+# Restart long-lived daemons so they pick up the new entity extraction + self-loop guard
+systemctl --user restart clawmem-watcher.service
+```
+
+### What changed behaviorally
+
+- **A-MEM entity extraction now keeps more entities on long-form content.** Documents with `content_type: research` keep up to 15 entities per enrichment pass (was 10), `hub` and `conversation` documents keep up to 12, and short types (`decision`, `deductive`, `note`, `handoff`, `progress`) tighten to 8. Anything else — including documents with no `content_type` frontmatter — keeps the pre-v0.8.3 default of 10. The LLM extraction prompt advertises the dynamic cap to the model directly, so a compliant model no longer stops early on long-form documents.
+- **Self-loops into `memory_relations` are rejected.** The `insertRelation` API boundary silently drops writes where `fromDoc === toDoc`, and the beads dependency bridge applies the same filter. No existing caller was known to emit self-loops — this is a defensive guard, not a bug fix for an observed failure.
+
+### Do I need to re-run `clawmem reindex --enrich` to pick up the new entity cap?
+
+Only if you want previously-enriched long-form documents to re-extract entities against the new cap. A-MEM enrichment is tied to an `input_hash` of (title + body), so re-enrichment is skipped when the document content is unchanged. To force re-extraction against the new cap on already-indexed docs:
+
+```bash
+# Re-enrich all documents (LLM call per doc — expect latency on large vaults)
+clawmem reindex --enrich
+```
+
+This is purely opt-in. New and modified documents pick up the new cap automatically on their next enrichment pass — no manual step needed for those.
+
+### Do I need to rebuild graphs?
+
+No. The self-loop guard only affects new writes. Existing self-loops in `memory_relations` (if any) are not scrubbed on upgrade. To check for and clean pre-existing self-loops:
+
+```bash
+sqlite3 ~/.cache/clawmem/index.sqlite \
+  "SELECT COUNT(*) FROM memory_relations WHERE source_id = target_id;"
+
+# If non-zero and you want to clean them:
+sqlite3 ~/.cache/clawmem/index.sqlite \
+  "DELETE FROM memory_relations WHERE source_id = target_id;"
+```
+
+This is optional housekeeping — the guard ensures no new self-loops are created, and existing ones have no observed impact beyond graph noise.
 
 ---
 

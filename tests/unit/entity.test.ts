@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach } from "bun:test";
 import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
+import { createMockLLM } from "../helpers/mock-llm.ts";
 import type { Store } from "../../src/store.ts";
 import {
   upsertEntity,
@@ -20,6 +21,8 @@ import {
   enrichDocumentEntities,
   getEntityGraphNeighbors,
   searchEntities,
+  extractEntities,
+  entityCapForContentType,
 } from "../../src/entity.ts";
 
 let store: Store;
@@ -195,5 +198,253 @@ describe("entity graph neighbors", () => {
     const neighbors = getEntityGraphNeighbors(store.db, [doc1!]);
     expect(neighbors.length).toBeGreaterThan(0);
     expect(neighbors.some(n => n.docId === doc2!)).toBe(true);
+  });
+});
+
+// =============================================================================
+// §1.5 v0.8.3 — Content-type-aware entity cap
+// =============================================================================
+//
+// Regression guard for v0.8.3 §1.5: the flat `.slice(0, 10)` in extractEntities
+// silently dropped legitimate entities on long-form content (research, hub,
+// conversation). Replaced with a content-type → cap mapping. Untyped callers
+// must still cap at 10 to preserve pre-v0.8.3 behavior.
+//
+// Pairs with clawmem-v0.8.3-plan.md § "Entity cap mapping (§1.5 specification)"
+// =============================================================================
+
+describe("entityCapForContentType (§1.5)", () => {
+  it("returns 15 for research content", () => {
+    expect(entityCapForContentType("research")).toBe(15);
+  });
+
+  it("returns 12 for hub content", () => {
+    expect(entityCapForContentType("hub")).toBe(12);
+  });
+
+  it("returns 12 for conversation content", () => {
+    expect(entityCapForContentType("conversation")).toBe(12);
+  });
+
+  it("returns 8 for decision content", () => {
+    expect(entityCapForContentType("decision")).toBe(8);
+  });
+
+  it("returns 8 for deductive content", () => {
+    expect(entityCapForContentType("deductive")).toBe(8);
+  });
+
+  it("returns 10 for project content", () => {
+    expect(entityCapForContentType("project")).toBe(10);
+  });
+
+  it("returns 10 for undefined content type (backward compat default)", () => {
+    expect(entityCapForContentType(undefined)).toBe(10);
+  });
+
+  it("returns 10 for empty string (falsy default path)", () => {
+    expect(entityCapForContentType("")).toBe(10);
+  });
+
+  it("returns 10 for unknown content type (fallback)", () => {
+    expect(entityCapForContentType("some-made-up-type")).toBe(10);
+  });
+
+  // v0.8.3 Codex review turn 23 — normalization fix.
+  // DB content_type values are not normalized at the write boundary, so
+  // hand-authored frontmatter ("Research", " conversation ", "DECISION")
+  // must still resolve to their canonical caps.
+  it("normalizes uppercase content type (Research → 15)", () => {
+    expect(entityCapForContentType("Research")).toBe(15);
+  });
+
+  it("normalizes fully uppercase content type (DECISION → 8)", () => {
+    expect(entityCapForContentType("DECISION")).toBe(8);
+  });
+
+  it("normalizes mixed-case content type (HuB → 12)", () => {
+    expect(entityCapForContentType("HuB")).toBe(12);
+  });
+
+  it("trims leading/trailing whitespace", () => {
+    expect(entityCapForContentType(" research ")).toBe(15);
+    expect(entityCapForContentType("\tconversation\n")).toBe(12);
+  });
+
+  it("whitespace-only string falls back to default 10", () => {
+    expect(entityCapForContentType("   ")).toBe(10);
+  });
+});
+
+describe("extractEntities content-type-aware cap (§1.5)", () => {
+  // Build a JSON array of N entities that will survive extractEntities filters:
+  // - not matching the doc title (similarityRatio < 0.85)
+  // - within length bounds (2-100 chars)
+  // - valid type from the allowed enum
+  // - not in the blocklist ("entity name", "example", "name", etc.)
+  // - not ending with a colon
+  // - "tool" type avoids the location validation branch
+  function buildEntityResponse(count: number): string {
+    const entities = Array.from({ length: count }, (_, i) => ({
+      name: `Widget${i}Factory`, // distinctive, no collision with title "Doc"
+      type: "tool",
+    }));
+    return JSON.stringify(entities);
+  }
+
+  it("research content keeps 15 entities (§1.5 main fix — was 10 in v0.8.2)", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(20),
+      model: "mock",
+      done: true,
+    });
+
+    const result = await extractEntities(llm, "Doc", "content body", "research");
+    expect(result).toHaveLength(15);
+  });
+
+  it("hub content keeps 12 entities", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(20),
+      model: "mock",
+      done: true,
+    });
+
+    const result = await extractEntities(llm, "Doc", "content body", "hub");
+    expect(result).toHaveLength(12);
+  });
+
+  it("conversation content keeps 12 entities", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(20),
+      model: "mock",
+      done: true,
+    });
+
+    const result = await extractEntities(llm, "Doc", "content body", "conversation");
+    expect(result).toHaveLength(12);
+  });
+
+  it("decision content keeps only 8 entities", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(20),
+      model: "mock",
+      done: true,
+    });
+
+    const result = await extractEntities(llm, "Doc", "content body", "decision");
+    expect(result).toHaveLength(8);
+  });
+
+  it("untyped call keeps exactly 10 entities (pre-v0.8.3 backward-compat)", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(20),
+      model: "mock",
+      done: true,
+    });
+
+    // No contentType argument — this is the regression guard for callers
+    // that don't thread content_type through.
+    const result = await extractEntities(llm, "Doc", "content body");
+    expect(result).toHaveLength(10);
+  });
+
+  it("unknown content type falls back to default 10", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(20),
+      model: "mock",
+      done: true,
+    });
+
+    const result = await extractEntities(llm, "Doc", "content body", "not-a-real-type");
+    expect(result).toHaveLength(10);
+  });
+
+  it("cap does not inflate small lists — 5 entities stays 5 even for research", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: buildEntityResponse(5),
+      model: "mock",
+      done: true,
+    });
+
+    const result = await extractEntities(llm, "Doc", "content body", "research");
+    expect(result).toHaveLength(5);
+  });
+
+  // v0.8.3 Codex review turn 23 — prompt-shape regression.
+  // The post-LLM slice is only half the fix. The prompt string itself must
+  // advertise the correct cap, otherwise a compliant model stops at the
+  // hardcoded "0-10 entities" even when we'd accept 15, and §1.5 becomes
+  // a no-op on long-form content in production.
+  describe("prompt embeds the dynamic cap", () => {
+    it("research → prompt says 0-15 entities", async () => {
+      const llm = createMockLLM();
+      llm.generate.mockResolvedValueOnce({
+        text: "[]",
+        model: "mock",
+        done: true,
+      });
+
+      await extractEntities(llm, "Doc", "content body", "research");
+
+      const calls = llm.generate.mock.calls;
+      expect(calls.length).toBe(1);
+      const [renderedPrompt] = calls[0] as [string, unknown];
+      expect(renderedPrompt).toContain("0-15 entities");
+      expect(renderedPrompt).not.toContain("0-10 entities");
+    });
+
+    it("decision → prompt says 0-8 entities", async () => {
+      const llm = createMockLLM();
+      llm.generate.mockResolvedValueOnce({
+        text: "[]",
+        model: "mock",
+        done: true,
+      });
+
+      await extractEntities(llm, "Doc", "content body", "decision");
+
+      const calls = llm.generate.mock.calls;
+      const [renderedPrompt] = calls[0] as [string, unknown];
+      expect(renderedPrompt).toContain("0-8 entities");
+      expect(renderedPrompt).not.toContain("0-10 entities");
+    });
+
+    it("untyped → prompt says 0-10 entities (default preserved)", async () => {
+      const llm = createMockLLM();
+      llm.generate.mockResolvedValueOnce({
+        text: "[]",
+        model: "mock",
+        done: true,
+      });
+
+      await extractEntities(llm, "Doc", "content body");
+
+      const calls = llm.generate.mock.calls;
+      const [renderedPrompt] = calls[0] as [string, unknown];
+      expect(renderedPrompt).toContain("0-10 entities");
+    });
+
+    it("uppercase content type normalizes into the prompt cap (Research → 15)", async () => {
+      const llm = createMockLLM();
+      llm.generate.mockResolvedValueOnce({
+        text: "[]",
+        model: "mock",
+        done: true,
+      });
+
+      await extractEntities(llm, "Doc", "content body", "Research");
+
+      const calls = llm.generate.mock.calls;
+      const [renderedPrompt] = calls[0] as [string, unknown];
+      expect(renderedPrompt).toContain("0-15 entities");
+    });
   });
 });

@@ -6,6 +6,7 @@ node_modules/
 # All documentation except shipped .md files
 *.md
 !README.md
+!RELEASE_NOTES.md
 !CLAUDE.md
 !AGENTS.md
 !SKILL.md
