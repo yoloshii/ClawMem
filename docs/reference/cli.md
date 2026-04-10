@@ -141,9 +141,9 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 | `CLAWMEM_VAULTS` | — | JSON map of vault name to SQLite path |
 | `CLAWMEM_API_TOKEN` | — | Bearer token for REST API auth |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction during indexing |
-| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background consolidation worker (light lane, 5-min interval) |
+| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background consolidation worker (light lane, 5-min interval). **v0.8.2:** every tick wraps in a `worker_leases` row (`light-consolidation` key) so dual-host (`clawmem watch` + `clawmem mcp`) is safe. Hosted by either `cmdWatch` (canonical, long-lived) or `cmdMcp` (per-session fallback). |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | `300000` | Light-lane worker interval in ms |
-| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance lane (second consolidation worker with DB-backed lease + stale-first batching + `maintenance_runs` journaling). See [heavy maintenance lane](../concepts/architecture.md#heavy-maintenance-lane-v080). |
+| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance lane (second consolidation worker with DB-backed lease + stale-first batching + `maintenance_runs` journaling). See [heavy maintenance lane](../concepts/architecture.md#heavy-maintenance-lane-v080). **v0.8.2:** canonical host is `clawmem watch`; `clawmem mcp` retains the same gate as a fallback host but emits a stderr warning advising operators to move heavy-lane hosting to the watcher because per-session stdio MCPs may never be alive during the configured quiet window. |
 | `CLAWMEM_HEAVY_LANE_INTERVAL` | `1800000` | **v0.8.0.** Heavy-lane tick interval in ms (default 30 min, min 30 s). |
 | `CLAWMEM_HEAVY_LANE_WINDOW_START` | — | **v0.8.0.** Start hour (0-23) of the quiet window. Unset → no window. |
 | `CLAWMEM_HEAVY_LANE_WINDOW_END` | — | **v0.8.0.** End hour (0-23, exclusive). Supports midnight wrap (22→6). |

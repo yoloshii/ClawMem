@@ -17,6 +17,7 @@ import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { hashContent } from "./indexer.ts";
 import { passesMergeSafety } from "./text-similarity.ts";
+import { withWorkerLease } from "./worker-lease.ts";
 import {
   checkContradiction,
   isActionableContradiction,
@@ -166,22 +167,68 @@ let consolidationTimer: Timer | null = null;
 let isRunning = false;
 let tickCount = 0;
 
+/**
+ * DB-backed worker lease name for the light consolidation lane (v0.8.2).
+ * Distinct from the heavy-maintenance lane's lease so both lanes can hold
+ * independent exclusivity against the same SQLite vault without colliding.
+ */
+export const DEFAULT_LIGHT_LANE_WORKER_NAME = "light-consolidation";
+
+/**
+ * Default worker-lease TTL for the light lane (10 min). A tick normally
+ * finishes in seconds, but Phase 2 consolidation + Phase 3 deductive
+ * synthesis can stack many LLM calls under worst-case conditions. A 10-min
+ * ceiling covers that case without leaving a stranded lease forever if the
+ * process is SIGKILL'd mid-tick — the next worker reclaims it atomically
+ * via the single-statement upsert in `acquireWorkerLease` once the TTL
+ * has elapsed.
+ */
+export const DEFAULT_LIGHT_LANE_LEASE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Options for a single consolidation tick (v0.8.2). All fields optional;
+ * omitting the bag reproduces pre-v0.8.2 behavior except for the newly
+ * added DB-backed lease wrap, which is always on.
+ *
+ *  - `workerName`   override the lease name (default "light-consolidation").
+ *                   Tests should pass a unique name to avoid cross-test
+ *                   contention with other suites running in the same bun
+ *                   process.
+ *  - `leaseTtlMs`   override the lease TTL. Tests use short TTLs (e.g.
+ *                   100 ms with a past `now`) to exercise expiry reclaim
+ *                   without real delay.
+ */
+export interface ConsolidationTickOptions {
+  workerName?: string;
+  leaseTtlMs?: number;
+}
+
 // =============================================================================
 // Worker Functions
 // =============================================================================
 
 /**
- * Starts the consolidation worker that enriches documents missing A-MEM metadata
- * and periodically consolidates observations.
+ * Starts the consolidation worker that enriches documents missing A-MEM
+ * metadata and periodically consolidates observations.
  *
- * @param store - Store instance with A-MEM methods
- * @param llm - LLM instance for memory note construction
- * @param intervalMs - Tick interval in milliseconds (default: 300000 = 5 min)
+ * v0.8.2 — every tick is wrapped in a DB-backed worker lease (see
+ * `runConsolidationTick`), so multiple host processes running this worker
+ * against the same vault cannot run Phase 2 merge / Phase 3 deductive
+ * synthesis concurrently. The tick still uses an in-process `isRunning`
+ * reentrancy guard that fires before the lease round-trip, so the common
+ * case (single process, overlapping timer fires) is handled without
+ * touching SQLite.
+ *
+ * @param store      - Store instance with A-MEM methods
+ * @param llm        - LLM instance for memory note construction
+ * @param intervalMs - Tick interval in milliseconds (default 300000 = 5 min)
+ * @param opts       - Optional lease overrides (worker name, TTL)
  */
 export function startConsolidationWorker(
   store: Store,
   llm: LlamaCpp,
-  intervalMs: number = 300000
+  intervalMs: number = 300000,
+  opts: ConsolidationTickOptions = {},
 ): void {
   // Clamp interval to minimum 15 seconds
   const interval = Math.max(15000, intervalMs);
@@ -190,7 +237,7 @@ export function startConsolidationWorker(
 
   // Set up periodic tick
   consolidationTimer = setInterval(async () => {
-    await tick(store, llm);
+    await runConsolidationTick(store, llm, opts);
   }, interval);
 
   // Use unref() to avoid blocking process exit
@@ -200,55 +247,133 @@ export function startConsolidationWorker(
 }
 
 /**
- * Stops the consolidation worker.
+ * Stops the consolidation worker. Async since v0.8.2 — clears the interval
+ * AND awaits any in-flight tick before resolving, so callers (signal
+ * handlers, test fixtures) can safely close the store afterward without
+ * yanking the DB out from under a mid-tick worker. The wait is bounded by
+ * `STOP_DRAIN_TIMEOUT_MS` (15s) so a pathologically stuck tick cannot
+ * wedge shutdown indefinitely; if the timeout fires, the function logs
+ * and returns anyway (the next process will reclaim the stale lease via
+ * the v0.8.0 `worker_leases` TTL upsert).
  */
-export function stopConsolidationWorker(): void {
+export async function stopConsolidationWorker(): Promise<void> {
   if (consolidationTimer) {
     clearInterval(consolidationTimer);
     consolidationTimer = null;
+    console.log("[consolidation] Worker stop signaled — draining in-flight tick");
+  }
+  const deadline = Date.now() + STOP_DRAIN_TIMEOUT_MS;
+  while (isRunning && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  if (isRunning) {
+    console.log(
+      `[consolidation] Worker stop drain timed out after ${STOP_DRAIN_TIMEOUT_MS}ms — tick still running`,
+    );
+  } else {
     console.log("[consolidation] Worker stopped");
   }
 }
 
 /**
- * Single worker tick: A-MEM backfill + periodic observation consolidation.
+ * v0.8.2 — bounded wait for in-flight light-lane tick during shutdown.
+ * 15 seconds is more than enough for Phase 1 + Phase 4 to drain (the
+ * cheap phases) and lets Phase 2/3 mid-flight LLM calls finish naturally
+ * in most environments. Stuck-tick scenarios (e.g. unreachable LLM with
+ * no socket timeout) fall back to the v0.8.0 worker_leases TTL reclaim.
  */
-async function tick(store: Store, llm: LlamaCpp): Promise<void> {
-  // Reentrancy guard
+const STOP_DRAIN_TIMEOUT_MS = 15_000;
+
+/**
+ * Run one consolidation tick: Phase 1 (A-MEM backfill) → Phase 2 (observation
+ * consolidation, every 6th tick) → Phase 3 (deductive synthesis, every 3rd
+ * tick) → Phase 4 (recall stats recomputation, every tick).
+ *
+ * v0.8.2 — wrapped in a DB-backed worker lease so at most one host process
+ * ticks at a time against the same vault, symmetric with the v0.8.0 heavy
+ * maintenance lane's `worker_leases` exclusivity pattern. Phase 2 is the
+ * race-sensitive phase Codex flagged in the v0.8.2 pre-rollout review:
+ * without the lease, two concurrent workers could both INSERT a new
+ * consolidated observation for the same cluster, or both merge into the
+ * same existing row and lose source_ids from the read-modify-write update
+ * in `mergeIntoExistingConsolidation`.
+ *
+ * An in-process reentrancy guard (`isRunning`) fires before the lease
+ * round-trip, so overlapping setInterval timer fires from the same process
+ * do not incur a SQLite round-trip per skip.
+ *
+ * Returns `{ acquired }` so integration tests (and the setInterval wrapper)
+ * can distinguish ticks that did real work from ticks skipped by the lease
+ * or reentrancy gate.
+ *
+ * Exported in v0.8.2 so tests can drive individual ticks directly without
+ * spinning up the setInterval loop.
+ */
+export async function runConsolidationTick(
+  store: Store,
+  llm: LlamaCpp,
+  opts: ConsolidationTickOptions = {},
+): Promise<{ acquired: boolean }> {
+  // In-process reentrancy guard: catches overlapping setInterval fires in
+  // the same process before we hit SQLite. Cheap; the lease is the
+  // cross-process authority.
   if (isRunning) {
-    console.log("[consolidation] Skipping tick (already running)");
-    return;
+    console.log("[consolidation] Skipping tick (already running in-process)");
+    return { acquired: false };
   }
 
+  const workerName = opts.workerName ?? DEFAULT_LIGHT_LANE_WORKER_NAME;
+  const leaseTtlMs = opts.leaseTtlMs ?? DEFAULT_LIGHT_LANE_LEASE_TTL_MS;
+
   isRunning = true;
-  tickCount++;
-
   try {
-    // Phase 1: A-MEM backfill (every tick)
-    await backfillAmem(store, llm);
+    const lease = await withWorkerLease(
+      store,
+      workerName,
+      leaseTtlMs,
+      async () => {
+        tickCount++;
+        try {
+          // Phase 1: A-MEM backfill (every tick)
+          await backfillAmem(store, llm);
 
-    // Phase 2: Observation consolidation (every 6th tick, ~30 min at default interval)
-    if (tickCount % 6 === 0) {
-      await consolidateObservations(store, llm);
-    }
+          // Phase 2: Observation consolidation (every 6th tick — ~30 min
+          // at default interval). Race-sensitive — see doc comment above.
+          if (tickCount % 6 === 0) {
+            await consolidateObservations(store, llm);
+          }
 
-    // Phase 3: Deductive synthesis (every 3rd tick, ~15 min at default interval)
-    if (tickCount % 3 === 0) {
-      await generateDeductiveObservations(store, llm);
-    }
+          // Phase 3: Deductive synthesis (every 3rd tick — ~15 min).
+          // Writes are mostly idempotent on the hash-stable path but the
+          // anti-contamination validator still burns LLM calls, so
+          // running two workers in parallel is pure cost.
+          if (tickCount % 3 === 0) {
+            await generateDeductiveObservations(store, llm);
+          }
 
-    // Phase 4: Recall stats recomputation (every tick — lightweight SQL aggregation)
-    try {
-      const updated = store.recomputeRecallStats();
-      if (updated > 0) {
-        console.log(`[consolidation] Phase 4: recomputed recall_stats for ${updated} docs`);
-      }
-    } catch (err) {
-      // Non-critical — recall stats are informational, not retrieval-blocking
-      console.error("[consolidation] Phase 4 recall stats failed:", err);
+          // Phase 4: Recall stats recomputation (every tick — lightweight
+          // SQL aggregation). Non-critical — recall stats are
+          // informational, not retrieval-blocking.
+          try {
+            const updated = store.recomputeRecallStats();
+            if (updated > 0) {
+              console.log(`[consolidation] Phase 4: recomputed recall_stats for ${updated} docs`);
+            }
+          } catch (err) {
+            console.error("[consolidation] Phase 4 recall stats failed:", err);
+          }
+        } catch (err) {
+          console.error("[consolidation] Tick failed:", err);
+        }
+      },
+    );
+
+    if (!lease.acquired) {
+      console.log(
+        `[consolidation] Skipping tick (lease '${workerName}' held by another worker)`,
+      );
     }
-  } catch (err) {
-    console.error("[consolidation] Tick failed:", err);
+    return { acquired: lease.acquired };
   } finally {
     isRunning = false;
   }

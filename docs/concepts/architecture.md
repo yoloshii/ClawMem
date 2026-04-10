@@ -283,6 +283,28 @@ SELECT json_extract(metrics_json, '$.selector') AS selector, COUNT(*)
 
 The heavy lane operates on whatever `Store` it is handed. `createStore(path)` maps 1:1 to a single SQLite vault, so `context_usage` counts and `recall_stats` ordering are both inherently scoped to the current vault via `store.db` — no per-vault predicate is needed in the queries. Multi-vault mode (running the heavy lane across multiple stores from a single process) is explicitly out of scope for v0.8.0 and would require extending `HeavyMaintenanceConfig` with an explicit vault list plus a per-vault lease name.
 
+### Dual-host worker architecture (v0.8.2)
+
+v0.8.0 shipped the heavy lane wired into `cmdMcp` (the stdio MCP host) only. In a Claude Code deployment that means workers are spawned per-session and die when the user closes Claude Code — defeating the heavy lane's quiet-window premise, which expects a long-lived process running at the configured hours regardless of user interactivity. v0.8.2 adds `cmdWatch` as a second host so the existing `clawmem-watcher.service` systemd user unit can carry both lanes 24/7, alongside the per-session MCP fallback.
+
+**Light lane gets its own DB lease.** The v0.8.0 heavy lane already had cross-process exclusivity via `worker_leases` (key `heavy-maintenance`). v0.8.2 extends the same primitive to the light lane (key `light-consolidation`, 10-min default TTL). `runConsolidationTick` now wraps the entire tick body in `withWorkerLease`, so two host processes against the same vault cannot:
+
+- both decide `findSimilarConsolidation(...)` is null and both INSERT a duplicate row into `consolidated_observations`
+- both merge into the same existing row and lose source_ids from the read-modify-write update in `mergeIntoExistingConsolidation`
+- double-burn LLM calls on the v0.7.1 anti-contamination wrapper for Phase 3 deductive synthesis
+
+The in-process `isRunning` reentrancy guard remains as the cheap first defense that catches overlapping `setInterval` fires before any SQLite round-trip; the lease is the cross-process authority.
+
+**Both hosts wire the same env-var gates.** `cmdWatch` and `cmdMcp` both check `CLAWMEM_ENABLE_CONSOLIDATION` and `CLAWMEM_HEAVY_LANE` (parsed via the shared `parseHeavyLaneConfigFromEnv()` helper in `maintenance.ts`). Off by default in both hosts. Operators opt in by setting the env vars on whichever long-lived process they want to host the workers — typically `clawmem-watcher.service` for the canonical setup.
+
+**`cmdMcp` warns when heavy lane is enabled.** Per-session stdio MCPs are short-lived and may never see the configured quiet window. When `CLAWMEM_HEAVY_LANE=true` is set on a stdio MCP host, `cmdMcp` emits a one-line warning to stderr advising operators to move heavy-lane hosting to `clawmem watch`. The fallback host still works, just with a visible reminder.
+
+**Async drain on shutdown.** Both worker stop helpers (`stopConsolidationWorker` and the closure returned by `startHeavyMaintenanceWorker`) are now `async`. They clear their `setInterval` AND poll their in-flight running flag (`isRunning` / `heavyRunning`) until any mid-tick worker drains. This guarantees the worker's `withWorkerLease` finally block runs against a still-open store, so the lease is released cleanly via `releaseWorkerLease` instead of being abandoned to TTL expiry. The drain wait is bounded — `STOP_DRAIN_TIMEOUT_MS=15s` for the light lane, `HEAVY_STOP_DRAIN_TIMEOUT_MS=30s` for the heavy lane — so a pathologically stuck tick (e.g. unreachable LLM with no socket timeout) cannot wedge shutdown indefinitely. After the timeout, the host logs and exits anyway; the next process reclaims the stale lease via the v0.8.0 atomic upsert.
+
+**Signal handlers registered before worker startup.** Both `cmdWatch` and `cmdMcp` now register their `SIGINT`/`SIGTERM` handlers BEFORE any worker initialization. The mutable `stopHeavyLane` is declared at the top, the closure captures it, the handlers are registered immediately, then the workers start and assign into the captured variable. Without this ordering, a `SIGTERM` arriving in the brief window between worker startup and handler registration would be handled by Node's default signal action (terminate with exit 143) and skip the async drain entirely.
+
+**Multi-host contention is safe.** Running both `clawmem watch` AND a per-session `clawmem mcp` against the same vault with both env vars enabled is supported. The `worker_leases` table arbitrates: only one host wins each tick, the other journals a skip (heavy lane) or logs a "lease held" message (light lane) and waits for the next interval. Operators who want exactly one worker per lane should set the env vars on `clawmem-watcher.service` only and leave `cmdMcp` unset.
+
 ## Multi-turn prior-query lookback (v0.8.1)
 
 A single-prompt retrieval query is wrong when the user's current turn is short. "Do the same thing for X", "Explain that in more depth", and "Now talk about refresh tokens in the same design" are all legitimate questions whose intent lives in the *previous* turn, not the current one. v0.8.1 teaches `context-surfacing` to build its retrieval query from the current prompt plus up to two recent same-session prior prompts, so short follow-up turns inherit the vocabulary of earlier turns. Everything else (composite scoring, snippet extraction, reranking, dedupe, routing hints, recall attribution) continues to use the raw current prompt unchanged — only the discovery path sees the multi-turn query.

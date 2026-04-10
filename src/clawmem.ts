@@ -45,6 +45,14 @@ import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from
 import { splitDocument } from "./splitter.ts";
 import { getProfile, updateProfile, isProfileStale } from "./profile.ts";
 import { regenerateAllDirectoryContexts } from "./directory-context.ts";
+import {
+  startConsolidationWorker,
+  stopConsolidationWorker,
+} from "./consolidation.ts";
+import {
+  parseHeavyLaneConfigFromEnv,
+  startHeavyMaintenanceWorker,
+} from "./maintenance.ts";
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
 import { contextSurfacing } from "./hooks/context-surfacing.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
@@ -1363,13 +1371,74 @@ async function cmdWatch() {
   const dirs = collections.map(col => col.path);
   const s = getStore();
 
+  // v0.8.2 Codex Turn 1 fix: register signal handlers BEFORE any async
+  // startup work or worker startup. Resources are declared as null and
+  // assigned once their respective creators run; the shutdown closure
+  // captures the variable references so updates after registration are
+  // visible. Without this ordering, a SIGTERM arriving during the brief
+  // window between the worker startup banner and the handler registration
+  // would terminate the watcher via the default signal action (exit 143)
+  // instead of running the async drain → release → close sequence.
+  let stopHeavyLane: (() => Promise<void>) | null = null;
+  let watcherHandle: { close: () => void } | null = null;
+  let checkpointTimerHandle: Timer | null = null;
+
+  // Graceful shutdown — stop workers, close watchers, then exit. SIGTERM
+  // handling is critical for systemd `systemctl --user stop` to shut down
+  // cleanly instead of being killed by the unit timeout. Both worker stops
+  // are awaited so any mid-tick worker drains and releases its lease via
+  // its own withWorkerLease finally block before we close the store.
+  const shutdown = async (signal: string) => {
+    console.log(`\n${c.dim}[watch] Received ${signal}, shutting down...${c.reset}`);
+    if (stopHeavyLane) {
+      await stopHeavyLane();
+      stopHeavyLane = null;
+    }
+    await stopConsolidationWorker();
+    if (checkpointTimerHandle) {
+      clearInterval(checkpointTimerHandle);
+      checkpointTimerHandle = null;
+    }
+    if (watcherHandle) {
+      watcherHandle.close();
+      watcherHandle = null;
+    }
+    closeStore();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => { void shutdown("SIGINT"); });
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+
   console.log(`${c.bold}Watching ${dirs.length} collection(s) for changes...${c.reset}`);
   for (const col of collections) {
     console.log(`  ${c.dim}${col.name}: ${col.path}${c.reset}`);
   }
   console.log(`${c.dim}Press Ctrl+C to stop.${c.reset}`);
 
-  const watcher = startWatcher(dirs, {
+  // v0.8.2: Light + heavy maintenance lane workers (opt-in via env vars).
+  // Hosting them in `cmdWatch` makes the long-lived watcher service the
+  // canonical host for both lanes — `clawmem-watcher.service` runs 24/7
+  // under systemd, so the heavy lane's quiet-window logic actually sees a
+  // live worker at the configured hours regardless of whether any Claude
+  // Code session is open. `cmdMcp` (stdio MCP) keeps the same env-var
+  // gates as a fallback host, but warns when CLAWMEM_HEAVY_LANE=true
+  // since per-session MCPs are short-lived. Both hosts share the same
+  // DB-backed `worker_leases` exclusivity (heavy lane v0.8.0, light lane
+  // v0.8.2), so running both at once is safe.
+  if (Bun.env.CLAWMEM_ENABLE_CONSOLIDATION === "true") {
+    const llm = getDefaultLlamaCpp();
+    const intervalMs = parseInt(Bun.env.CLAWMEM_CONSOLIDATION_INTERVAL || "300000", 10);
+    console.log(`${c.dim}[watch] Starting consolidation worker (light lane, interval=${intervalMs}ms)${c.reset}`);
+    startConsolidationWorker(s, llm, intervalMs);
+  }
+  if (Bun.env.CLAWMEM_HEAVY_LANE === "true") {
+    const llm = getDefaultLlamaCpp();
+    const cfg = parseHeavyLaneConfigFromEnv();
+    console.log(`${c.dim}[watch] Starting heavy maintenance lane worker${c.reset}`);
+    stopHeavyLane = startHeavyMaintenanceWorker(s, llm, cfg);
+  }
+
+  watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,
     onChanged: async (fullPath, event) => {
       // Find which collection this belongs to
@@ -1424,45 +1493,12 @@ async function cmdWatch() {
     },
   });
 
-  // Skill vault watcher: watch _clawmem-skills/ content root if configured
-  let skillWatcher: { close: () => void } | null = null;
-  try {
-    const { getVaultPath, getSkillContentRoot } = await import("./config.ts");
-    const { resolveStore } = await import("./store.ts");
-    const skillVaultPath = getVaultPath("skill");
-    const skillRoot = getSkillContentRoot();
-
-    if (skillVaultPath && existsSync(skillRoot)) {
-      const skillStore = resolveStore("skill");
-      console.log(`${c.bold}Watching skill vault content root...${c.reset}`);
-      console.log(`  ${c.dim}skill: ${skillRoot} → ${skillVaultPath}${c.reset}`);
-
-      skillWatcher = startWatcher([skillRoot], {
-        debounceMs: 2000,
-        onChanged: async (fullPath, event) => {
-          const relativePath = fullPath.slice(skillRoot.length + 1);
-          console.log(`${c.dim}[${event}]${c.reset} skill/${relativePath}`);
-
-          const stats = await indexCollection(skillStore, "skill-observations", skillRoot, "**/*.md");
-          if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
-            console.log(`  skill: +${stats.added} ~${stats.updated} -${stats.removed}`);
-          }
-        },
-        onError: (err) => {
-          console.error(`${c.red}Skill watch error: ${err.message}${c.reset}`);
-        },
-      });
-    }
-  } catch {
-    // Skill vault not configured — skip
-  }
-
   // Periodic WAL checkpoint: the watcher holds a long-lived DB connection which
   // prevents SQLite auto-checkpoint from shrinking the WAL file. Without this,
   // the WAL grows unbounded (observed 77MB+), slowing every concurrent DB access
   // (hooks, MCP) and eventually causing UserPromptSubmit hook timeouts.
   const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000; // 5 minutes
-  const checkpointTimer = setInterval(() => {
+  checkpointTimerHandle = setInterval(() => {
     try {
       s.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
     } catch {
@@ -1470,16 +1506,7 @@ async function cmdWatch() {
     }
   }, WAL_CHECKPOINT_INTERVAL);
 
-  // Keep running until Ctrl+C
-  process.on("SIGINT", () => {
-    clearInterval(checkpointTimer);
-    watcher.close();
-    skillWatcher?.close();
-    closeStore();
-    process.exit(0);
-  });
-
-  // Block forever
+  // Block forever — shutdown is driven by signal handlers registered above.
   await new Promise(() => {});
 }
 

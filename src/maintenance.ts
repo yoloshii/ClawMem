@@ -77,6 +77,37 @@ const DEFAULT_CONFIG: Required<Omit<HeavyMaintenanceConfig, "workerName" | "cloc
 
 const DEFAULT_WORKER_NAME = "heavy-maintenance";
 
+/**
+ * Parse a `HeavyMaintenanceConfig` from `Bun.env` (v0.8.2). Shared by every
+ * host that can start the heavy lane (`cmdMcp` in mcp.ts, `cmdWatch` in
+ * clawmem.ts) so the env var convention stays in one place. Each field is
+ * left undefined when its env var is unset, so `DEFAULT_CONFIG` continues
+ * to drive any field the operator did not explicitly override.
+ */
+export function parseHeavyLaneConfigFromEnv(): HeavyMaintenanceConfig {
+  return {
+    intervalMs: Bun.env.CLAWMEM_HEAVY_LANE_INTERVAL
+      ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_INTERVAL, 10)
+      : undefined,
+    windowStartHour: Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_START
+      ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_START, 10)
+      : null,
+    windowEndHour: Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_END
+      ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_END, 10)
+      : null,
+    maxContextUsagesPer10m: Bun.env.CLAWMEM_HEAVY_LANE_MAX_USAGES
+      ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_MAX_USAGES, 10)
+      : undefined,
+    staleObservationLimit: Bun.env.CLAWMEM_HEAVY_LANE_OBS_LIMIT
+      ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_OBS_LIMIT, 10)
+      : undefined,
+    staleDeductiveLimit: Bun.env.CLAWMEM_HEAVY_LANE_DED_LIMIT
+      ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_DED_LIMIT, 10)
+      : undefined,
+    useSurprisalSelector: Bun.env.CLAWMEM_HEAVY_LANE_SURPRISAL === "true",
+  };
+}
+
 // =============================================================================
 // Journal helpers
 // =============================================================================
@@ -503,7 +534,7 @@ export function startHeavyMaintenanceWorker(
   store: Store,
   llm: LlamaCpp,
   cfg: HeavyMaintenanceConfig = {},
-): () => void {
+): () => Promise<void> {
   const merged = { ...DEFAULT_CONFIG, ...cfg };
   // Clamp interval to minimum 30 seconds so buggy configs can't pin the CPU.
   const interval = Math.max(30_000, merged.intervalMs);
@@ -530,11 +561,35 @@ export function startHeavyMaintenanceWorker(
   }, interval);
   heavyTimer.unref();
 
-  return () => {
+  // v0.8.2 — async stop handle. Clears the timer AND awaits any in-flight
+  // tick before resolving, so callers can safely close the store afterward
+  // without yanking the DB from under a mid-tick worker. Bounded wait —
+  // a pathologically stuck tick cannot wedge shutdown indefinitely; the
+  // worker_leases TTL upsert reclaims any stranded lease on the next
+  // process startup.
+  return async () => {
     if (heavyTimer) {
       clearInterval(heavyTimer);
       heavyTimer = null;
+      console.log("[heavy-lane] Worker stop signaled — draining in-flight tick");
+    }
+    const deadline = Date.now() + HEAVY_STOP_DRAIN_TIMEOUT_MS;
+    while (heavyRunning && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    if (heavyRunning) {
+      console.log(
+        `[heavy-lane] Worker stop drain timed out after ${HEAVY_STOP_DRAIN_TIMEOUT_MS}ms — tick still running`,
+      );
+    } else {
       console.log("[heavy-lane] Worker stopped");
     }
   };
 }
+
+/**
+ * v0.8.2 — bounded wait for in-flight heavy-lane tick during shutdown.
+ * 30 seconds covers a Phase 2 + Phase 3 stack with reasonable LLM latencies
+ * before falling back to the worker_leases TTL reclaim path.
+ */
+const HEAVY_STOP_DRAIN_TIMEOUT_MS = 30_000;

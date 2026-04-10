@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.8.1**.
+Guide for upgrading between released versions. Current: **v0.8.2**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -36,8 +36,82 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - `clawmem reindex --enrich` — no new enrichment stages added
 - `clawmem build-graphs` — no new graph edge types
 - `clawmem setup hooks` — hook configuration is unchanged (no new hooks, no renamed hooks, no changed budgets)
-- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.1
+- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.2
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
+
+---
+
+## v0.8.1 → v0.8.2
+
+v0.8.2 is a pure code release: no schema changes, no new dependencies, no new env vars. The only behavior change is operational — the long-lived `clawmem watch` process now hosts the consolidation and heavy maintenance lane workers in addition to `cmdMcp`, and the light lane gained the same DB-backed `worker_leases` exclusivity the heavy lane already had. See [`docs/concepts/architecture.md#dual-host-worker-architecture-v082`](../concepts/architecture.md) for the architectural walkthrough.
+
+### Quick path
+
+```bash
+git pull   # or: bun update -g clawmem / npm update -g clawmem
+systemctl --user restart clawmem-watcher.service  # if installed as a user unit
+```
+
+### Recommended deployment change
+
+Move worker hosting from `cmdMcp` (per-session) to `cmdWatch` (long-lived, canonical) by setting the env vars on your watcher service unit instead of the wrapper. Example systemd drop-in:
+
+```bash
+systemctl --user edit clawmem-watcher.service
+```
+
+Then paste:
+
+```ini
+[Service]
+Environment=CLAWMEM_ENABLE_CONSOLIDATION=true
+Environment=CLAWMEM_HEAVY_LANE=true
+Environment=CLAWMEM_HEAVY_LANE_WINDOW_START=2
+Environment=CLAWMEM_HEAVY_LANE_WINDOW_END=6
+```
+
+Then `systemctl --user restart clawmem-watcher.service`. The watcher process now runs both lanes 24/7 — the heavy lane sees the configured 02:00-06:00 quiet window every night regardless of whether any Claude Code session is open at the time, and the light lane drains the enrichment backlog continuously.
+
+`cmdMcp` remains a supported fallback host for users who do not run `clawmem watch` (e.g. macOS users running everything via Claude Code launchd). When `CLAWMEM_HEAVY_LANE=true` is set on a stdio MCP host, `cmdMcp` emits a one-line warning to stderr advising operators to move heavy-lane hosting to the watcher.
+
+### What changed under the hood
+
+- **Light-lane worker lease (`light-consolidation` key)** — `runConsolidationTick` now wraps each tick in `withWorkerLease`. Two host processes against the same vault cannot race on Phase 2 consolidated_observations writes or duplicate Phase 3 deductive synthesis LLM calls. The in-process `isRunning` reentrancy guard remains as the cheap first defense before the SQLite round-trip.
+- **`cmdWatch` hosts both workers** — same env-var gates as `cmdMcp`. Off by default in both hosts.
+- **`cmdMcp` heavy-lane warning** — `console.error` advises moving heavy-lane hosting to the watcher.
+- **Async drain on shutdown** — `stopConsolidationWorker` and the closure returned by `startHeavyMaintenanceWorker` are now async. They clear their `setInterval` AND poll their in-flight running flag until any mid-tick worker drains before resolving, so the worker's `withWorkerLease` finally block runs against a still-open store. Bounded waits (15s light, 30s heavy) prevent stuck ticks from wedging shutdown.
+- **Signal handlers registered before worker startup** — both `cmdWatch` and `cmdMcp` register `SIGINT`/`SIGTERM` handlers before any worker initialization, eliminating the brief race window where a signal arriving mid-startup would terminate via the default action and skip the async drain.
+
+### Multi-host safety
+
+Running BOTH `clawmem watch` (with env vars) AND a per-session `clawmem mcp` (with env vars) against the same vault is supported in v0.8.2. The `worker_leases` table arbitrates: only one host wins each tick, the other journals a skip (heavy lane) or logs "lease held" (light lane). For the cleanest setup, set the env vars on `clawmem-watcher.service` only and leave `cmdMcp` unset.
+
+### What you do NOT need to do
+
+- No SQL migration (no schema changes)
+- No `clawmem embed` (no embedding contract change)
+- No `clawmem reindex` (no document storage change)
+- No `clawmem setup hooks` (no hook config change)
+- No `bun install` / `npm install` (no dependency change)
+
+### Verify the upgrade
+
+```bash
+# Confirm watcher is running latest code
+systemctl --user status clawmem-watcher.service
+
+# After enabling the env vars + restart, watcher should log:
+#   [watch] Starting consolidation worker (light lane, interval=...)
+#   [watch] Starting heavy maintenance lane worker
+#   [consolidation] Worker started
+#   [heavy-lane] Starting worker (interval=..., window=2-6, ...)
+journalctl --user -u clawmem-watcher.service -n 50 --no-pager
+
+# After the first quiet-window tick, journal should have rows
+sqlite3 -readonly ~/.cache/clawmem/index.sqlite \
+  "SELECT lane, phase, status, reason, started_at FROM maintenance_runs
+   WHERE lane = 'heavy' ORDER BY id DESC LIMIT 10"
+```
 
 ---
 

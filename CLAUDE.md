@@ -94,9 +94,9 @@ curl http://host:8090/v1/models
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups. |
 | `CLAWMEM_VAULTS` | (none) | JSON map of vault name → SQLite path for multi-vault mode. E.g. `{"work":"~/.cache/clawmem/work.sqlite"}` |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing. |
-| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
+| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs and runs Phase 2/3 consolidation + deductive synthesis. **v0.8.2:** every tick is wrapped in a DB-backed `worker_leases` row (`light-consolidation` key), so multiple host processes against the same vault cannot race on Phase 2 merge writes. Hosted by either `clawmem watch` (canonical, long-lived) or `clawmem mcp` (per-session fallback). |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
-| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance worker — a second, longer-interval consolidation lane with DB-backed `worker_leases` exclusivity, stale-first batching, and `maintenance_runs` journaling. Runs alongside the light lane; off by default. |
+| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance worker — a second, longer-interval consolidation lane with DB-backed `worker_leases` exclusivity, stale-first batching, and `maintenance_runs` journaling. Runs alongside the light lane; off by default. **v0.8.2:** canonical host is `clawmem watch` (e.g. systemd `clawmem-watcher.service`); `clawmem mcp` retains the same gate as a fallback host but emits a stderr warning advising operators to move heavy-lane hosting to the watcher because per-session stdio MCPs may never be alive during the configured quiet window. |
 | `CLAWMEM_HEAVY_LANE_INTERVAL` | 1800000 | **v0.8.0.** Heavy-lane tick interval in ms (min 30000, default 30 min). |
 | `CLAWMEM_HEAVY_LANE_WINDOW_START` | (none) | **v0.8.0.** Start hour (0-23) of the quiet window. Unset → no window. |
 | `CLAWMEM_HEAVY_LANE_WINDOW_END` | (none) | **v0.8.0.** End hour (0-23, exclusive) of the quiet window. Supports midnight wrap (22→6). |

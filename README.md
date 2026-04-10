@@ -108,6 +108,19 @@ Adds +56 tests (13 worker-lease + 35 maintenance unit + 8 maintenance integratio
 
 Adds +27 tests (22 unit + 5 integration) on top of the v0.8.0 baseline.
 
+### v0.8.2 Dual-Host Worker Architecture
+
+Both maintenance lanes can now be hosted by the long-lived `clawmem watch` watcher service in addition to the existing per-session `clawmem mcp` host. This makes the systemd-managed watcher the canonical 24/7 home for the v0.8.0 heavy maintenance lane — its quiet-window logic finally sees a live worker at the configured hours regardless of whether any Claude Code session is open. The light consolidation lane (Phase 1 backfill + Phase 2 merge + Phase 3 deductive synthesis + Phase 4 recall stats) now also acquires its own DB-backed `worker_leases` row before each tick, symmetric with the heavy lane's existing exclusivity, so multiple host processes against the same vault cannot race on Phase 2 merges or Phase 3 deductive writes.
+
+- **Light-lane worker lease** — `runConsolidationTick` wraps every tick (Phase 1 → 4) in `withWorkerLease` against a new `light-consolidation` worker name with a 10-minute TTL. Two host processes (e.g. one watcher service + one per-session stdio MCP) cannot both consolidate the same near-duplicate observations or both INSERT a duplicate row into `consolidated_observations`. Phase 1 enrichment is also serialized — overkill for cost but cleaner for symmetry. The in-process `isRunning` reentrancy guard remains the cheap first defense before the SQLite lease round-trip.
+- **`cmdWatch` hosts both workers** — `clawmem watch` honors the same `CLAWMEM_ENABLE_CONSOLIDATION` and `CLAWMEM_HEAVY_LANE` env-var gates as `cmdMcp`. Off by default. Mirror the existing systemd unit (or your wrapper `.env`) to opt in. The recommended deployment for v0.8.2+ is to set both env vars on `clawmem-watcher.service` and leave `cmdMcp` unset, so the heavy lane has a continuously available host independent of Claude Code session lifecycle.
+- **`cmdMcp` is now a fallback host with a heavy-lane warning** — `cmdMcp` retains the same env-var gates so non-watcher deployments (e.g. macOS users running everything via Claude Code launchd) keep working unchanged. When `CLAWMEM_HEAVY_LANE=true` is set on a stdio MCP host, `cmdMcp` emits a one-line warning to stderr advising operators to move heavy-lane hosting to `clawmem watch` instead.
+- **Async drain on shutdown** — both worker stop helpers (`stopConsolidationWorker` and the closure returned by `startHeavyMaintenanceWorker`) are now `async`, clearing their `setInterval` AND polling their in-flight running flag until any mid-tick worker drains. This guarantees the worker's `withWorkerLease` finally block runs against a still-open store, so the lease is released cleanly instead of leaking until TTL expiry. Bounded waits (15s light, 30s heavy) prevent a stuck tick from wedging shutdown indefinitely; the next process reclaims any stranded lease atomically.
+- **Signal handlers registered before worker startup** — both `cmdWatch` and `cmdMcp` now register their `SIGINT`/`SIGTERM` handlers BEFORE any worker initialization. A signal arriving in the brief window between worker startup and handler registration would otherwise terminate the host via the default signal action (exit 143) and skip the async drain entirely.
+- **Subprocess smoke test** — new `tests/integration/cmdwatch-workers.integration.test.ts` spawns `bun src/clawmem.ts watch` against a temp vault with short worker intervals, exercises the env-var gates, exercises a real heavy-lane tick (slow path, ~35s), and asserts the lease is released cleanly on `SIGTERM`.
+
+Adds +15 tests (9 light-lane lease unit + 5 cmdWatch fast subprocess + 1 cmdWatch slow subprocess) on top of the v0.8.1 baseline.
+
 ## Architecture
 
 <p align="center">

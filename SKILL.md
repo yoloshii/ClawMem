@@ -85,14 +85,14 @@ curl http://host:8090/v1/models
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` auto-downloads. Set `true` for remote-only. |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing. |
-| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker backfills unenriched docs. Needs long-lived MCP process. |
+| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Light-lane consolidation worker (Phase 1 backfill + Phase 2 merge + Phase 3 deductive synthesis + Phase 4 recall stats). **v0.8.2:** every tick wraps in a `worker_leases` row (`light-consolidation` key) so multiple host processes against the same vault cannot race on Phase 2 merges. Hosted by `clawmem watch` (canonical) or `clawmem mcp` (per-session fallback). |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
 | `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 merge-safety score threshold when candidate and existing anchors align. |
 | `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold (fallback when anchors are ambiguous). |
 | `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration. |
 | `CLAWMEM_CONTRADICTION_POLICY` | `link` | **v0.7.1.** How the merge-time contradiction gate handles a blocked merge. `link` (default) keeps both rows + inserts `contradicts` edge. `supersede` marks the old row `status='inactive'`. |
 | `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | **v0.7.1.** Minimum combined heuristic+LLM confidence required before the contradiction gate blocks a merge. |
-| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance worker — a second, longer-interval consolidation lane with DB-backed `worker_leases` exclusivity, stale-first batching, and `maintenance_runs` journaling. Runs alongside the light lane. |
+| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance worker — a second, longer-interval consolidation lane with DB-backed `worker_leases` exclusivity, stale-first batching, and `maintenance_runs` journaling. Runs alongside the light lane. **v0.8.2:** canonical host is `clawmem watch` (e.g. systemd `clawmem-watcher.service`); `clawmem mcp` retains the same gate as a fallback host but emits a stderr warning advising operators to move heavy-lane hosting to the watcher because per-session stdio MCPs may never be alive during the configured quiet window. |
 | `CLAWMEM_HEAVY_LANE_INTERVAL` | 1800000 | **v0.8.0.** Heavy-lane tick interval in ms (min 30000, default 30 min). |
 | `CLAWMEM_HEAVY_LANE_WINDOW_START` / `_END` | (none) | **v0.8.0.** Start/end hours (0-23) of the quiet window. Supports midnight wrap (22→6). Null on either bound = always in window. |
 | `CLAWMEM_HEAVY_LANE_MAX_USAGES` | 30 | **v0.8.0.** Max `context_usage` rows in the last 10 min before the heavy lane skips with `reason='query_rate_high'`. |
@@ -767,7 +767,7 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 - SAME (composite scoring), MAGMA (intent + graph), A-MEM (self-evolving notes) layer on top of QMD substrate.
 - Three `llama-server` instances on local or remote GPU. Wrapper defaults to `localhost:8088/8089/8090`.
 - `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process fallback. Set `true` for remote-only to fail fast.
-- Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs. Only runs if MCP process stays alive long enough (every 5min).
+- Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs and runs Phase 2 merge / Phase 3 deductive synthesis. **v0.8.2:** hosted by either `clawmem watch` (long-lived, canonical) or `clawmem mcp` (per-session fallback); every tick acquires a `light-consolidation` `worker_leases` row before doing work, so dual-hosting against the same vault is safe.
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
 - HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
 - OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction + runtime delegation (v0.3.0+, required for OpenClaw v2026.3.28+).

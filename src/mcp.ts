@@ -39,7 +39,10 @@ import { classifyIntent, decomposeQuery, extractTemporalConstraint, type IntentT
 import { adaptiveTraversal, mergeTraversalResults, mpfpTraversal } from "./graph-traversal.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
-import { startHeavyMaintenanceWorker, type HeavyMaintenanceConfig } from "./maintenance.ts";
+import {
+  parseHeavyLaneConfigFromEnv,
+  startHeavyMaintenanceWorker,
+} from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
 import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
 
@@ -2595,8 +2598,37 @@ This is the recommended entry point for ALL memory queries.`,
   await server.connect(transport);
 
   // ---------------------------------------------------------------------------
-  // Consolidation Worker
+  // Shutdown wiring + Workers
   // ---------------------------------------------------------------------------
+
+  // v0.8.2 Codex Turn 2 fix: register signal handlers BEFORE any worker
+  // startup, mirroring the same null-handle capture pattern that cmdWatch
+  // uses. The handler is the only thing that suppresses Node's default
+  // signal action (terminate), so a SIGTERM arriving in the brief window
+  // between worker startup and `process.on(...)` registration would
+  // exit-143 the process and skip the async drain entirely, leaking any
+  // lease the worker had just acquired. Capturing `stopHeavyLane` as a
+  // mutable closure variable lets the registration happen before the
+  // worker is actually created — the handler reads whatever value is
+  // bound at the moment a signal arrives.
+  let stopHeavyLane: (() => Promise<void>) | null = null;
+
+  // Signal handlers for graceful shutdown. async stop sequence: both
+  // worker stops await any in-flight tick before resolving so the store
+  // is not closed underneath a mid-tick worker. Bounded waits inside the
+  // stop functions guarantee the handler cannot wedge indefinitely.
+  const shutdownMcp = async (signal: string) => {
+    console.error(`\n[mcp] Received ${signal}, shutting down...`);
+    if (stopHeavyLane) {
+      await stopHeavyLane();
+      stopHeavyLane = null;
+    }
+    await stopConsolidationWorker();
+    closeAllStores();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => { void shutdownMcp("SIGINT"); });
+  process.on("SIGTERM", () => { void shutdownMcp("SIGTERM"); });
 
   // Start consolidation worker if enabled
   if (Bun.env.CLAWMEM_ENABLE_CONSOLIDATION === "true") {
@@ -2609,49 +2641,25 @@ This is the recommended entry point for ALL memory queries.`,
   // longer interval than the light lane, only inside a configurable quiet
   // window, and gated by context_usage query-rate so interactive sessions
   // are never starved. Off by default.
-  let stopHeavyLane: (() => void) | null = null;
+  //
+  // v0.8.2: warn when this lane is enabled on a stdio MCP host. Per-session
+  // MCPs spawned by Claude Code die with the session, which means the
+  // configured quiet window may never see a live worker if no Claude Code
+  // session is open at that time. The watcher service (`clawmem watch`) is
+  // the canonical long-lived host for the heavy lane as of v0.8.2 — see
+  // docs/concepts/architecture.md and docs/guides/upgrading.md for the
+  // dual-host rationale.
   if (Bun.env.CLAWMEM_HEAVY_LANE === "true") {
+    console.error(
+      "[mcp] WARNING: CLAWMEM_HEAVY_LANE=true on a stdio MCP host. " +
+        "Per-session MCPs are short-lived; the configured quiet window may " +
+        "never see a live worker. As of v0.8.2 the canonical heavy-lane host " +
+        "is `clawmem watch` (e.g. systemd user unit clawmem-watcher.service). " +
+        "Set the same env var on the watcher service for reliable operation.",
+    );
     const llm = getDefaultLlamaCpp();
-    const cfg: HeavyMaintenanceConfig = {
-      intervalMs: Bun.env.CLAWMEM_HEAVY_LANE_INTERVAL
-        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_INTERVAL, 10)
-        : undefined,
-      windowStartHour: Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_START
-        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_START, 10)
-        : null,
-      windowEndHour: Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_END
-        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_WINDOW_END, 10)
-        : null,
-      maxContextUsagesPer10m: Bun.env.CLAWMEM_HEAVY_LANE_MAX_USAGES
-        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_MAX_USAGES, 10)
-        : undefined,
-      staleObservationLimit: Bun.env.CLAWMEM_HEAVY_LANE_OBS_LIMIT
-        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_OBS_LIMIT, 10)
-        : undefined,
-      staleDeductiveLimit: Bun.env.CLAWMEM_HEAVY_LANE_DED_LIMIT
-        ? parseInt(Bun.env.CLAWMEM_HEAVY_LANE_DED_LIMIT, 10)
-        : undefined,
-      useSurprisalSelector: Bun.env.CLAWMEM_HEAVY_LANE_SURPRISAL === "true",
-    };
-    stopHeavyLane = startHeavyMaintenanceWorker(store, llm, cfg);
+    stopHeavyLane = startHeavyMaintenanceWorker(store, llm, parseHeavyLaneConfigFromEnv());
   }
-
-  // Signal handlers for graceful shutdown
-  process.on("SIGINT", () => {
-    console.error("\n[mcp] Received SIGINT, shutting down...");
-    stopConsolidationWorker();
-    if (stopHeavyLane) stopHeavyLane();
-    closeAllStores();
-    process.exit(0);
-  });
-
-  process.on("SIGTERM", () => {
-    console.error("\n[mcp] Received SIGTERM, shutting down...");
-    stopConsolidationWorker();
-    if (stopHeavyLane) stopHeavyLane();
-    closeAllStores();
-    process.exit(0);
-  });
 }
 
 if (import.meta.main) {
