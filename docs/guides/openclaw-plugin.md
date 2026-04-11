@@ -52,11 +52,32 @@ The plugin manifest (`src/openclaw/plugin.json`) supports:
 | `enableTools` | true | Register agent tools |
 | `servePort` | 7438 | REST API port for agent tools |
 
+## Coexistence with OpenClaw Active Memory
+
+OpenClaw v2026.4.10 introduced [Active Memory](https://docs.openclaw.ai/concepts/active-memory) — an optional plugin that runs a blocking memory sub-agent before each reply, searching OpenClaw's native memory (dreaming, wiki, memory palace).
+
+**ClawMem and Active Memory are fully compatible.** They operate on different integration surfaces:
+
+| Dimension | ClawMem | Active Memory |
+|-----------|---------|---------------|
+| Plugin kind | `context-engine` | standard plugin |
+| Injection target | User prompt (`prependContext`) | System prompt (`appendSystemContext`) |
+| Memory backend | ClawMem SQLite vault | OpenClaw native dreaming/wiki |
+| Latency | ~200-500ms (CLI hook) | 3-15s (LLM sub-agent) |
+
+Both can run simultaneously — Active Memory handles casual personal recall ("what's my favorite food") while ClawMem handles deep project context (decisions, architecture, cross-session chains). There is no conflict or duplicate injection between them because they search different backends and inject into different prompt regions.
+
+**No configuration changes needed.** If Active Memory is enabled, ClawMem continues working as before. The deployment options below control ClawMem's relationship with OpenClaw's *native memory search* (`memorySearch.extraPaths`), which is separate from Active Memory.
+
+### OpenClaw version note
+
+OpenClaw v2026.4.10 also fixed a config normalization bug (#64192) where `plugins.slots.contextEngine` was silently dropped during config processing. If you configure ClawMem via the context engine slot (`plugins.slots.contextEngine: "clawmem"`), upgrade to OpenClaw v2026.4.10+ to ensure reliable plugin activation. Earlier versions still activate ClawMem via explicit `plugins.entries.clawmem.enabled: true`, but the slot path is more robust.
+
 ## Deployment options
 
 ### Option 1: ClawMem Exclusive (recommended)
 
-ClawMem handles 100% of memory. Disable OpenClaw's native memory:
+ClawMem handles 100% of structured memory. Disable OpenClaw's native memory search to avoid duplicate injection from `memorySearch.extraPaths`:
 
 ```bash
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
@@ -64,9 +85,11 @@ openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 
 Benefits: no context waste from duplicate injection, all memory in ClawMem's hybrid search.
 
+This does NOT disable Active Memory (which is a separate plugin). If you want both ClawMem and Active Memory, leave Active Memory enabled — they complement each other.
+
 ### Option 2: Hybrid
 
-Run both ClawMem and OpenClaw's native memory:
+Run both ClawMem and OpenClaw's native memory search:
 
 ```bash
 openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents"]'

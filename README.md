@@ -196,10 +196,14 @@ clawmem setup openclaw   # Shows installation steps
 - **5 agent tools** - `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
 - **Session lifecycle hooks** - `session_start`, `session_end`, `before_reset` safety net
 
-Disable OpenClaw's native memory and `memory-lancedb` auto-recall/capture to avoid duplicate injection:
+Disable OpenClaw's native memory search to avoid duplicate injection:
 ```bash
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
+
+ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.ai/concepts/active-memory) plugin (v2026.4.10+) — they search different backends and inject into different prompt regions, so both can run simultaneously without conflict. See the [OpenClaw plugin guide](docs/guides/openclaw-plugin.md#coexistence-with-openclaw-active-memory) for details.
+
+> **OpenClaw v2026.4.10+** recommended — fixes a config normalization bug where `plugins.slots.contextEngine` was silently dropped (#64192).
 
 **Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
 

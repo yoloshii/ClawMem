@@ -605,12 +605,15 @@ Phase 3 deductive synthesis applies the same `contradicts` link for any draft th
 
 ## OpenClaw Integration
 
+**Active Memory coexistence:** ClawMem is fully compatible with OpenClaw's Active Memory plugin (v2026.4.10+). They search different backends and inject into different prompt regions — both can run simultaneously. The deployment options below control native memory search (`memorySearch.extraPaths`), not Active Memory.
+
+**OpenClaw v2026.4.10+ recommended** — fixes contextEngine slot being silently dropped during config normalization (#64192).
+
 ### Option 1: ClawMem Exclusive (Recommended)
 
-ClawMem handles 100% of memory. No redundancy.
+ClawMem handles 100% of structured memory. Disable native memory search:
 
 ```bash
-# Disable OpenClaw's native memory
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
@@ -618,7 +621,7 @@ openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 
 ### Option 2: Hybrid
 
-Run both ClawMem and OpenClaw native memory.
+Run both ClawMem and OpenClaw native memory search.
 
 ```bash
 openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/notes"]'
