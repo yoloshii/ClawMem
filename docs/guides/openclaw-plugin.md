@@ -5,10 +5,12 @@ ClawMem integrates with OpenClaw as a native ContextEngine plugin, giving OpenCl
 ## Install
 
 ```bash
-./bin/clawmem setup openclaw
+clawmem setup openclaw
 ```
 
-This registers ClawMem as a context engine plugin with OpenClaw.
+This auto-installs the plugin: creates `~/.openclaw/extensions/clawmem` as a symlink to the plugin source, verifies the manifest, and prints the remaining steps (gateway restart, slot config, GPU endpoints). Run `clawmem setup openclaw --remove` to uninstall.
+
+If the symlink already exists and points to the correct location, setup is idempotent. If it points somewhere else (e.g., after an npm update changed the install path), setup replaces it automatically.
 
 ## Architecture
 
@@ -42,7 +44,7 @@ This is required since OpenClaw v2026.3.28 — returning `compacted: false` with
 
 ## Configuration
 
-The plugin manifest (`src/openclaw/plugin.json`) supports:
+The plugin manifest (`src/openclaw/openclaw.plugin.json`) supports:
 
 | Option | Default | Description |
 |--------|---------|-------------|

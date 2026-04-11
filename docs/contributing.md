@@ -67,7 +67,7 @@ src/
     engine.ts         ContextEngine implementation
     shell.ts          Shell-out transport utilities
     tools.ts          REST API agent tools
-    plugin.json       Plugin manifest
+    openclaw.plugin.json  Plugin manifest (OpenClaw-expected filename)
 tests/
   unit/               Unit tests
   integration/        Integration tests (when present)

@@ -4,6 +4,21 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.8.4 — OpenClaw Setup Auto-Install + Active Memory Coexistence Docs
+
+Fixes the OpenClaw plugin setup workflow that caused issue #5 ("plugin not found: clawmem"). Patch release — no schema changes, no migration required.
+
+- **`clawmem setup openclaw` now auto-installs** — previously only printed manual instructions (symlink + manifest copy + config set), which users frequently skipped or misconfigured. Now auto-creates `~/.openclaw/extensions/clawmem` as a symlink to the plugin source, verifies the manifest exists, and prints only the remaining steps that require a gateway restart first (slot assignment, GPU endpoints, REST API). Handles stale symlinks (detects via `readlink` compare, replaces automatically after npm updates), existing directories (removes and re-symlinks), and regular file conflicts (aborts with clear message). Idempotent on re-run.
+- **`clawmem setup openclaw --remove` now auto-uninstalls** — previously only printed removal instructions. Now removes the symlink/directory and resets the context engine slot to `legacy` via `openclaw config set` (if the OpenClaw CLI is available). Falls back to printing the manual command when the CLI is absent.
+- **Manifest renamed to `openclaw.plugin.json`** — the plugin manifest shipped as `plugin.json` but OpenClaw expects `openclaw.plugin.json`. The old setup workflow worked around this with a copy step that wrote into the symlinked source tree (bad for protected npm prefixes and source checkouts). Now ships with the correct filename, eliminating the copy step entirely.
+- **OpenClaw v2026.4.10+ version warning** — setup prints a warning about the config normalization bug (openclaw/openclaw#64192) where `plugins.slots.contextEngine` was silently dropped on earlier versions. The warning is informational, not fatal.
+- **Active Memory coexistence documented** — new section in the OpenClaw plugin guide explaining that ClawMem and OpenClaw's Active Memory plugin (v2026.4.10+) are fully compatible: different plugin kinds, different injection targets (user prompt vs system prompt), different memory backends. Both can run simultaneously.
+- **Codex review** — GPT 5.4 High, session `019d72d5`, turns 25-27 (~4.32M cumulative tokens). Turn 25 raised 1 High (manifest copy into source tree) + 2 Medium (auto-install gap, version warning). Turn 26 raised 1 High (config set before gateway restart) + 1 Low (regular file conflict unhandled). Turn 27: zero remaining findings.
+
+No breaking changes. Existing users who previously ran the manual symlink steps are unaffected — `setup openclaw` detects the existing correct symlink and skips re-creation.
+
+---
+
 ## v0.8.3 — Content-Type-Aware Entity Cap + Self-Loop Guard + Docs Restructure
 
 Two small safety/correctness fixes land alongside a major documentation restructure. Patch release — no schema changes, no migration required, no new env vars.

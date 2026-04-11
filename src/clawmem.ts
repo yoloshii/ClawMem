@@ -1300,43 +1300,115 @@ function cmdPath() {
 
 async function cmdSetupOpenClaw(args: string[]) {
   const remove = args.includes("--remove");
-  const binPath = findClawmemBinary();
   const pluginDir = pathResolve(import.meta.dir, "openclaw");
+  const extensionsDir = pathResolve(process.env.HOME || "~", ".openclaw", "extensions");
+  const linkPath = pathResolve(extensionsDir, "clawmem");
+
+  // Check if openclaw CLI is available
+  const hasOpenClawCli = (() => {
+    try {
+      const r = Bun.spawnSync(["openclaw", "--version"], { stdout: "pipe", stderr: "pipe" });
+      return r.exitCode === 0;
+    } catch { return false; }
+  })();
 
   if (remove) {
-    console.log(`${c.green}To remove ClawMem from OpenClaw:${c.reset}`);
-    console.log(`  1. Remove the symlink: rm ~/.openclaw/extensions/clawmem`);
-    console.log(`  2. Remove from config: openclaw config set plugins.slots.contextEngine legacy`);
+    // Actually uninstall — mirror of install behavior
+    let removed = false;
+    try {
+      const stat = await import("fs").then(m => m.lstatSync(linkPath));
+      if (stat.isSymbolicLink() || stat.isDirectory()) {
+        const { unlinkSync, rmSync } = await import("fs");
+        if (stat.isSymbolicLink()) {
+          unlinkSync(linkPath);
+        } else {
+          rmSync(linkPath, { recursive: true });
+        }
+        console.log(`${c.green}Removed plugin from ${linkPath}${c.reset}`);
+        removed = true;
+      }
+    } catch (e: any) {
+      if (e.code !== "ENOENT") throw e;
+      console.log(`${c.dim}Plugin not installed at ${linkPath}${c.reset}`);
+    }
+
+    if (hasOpenClawCli) {
+      Bun.spawnSync(["openclaw", "config", "set", "plugins.slots.contextEngine", "legacy"], { stdout: "inherit", stderr: "inherit" });
+      console.log(`${c.green}Reset context engine slot to legacy${c.reset}`);
+    } else if (removed) {
+      console.log(`${c.dim}openclaw CLI not found — manually run: openclaw config set plugins.slots.contextEngine legacy${c.reset}`);
+    }
     return;
   }
 
-  // Check that the OpenClaw plugin files exist
+  // Verify plugin source files exist
   if (!existsSync(pathResolve(pluginDir, "index.ts"))) {
     die(`OpenClaw plugin files not found at ${pluginDir}`);
   }
+  if (!existsSync(pathResolve(pluginDir, "openclaw.plugin.json"))) {
+    die(`Plugin manifest not found at ${pluginDir}/openclaw.plugin.json`);
+  }
 
-  console.log(`${c.green}ClawMem OpenClaw Plugin Setup${c.reset}`);
+  // Create extensions directory
+  if (!existsSync(extensionsDir)) {
+    mkdirSync(extensionsDir, { recursive: true });
+  }
+
+  // Remove stale symlink/directory if present
+  try {
+    const { lstatSync, unlinkSync, rmSync } = await import("fs");
+    const stat = lstatSync(linkPath);
+    if (stat.isSymbolicLink()) {
+      const { readlinkSync } = await import("fs");
+      const target = readlinkSync(linkPath);
+      if (target === pluginDir) {
+        console.log(`${c.dim}Symlink already correct at ${linkPath}${c.reset}`);
+      } else {
+        unlinkSync(linkPath);
+        console.log(`${c.dim}Replaced stale symlink (was → ${target})${c.reset}`);
+      }
+    } else if (stat.isDirectory()) {
+      rmSync(linkPath, { recursive: true });
+      console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
+    } else {
+      // Regular file or other non-symlink, non-directory — conflict
+      die(`${linkPath} exists but is not a symlink or directory. Remove it manually and re-run setup.`);
+    }
+  } catch (e: any) {
+    if (e.code !== "ENOENT") throw e;
+  }
+
+  // Create symlink
+  if (!existsSync(linkPath)) {
+    const { symlinkSync } = await import("fs");
+    symlinkSync(pluginDir, linkPath);
+  }
+  console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir}${c.reset}`);
+
+  // Version warning
   console.log();
-  console.log(`Plugin source: ${pluginDir}`);
-  console.log(`ClawMem binary: ${binPath}`);
+  console.log(`${c.bold}Note:${c.reset} OpenClaw v2026.4.10+ recommended — earlier versions`);
+  console.log(`have a bug where plugins.slots.contextEngine is silently dropped`);
+  console.log(`during config normalization (openclaw/openclaw#64192).`);
+
+  // Remaining steps — gateway must restart BEFORE setting the context engine slot,
+  // otherwise OpenClaw hasn't discovered the plugin yet and the slot assignment
+  // fails or is ignored (the exact bug reported in issue #5).
   console.log();
-  console.log(`${c.bold}Installation steps:${c.reset}`);
+  console.log(`${c.bold}Next steps:${c.reset}`);
   console.log();
-  console.log(`  1. Symlink the plugin into OpenClaw extensions:`);
-  console.log(`     ${c.cyan}ln -s ${pluginDir} ~/.openclaw/extensions/clawmem${c.reset}`);
+  console.log(`  1. Restart OpenClaw gateway to discover the plugin:`);
+  console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
   console.log();
-  console.log(`  2. Copy the plugin manifest:`);
-  console.log(`     ${c.cyan}cp ${pluginDir}/plugin.json ~/.openclaw/extensions/clawmem/openclaw.plugin.json${c.reset}`);
-  console.log();
-  console.log(`  3. Set ClawMem as the active context engine:`);
+  console.log(`  2. Set ClawMem as the active context engine (after restart):`);
   console.log(`     ${c.cyan}openclaw config set plugins.slots.contextEngine clawmem${c.reset}`);
   console.log();
-  console.log(`  4. Configure GPU endpoints (if not using defaults):`);
+  console.log(`  3. Configure GPU endpoints (if not using defaults):`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlm http://YOUR_GPU:8089${c.reset}`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuRerank http://YOUR_GPU:8090${c.reset}`);
   console.log();
-  console.log(`  5. Start the REST API (for tool calls):`);
+  console.log(`  4. Start the REST API (for agent tools):`);
   console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
   console.log();
   console.log(`${c.dim}ClawMem will work alongside Claude Code hooks — both modes share the same vault.${c.reset}`);

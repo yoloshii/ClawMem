@@ -216,6 +216,12 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## OpenClaw
 
+**"plugin not found: clawmem" / "Context engine 'clawmem' is not registered"**
+- OpenClaw can't find the ClawMem plugin files. This happens when `clawmem setup openclaw` wasn't run, or the symlink is broken/missing.
+- Fix: Run `clawmem setup openclaw` — this auto-creates the symlink at `~/.openclaw/extensions/clawmem` pointing to the plugin source. Then follow the printed next steps: restart the gateway, set the context engine slot, and start the REST API.
+- If re-running setup doesn't help: check the symlink exists (`ls -la ~/.openclaw/extensions/clawmem`), verify it points to a directory containing `openclaw.plugin.json` and `index.ts`, and confirm the `openclaw.plugin.json` file has `"id": "clawmem"`.
+- OpenClaw v2026.4.10+ required for reliable `plugins.slots.contextEngine` handling. Earlier versions silently drop the contextEngine slot during config normalization (openclaw/openclaw#64192). Upgrade with `sudo npm i -g openclaw@latest`.
+
 **REST API tools return no results**
 - The `clawmem serve` process may not be running. The plugin auto-starts it, but it doesn't survive plugin crashes.
 - Fix: Check with `curl http://localhost:7438/health`. If unreachable, either restart OpenClaw or run `clawmem serve` as a [systemd service](guides/systemd-services.md#rest-api-service-for-openclaw) for persistence.

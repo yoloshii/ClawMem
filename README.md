@@ -186,7 +186,7 @@ clawmem setup mcp      # Register MCP server in ~/.claude.json (31 tools)
 ClawMem registers as a native ContextEngine plugin - OpenClaw's pluggable interface for context management. Same 90/10 automatic retrieval, delivered through OpenClaw's lifecycle system instead of Claude Code hooks.
 
 ```bash
-clawmem setup openclaw   # Shows installation steps
+clawmem setup openclaw   # Auto-installs plugin, prints remaining steps
 ```
 
 **What the plugin provides:**

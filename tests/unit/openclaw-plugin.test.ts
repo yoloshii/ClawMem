@@ -190,8 +190,8 @@ describe("ClawMemContextEngine", () => {
 // =============================================================================
 
 describe("plugin config", () => {
-  test("plugin.json is valid JSON", async () => {
-    const file = Bun.file(`${import.meta.dir}/../../src/openclaw/plugin.json`);
+  test("openclaw.plugin.json is valid JSON", async () => {
+    const file = Bun.file(`${import.meta.dir}/../../src/openclaw/openclaw.plugin.json`);
     const content = await file.json();
     expect(content.id).toBe("clawmem");
     expect(content.kind).toBe("context-engine");
