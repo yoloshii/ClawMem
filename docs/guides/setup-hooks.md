@@ -5,7 +5,7 @@ Claude Code hooks give ClawMem automatic context injection and extraction on eve
 ## Install default hooks
 
 ```bash
-./bin/clawmem setup hooks
+clawmem setup hooks
 ```
 
 This installs hooks into `~/.claude/settings.json`:
@@ -77,7 +77,7 @@ If you prefer to configure hooks manually instead of running `setup hooks`, add 
 ## Remove hooks
 
 ```bash
-./bin/clawmem setup hooks --remove
+clawmem setup hooks --remove
 ```
 
 ## Available but not default

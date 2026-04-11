@@ -5,7 +5,7 @@ Register ClawMem as an MCP (Model Context Protocol) server so AI agents can call
 ## Install
 
 ```bash
-./bin/clawmem setup mcp
+clawmem setup mcp
 ```
 
 This adds ClawMem to your MCP client's configuration as a stdio server. For Claude Code, it writes to `~/.claude.json`.

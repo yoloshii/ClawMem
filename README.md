@@ -1073,40 +1073,36 @@ Manual layers benefit from periodic re-indexing — a cron job running `clawmem 
 ### Setup
 
 ```bash
-# Bootstrap workspace collection (use your agent's workspace path)
-./bin/clawmem bootstrap ~/workspace --name workspace
+# Bootstrap a content directory (creates vault + indexes + embeds + installs hooks + MCP)
+clawmem bootstrap ~/notes --name notes
 
-# Bootstrap each project
-./bin/clawmem bootstrap ~/Projects/my-project --name my-project
+# Bootstrap each project you want indexed
+clawmem bootstrap ~/Projects/my-project --name my-project
 
-# Enable auto-embed for real-time indexing
-# Edit ~/.config/clawmem/config.yaml → autoEmbed: true
-
-# Install watcher as systemd service
-./bin/clawmem install-service --enable
+# Install watcher + embed timer as systemd services
+clawmem install-service --enable
 ```
 
-#### OpenClaw-Specific
+#### OpenClaw-specific
 
 ```bash
-# OpenClaw uses ~/.openclaw/workspace/ as its workspace root
-./bin/clawmem bootstrap ~/.openclaw/workspace --name workspace
+# Install the ContextEngine plugin (auto-symlinks into ~/.openclaw/extensions/)
+clawmem setup openclaw
+# Then follow the printed next steps: restart gateway, set slot, configure GPU endpoints
 ```
 
-#### Hermes-Specific
+Index your content directories with `clawmem bootstrap` as above. The OpenClaw plugin shares the same vault as Claude Code hooks.
+
+#### Hermes-specific
 
 ```bash
-# Hermes uses ~/.hermes/ as its home directory
-./bin/clawmem bootstrap ~/.hermes --name hermes-home
+# Install the memory provider plugin (symlink or copy)
+ln -s $(npm root -g)/clawmem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
 
-# Install the memory provider plugin
-cp -r src/hermes /path/to/hermes-agent/plugins/memory/clawmem
-
-# Start clawmem serve (external mode)
+# Start the REST API (required for Hermes tool calls)
 clawmem serve --port 7438 &
 
-# Configure Hermes to use ClawMem
-# In your Hermes config.yaml:
+# Configure Hermes to use ClawMem (in your Hermes config.yaml):
 #   memory:
 #     provider: clawmem
 ```

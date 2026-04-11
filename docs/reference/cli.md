@@ -83,7 +83,7 @@ clawmem watch                   # Start file watcher (indexes on .md changes)
 clawmem setup hooks             # Install Claude Code hooks
 clawmem setup hooks --remove    # Remove installed hooks
 clawmem setup mcp               # Register MCP server
-clawmem setup openclaw          # Register OpenClaw ContextEngine plugin
+clawmem setup openclaw          # Auto-install OpenClaw ContextEngine plugin
 clawmem setup curator           # Install curator agent
 ```
 

@@ -28,7 +28,7 @@ ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 The fastest path — one command to init, index, embed, set up hooks, and register MCP:
 
 ```bash
-./bin/clawmem bootstrap ~/notes --name notes
+clawmem bootstrap ~/notes --name notes
 ```
 
 This creates a vault at `~/.cache/clawmem/index.sqlite`, indexes all `.md` files under `~/notes`, embeds them for vector search, installs Claude Code hooks, and registers the MCP server.
@@ -37,19 +37,19 @@ This creates a vault at `~/.cache/clawmem/index.sqlite`, indexes all `.md` files
 
 ```bash
 # 1. Initialize the vault
-./bin/clawmem init
+clawmem init
 
 # 2. Add a collection (directory of markdown files)
-./bin/clawmem collection add ~/notes --name notes
+clawmem collection add ~/notes --name notes
 
 # 3. Index and embed
-./bin/clawmem update --embed
+clawmem update --embed
 
 # 4. Set up Claude Code hooks (automatic context injection)
-./bin/clawmem setup hooks
+clawmem setup hooks
 
 # 5. Register the MCP server (agent-initiated tools)
-./bin/clawmem setup mcp
+clawmem setup mcp
 ```
 
 ## Start GPU services
@@ -79,8 +79,8 @@ No GPU? See [cloud embedding](guides/cloud-embedding.md) for OpenAI, Voyage, Jin
 ## Verify
 
 ```bash
-./bin/clawmem doctor    # Full health check
-./bin/clawmem status    # Quick index status
+clawmem doctor    # Full health check
+clawmem status    # Quick index status
 bun test                # Run test suite
 ```
 

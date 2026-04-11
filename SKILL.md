@@ -118,15 +118,15 @@ ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 clawmem bootstrap ~/notes --name notes
 
 # Or step by step:
-./bin/clawmem init
-./bin/clawmem collection add ~/notes --name notes
-./bin/clawmem update --embed
-./bin/clawmem setup hooks
-./bin/clawmem setup mcp
+clawmem init
+clawmem collection add ~/notes --name notes
+clawmem update --embed
+clawmem setup hooks
+clawmem setup mcp
 
 # Verify
-./bin/clawmem doctor    # Full health check
-./bin/clawmem status    # Quick index status
+clawmem doctor    # Full health check
+clawmem status    # Quick index status
 ```
 
 ### Background Services (systemd user units)

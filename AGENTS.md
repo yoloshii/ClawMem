@@ -128,15 +128,15 @@ ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
 clawmem bootstrap ~/notes --name notes
 
 # Or step by step:
-./bin/clawmem init
-./bin/clawmem collection add ~/notes --name notes
-./bin/clawmem update --embed
-./bin/clawmem setup hooks
-./bin/clawmem setup mcp
+clawmem init
+clawmem collection add ~/notes --name notes
+clawmem update --embed
+clawmem setup hooks
+clawmem setup mcp
 
 # Verify
-./bin/clawmem doctor    # Full health check
-./bin/clawmem status    # Quick index status
+clawmem doctor    # Full health check
+clawmem status    # Quick index status
 ```
 
 ### Background Services (systemd user units)
@@ -206,18 +206,17 @@ systemctl --user status clawmem-watcher.service clawmem-embed.timer
 
 When using ClawMem with OpenClaw, choose one of two deployment options:
 
+**Active Memory coexistence:** ClawMem is fully compatible with OpenClaw's Active Memory plugin (v2026.4.10+). They search different backends (ClawMem vault vs dreaming/wiki) and inject into different prompt regions (user prompt vs system prompt). Both can run simultaneously — no configuration needed.
+
+**OpenClaw v2026.4.10+ recommended:** Fixes a config normalization bug where `plugins.slots.contextEngine` was silently dropped (#64192).
+
 ### Option 1: ClawMem Exclusive (Recommended)
 
-ClawMem handles 100% of memory operations via hooks + MCP tools. Zero redundancy.
-
-**Benefits:**
-- No context window waste (avoids 10-15% duplicate injection)
-- Prevents OpenClaw native memory auto-initialization on updates
-- All memory in ClawMem's hybrid search + graph traversal system
+ClawMem handles 100% of structured memory. Disable native memory search (not Active Memory — that's separate and compatible):
 
 **Configuration:**
 ```bash
-# Disable OpenClaw's native memory
+# Disable OpenClaw's native memory search
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 
 # Verify
@@ -235,7 +234,7 @@ ls ~/.openclaw/agents/main/memory/
 
 ### Option 2: Hybrid (ClawMem + Native)
 
-Run both ClawMem and OpenClaw's native memory for redundancy.
+Run both ClawMem and OpenClaw's native memory search for redundancy.
 
 **Configuration:**
 ```bash
@@ -243,9 +242,9 @@ openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/
 ```
 
 **Tradeoffs:**
-- ✅ Redundant recall from two independent systems
-- ❌ 10-15% context window waste from duplicate facts
-- ❌ Two memory indices to maintain
+- Redundant recall from two independent systems
+- 10-15% context window waste from duplicate facts
+- Two memory indices to maintain
 
 **Recommendation:** Use Option 1 unless you have a specific need for redundant memory systems.
 
