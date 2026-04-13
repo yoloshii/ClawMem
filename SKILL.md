@@ -294,7 +294,7 @@ Once escalated, route by query type:
 | `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
 | `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
 | `vault_sync` | Index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories. |
-| `kg_query` | Query SPO knowledge graph for entity relationships with temporal validity. Uses entity resolution. |
+| `kg_query` | Query SPO knowledge graph for entity relationships with temporal validity. Accepts entity name or canonical ID (`vault:type:slug`). Triples are populated by decision-extractor from observer-emitted `<triples>` blocks using a canonical predicate vocabulary. |
 | `diary_write` | Write diary entry. Use proactively in non-hooked environments. Do NOT use in Claude Code. |
 | `diary_read` | Read recent diary entries. Filter by agent name. |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |

@@ -649,11 +649,18 @@ export async function postIndexEnrich(
 }
 
 /**
- * Observation with document ID for causal inference
+ * Observation with document ID for causal inference and SPO triple extraction.
+ *
+ * Populated by the decision-extractor hook after an observation is successfully
+ * persisted. Consumed by:
+ *   - `inferCausalLinks` (A-MEM) — uses docId + facts
+ *   - `insertObservationTriples` (decision-extractor) — uses docId + obsType + triples
  */
 export interface ObservationWithDoc {
   docId: number;
   facts: string[];
+  obsType?: string;
+  triples?: Array<{ subject: string; predicate: string; object: string }>;
 }
 
 /**

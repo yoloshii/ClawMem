@@ -1930,9 +1930,9 @@ This is the recommended entry point for ALL memory queries.`,
     "kg_query",
     {
       title: "Knowledge Graph Query",
-      description: "Query the knowledge graph for an entity's relationships. Returns structured facts with temporal validity (valid_from/valid_to). Use for 'what does X relate to?', 'what was true about X on date Y?', 'who/what is connected to X?'.",
+      description: "Query the knowledge graph for an entity's relationships. Returns structured facts with temporal validity (valid_from/valid_to). Use for 'what does X relate to?', 'what was true about X on date Y?', 'who/what is connected to X?'. Accepts an entity name (e.g. 'ClawMem') OR a canonical entity ID in the form 'vault:type:slug' (e.g. 'default:service:clawmem').",
       inputSchema: {
-        entity: z.string().describe("Entity name or ID to query"),
+        entity: z.string().describe("Entity name or canonical ID ('vault:type:slug') to query"),
         as_of: z.string().optional().describe("Date filter (YYYY-MM-DD) — only facts valid at this date"),
         direction: z.enum(["outgoing", "incoming", "both"]).optional().default("both").describe("Relationship direction"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
@@ -1941,17 +1941,30 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ entity, as_of, direction, vault }) => {
       const store = getStore(vault);
 
+      // Canonical IDs look like `vault:type:slug` — accept them directly so callers
+      // that already resolved an entity can round-trip its ID without losing it to
+      // a name-search fallback that would never match.
+      const CANONICAL_ID_RE = /^[a-z][a-z0-9-]*:[a-z_]+:[a-z0-9_]+$/;
+
       const entityResults = store.searchEntities(entity, 1);
-      const entityId = entityResults.length > 0
-        ? entityResults[0]!.entity_id
-        : entity.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+      let entityId: string;
+      if (entityResults.length > 0) {
+        entityId = entityResults[0]!.entity_id;
+      } else if (CANONICAL_ID_RE.test(entity)) {
+        entityId = entity; // caller passed a canonical ID directly
+      } else {
+        const stats = store.getTripleStats();
+        return {
+          content: [{ type: "text", text: `No entity found matching "${entity}". The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current). Try a shorter/broader name, or pass a canonical ID in the form 'vault:type:slug'.` }],
+        };
+      }
 
       const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction });
       const stats = store.getTripleStats();
 
       if (triples.length === 0) {
         return {
-          content: [{ type: "text", text: `No knowledge graph facts found for "${entity}". The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current).` }],
+          content: [{ type: "text", text: `No knowledge graph facts found for "${entity}" (resolved to ${entityId}). The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current).` }],
         };
       }
 

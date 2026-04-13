@@ -22,6 +22,13 @@ export type Observation = {
   concepts: string[];
   filesRead: string[];
   filesModified: string[];
+  triples?: ParsedTriple[];
+};
+
+export type ParsedTriple = {
+  subject: string;
+  predicate: string;
+  object: string;
 };
 
 export type SessionSummary = {
@@ -48,28 +55,54 @@ const GENERATION_TEMPERATURE = 0.3;
 // =============================================================================
 
 const OBSERVATION_SYSTEM_PROMPT = `You are an observer analyzing a coding session transcript. Extract structured observations.
-For each significant action, decision, or discovery, output an <observation> XML element.
+For each significant action, decision, or discovery, output an <observation> XML element with the structure below.
 
+Structure:
 <observation>
-  <type>one of: decision, bugfix, feature, refactor, discovery, change, preference, milestone, problem</type>
-  <title>Brief descriptive title (max 80 chars)</title>
+  <type>...</type>
+  <title>...</title>
   <facts>
-    <fact>Individual atomic fact</fact>
+    <fact>...</fact>
   </facts>
-  <narrative>2-3 sentences explaining context and reasoning</narrative>
+  <triples>
+    <triple>
+      <subject>...</subject>
+      <predicate>...</predicate>
+      <object>...</object>
+    </triple>
+  </triples>
+  <narrative>...</narrative>
   <concepts>
-    <concept>one of: how-it-works, why-it-exists, what-changed, problem-solution, gotcha, pattern, trade-off</concept>
+    <concept>...</concept>
   </concepts>
-  <files_read><file>path/to/file</file></files_read>
-  <files_modified><file>path/to/file</file></files_modified>
+  <files_read><file>...</file></files_read>
+  <files_modified><file>...</file></files_modified>
 </observation>
 
-Rules:
+Field rules:
+- <type>: one of decision, bugfix, feature, refactor, discovery, change, preference, milestone, problem
+- <title>: brief descriptive title, max 80 chars
+- <facts>: 1-5 <fact> elements, each a standalone atomic claim about what happened or what is true (concrete, specific, no schema placeholders or template text)
+- <triples>: 0-3 <triple> elements for structural relationships between named entities (see predicate vocabulary below). Omit entirely if no relational claims apply. Do NOT emit triples for descriptive facts — only for explicit S-P-O relations.
+- <narrative>: 2-3 sentences explaining WHY something was done, not just WHAT
+- <concepts>: 0-3 <concept> elements from: how-it-works, why-it-exists, what-changed, problem-solution, gotcha, pattern, trade-off
+- <files_read>, <files_modified>: only files explicitly mentioned in the transcript
+
+Predicate vocabulary (use EXACTLY these predicates in <predicate>, nothing else):
+- adopted, migrated_to — switching to a new tool/framework/approach
+- deployed_to, runs_on — where something runs
+- replaced — when one thing supersedes another
+- depends_on, integrates_with, uses — structural dependencies
+- prefers, avoids — user preferences (use for <subject>user</subject>)
+- caused_by, resolved_by — causal relationships between problems and fixes
+- owned_by — responsibility / ownership
+
+<subject> and <object> must be short canonical entity names (2-80 chars). No sentences. No placeholder text. If you cannot fit a claim into this vocabulary, keep it in <facts> instead and omit the triple.
+
+Observation rules:
 - Output 1-5 observations, focusing on the MOST significant events
-- Each fact should be a standalone, atomic piece of information
-- The narrative should explain WHY something was done, not just WHAT
-- Only include files that were explicitly mentioned in the transcript
 - If no significant observations, output nothing
+- Never use schema example text or template placeholders in <fact>, <subject>, or <object> — emit only real content extracted from the transcript
 
 Type guidance:
 - preference: user expresses a preference, habit, or way of working (e.g., "don't use subagents for this", "I prefer single PRs")
@@ -131,6 +164,47 @@ const VALID_CONCEPTS = new Set([
   "gotcha", "pattern", "trade-off",
 ]);
 
+// Canonical SPO predicate vocabulary — parser rejects anything outside this set.
+// Must stay in sync with the predicate list in OBSERVATION_SYSTEM_PROMPT.
+export const VALID_PREDICATES = new Set([
+  "adopted", "migrated_to",
+  "deployed_to", "runs_on",
+  "replaced",
+  "depends_on", "integrates_with", "uses",
+  "prefers", "avoids",
+  "caused_by", "resolved_by",
+  "owned_by",
+]);
+
+// Predicates whose <object> should be stored as a literal (not resolved to an entity).
+export const LITERAL_PREDICATES = new Set(["prefers", "avoids"]);
+
+// Exact placeholder strings that must never be persisted as facts or triple components.
+// Defense-in-depth: even though the prompt no longer places example text inside
+// <fact>/<subject>/<object> tags, a weak model could still echo these phrases.
+const SCHEMA_PLACEHOLDER_STRINGS = new Set([
+  "individual atomic fact",
+  "atomic fact",
+  "one atomic claim per fact element",
+  "brief descriptive title",
+  "canonical entity name",
+]);
+
+// Regex for template placeholder markers: {{...}}, <!--...-->, ${...}.
+// Intentionally narrow — earlier drafts rejected any line starting with
+// "example:" / "placeholder:", which false-positived legitimate facts like
+// "Example: QMD switched to Bun in v0.2". Shape-only matching avoids that
+// drift; the exact-string blocklist above handles known echoed placeholders.
+const PLACEHOLDER_REGEX = /^(\{\{.*\}\}|<!--.*-->|\$\{.*\})/;
+
+function isSchemaPlaceholder(text: string): boolean {
+  if (!text) return true;
+  const normalized = text.trim().toLowerCase();
+  if (SCHEMA_PLACEHOLDER_STRINGS.has(normalized)) return true;
+  if (PLACEHOLDER_REGEX.test(normalized)) return true;
+  return false;
+}
+
 export function parseObservationXml(xml: string): Observation | null {
   const typeMatch = xml.match(/<type>\s*(.*?)\s*<\/type>/s);
   const titleMatch = xml.match(/<title>\s*(.*?)\s*<\/title>/s);
@@ -141,22 +215,65 @@ export function parseObservationXml(xml: string): Observation | null {
   const type = typeMatch[1].trim().toLowerCase();
   if (!VALID_OBSERVATION_TYPES.has(type)) return null;
 
-  const facts = extractMultiple(xml, "fact");
+  const rawTitle = titleMatch[1].trim();
+  if (isSchemaPlaceholder(rawTitle)) return null;
+
+  const facts = extractMultiple(xml, "fact")
+    .filter(f => f.length >= 5)
+    .filter(f => !isSchemaPlaceholder(f));
+
   const concepts = extractMultiple(xml, "concept")
     .filter(c => VALID_CONCEPTS.has(c.toLowerCase()))
     .map(c => c.toLowerCase());
   const filesRead = extractMultiple(xml, "file", "files_read");
   const filesModified = extractMultiple(xml, "file", "files_modified");
 
+  // Parse triples (Fix A): strict validation against canonical predicate vocabulary.
+  // Missing/malformed triples are silently dropped — fail-closed on ambiguity.
+  const triples = extractTriples(xml);
+
   return {
     type: type as Observation["type"],
-    title: titleMatch[1].trim().slice(0, 80),
-    facts: facts.filter(f => f.length >= 5),
+    title: rawTitle.slice(0, 80),
+    facts,
     narrative: narrativeMatch?.[1]?.trim() || "",
     concepts,
     filesRead,
     filesModified,
+    triples: triples.length > 0 ? triples : undefined,
   };
+}
+
+function extractTriples(xml: string): ParsedTriple[] {
+  const parentMatch = xml.match(/<triples>([\s\S]*?)<\/triples>/s);
+  if (!parentMatch?.[1]) return [];
+
+  const blockRegex = /<triple>([\s\S]*?)<\/triple>/g;
+  const results: ParsedTriple[] = [];
+  let match;
+  while ((match = blockRegex.exec(parentMatch[1])) !== null) {
+    const block = match[1] ?? "";
+    const subject = block.match(/<subject>\s*(.*?)\s*<\/subject>/s)?.[1]?.trim();
+    const rawPredicate = block.match(/<predicate>\s*(.*?)\s*<\/predicate>/s)?.[1]?.trim();
+    const object = block.match(/<object>\s*(.*?)\s*<\/object>/s)?.[1]?.trim();
+
+    if (!subject || !rawPredicate || !object) continue;
+
+    const predicate = rawPredicate.toLowerCase().replace(/\s+/g, "_");
+    if (!VALID_PREDICATES.has(predicate)) continue;
+
+    // Length bounds — guards against sentence-shaped subjects/objects that the
+    // regex-era tests expected. Subject and object should be short canonical names.
+    if (subject.length < 2 || subject.length > 80) continue;
+    if (object.length < 2 || object.length > 120) continue;
+
+    if (isSchemaPlaceholder(subject) || isSchemaPlaceholder(object)) continue;
+
+    results.push({ subject, predicate, object });
+
+    if (results.length >= 5) break; // cap per observation
+  }
+  return results;
 }
 
 export function parseSummaryXml(xml: string): SessionSummary | null {

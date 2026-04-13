@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.8.4**.
+Guide for upgrading between released versions. Current: **v0.8.5**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -21,7 +21,7 @@ Hooks (spawned fresh per Claude Code invocation) and the MCP stdio server (respa
 
 ### What auto-applies on first open
 
-All schema changes from v0.7.1 → v0.8.3 are additive and idempotent:
+All schema changes from v0.7.1 → v0.8.5 are additive and idempotent:
 
 - New tables via `CREATE TABLE IF NOT EXISTS`
 - New columns via `ALTER TABLE ADD COLUMN` wrapped in `try/catch`
@@ -36,8 +36,78 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - `clawmem reindex --enrich` — no new enrichment stages added
 - `clawmem build-graphs` — no new graph edge types
 - `clawmem setup hooks` — hook configuration is unchanged (no new hooks, no renamed hooks, no changed budgets)
-- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.3
+- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.5
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
+
+---
+
+## v0.8.4 → v0.8.5
+
+v0.8.5 is a drop-in fix for the SPO triple extraction bug cluster (see RELEASE_NOTES.md entry for the full bug list). `entity_triples` stayed at zero on pre-v0.8.5 vaults regardless of activity, making `kg_query` return empty for every entity. v0.8.5 fixes the population path end-to-end. No schema changes, no new env vars, no new dependencies, no breaking API changes. All behavior changes are additive.
+
+### Quick path
+
+```bash
+bun update -g clawmem   # or: npm update -g clawmem
+# Or source install:
+cd ~/clawmem && git pull
+
+# Restart long-lived daemons so they pick up the new decision-extractor pipeline
+systemctl --user restart clawmem-watcher.service
+```
+
+Claude Code hooks and the stdio MCP server pick up the new code automatically on their next invocation — no `clawmem setup hooks` re-run needed. The hook command in `~/.claude/settings.json` is `${binPath} hook ${name}`, which resolves at runtime to the upgraded binary.
+
+### What changed behaviorally
+
+- **`entity_triples` actually populates now.** The decision-extractor Stop hook persists observer-emitted SPO triples into `entity_triples` using canonical `vault:type:slug` entity IDs shared with A-MEM. Eligible observation types are `decision`, `preference`, `milestone`, `problem`, `discovery`, `feature`.
+- **`kg_query` accepts canonical IDs as well as entity names.** Callers that already resolved an entity via `searchEntities` or `list_vaults` output can now round-trip the canonical ID (e.g. `default:project:clawmem`) directly into `kg_query` without going through a name-based fallback that would fabricate a different ID.
+- **Tight predicate vocabulary** — only `adopted`, `migrated_to`, `deployed_to`, `runs_on`, `replaced`, `depends_on`, `integrates_with`, `uses`, `prefers`, `avoids`, `caused_by`, `resolved_by`, `owned_by` are emitted. Anything the observer produces outside this set is silently dropped at parse time.
+- **Observation path disambiguation.** Multiple observations of the same type within one Claude Code session no longer collide on filename — the new path scheme embeds an 8-char `obsHash` slice so each observation gets a unique document row. Pre-v0.8.5 sessions silently lost the second-onward observation per type.
+
+### Do I need to clean up dead pre-v0.8.5 data?
+
+**Optional.** Pre-v0.8.5 runs left two kinds of harmless dead data in SQLite:
+
+1. `entity_nodes` rows with `entity_type='auto'` — minted by the old regex-based triple path. `'auto'` is not a valid compatibility bucket, so these entities never resolve via `kg_query` — they cost a few KB of storage and nothing else.
+2. `entity_triples` rows with schema-placeholder `source_fact` values (e.g. `"Individual atomic fact"`, `"canonical entity name"`) — the 1.7B observer occasionally echoed example text from the old prompt into real facts.
+
+Neither affects correctness or query results going forward, because v0.8.5 writes canonical IDs only and the new prompt + parser filter placeholder strings before persistence. Clean them if you want a tidy store:
+
+```bash
+sqlite3 ~/.cache/clawmem/index.sqlite "
+  DELETE FROM entity_triples WHERE source_fact LIKE '%atomic fact%' OR source_fact LIKE '%canonical entity name%';
+  DELETE FROM entity_nodes WHERE entity_type='auto';
+"
+```
+
+The troubleshooting guide has the full set of diagnostic queries and the symptom-by-symptom checklist for confirming you were on pre-v0.8.5: see the "kg_query returns empty for every entity" entry in [`docs/troubleshooting.md`](../troubleshooting.md#hooks).
+
+### Do I need to re-run `clawmem reindex --enrich`?
+
+**No.** v0.8.5 does not introduce new enrichment stages, so `--enrich` is not required to benefit from the fix. New Stop-hook activity from v0.8.5 onward is the cleanest source of triples.
+
+Running `--enrich` anyway is harmless but unnecessary — it will re-extract entities against the same entity cap as v0.8.3, not re-fire the decision-extractor hook. Past observation transcripts are gone (they were consumed by the Stop hook on their original session), so re-enrichment on already-persisted `_clawmem/observations/*.md` files cannot recover observations lost to the pre-v0.8.5 path-collision bug — those are permanently gone. Only future sessions generate new triples.
+
+### Confirming the fix is live
+
+After a real Claude Code session that fires the Stop hook:
+
+```bash
+# Should show reconstructed "subject predicate object" strings, not placeholder echoes or JSON blobs
+sqlite3 ~/.cache/clawmem/index.sqlite \
+  "SELECT source_fact FROM entity_triples ORDER BY created_at DESC LIMIT 5;"
+
+# Should show only real bucket types (project/service/tool/concept/person/org/location), never 'auto'
+sqlite3 ~/.cache/clawmem/index.sqlite \
+  "SELECT DISTINCT entity_type FROM entity_nodes
+   WHERE entity_id IN (SELECT subject_id FROM entity_triples ORDER BY created_at DESC LIMIT 50);"
+
+# Should increment after each real session — not after every indexing tick
+sqlite3 ~/.cache/clawmem/index.sqlite "SELECT COUNT(*) FROM entity_triples;"
+```
+
+If `entity_triples` still shows zero after multiple Stop-hook-firing sessions, the Stop hook itself is not firing — check `~/.claude/settings.json` for a ClawMem entry under `hooks.Stop`, and run `clawmem doctor` to verify hook installation.
 
 ---
 
@@ -275,6 +345,12 @@ See [`docs/concepts/architecture.md`](../concepts/architecture.md) for the archi
 Context-surfacing hook joins the current prompt with up to 2 recent same-session priors from the new `context_usage.query_text` column for discovery queries (vector, FTS, expansion). Rerank, composite scoring, chunk selection, snippet extraction, file-path FTS supplements, and recall attribution all stay on the raw current prompt. Privacy-conscious persistence split: gated skip paths (slash commands, heartbeats, too-short prompts) persist `query_text = NULL` to keep agent noise out of future lookback; post-retrieval empty paths still persist so a follow-up turn can reuse the intent.
 
 See [`docs/concepts/architecture.md`](../concepts/architecture.md) for the architectural walkthrough.
+
+### v0.8.5 — SPO triple extraction fix
+
+The knowledge graph finally populates. Pre-v0.8.5 decision-extractor wrote zero rows to `entity_triples` on production vaults because of a bug cluster: observation-type gate too narrow (rejected ~77% of real observations), regex-based triple extractor expected sentence shape (facts are usually descriptive phrases), entity IDs written with invalid `'auto'` type, same-type observations in one session collided on filename and the second was silently dropped, and a weak model occasionally echoed schema placeholder text (`"Individual atomic fact"`) into real triples. v0.8.5 replaces the regex path with observer-LLM-emitted `<triples>` blocks using a tight 13-predicate vocabulary (`adopted`, `migrated_to`, `deployed_to`, `runs_on`, `replaced`, `depends_on`, `integrates_with`, `uses`, `prefers`, `avoids`, `caused_by`, `resolved_by`, `owned_by`), canonical `vault:type:slug` entity IDs via `ensureEntityCanonical` (shared namespace with A-MEM, never writes `'auto'`), ambiguity-safe type inheritance via `resolveEntityTypeExact` (zero or multiple bucket matches → default to `concept`), widened observation-type gate (`decision`/`preference`/`milestone`/`problem`/`discovery`/`feature`), 8-char SHA256 hash slice in observation paths for collision-free persistence, placeholder defense at both prompt and parser, `kg_query` canonical-ID round-trip, and `source_doc_id` provenance on every triple. 4-turn Codex review.
+
+See [`docs/troubleshooting.md`](../troubleshooting.md) "kg_query returns empty for every entity" for diagnostic symptoms and optional cleanup SQL.
 
 ---
 

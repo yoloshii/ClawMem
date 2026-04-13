@@ -355,6 +355,69 @@ export function resolveEntityCanonical(
 // =============================================================================
 
 /**
+ * Resolve the entity_type for a name via exact case-insensitive match.
+ *
+ * Returns the type only when EXACTLY ONE active entity in the given vault shares
+ * the name. Zero matches → null (caller should default to a safe type). Multiple
+ * matches (ambiguous across buckets, e.g. "Alice" as person AND "Alice" as project)
+ * → null so the caller falls back to a safe default instead of arbitrarily picking.
+ *
+ * Exact match only — no fuzzy matching — to avoid false inheritance on near-names.
+ */
+export function resolveEntityTypeExact(
+  db: Database,
+  name: string,
+  vault: string = 'default'
+): string | null {
+  const rows = db.prepare(`
+    SELECT DISTINCT entity_type FROM entity_nodes
+    WHERE LOWER(name) = LOWER(?) AND vault = ?
+  `).all(name, vault) as Array<{ entity_type: string }>;
+
+  if (rows.length !== 1) return null; // zero or ambiguous
+  return rows[0]!.entity_type;
+}
+
+/**
+ * Resolve-or-create a canonical entity without incrementing mention_count.
+ *
+ * Used by consumers that reference an entity but do NOT constitute a document
+ * mention (e.g. SPO triple extraction). Semantically distinct from upsertEntity,
+ * which treats every call as a doc mention and inflates the count.
+ *
+ * Flow: resolveEntityCanonical (FTS5 + fuzzy + bucket match) → reuse if found,
+ * otherwise mint a new canonical `vault:type:slug` entity with mention_count = 0.
+ *
+ * Returns the entity_id.
+ */
+export function ensureEntityCanonical(
+  db: Database,
+  name: string,
+  type: string,
+  vault: string = 'default'
+): string {
+  const canonicalId = resolveEntityCanonical(db, name, type, vault);
+  if (canonicalId) return canonicalId;
+
+  const entityId = makeEntityId(name, type, vault);
+  db.prepare(`
+    INSERT OR IGNORE INTO entity_nodes (entity_id, entity_type, name, description, created_at, mention_count, last_seen, vault)
+    VALUES (?, ?, ?, NULL, datetime('now'), 0, datetime('now'), ?)
+  `).run(entityId, type, name, vault);
+
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO entities_fts (entity_id, name, entity_type)
+      VALUES (?, ?, ?)
+    `).run(entityId, name.toLowerCase(), type);
+  } catch {
+    // FTS insert may fail if table doesn't exist yet — non-fatal
+  }
+
+  return entityId;
+}
+
+/**
  * Upsert an entity into entity_nodes and entities_fts.
  * Returns the entity_id (canonical or new).
  */

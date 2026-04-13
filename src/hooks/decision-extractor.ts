@@ -17,13 +17,23 @@ import {
   validateTranscriptPath,
 } from "../hooks.ts";
 import { hashContent } from "../indexer.ts";
-import { extractObservations, type Observation } from "../observer.ts";
+import { extractObservations, type Observation, LITERAL_PREDICATES } from "../observer.ts";
 import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
 import { extractJsonFromLLM } from "../amem.ts";
 import { DEFAULT_EMBED_MODEL, extractSnippet, type SearchResult } from "../store.ts";
+import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
+
+// Observation types that are allowed to contribute SPO triples. Widened from the
+// original {decision, preference, milestone, problem} gate, which rejected 77% of
+// real observations in production vaults (the majority type is 'discovery').
+// See BACKLOG.md §1.6 for the full diagnosis.
+const SPO_ELIGIBLE_OBSERVATION_TYPES = new Set<Observation["type"]>([
+  "decision", "preference", "milestone", "problem",
+  "discovery", "feature",
+]);
 
 // =============================================================================
 // Facet-Based Merge Policy
@@ -325,42 +335,8 @@ export async function decisionExtractor(
   const observationsWithDocs: ObservationWithDoc[] = [];
   if (observations.length > 0) {
     for (const obs of observations) {
-      const obsPath = `observations/${dateStr}-${sessionId.slice(0, 8)}-${obs.type}.md`;
-      const obsBody = formatObservation(obs, dateStr, sessionId);
-      const obsHash = hashContent(obsBody);
-
-      store.insertContent(obsHash, obsBody, timestamp);
-      try {
-        store.insertDocument("_clawmem", obsPath, obs.title, obsHash, timestamp, timestamp);
-        const doc = store.findActiveDocument("_clawmem", obsPath);
-        if (doc) {
-          store.updateDocumentMeta(doc.id, {
-            content_type: obs.type === "decision" ? "decision"
-              : obs.type === "preference" ? "preference"
-              : obs.type === "milestone" ? "milestone"
-              : obs.type === "problem" ? "problem"
-              : "observation",
-            confidence: 0.80,
-          });
-          store.updateObservationFields(obsPath, "_clawmem", {
-            observation_type: obs.type,
-            facts: JSON.stringify(obs.facts),
-            narrative: obs.narrative,
-            concepts: JSON.stringify(obs.concepts),
-            files_read: JSON.stringify(obs.filesRead),
-            files_modified: JSON.stringify(obs.filesModified),
-          });
-
-          if (obs.facts.length > 0) {
-            observationsWithDocs.push({
-              docId: doc.id,
-              facts: obs.facts,
-            });
-          }
-        }
-      } catch {
-        // May already exist
-      }
+      const wit = persistObservationDoc(store, obs, sessionId, dateStr, timestamp);
+      if (wit) observationsWithDocs.push(wit);
     }
 
     // Infer causal links from observations with facts
@@ -375,31 +351,12 @@ export async function decisionExtractor(
       }
     }
 
-    // Extract SPO triples from observation facts (preference/decision types get priority)
-    for (const obs of observations) {
-      if (!obs.facts || obs.facts.length === 0) continue;
-      for (const fact of obs.facts) {
-        const triple = extractTripleFromFact(fact, obs.type);
-        if (triple) {
-          try {
-            store.db.prepare(
-              "INSERT OR IGNORE INTO entity_nodes (entity_id, name, entity_type, created_at) VALUES (?, ?, ?, ?)"
-            ).run(triple.subjectId, triple.subject, "auto", new Date().toISOString());
-            if (triple.objectId) {
-              store.db.prepare(
-                "INSERT OR IGNORE INTO entity_nodes (entity_id, name, entity_type, created_at) VALUES (?, ?, ?, ?)"
-              ).run(triple.objectId, triple.object, "auto", new Date().toISOString());
-            }
-            store.addTriple(triple.subjectId, triple.predicate, triple.objectId, triple.objectId ? null : triple.object, {
-              confidence: obs.type === "decision" || obs.type === "preference" ? 0.9 : 0.7,
-              sourceFact: fact,
-            });
-          } catch {
-            // Triple insertion errors are non-fatal
-          }
-        }
-      }
-    }
+    // Extract SPO triples from observation-emitted <triples> blocks (Fix A).
+    // The regex-based extractTripleFromFact is gone — the observer LLM now emits
+    // structured triples alongside facts, parsed and validated in parseObservationXml.
+    // We iterate observationsWithDocs (not raw observations) so every triple gets
+    // real source_doc_id provenance from the persisted observation document (Fix F).
+    insertObservationTriples(store, observations, observationsWithDocs);
   }
 
   // Extract decisions (observer-first, regex fallback)
@@ -691,67 +648,140 @@ function formatObservation(obs: Observation, dateStr: string, sessionId: string)
 }
 
 // =============================================================================
+// Observation persistence
+// =============================================================================
+
+/**
+ * Persist a single observation as a `_clawmem` document and return an
+ * `ObservationWithDoc` for downstream consumers (causal inference + SPO
+ * triples).
+ *
+ * Path format: `observations/${date}-${session8}-${type}-${hash8}.md`. The
+ * 8-char hash slice (SHA256 of the formatted body) disambiguates multiple
+ * observations of the same type within a single session — without it, the
+ * second insert hits the `UNIQUE(collection, path)` constraint, is silently
+ * dropped, and its triples never reach `entity_triples`. See Codex Turn 3
+ * for the regression this guards against.
+ *
+ * Returns null when the doc cannot be looked up after insert OR when the
+ * observation has no facts (triples without facts wouldn't survive the
+ * causal-links/facts filter downstream).
+ */
+export function persistObservationDoc(
+  store: Store,
+  obs: Observation,
+  sessionId: string,
+  dateStr: string,
+  timestamp: string
+): ObservationWithDoc | null {
+  const obsBody = formatObservation(obs, dateStr, sessionId);
+  const obsHash = hashContent(obsBody);
+  const obsPath = `observations/${dateStr}-${sessionId.slice(0, 8)}-${obs.type}-${obsHash.slice(0, 8)}.md`;
+
+  store.insertContent(obsHash, obsBody, timestamp);
+  try {
+    store.insertDocument("_clawmem", obsPath, obs.title, obsHash, timestamp, timestamp);
+    const doc = store.findActiveDocument("_clawmem", obsPath);
+    if (!doc) return null;
+
+    store.updateDocumentMeta(doc.id, {
+      content_type: obs.type === "decision" ? "decision"
+        : obs.type === "preference" ? "preference"
+        : obs.type === "milestone" ? "milestone"
+        : obs.type === "problem" ? "problem"
+        : "observation",
+      confidence: 0.80,
+    });
+    store.updateObservationFields(obsPath, "_clawmem", {
+      observation_type: obs.type,
+      facts: JSON.stringify(obs.facts),
+      narrative: obs.narrative,
+      concepts: JSON.stringify(obs.concepts),
+      files_read: JSON.stringify(obs.filesRead),
+      files_modified: JSON.stringify(obs.filesModified),
+    });
+
+    if (obs.facts.length === 0) return null;
+    return {
+      docId: doc.id,
+      facts: obs.facts,
+      obsType: obs.type,
+      triples: obs.triples,
+    };
+  } catch (err) {
+    console.log(`[decision-extractor] Failed to persist observation ${obs.type}/${obs.title}:`, err);
+    return null;
+  }
+}
+
+// =============================================================================
 // SPO Triple Extraction from Facts
 // =============================================================================
 
-type ExtractedTriple = {
-  subject: string;
-  subjectId: string;
-  predicate: string;
-  object: string;
-  objectId: string | null;
-};
+/**
+ * Insert SPO triples emitted by the observer into `entity_triples`.
+ *
+ * Uses canonical vault:type:slug entity IDs via `ensureEntityCanonical` so the
+ * knowledge graph stays in one namespace with A-MEM entities. Type inheritance
+ * is exact-match-only and ambiguity-safe: if a name resolves to exactly one type
+ * already in `entity_nodes`, inherit it; otherwise default to `concept`.
+ *
+ * Provenance: every triple carries `source_doc_id` from the persisted observation
+ * document. Iterates `observationsWithDocs` directly so triples from observations
+ * whose doc insert failed are naturally skipped — no order-matching gymnastics.
+ */
+function insertObservationTriples(
+  store: Store,
+  _observations: Observation[],
+  observationsWithDocs: ObservationWithDoc[]
+): void {
+  if (observationsWithDocs.length === 0) return;
 
-function toEntityId(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-}
+  // Per-invocation cache keyed on (vault, normalizedName, resolvedType) to avoid
+  // redundant SQL for repeated entity references within a single extraction.
+  const vault = "default";
+  const cache = new Map<string, string>();
 
-function extractTripleFromFact(fact: string, obsType: string): ExtractedTriple | null {
-  // Only extract from decision/preference/milestone/problem types — skip noisy bugfix/feature/change facts
-  if (!["decision", "preference", "milestone", "problem"].includes(obsType)) return null;
+  const resolveEntity = (name: string, type: string): string => {
+    const key = `${vault}:${type}:${name.toLowerCase().trim()}`;
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const id = ensureEntityCanonical(store.db, name, type, vault);
+    cache.set(key, id);
+    return id;
+  };
 
-  // Conservative verb patterns — only clear relational predicates
-  const verbPatterns = [
-    /^(.+?)\s+(chose|selected|switched to|migrated to|adopted)\s+(.+?)\.?$/i,
-    /^(.+?)\s+(deployed to|runs on|hosted on|installed on)\s+(.+?)\.?$/i,
-    /^(.+?)\s+(replaced|superseded|deprecated)\s+(.+?)\.?$/i,
-    /^(.+?)\s+(depends on|integrates with|connects to)\s+(.+?)\.?$/i,
-  ];
+  for (const wit of observationsWithDocs) {
+    if (!wit.triples || wit.triples.length === 0) continue;
+    const obsType = wit.obsType as Observation["type"] | undefined;
+    if (!obsType || !SPO_ELIGIBLE_OBSERVATION_TYPES.has(obsType)) continue;
 
-  for (const pattern of verbPatterns) {
-    const match = fact.match(pattern);
-    if (match) {
-      const subject = match[1]!.trim();
-      const predicate = match[2]!.trim();
-      const object = match[3]!.trim();
+    const confidence = obsType === "decision" || obsType === "preference" ? 0.9 : 0.7;
 
-      // Reject subjects/objects that look like sentences rather than entity names
-      if (subject.length < 3 || object.length < 3 || subject.length > 60 || object.length > 60) continue;
-      if (subject.includes(",") || object.includes(",")) continue; // likely a clause, not an entity
+    for (const triple of wit.triples) {
+      try {
+        const subjectType = resolveEntityTypeExact(store.db, triple.subject, vault) ?? "concept";
+        const subjectId = resolveEntity(triple.subject, subjectType);
 
-      return {
-        subject,
-        subjectId: toEntityId(subject),
-        predicate: predicate.toLowerCase().replace(/\s+/g, "_"),
-        object,
-        objectId: toEntityId(object),
-      };
+        let objectId: string | null = null;
+        let objectLiteral: string | null = null;
+
+        if (LITERAL_PREDICATES.has(triple.predicate)) {
+          objectLiteral = triple.object;
+        } else {
+          const objectType = resolveEntityTypeExact(store.db, triple.object, vault) ?? "concept";
+          objectId = resolveEntity(triple.object, objectType);
+        }
+
+        store.addTriple(subjectId, triple.predicate, objectId, objectLiteral, {
+          confidence,
+          sourceFact: `${triple.subject} ${triple.predicate} ${triple.object}`,
+          sourceDocId: wit.docId,
+        });
+      } catch (err) {
+        // Triple insertion errors are non-fatal — log at debug
+        console.log(`[decision-extractor] Failed to insert triple ${triple.subject}/${triple.predicate}/${triple.object}:`, err);
+      }
     }
   }
-
-  // Preference facts only: "User prefers X" / "Prefers X"
-  if (obsType === "preference") {
-    const prefMatch = fact.match(/^(?:user\s+)?(?:prefers?|avoids?)\s+(.+?)\.?$/i);
-    if (prefMatch && prefMatch[1]!.trim().length > 2) {
-      return {
-        subject: "user",
-        subjectId: "user",
-        predicate: "prefers",
-        object: prefMatch[1]!.trim(),
-        objectId: null, // literal, not entity
-      };
-    }
-  }
-
-  return null;
 }

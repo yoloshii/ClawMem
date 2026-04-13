@@ -717,7 +717,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `build_graphs` | Build temporal and/or semantic graphs from document corpus |
 | `find_causal_links` | Trace decision chains: "what led to X", "how we got from A to B". Follow up `intent_search` with this tool on a top result to walk the full causal chain. Traverses causes / caused_by / both up to N hops with depth-annotated reasoning. |
-| `kg_query` | Query the SPO knowledge graph: "what does X relate to?", "what was true about X when?". Returns temporal entity-relationship triples with validity windows. Uses entity resolution for lookup. |
+| `kg_query` | Query the SPO knowledge graph: "what does X relate to?", "what was true about X when?". Returns temporal entity-relationship triples with validity windows. Accepts entity name (resolved via `searchEntities`) or canonical ID in `vault:type:slug` form. Triples are populated by the decision-extractor hook from observer-emitted `<triples>` blocks. |
 | `memory_evolution_status` | Show how a document's A-MEM metadata evolved over time |
 | `timeline` | Show the temporal neighborhood around a document — what was created/modified before and after it. Progressive disclosure: search → timeline (context) → get (full content). Supports same-collection scoping and session correlation. |
 

@@ -26,7 +26,17 @@ Most edges are created automatically during indexing (A-MEM link generation) and
 
 ### SPO knowledge graph (entity_triples)
 
-Separate from `memory_relations`, the `entity_triples` table stores structured Subject-Predicate-Object facts with temporal validity (`valid_from`/`valid_to`). Triples are extracted from observation facts by `decision-extractor` — only from decision, preference, milestone, and problem types. Query via `kg_query(entity)` MCP tool. This is not used by `adaptiveTraversal()` — it serves a different purpose (structured entity lookup vs document graph traversal).
+Separate from `memory_relations`, the `entity_triples` table stores structured Subject-Predicate-Object facts with temporal validity (`valid_from`/`valid_to`). Triples are emitted by the observer LLM as `<triples>` blocks alongside `<facts>`, parsed and validated by `parseObservationXml` against a tight canonical predicate vocabulary, then persisted by `decision-extractor` using canonical `vault:type:slug` entity IDs via `ensureEntityCanonical`.
+
+**Eligible observation types** for triple extraction: decision, preference, milestone, problem, discovery, feature. Observation types `bugfix`, `change`, `refactor` are excluded as secondary safety net.
+
+**Canonical predicate vocabulary** (parser rejects anything outside this set): `adopted`, `migrated_to`, `deployed_to`, `runs_on`, `replaced`, `depends_on`, `integrates_with`, `uses`, `prefers`, `avoids`, `caused_by`, `resolved_by`, `owned_by`. The `prefers` and `avoids` predicates store their object as a literal (not resolved to an entity).
+
+**Entity type inheritance** is ambiguity-safe via `resolveEntityTypeExact`: if exactly one active entity in the vault shares the name, its type is inherited; zero matches or multiple matches (cross-bucket ambiguity) default to `concept`.
+
+**Provenance**: each triple's `source_doc_id` points at the persisted observation document it was extracted from. Triples for observations whose doc insert failed are naturally skipped because the extractor iterates the `ObservationWithDoc` array.
+
+Query via the `kg_query(entity)` MCP tool — accepts either an entity name (resolved via `searchEntities`) or a canonical ID in `vault:type:slug` form. This is not used by `adaptiveTraversal()` — it serves a different purpose (structured entity lookup vs document graph traversal).
 
 ### Edge collision
 
