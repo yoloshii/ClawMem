@@ -1304,8 +1304,28 @@ function cmdPath() {
   console.log(getDefaultDbPath());
 }
 
+/**
+ * Read a single OpenClaw config key via `openclaw config get <key>`. Returns
+ * the trimmed string value, or undefined when the key is unset / the CLI is
+ * unavailable / the key is missing. Callers should treat undefined as
+ * "no opinion" rather than "definitely unset".
+ */
+function readOpenClawConfigValue(key: string): string | undefined {
+  try {
+    const r = Bun.spawnSync(["openclaw", "config", "get", key], { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) return undefined;
+    const out = new TextDecoder().decode(r.stdout).trim();
+    if (!out) return undefined;
+    // `openclaw config get` may print JSON ("clawmem"\n) or raw (clawmem). Strip quotes.
+    return out.replace(/^"(.*)"$/, "$1");
+  } catch {
+    return undefined;
+  }
+}
+
 async function cmdSetupOpenClaw(args: string[]) {
   const remove = args.includes("--remove");
+  const linkMode = args.includes("--link");
   const pluginDir = pathResolve(import.meta.dir, "openclaw");
   const extensionsDir = pathResolve(process.env.HOME || "~", ".openclaw", "extensions");
   const linkPath = pathResolve(extensionsDir, "clawmem");
@@ -1339,10 +1359,21 @@ async function cmdSetupOpenClaw(args: string[]) {
     }
 
     if (hasOpenClawCli) {
-      Bun.spawnSync(["openclaw", "config", "set", "plugins.slots.contextEngine", "legacy"], { stdout: "inherit", stderr: "inherit" });
-      console.log(`${c.green}Reset context engine slot to legacy${c.reset}`);
+      // Reset the memory slot if ClawMem owned it (post-§14.3-migration installs).
+      const memSlot = readOpenClawConfigValue("plugins.slots.memory");
+      if (memSlot === "clawmem") {
+        Bun.spawnSync(["openclaw", "config", "unset", "plugins.slots.memory"], { stdout: "inherit", stderr: "inherit" });
+        console.log(`${c.green}Cleared memory slot (was clawmem)${c.reset}`);
+      }
+      // Reset the legacy context-engine slot if any pre-§14.3-migration install
+      // left it pointing at clawmem.
+      const ceSlot = readOpenClawConfigValue("plugins.slots.contextEngine");
+      if (ceSlot === "clawmem") {
+        Bun.spawnSync(["openclaw", "config", "set", "plugins.slots.contextEngine", "legacy"], { stdout: "inherit", stderr: "inherit" });
+        console.log(`${c.green}Reset context engine slot to legacy (was clawmem)${c.reset}`);
+      }
     } else if (removed) {
-      console.log(`${c.dim}openclaw CLI not found — manually run: openclaw config set plugins.slots.contextEngine legacy${c.reset}`);
+      console.log(`${c.dim}openclaw CLI not found — manually clear: openclaw config unset plugins.slots.memory && openclaw config set plugins.slots.contextEngine legacy${c.reset}`);
     }
     return;
   }
@@ -1354,42 +1385,86 @@ async function cmdSetupOpenClaw(args: string[]) {
   if (!existsSync(pathResolve(pluginDir, "openclaw.plugin.json"))) {
     die(`Plugin manifest not found at ${pluginDir}/openclaw.plugin.json`);
   }
+  if (!existsSync(pathResolve(pluginDir, "package.json"))) {
+    die(`Plugin package.json not found at ${pluginDir}/package.json — required for OpenClaw v2026.4.11+ discovery`);
+  }
 
   // Create extensions directory
   if (!existsSync(extensionsDir)) {
     mkdirSync(extensionsDir, { recursive: true });
   }
 
-  // Remove stale symlink/directory if present
+  // Remove any stale install (symlink or directory) before re-installing.
+  // OpenClaw v2026.4.11+ discovery (discoverInDirectory in ids-*.js) uses
+  // readdirSync({ withFileTypes: true }) where symlinks report
+  // isDirectory() === false and get silently skipped, so copy mode is the
+  // default. The --link flag keeps symlink behavior for older OpenClaw
+  // versions or local development workflows where editing the live source
+  // should take effect without re-running setup.
   try {
     const { lstatSync, unlinkSync, rmSync } = await import("fs");
     const stat = lstatSync(linkPath);
     if (stat.isSymbolicLink()) {
-      const { readlinkSync } = await import("fs");
-      const target = readlinkSync(linkPath);
-      if (target === pluginDir) {
-        console.log(`${c.dim}Symlink already correct at ${linkPath}${c.reset}`);
-      } else {
-        unlinkSync(linkPath);
-        console.log(`${c.dim}Replaced stale symlink (was → ${target})${c.reset}`);
-      }
+      unlinkSync(linkPath);
+      console.log(`${c.dim}Replaced stale symlink at ${linkPath}${c.reset}`);
     } else if (stat.isDirectory()) {
       rmSync(linkPath, { recursive: true });
       console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
     } else {
-      // Regular file or other non-symlink, non-directory — conflict
       die(`${linkPath} exists but is not a symlink or directory. Remove it manually and re-run setup.`);
     }
   } catch (e: any) {
     if (e.code !== "ENOENT") throw e;
   }
 
-  // Create symlink
-  if (!existsSync(linkPath)) {
+  if (linkMode) {
     const { symlinkSync } = await import("fs");
     symlinkSync(pluginDir, linkPath);
+    console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir} (symlink)${c.reset}`);
+    console.log(`${c.yellow}  Warning: symlink mode. OpenClaw v2026.4.11+ discovery skips${c.reset}`);
+    console.log(`${c.yellow}  symlinks silently. Re-run without --link on current releases.${c.reset}`);
+  } else {
+    const { cpSync } = await import("fs");
+    cpSync(pluginDir, linkPath, { recursive: true, dereference: true });
+    console.log(`${c.green}Installed plugin: ${linkPath} (copied from ${pluginDir})${c.reset}`);
   }
-  console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir}${c.reset}`);
+
+  // ----- §14.3 upgrade migration -----
+  // ClawMem v0.10.0 changed `kind: "context-engine"` to `kind: "memory"`.
+  // Existing installs with `plugins.slots.contextEngine = "clawmem"` will hit
+  // a hard runtime error after upgrading because OpenClaw's
+  // `resolveContextEngine()` throws on unknown engine ids. Detect and rewrite
+  // the stale config to "legacy" so OpenClaw's built-in LegacyContextEngine
+  // takes over compaction. Also detect any pre-existing `plugins.slots.memory`
+  // assignment so we don't clobber a user's choice during upgrade.
+  let migrationApplied = false;
+  if (hasOpenClawCli) {
+    const staleContextEngine = readOpenClawConfigValue("plugins.slots.contextEngine");
+    if (staleContextEngine === "clawmem") {
+      console.log();
+      console.log(`${c.bold}${c.cyan}Upgrade migration detected:${c.reset}`);
+      console.log(`  Found legacy ClawMem context-engine slot config from v0.9.x or earlier.`);
+      console.log(`  Rewriting plugins.slots.contextEngine: clawmem → legacy`);
+      console.log(`  ${c.dim}(ClawMem now registers as a memory plugin. OpenClaw's built-in${c.reset}`);
+      console.log(`  ${c.dim} LegacyContextEngine will handle compaction unless you install a${c.reset}`);
+      console.log(`  ${c.dim} third-party context-engine plugin like hermes-lcm.)${c.reset}`);
+      const migrate = Bun.spawnSync(
+        ["openclaw", "config", "set", "plugins.slots.contextEngine", "legacy"],
+        { stdout: "inherit", stderr: "inherit" },
+      );
+      if (migrate.exitCode === 0) {
+        migrationApplied = true;
+      } else {
+        console.log(`${c.yellow}  Warning: failed to rewrite stale config — please run manually:${c.reset}`);
+        console.log(`    ${c.cyan}openclaw config set plugins.slots.contextEngine legacy${c.reset}`);
+      }
+    }
+  } else {
+    console.log();
+    console.log(`${c.dim}Upgrade migration skipped — openclaw CLI not on PATH. If upgrading${c.reset}`);
+    console.log(`${c.dim}from v0.9.x or earlier, manually run:${c.reset}`);
+    console.log(`  ${c.cyan}openclaw config set plugins.slots.contextEngine legacy${c.reset}`);
+  }
 
   // Version warning
   console.log();
@@ -1397,17 +1472,21 @@ async function cmdSetupOpenClaw(args: string[]) {
   console.log(`have a bug where plugins.slots.contextEngine is silently dropped`);
   console.log(`during config normalization (openclaw/openclaw#64192).`);
 
-  // Remaining steps — gateway must restart BEFORE setting the context engine slot,
-  // otherwise OpenClaw hasn't discovered the plugin yet and the slot assignment
-  // fails or is ignored (the exact bug reported in issue #5).
+  // Remaining steps. CLI discovery finds the plugin immediately because the
+  // plugin dir now ships a package.json with openclaw.extensions declared, so
+  // `openclaw plugins enable clawmem` can run before any gateway restart.
+  // The enable command switches the exclusive memory slot to clawmem and
+  // disables memory-core/memory-lancedb automatically. Then the gateway
+  // restart applies the new slot assignment.
   console.log();
   console.log(`${c.bold}Next steps:${c.reset}`);
   console.log();
-  console.log(`  1. Restart OpenClaw gateway to discover the plugin:`);
-  console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
+  console.log(`  1. Enable ClawMem as the active memory plugin:`);
+  console.log(`     ${c.cyan}openclaw plugins enable clawmem${c.reset}`);
+  console.log(`     ${c.dim}(Switches plugins.slots.memory to clawmem and disables memory-core if active.)${c.reset}`);
   console.log();
-  console.log(`  2. Set ClawMem as the active context engine (after restart):`);
-  console.log(`     ${c.cyan}openclaw config set plugins.slots.contextEngine clawmem${c.reset}`);
+  console.log(`  2. Restart the gateway to apply:`);
+  console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
   console.log();
   console.log(`  3. Configure GPU endpoints (if not using defaults):`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
@@ -1417,7 +1496,24 @@ async function cmdSetupOpenClaw(args: string[]) {
   console.log(`  4. Start the REST API (for agent tools):`);
   console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
   console.log();
+  console.log(`${c.bold}Important: keep dreaming disabled${c.reset}`);
+  console.log(`  ClawMem runs its own consolidation workers (CLAWMEM_ENABLE_CONSOLIDATION`);
+  console.log(`  light lane and CLAWMEM_HEAVY_LANE heavy lane). Keep ${c.cyan}dreaming.enabled = false${c.reset}`);
+  console.log(`  in OpenClaw's memory config to avoid auto-loading the bundled memory-core`);
+  console.log(`  dreaming engine alongside ClawMem (#65411 coexistence rule).`);
+  console.log();
+  console.log(`${c.bold}Compaction:${c.reset} OpenClaw's built-in LegacyContextEngine handles compaction`);
+  console.log(`by default. Install a third-party context-engine plugin (hermes-lcm, etc.)`);
+  console.log(`if you want a different compaction strategy. ClawMem injects pre-emptive`);
+  console.log(`precompact state via ${c.cyan}before_prompt_build${c.reset} when token usage approaches the`);
+  console.log(`compaction threshold.`);
+  console.log();
   console.log(`${c.dim}ClawMem will work alongside Claude Code hooks — both modes share the same vault.${c.reset}`);
+
+  if (migrationApplied) {
+    console.log();
+    console.log(`${c.green}✓ Upgrade migration applied — restart OpenClaw to pick up the new plugin kind.${c.reset}`);
+  }
 }
 
 function findClawmemBinary(): string {
@@ -1733,6 +1829,37 @@ async function cmdDoctor() {
     }
   } catch {
     // Skip
+  }
+
+  // 8. OpenClaw plugin slot config (§14.3 upgrade migration check)
+  try {
+    const stale = readOpenClawConfigValue("plugins.slots.contextEngine");
+    if (stale === "clawmem") {
+      console.log(
+        `${c.red}✗${c.reset} OpenClaw config: stale ${c.cyan}plugins.slots.contextEngine = "clawmem"${c.reset}`,
+      );
+      console.log(
+        `   ${c.dim}ClawMem v0.10.0 is now a memory plugin. Run ${c.cyan}clawmem setup openclaw${c.dim} to migrate,${c.reset}`,
+      );
+      console.log(
+        `   ${c.dim}or manually: ${c.cyan}openclaw config set plugins.slots.contextEngine legacy${c.reset}`,
+      );
+      issues++;
+    } else if (stale && stale !== "legacy") {
+      console.log(
+        `${c.green}✓${c.reset} OpenClaw context-engine slot: ${c.cyan}${stale}${c.reset} (third-party LCM)`,
+      );
+    }
+    const memSlot = readOpenClawConfigValue("plugins.slots.memory");
+    if (memSlot === "clawmem") {
+      console.log(`${c.green}✓${c.reset} OpenClaw memory slot: ${c.cyan}clawmem${c.reset}`);
+    } else if (memSlot) {
+      console.log(
+        `${c.dim}-${c.reset} OpenClaw memory slot: ${c.cyan}${memSlot}${c.reset} (ClawMem hooks will not fire under this agent)`,
+      );
+    }
+  } catch {
+    // openclaw CLI unavailable — skip silently
   }
 
   console.log();

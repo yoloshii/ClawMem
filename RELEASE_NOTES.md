@@ -4,6 +4,81 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.0 — OpenClaw Pure-Memory Migration (§14.3) + v2026.4.11 Packaging Fix
+
+v0.10.0 is the OpenClaw pure-memory migration. ClawMem's OpenClaw plugin is no longer a `kind: context-engine` plugin wrapping a `ClawMemContextEngine` class. It is a `kind: memory` plugin that wires every lifecycle event (`before_prompt_build`, `agent_end`, `before_compaction`, `session_start`) through OpenClaw's plugin-hook bus directly. This matches the direction OpenClaw's own `context-engine` slot has taken since v2026.4.x (narrowed to runtime compaction) and moves ClawMem to the slot it was always logically targeting: the exclusive `memory` slot, alongside `memory-core` and `memory-lancedb` (which it automatically displaces when enabled).
+
+### Why this matters — dual plugin surfaces across OpenClaw and Hermes
+
+Over the last year, the OpenClaw and Hermes maintainers independently converged on the same architectural split: agent runtimes expose **two** distinct plugin surfaces, one for **memory** (persistent, cross-session, retrieval-first) and one for **context engines** (in-session, lossless or lossy compression, compaction-first). Hermes shipped its `MemoryProvider` ABC from the start, and ClawMem has always been plugged in there correctly — as a memory provider. OpenClaw's plugin kind vocabulary took longer to stabilize, with `context-engine` originally broad enough to accommodate both roles, then narrowing through v2026.4.x to what it is today: runtime compaction / compression specifically.
+
+Under the stabilized definition, **ClawMem is a memory layer, not a context engine.** A memory layer maintains a durable index of prior sessions, decisions, and knowledge and serves them back into new conversations via retrieval. A context engine reshapes the live session window: compressing old turns, summarizing transcripts, handing off between models. These are different jobs on different time axes. Calling ClawMem a "context engine" was accurate for the ClawMem-as-OpenClaw-plugin wiring pre-v0.10.0 only because no other slot existed yet. Post-v0.10.0 it is misleading in both directions: it mislabels what ClawMem does, and it **blocks OpenClaw users from pairing ClawMem with a genuine context-engine plugin** (e.g. an LCM-compression plugin like `lossless-claw`) because the two would fight over the same slot.
+
+On v0.10.0, OpenClaw users get the same composability Hermes users have had all along:
+
+- **Memory slot:** `clawmem` — cross-session retrieval, knowledge graph, decision extraction, the 5 agent tools
+- **Context-engine slot:** free for an LCM/compression plugin that runs inside the live session window (e.g. `lossless-claw`)
+
+Both can be enabled at the same time. They do not overlap. The memory slot is about what you knew yesterday; the context-engine slot is about what fits in today's prompt. This is the end state the OpenClaw maintainers have been steering toward for several releases, and v0.10.0 is ClawMem moving to the seat that was prepared for it. For Hermes users nothing changes — ClawMem has always been correctly integrated as a memory provider there.
+
+### What is unchanged
+
+The retrieval pipeline, composite scoring, profiles, vault format, hook set, `<vault-context>` output, and the 5 registered agent tools are **unchanged**. No schema migration, no new env vars, no new dependencies. The vault on disk is byte-identical to v0.9.0. Claude Code users who do not run OpenClaw can upgrade with no action beyond `git pull`.
+
+v0.10.0 also fixes a packaging bug that surfaced when OpenClaw shipped v2026.4.11. The new discovery path (`readdirSync({ withFileTypes: true })` + `dirent.isDirectory()`) started silently skipping ClawMem's symlinked plugin directory. Diagnosis, confirmation via an external user on yoloshii/ClawMem#5, and the complete fix (discovery manifest + copy-not-symlink install) are all in this release.
+
+### §14.3 — Pure-memory plugin registration
+
+- **Plugin kind changes from `context-engine` to `memory`.** The adapter in `src/openclaw/` registers as `kind: memory`. OpenClaw's exclusive `memory` slot now holds `clawmem` (via `openclaw plugins enable clawmem`, which also disables any competing memory plugin in the same step). The older `plugins.slots.contextEngine: "clawmem"` pattern no longer applies — v0.10.0 does not occupy that slot.
+- **`ClawMemContextEngine` class removed.** Every lifecycle surface the plugin needs — prompt injection, post-turn extraction, pre-compaction state capture, session bootstrap — is now a plain `PluginHookName` handler on the plugin-hook bus. `before_prompt_build` is the **load-bearing** path: it runs prompt-aware retrieval (context-surfacing every turn + cached bootstrap context on first turn) AND runs `precompact-extract` synchronously when token usage approaches the compaction threshold, so state is captured before the LLM call that could trigger compaction on this turn (no race with the compactor). `agent_end` runs decision-extractor + handoff-generator + feedback-loop in parallel (fire-and-forget at OpenClaw's call site). `before_compaction` is a **defense-in-depth fallback only** — fire-and-forget, races the compactor, exists solely to catch the rare case where `before_prompt_build`'s proximity heuristic missed a sudden token-count jump; it forces the precompact regardless of proximity since by the time it runs compaction is already in motion. `session_start` registers the session and caches the bootstrap context for first-turn injection. This is a strict improvement over v0.3.0's shape, where the pre-emptive extraction happened inside `ContextEngine.compact()` via `delegateCompactionToRuntime()` — the v0.10.0 wiring moves the extraction up the stack into `before_prompt_build` where it has a real pre-LLM hook to await on.
+- **Behavior is identical from the agent's point of view.** The `<vault-context>` block is byte-equivalent to v0.9.0 on the same vault with the same prompt. This is a packaging and registration change, not a behavioral one. The pure-memory shape is the architecturally correct home for what ClawMem has always done — the old `context-engine` shape was load-bearing on an OpenClaw version that narrowed out from under us.
+
+### v2026.4.11 packaging fix (external report → yoloshii/ClawMem#5)
+
+The packaging fix is co-resident with §14.3 because they are both in the same file and both required for v0.10.0 to run on the current OpenClaw release. The symptom was reported externally by @withx on a fresh install of OpenClaw v2026.4.11 + ClawMem — the plugin looked installed to every CLI command but never registered at runtime.
+
+- **`src/openclaw/package.json` is the new discovery manifest.** OpenClaw v2026.4.11's `discoverInDirectory` reads `package.json` and checks for the `openclaw.extensions: ["./index.ts"]` field before descending into a candidate plugin directory. Pre-v0.10.0 ClawMem shipped `openclaw.plugin.json` as the only manifest. That file is still shipped and still parsed at runtime, but it is not enough on its own for discovery on v2026.4.11+ — the plugin directory is silently skipped. v0.10.0 adds `package.json` to the plugin source tree and `clawmem setup openclaw` now verifies it is present before copying.
+- **`clawmem setup openclaw` defaults to recursive copy, not symlink.** OpenClaw v2026.4.11's discoverer walks the extensions directory with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()` to decide which entries to descend into. Symlinks to directories report `isDirectory() === false` on that API shape, so a symlinked plugin is silently skipped during discovery and never registers. Every ClawMem release since the OpenClaw plugin was introduced shipped a symlinked install — it worked on OpenClaw v2026.3.x but stopped working on v2026.4.11. `cmdSetupOpenClaw` now runs `cpSync(..., { recursive: true, dereference: true })` to install the plugin as a real directory. A new `--link` opt-in flag preserves the old symlink behavior for local dev workflows and for older OpenClaw versions, with a warning that v2026.4.11+ discovery will skip the symlink.
+- **Next-steps output uses `openclaw plugins enable clawmem`.** The setup command now prints `openclaw plugins enable clawmem` instead of `openclaw config set plugins.slots.memory clawmem`. The `enable` verb pre-validates that the plugin is in the discovered registry (so it only runs on a successful copy), switches the exclusive `memory` slot, and disables the previous occupant (`memory-core`, `memory-lancedb`) in a single command. The older `config set` pattern failed silently on v2026.4.11 because the slot validator rejected a plugin id that had not been discovered first.
+- **Multi-user ownership gotcha is documented.** OpenClaw v2026.4.11 enforces that plugin directories be owned by the current runtime user or root, rejecting foreign-owned directories with `suspicious ownership (uid=X, expected uid=Y or root)`. This is a security feature (it prevents a gateway running as a privileged system user from loading code a less-privileged user dropped into its extensions directory). On single-user installs where the gateway runs as your own user account, the ownership check passes automatically. On deployments where the gateway runs as a dedicated system user (e.g. `openclaw`) different from the installer user (e.g. `sciros`), you must `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem` after running setup. Documented in `docs/guides/openclaw-plugin.md` Install section and `docs/troubleshooting.md` OpenClaw section.
+
+### Test coverage
+
++2 regression gates on top of the v0.9.0 test baseline, locking in the v2026.4.11 packaging fix:
+
+- `tests/unit/openclaw-plugin.test.ts::cmdSetupOpenClaw defaults to copy mode (v2026.4.11+ compat)` — asserts the `cpSync(pluginDir, linkPath, ...)` call exists in `cmdSetupOpenClaw` and the `--link` opt-in is parsed via `args.includes("--link")`. If a future edit flips the default back to symlink without also updating the assertion, the test fails loudly.
+- `tests/unit/openclaw-plugin.test.ts::src/openclaw/package.json declares openclaw.extensions (v2026.4.11+ discovery gate)` — reads `src/openclaw/package.json`, asserts `type === "module"` and `openclaw.extensions` is an array containing `"./index.ts"`. If the manifest is ever deleted or reshaped without updating this test, the suite fails before the change reaches release.
+
+Public test suite: **1105 → 1107, zero regressions.** The one pre-existing assertion in the `Shipping Condition 2 — setup-time migration text is present` suite was updated from `"plugins.slots.memory clawmem"` to `"openclaw plugins enable clawmem"` to match the new next-steps output shape.
+
+### VM 202 end-to-end validation
+
+Captured on a representative multi-user install (VM 202: OpenClaw gateway runs as system user `openclaw`, ClawMem installed by admin user `sciros`, separate from `himadmin`):
+
+```
+[plugins] clawmem: plugin registered (kind=memory, bin=/home/sciros/clawmem/bin/clawmem, profile=balanced, budget=800)
+[plugins] clawmem: registered 5 agent tools
+[gateway] ready (7 plugins: acpx, browser, clawmem, device-pair, phone-control, talk-voice, telegram; 11.3s)
+```
+
+The runtime registration log line explicitly emits `kind=memory`, which is the §14.3 change proving the new registration path is live. The `clawmem` entry appears in the gateway ready line alongside the stock plugins, proving the packaging fix clears v2026.4.11's discovery gate. The multi-user ownership check (`suspicious ownership (uid=1001, expected uid=997 or root)`) reproduced and cleared after `sudo chown -R openclaw:openclaw ~/.openclaw/extensions/clawmem`, which is now a documented step in `docs/guides/openclaw-plugin.md` for multi-user deployments.
+
+### Codex review
+
+GPT 5.4 High, session `019d72d5` (continues the session chain used from v0.7.1 through v0.9.0, now cumulative across 20+ turns). The §14.3 implementation reached zero remaining findings before the v2026.4.11 packaging gap was discovered. Codex was re-engaged with the packaging compat delta (new `package.json`, copy-default `cmdSetupOpenClaw`, next-steps rewrite, +2 regression gates, VM 202 e2e evidence) for a final pre-ship pass, same session.
+
+### External credit
+
+- **@withx** — reported the OpenClaw v2026.4.11 incompatibility on yoloshii/ClawMem#5 and confirmed the runtime symptom on a fresh install that did not share any state with the development machines. The external reproduction is what made it clear this was a clean packaging gap, not a machine-specific config drift.
+
+### Upgrading from v0.9.0
+
+v0.10.0 is **drop-in safe for Claude Code users**: `cd ~/clawmem && git pull && systemctl --user restart clawmem-watcher.service`. Nothing on the retrieval path changed.
+
+**OpenClaw users** must also re-run `clawmem setup openclaw` (to switch the extensions dir from symlink to recursive copy), chown the new directory to the gateway user on multi-user installs, and restart the gateway. The full step-by-step is in [docs/guides/upgrading.md](docs/guides/upgrading.md#v090--v0100). **Upgrade OpenClaw to v2026.4.11+ first** — v0.10.0's setup and discovery behavior depend on v2026.4.11's new plugin discovery contract.
+
+---
+
 ## v0.9.0 — `<vault-facts>` KG Injection + Session-Scoped Focus Topic Boost
 
 Two context-surfacing upgrades. §11.1 adds a `<vault-facts>` SPO-triple injection block inside `<vault-context>` so the model gets structured "what is currently true about the entities in this prompt" alongside the existing `<facts>` (surfaced documents) and `<relationships>` (memory-graph edges) blocks. §11.4 adds a per-session topic steering lever (`clawmem focus set "<topic>" --session-id <id>`) that biases retrieval toward a declared topic for the duration of a working session without mutating any persisted state. Both changes live exclusively on the read path and are fail-open — the baseline pre-v0.9.0 `<vault-context>` shape is byte-identical when the new stages don't fire, and every downstream stage (threshold, diversification, token budget, injection) is unchanged. v0.8.5 was the last feature release; v0.9.0 is **drop-in safe**: one idempotent expression-index migration, no breaking API changes, no required reindex/embed, no schema rewrites.

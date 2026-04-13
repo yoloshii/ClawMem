@@ -63,11 +63,12 @@ src/
     staleness-check.ts     SessionStart hook (optional)
     curator-nudge.ts       SessionStart hook
   openclaw/
-    index.ts          OpenClaw plugin entry
-    engine.ts         ContextEngine implementation
+    index.ts          Plugin entry point (registers as kind=memory, wires hook handlers)
+    engine.ts         Retrieval/extraction engine (invoked from hook handlers in index.ts)
     shell.ts          Shell-out transport utilities
     tools.ts          REST API agent tools
-    openclaw.plugin.json  Plugin manifest (OpenClaw-expected filename)
+    openclaw.plugin.json  Legacy plugin manifest (still shipped; parsed at runtime)
+    package.json      OpenClaw v2026.4.11+ discovery manifest (openclaw.extensions)
 tests/
   unit/               Unit tests
   integration/        Integration tests (when present)

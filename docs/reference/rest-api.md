@@ -1,6 +1,6 @@
 # ClawMem REST API reference
 
-HTTP REST API for non-MCP clients, web dashboards, cross-machine access, and **OpenClaw agent tools**. Required for OpenClaw integration — the ContextEngine plugin serves 5 agent tools (search, get, session_log, timeline, similar) via this API. See the [OpenClaw plugin guide](../guides/openclaw-plugin.md) for details.
+HTTP REST API for non-MCP clients, web dashboards, cross-machine access, and **OpenClaw agent tools**. Required for OpenClaw integration — the memory plugin serves 5 agent tools (search, get, session_log, timeline, similar) via this API. See the [OpenClaw plugin guide](../guides/openclaw-plugin.md) for details.
 
 ## Start the server
 

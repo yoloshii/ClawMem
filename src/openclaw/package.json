@@ -1,0 +1,9 @@
+{
+  "name": "clawmem-openclaw-plugin",
+  "version": "0.10.0",
+  "description": "OpenClaw plugin adapter for ClawMem — on-device hybrid memory layer",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}

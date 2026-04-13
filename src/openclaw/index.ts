@@ -1,56 +1,81 @@
 /**
- * ClawMem OpenClaw Plugin — Entry Point
+ * ClawMem OpenClaw Plugin — Entry Point (§14.3 pure-memory migration)
  *
- * Registers ClawMem as an OpenClaw ContextEngine plugin with:
- * 1. ContextEngine (engine.ts) — lifecycle: afterTurn, compact, bootstrap
- * 2. Plugin hooks — before_prompt_build (retrieval), session_start/end, before_reset
- * 3. Agent tools — clawmem_search, clawmem_get, clawmem_session_log, clawmem_timeline, clawmem_similar
- * 4. Service — starts clawmem serve (REST API) for tool HTTP calls
+ * Registers ClawMem as an OpenClaw `kind: "memory"` plugin. The previous
+ * `kind: "context-engine"` registration is gone — ClawMem no longer
+ * implements the `ContextEngine` interface and OpenClaw's built-in
+ * `LegacyContextEngine` (or any third-party LCM plugin the user installs)
+ * now owns compaction.
  *
- * Architecture per GPT 5.4 High review:
- * - Prompt-aware retrieval goes through before_prompt_build (has the user prompt)
- * - Post-turn extraction goes through ContextEngine.afterTurn() (has messages[])
- * - Compaction goes through ContextEngine.compact() → precompact-extract → delegate to runtime
- * - assemble() is minimal pass-through (retrieval already injected via hook)
+ * What ClawMem provides under the memory slot:
+ *   1. MemoryPluginCapability via `api.registerMemoryCapability()` — gives
+ *      OpenClaw a `MemoryPluginRuntime.resolveMemoryBackendConfig()` so the
+ *      runtime knows ClawMem owns memory for this agent. The
+ *      `getMemorySearchManager` slot is a stub (ClawMem retrieval flows
+ *      through the existing hook + REST API path, not OpenClaw's memory
+ *      search manager).
+ *
+ *   2. PluginHookName event subscriptions via `api.on()` for the lifecycle
+ *      work that the deleted ContextEngine class used to handle:
+ *
+ *        before_prompt_build — context surfacing + pre-emptive precompact
+ *                              (the only awaited correctness path for
+ *                              precompact-extract on the per-turn lifecycle)
+ *        agent_end           — decision-extractor, handoff-generator,
+ *                              feedback-loop (eventually-consistent vault
+ *                              writes; fire-and-forget context is OK)
+ *        before_compaction   — fire-and-forget precompact-extract fallback
+ *                              (defense-in-depth only, never load-bearing)
+ *        session_start       — session-bootstrap hook + cache result for
+ *                              first-turn before_prompt_build consumption
+ *        session_end         — clearSessionState
+ *        before_reset        — extraction one last time + clearSessionState
+ *
+ *   3. Agent tools registration (clawmem_search, clawmem_get, etc.) when
+ *      enableTools is set in plugin config — unchanged from prior version.
+ *
+ *   4. REST API service (`clawmem serve`) lifecycle — unchanged.
+ *
+ * §14.3 critical correctness contract: `agent_end` is fire-and-forget at
+ * `attempt.ts:2226-2249`. Precompact-extract MUST run inside
+ * `handleBeforePromptBuild` (which IS awaited at `attempt.ts:1661`), gated
+ * by the proximity heuristic in `compaction-threshold.ts`. See `engine.ts`
+ * top-of-file comment for the full rationale.
  */
 
-import { ClawMemContextEngine } from "./engine.js";
-import { resolveClawMemBin, execHook, parseHookOutput, extractContext } from "./shell.js";
+import { resolveClawMemBin } from "./shell.js";
 import type { ClawMemConfig } from "./shell.js";
 import { createTools } from "./tools.js";
+import {
+  handleAgentEnd,
+  handleBeforeCompaction,
+  handleBeforePromptBuild,
+  handleBeforeReset,
+  handleSessionEnd,
+  handleSessionStart,
+  type AgentEndContext,
+  type AgentEndEvent,
+  type BeforeCompactionContext,
+  type BeforeCompactionEvent,
+  type BeforePromptBuildContext,
+  type BeforePromptBuildEvent,
+  type BeforeResetContext,
+  type BeforeResetEvent,
+  type Logger,
+  type SessionEndEvent,
+  type SessionStartContext,
+  type SessionStartEvent,
+} from "./engine.js";
+import {
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  DEFAULT_RESERVE_TOKENS_FLOOR,
+  DEFAULT_SOFT_THRESHOLD_TOKENS,
+  PRECOMPACT_PROXIMITY_RATIO_DEFAULT,
+  type CompactionThresholdConfig,
+} from "./compaction-threshold.js";
 
 // =============================================================================
-// Prompt Cleaning (strips OpenClaw noise for better retrieval)
-// Pattern extracted from memory-core-plus (MIT, aloong-planet)
-// =============================================================================
-
-/**
- * Strip OpenClaw-specific noise from the user prompt before using it as a
- * search query. Gateway prompts contain metadata, system events, timestamps,
- * and previously injected context that degrade embedding/BM25 quality.
- */
-function cleanPromptForSearch(prompt: string): string {
-  let cleaned = prompt;
-  // Strip previously injected vault-context (avoid re-searching our own output)
-  cleaned = cleaned.replace(/<vault-context>[\s\S]*?<\/vault-context>/g, "");
-  cleaned = cleaned.replace(/<vault-routing>[\s\S]*?<\/vault-routing>/g, "");
-  cleaned = cleaned.replace(/<vault-session>[\s\S]*?<\/vault-session>/g, "");
-  // Strip OpenClaw sender metadata block
-  cleaned = cleaned.replace(/Sender\s*\(untrusted metadata\)\s*:\s*```json\n[\s\S]*?```/g, "");
-  cleaned = cleaned.replace(/Sender\s*\(untrusted metadata\)\s*:\s*\{[\s\S]*?\}\s*/g, "");
-  // Strip OpenClaw runtime context blocks
-  cleaned = cleaned.replace(/OpenClaw runtime context \(internal\):[\s\S]*?(?=\n\n|\n?$)/g, "");
-  // Strip "System: ..." single-line event entries
-  cleaned = cleaned.replace(/^System:.*$/gm, "");
-  // Strip timestamp prefixes e.g. "[Sat 2026-03-14 16:19 GMT+8] "
-  cleaned = cleaned.replace(/^\[.*?GMT[+-]\d+\]\s*/gm, "");
-  // Collapse excessive whitespace
-  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
-  return cleaned || prompt;
-}
-
-// =============================================================================
-// Plugin Definition
+// Plugin definition
 // =============================================================================
 
 const PROFILE_BUDGETS: Record<string, number> = {
@@ -62,9 +87,10 @@ const PROFILE_BUDGETS: Record<string, number> = {
 const clawmemPlugin = {
   id: "clawmem",
   name: "ClawMem",
-  description: "On-device hybrid memory system with composite scoring, graph traversal, and lifecycle management",
-  version: "0.2.0",
-  kind: "context-engine" as const,
+  description:
+    "On-device hybrid memory layer for OpenClaw — composite scoring, graph traversal, lifecycle management, and pre-emptive compaction state extraction",
+  version: "0.10.0",
+  kind: "memory" as const,
 
   register(api: any) {
     // ----- Resolve config -----
@@ -86,109 +112,94 @@ const clawmemPlugin = {
       },
     };
 
-    const logger = api.logger;
-    logger.info(`clawmem: plugin registered (bin: ${cfg.clawmemBin}, profile: ${profile}, budget: ${tokenBudget})`);
+    const thresholdCfg: CompactionThresholdConfig = {
+      contextWindowTokens:
+        (pluginCfg.compactionContextWindow as number | undefined) ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+      precompactProximityRatio:
+        (pluginCfg.precompactProximityRatio as number | undefined) ??
+        PRECOMPACT_PROXIMITY_RATIO_DEFAULT,
+      softThresholdTokens:
+        (pluginCfg.softThresholdTokens as number | undefined) ?? DEFAULT_SOFT_THRESHOLD_TOKENS,
+      reserveTokensFloor:
+        (pluginCfg.reserveTokensFloor as number | undefined) ?? DEFAULT_RESERVE_TOKENS_FLOOR,
+    };
 
-    // ----- Register ContextEngine -----
-    const engine = new ClawMemContextEngine(cfg, logger);
-    api.registerContextEngine("clawmem", () => engine);
+    const logger = api.logger as Logger;
+    logger.info(
+      `clawmem: plugin registered (kind=memory, bin=${cfg.clawmemBin}, profile=${profile}, budget=${tokenBudget})`,
+    );
 
-    // ----- Track first-turn per session -----
-    const surfacedSessions = new Set<string>();
+    // ----- Register memory capability -----
+    // ClawMem owns the memory slot for this agent. The runtime stub returns
+    // null for getMemorySearchManager because ClawMem retrieval flows through
+    // the before_prompt_build hook + REST API path, not OpenClaw's memory
+    // search manager interface. resolveMemoryBackendConfig signals "builtin"
+    // so OpenClaw's auto-reply memory-flush path treats this agent as
+    // memory-managed.
+    api.registerMemoryCapability({
+      runtime: {
+        async getMemorySearchManager(_params: {
+          cfg: unknown;
+          agentId: string;
+          purpose?: "default" | "status";
+        }) {
+          return { manager: null };
+        },
+        resolveMemoryBackendConfig(_params: { cfg: unknown; agentId: string }) {
+          return { backend: "builtin" as const };
+        },
+      },
+    });
 
-    // ----- Plugin Hook: before_prompt_build -----
-    // This is WHERE retrieval happens (P1 finding: assemble() lacks the user prompt)
-    api.on("before_prompt_build", async (
-      event: { prompt: string; messages?: unknown[] },
-      ctx: { sessionId?: string; sessionKey?: string }
-    ) => {
-      if (!event.prompt || event.prompt.length < 5) return;
+    // ----- Plugin Hook: before_prompt_build (AWAITED — load-bearing path) -----
+    // Both context-surfacing retrieval injection and pre-emptive precompact
+    // extraction live here. handleBeforePromptBuild is async and the OpenClaw
+    // attempt path awaits the result at attempt.ts:1661 before building the
+    // effective prompt. precompact-extract therefore runs strictly before
+    // the LLM call that could trigger compaction on this turn.
+    api.on(
+      "before_prompt_build",
+      async (event: BeforePromptBuildEvent, ctx: BeforePromptBuildContext) => {
+        return handleBeforePromptBuild(cfg, thresholdCfg, logger, event, ctx);
+      },
+      { priority: 10 },
+    );
 
-      const sessionId = ctx.sessionId || "unknown";
-      const isFirstTurn = !surfacedSessions.has(sessionId);
+    // ----- Plugin Hook: agent_end (FIRE-AND-FORGET in core) -----
+    // Decision-extractor, handoff-generator, and feedback-loop run here.
+    // These writes are eventually-consistent (saveMemory dedupes), so the
+    // fire-and-forget context at attempt.ts:2226-2249 is acceptable.
+    // precompact-extract is intentionally NOT in this handler — it lives
+    // in handleBeforePromptBuild for correctness reasons.
+    api.on("agent_end", async (event: AgentEndEvent, ctx: AgentEndContext) => {
+      await handleAgentEnd(cfg, logger, event, ctx);
+    });
 
-      let context = "";
-
-      // On first turn: consume cached bootstrap context from engine.bootstrap()
-      // (avoids duplicate session-bootstrap hook invocation)
-      if (isFirstTurn) {
-        surfacedSessions.add(sessionId);
-
-        const bootstrapContext = engine.takeBootstrapContext(sessionId);
-        if (bootstrapContext) {
-          context += bootstrapContext + "\n\n";
-        }
-      }
-
-      // Every turn: run context-surfacing for prompt-aware retrieval
-      // Clean the prompt to remove OpenClaw noise before search
-      const searchPrompt = cleanPromptForSearch(event.prompt);
-      const surfacingResult = await execHook(cfg, "context-surfacing", {
-        session_id: sessionId,
-        prompt: searchPrompt,
-      });
-
-      if (surfacingResult.exitCode === 0) {
-        const parsed = parseHookOutput(surfacingResult.stdout);
-        const surfacedContext = extractContext(parsed);
-        if (surfacedContext) {
-          context += surfacedContext;
-        }
-      } else {
-        logger.warn(`clawmem: context-surfacing failed: ${surfacingResult.stderr}`);
-      }
-
-      if (!context.trim()) return;
-
-      return { prependContext: context.trim() };
-    }, { priority: 10 }); // Run early to prepend context before other hooks
+    // ----- Plugin Hook: before_compaction (FIRE-AND-FORGET fallback only) -----
+    // Defense-in-depth only — the load-bearing precompact path is in
+    // before_prompt_build above. This handler races with compaction itself
+    // and offers no correctness guarantee on its own.
+    api.on(
+      "before_compaction",
+      async (event: BeforeCompactionEvent, ctx: BeforeCompactionContext) => {
+        await handleBeforeCompaction(cfg, thresholdCfg, logger, event, ctx);
+      },
+    );
 
     // ----- Plugin Hook: session_start -----
-    api.on("session_start", async (
-      event: { sessionId: string; sessionKey?: string },
-      _ctx: unknown
-    ) => {
-      logger.info?.(`clawmem: session started ${event.sessionId}`);
+    api.on("session_start", async (event: SessionStartEvent, ctx: SessionStartContext) => {
+      await handleSessionStart(cfg, logger, event, ctx);
     });
 
     // ----- Plugin Hook: session_end -----
-    api.on("session_end", async (
-      event: { sessionId: string; sessionKey?: string; messageCount: number },
-      _ctx: unknown
-    ) => {
-      // Cleanup tracked state
-      surfacedSessions.delete(event.sessionId);
-      engine.clearSession(event.sessionId);
-      logger.info?.(`clawmem: session ended ${event.sessionId} (${event.messageCount} messages)`);
+    api.on("session_end", async (event: SessionEndEvent, _ctx: unknown) => {
+      handleSessionEnd(logger, event);
     });
 
     // ----- Plugin Hook: before_reset -----
-    // Safety net for /new and /reset — ensure extraction runs before session clears
-    api.on("before_reset", async (
-      event: { sessionFile?: string; messages?: unknown[]; reason?: string },
-      ctx: { sessionId?: string; sessionKey?: string }
-    ) => {
-      if (!event.sessionFile || !ctx.sessionId) return;
-
-      // Run extraction hooks before reset clears the session
-      const hookInput = {
-        session_id: ctx.sessionId,
-        transcript_path: event.sessionFile,
-      };
-
-      await Promise.allSettled([
-        execHook(cfg, "decision-extractor", hookInput),
-        execHook(cfg, "handoff-generator", hookInput),
-        execHook(cfg, "feedback-loop", hookInput),
-      ]);
-
-      surfacedSessions.delete(ctx.sessionId);
-      engine.clearSession(ctx.sessionId);
+    api.on("before_reset", async (event: BeforeResetEvent, ctx: BeforeResetContext) => {
+      await handleBeforeReset(cfg, logger, event, ctx);
     });
-
-    // NOTE: before_compaction hook removed — precompact-extract now fires only
-    // in engine.compact() before delegating to the runtime compactor. This avoids
-    // the duplicate invocation that previously existed.
 
     // ----- Register Tools -----
     if (cfg.enableTools) {
@@ -204,7 +215,7 @@ const clawmemPlugin = {
               return tool.execute(toolCallId, params);
             },
           },
-          { name: tool.name }
+          { name: tool.name },
         );
       }
       logger.info(`clawmem: registered ${tools.length} agent tools`);
@@ -215,7 +226,7 @@ const clawmemPlugin = {
 
     api.registerService({
       id: "clawmem-api",
-      async start(svcCtx: { logger: typeof logger }) {
+      async start(svcCtx: { logger: Logger }) {
         const { spawnBackground } = await import("./shell.js");
         serveChild = spawnBackground(cfg, ["serve", "--port", String(cfg.servePort)], svcCtx.logger);
         svcCtx.logger.info(`clawmem: REST API spawned (pid=${serveChild.pid})`);

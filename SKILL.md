@@ -605,9 +605,11 @@ Phase 3 deductive synthesis applies the same `contradicts` link for any draft th
 
 ## OpenClaw Integration
 
-**Active Memory coexistence:** ClawMem is fully compatible with OpenClaw's Active Memory plugin (v2026.4.10+). They search different backends and inject into different prompt regions — both can run simultaneously. The deployment options below control native memory search (`memorySearch.extraPaths`), not Active Memory.
+**Active Memory coexistence:** ClawMem is fully compatible with OpenClaw's Active Memory plugin (v2026.4.10+). They search different backends and inject into different prompt regions, both can run simultaneously. The deployment options below control native memory search (`memorySearch.extraPaths`), not Active Memory.
 
-**OpenClaw v2026.4.10+ recommended** — fixes contextEngine slot being silently dropped during config normalization (#64192).
+**OpenClaw v2026.4.11+ required for ClawMem v0.10.0+.** v2026.4.11 tightened plugin discovery (requires `package.json` with `openclaw.extensions`, rejects symlinked plugin directories). ClawMem v0.10.0 ships the new discovery manifest and defaults `clawmem setup openclaw` to recursive copy (not symlink). v2026.4.10 earlier fixed the #64192 config-normalization bug that dropped the `contextEngine` slot, which is now moot on v0.10.0+ because v0.10.0 uses the `memory` slot instead.
+
+**ClawMem v0.10.0 plugin kind:** `memory` (not `context-engine`). Enable with `openclaw plugins enable clawmem`, which also disables `memory-core` / `memory-lancedb` in one step.
 
 ### Option 1: ClawMem Exclusive (Recommended)
 
@@ -629,9 +631,15 @@ openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/
 
 **Tradeoffs:** Redundant recall but 10-15% context window waste from duplicate facts.
 
-### Compaction (v0.3.0+, required for OpenClaw v2026.3.28+)
+### Multi-user install gotcha (v2026.4.11+)
 
-`compact()` delegates to OpenClaw's runtime compactor via `delegateCompactionToRuntime()`. Previous versions returned `compacted: false` expecting legacy fallback — that fallback no longer exists. Without this fix, OpenClaw sessions never compact and context grows unbounded.
+If the gateway runs as a dedicated system user (e.g. `openclaw`) different from the user who runs `clawmem setup openclaw` (e.g. `sciros`), the copied plugin dir is rejected with `suspicious ownership (uid=X, expected uid=Y or root)`. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs are not affected.
+
+Also: if the gateway user cannot traverse `~/<installer>/.openclaw/` (directory mode 700), the gateway fails to start with `Missing config. Run openclaw setup or set gateway.mode=local`. Fix: `sudo chmod 750 ~/<installer>/.openclaw` and ensure the gateway user is in the owning group.
+
+### Precompact state capture — where it runs
+
+The load-bearing surface for `precompact-extract` is `before_prompt_build`, not `before_compaction`. `before_prompt_build` awaits the extraction synchronously when token usage approaches the compaction threshold, so state capture completes before the LLM call that could trigger compaction on this turn. `before_compaction` is a defense-in-depth fallback only — fire-and-forget at OpenClaw's call site, races the compactor, exists for the rare case the proximity heuristic in `before_prompt_build` missed a sudden token jump. v0.3.0 did the pre-emptive extraction from `ContextEngine.compact()` via `delegateCompactionToRuntime()`; v0.10.0 moves it into `before_prompt_build` where it has a real pre-LLM hook to await on. ClawMem does not implement compaction itself — if you want compression in the same OpenClaw runtime, install a context-engine plugin (e.g. `lossless-claw`) into the context-engine slot, which v0.10.0 no longer occupies.
 
 ---
 
@@ -786,7 +794,7 @@ clawmem focus clear --session-id abc123
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs and runs Phase 2 merge / Phase 3 deductive synthesis. **v0.8.2:** hosted by either `clawmem watch` (long-lived, canonical) or `clawmem mcp` (per-session fallback); every tick acquires a `light-consolidation` `worker_leases` row before doing work, so dual-hosting against the same vault is safe.
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
 - HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
-- OpenClaw ContextEngine plugin: `clawmem setup openclaw` — registers as native OpenClaw context engine. Dual-mode: shares vault with Claude Code hooks. Uses `before_prompt_build` for retrieval, `afterTurn()` for extraction, `compact()` for pre-compaction + runtime delegation (v0.3.0+, required for OpenClaw v2026.3.28+).
+- OpenClaw memory plugin (v0.10.0+): `clawmem setup openclaw` — registers as native OpenClaw memory plugin (`kind: memory`). Dual-mode: shares vault with Claude Code hooks. Hook wiring on the plugin-hook bus: `before_prompt_build` is the **load-bearing** path — it runs prompt-aware retrieval AND the pre-emptive `precompact-extract` synchronously when token usage approaches the compaction threshold, so state is captured before the LLM call that could trigger compaction. `agent_end` runs decision-extractor + handoff-generator + feedback-loop in parallel (fire-and-forget at OpenClaw's call site). `before_compaction` is **defense-in-depth fallback only** — fire-and-forget, races the compactor, exists for the rare case where the proximity heuristic in `before_prompt_build` missed a sudden token jump. `session_start` registers the session + caches first-turn bootstrap context. The §14.3 migration removed the `ClawMemContextEngine` class and moved the plugin from the `context-engine` slot to the `memory` slot. Requires OpenClaw v2026.4.11+ (earlier versions do not support the new discovery contract).
 - Hermes Agent MemoryProvider plugin: `src/hermes/` — Python plugin for Hermes's memory system. Shell-out hooks for lifecycle (prefetch, extraction, precompact), REST API for tools. Plugin-managed transcript JSONL bridges Hermes turn pairs to ClawMem file format. Shares vault with Claude Code and OpenClaw.
 
 ## Tool Selection (one-liner)

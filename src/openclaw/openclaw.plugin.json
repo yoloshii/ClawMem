@@ -1,6 +1,9 @@
 {
   "id": "clawmem",
-  "kind": "context-engine",
+  "kind": "memory",
+  "activation": {
+    "onCapabilities": ["hook", "tool"]
+  },
   "uiHints": {
     "clawmemBin": {
       "label": "ClawMem Binary Path",

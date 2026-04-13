@@ -1,6 +1,6 @@
 # ClawMem overview
 
-ClawMem is an open-source memory engine for Claude Code and AI agents. It runs on-device, giving agents persistent and searchable memory that survives across sessions, compactions, and runtime boundaries. The system integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client including OpenClaw), or a native OpenClaw ContextEngine plugin.
+ClawMem is an open-source memory engine for Claude Code and AI agents. It runs on-device, giving agents persistent and searchable memory that survives across sessions, compactions, and runtime boundaries. The system integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client including OpenClaw), or a native OpenClaw memory plugin (`kind: memory`, v0.10.0+).
 
 ## What it does
 
@@ -57,7 +57,7 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
 
 1. **Local-first** — all data stays on your machine in a single SQLite file. No cloud dependencies unless you opt into cloud embedding.
 2. **Fail-open** — every hook and search path degrades gracefully. A failed GPU call returns BM25-only results, not an error.
-3. **Dual-mode** — the same vault is shared between Claude Code hooks and OpenClaw's ContextEngine plugin. Both runtimes read and write the same memory.
+3. **Dual-mode** — the same vault is shared between Claude Code hooks and OpenClaw's memory plugin. Both runtimes read and write the same memory.
 4. **Progressive disclosure** — agents see compact results first (`compact=true`), then fetch full content only when needed. Minimizes context window usage.
 5. **Zero-config default** — a single vault with `clawmem bootstrap` gets you running. Multi-vault, cloud embedding, and profiles are opt-in.
 
@@ -91,7 +91,7 @@ ClawMem indexes prose, not code. Source files (`.ts`, `.py`, `.go`, etc.) are ex
 | Runtime | Integration | How | Services needed |
 |---------|------------|-----|-----------------|
 | Claude Code | Hooks + MCP stdio | `clawmem setup hooks` + `clawmem setup mcp` | watcher + embed timer |
-| OpenClaw | ContextEngine plugin + REST API | `clawmem setup openclaw` | watcher + embed timer + `clawmem serve` |
+| OpenClaw | Memory plugin + REST API | `clawmem setup openclaw` (requires OpenClaw v2026.4.11+) | watcher + embed timer + `clawmem serve` |
 | Any MCP client | MCP stdio | Add to MCP config | watcher + embed timer |
 | Web / scripts | REST API | `clawmem serve` | watcher + embed timer + `clawmem serve` |
 

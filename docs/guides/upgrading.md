@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.9.0**.
+Guide for upgrading between released versions. Current: **v0.10.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -39,6 +39,61 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - `clawmem setup hooks` — hook configuration is unchanged (no new hooks, no renamed hooks, no changed budgets)
 - `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.9.0
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
+
+---
+
+## v0.9.0 → v0.10.0
+
+v0.10.0 is the OpenClaw pure-memory migration (§14.3). It changes how the ClawMem plugin registers with OpenClaw and updates `clawmem setup openclaw` to produce a layout that the v2026.4.11+ plugin discoverer actually finds. There are no schema changes, no new env vars, and no changes to the retrieval pipeline, hook set, or agent tools. The vault on disk is byte-identical to v0.9.0. Claude Code users who do not run OpenClaw can upgrade with no action beyond `git pull`.
+
+**Why the migration, in one paragraph.** OpenClaw and Hermes have converged on a two-surface plugin model — one slot for memory plugins (cross-session, retrieval-first) and a separate slot for context-engine plugins (in-session, compaction-first). Under that model ClawMem is a memory layer, not a context engine, and Hermes has always had it plugged in correctly via `MemoryProvider`. Pre-v0.10.0 the OpenClaw integration occupied the context-engine slot only because OpenClaw had no separate memory slot at the time. v0.10.0 moves ClawMem to the OpenClaw `memory` slot and frees the `context-engine` slot for genuine compression/compaction plugins like `lossless-claw`. You can now run both at once. See [RELEASE_NOTES.md](../../RELEASE_NOTES.md#v0100--openclaw-pure-memory-migration-143--v20264.11-packaging-fix) and [docs/guides/openclaw-plugin.md](openclaw-plugin.md#memory-vs-context-engine--the-dual-plugin-surface) for the full rationale.
+
+**OpenClaw users MUST upgrade to OpenClaw v2026.4.11+** before running v0.10.0's `clawmem setup openclaw`. The new discovery contract and the new install layout both depend on behavior that only exists in OpenClaw v2026.4.11 and later.
+
+### Quick path
+
+```bash
+# Source install
+cd ~/clawmem && git pull
+
+# Restart long-lived daemons (still needed if you run the watcher / serve as a user unit)
+systemctl --user restart clawmem-watcher.service
+
+# OpenClaw users: re-run setup so the plugin dir switches from symlink to recursive copy
+clawmem setup openclaw
+
+# Multi-user installs only: chown the new plugin dir to the gateway user
+#   (see docs/guides/openclaw-plugin.md for the full ownership gotcha)
+sudo chown -R <openclaw-gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem
+
+# Then restart the gateway so it re-discovers the plugin
+sudo systemctl restart openclaw-gateway.service   # or whatever your gateway unit is called
+```
+
+Hooks and the stdio MCP server pick up the new binary automatically on their next invocation — no `clawmem setup hooks` re-run needed.
+
+### What changed under the hood
+
+- **Plugin registers as `kind: memory`, not `kind: context-engine`.** The adapter in `src/openclaw/` no longer exposes a `ClawMemContextEngine` class. Lifecycle events on the plugin-hook bus: `before_prompt_build` is the **load-bearing** path, running prompt-aware retrieval AND the pre-emptive `precompact-extract` synchronously when token usage approaches the compaction threshold (captures state strictly before the LLM call that could trigger compaction, no race with the compactor); `agent_end` runs decision-extractor + handoff-generator + feedback-loop in parallel; `before_compaction` is **defense-in-depth fallback only** — fire-and-forget at OpenClaw's call site, races the compactor, exists for the rare case where the proximity heuristic in `before_prompt_build` missed a sudden token jump; `session_start` registers the session and caches first-turn bootstrap. The retrieval pipeline, composite scoring, profiles, vault format, and the 5 registered agent tools are unchanged. This is a packaging and registration change, not a behavioral one. v0.3.0 did the pre-emptive extraction from `ContextEngine.compact()` via `delegateCompactionToRuntime()`; v0.10.0 moves it up the stack into `before_prompt_build` where it has a real pre-LLM hook to await on, and demotes the compaction-entry-point handler to the fallback role.
+- **`plugins.slots.memory: "clawmem"` replaces `plugins.slots.contextEngine: "clawmem"`.** On the new pure-memory plugin, the exclusive slot is `memory`. The `setup openclaw` next-steps output tells you to run `openclaw plugins enable clawmem`, which sets the slot and disables competing memory plugins (`memory-core`, `memory-lancedb`) in a single command. You do NOT need to run the older `openclaw config set plugins.slots.contextEngine clawmem` pattern on v0.10.0.
+- **`src/openclaw/package.json` is now the plugin's discovery manifest.** OpenClaw v2026.4.11's `discoverInDirectory` reads `package.json` for the `openclaw.extensions` field and uses that to decide whether a directory under `~/.openclaw/extensions/` is a valid plugin. The older `openclaw.plugin.json` manifest is still shipped and parsed at runtime, but it is not sufficient to pass discovery on v2026.4.11+ without the `package.json` companion file. v0.10.0 adds the `package.json` to the plugin source tree, and `clawmem setup openclaw` verifies it is present before copying.
+- **`clawmem setup openclaw` defaults to recursive copy instead of symlink.** OpenClaw v2026.4.11 walks `~/.openclaw/extensions/` with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()` to descend into candidate plugin directories. Symlinks to directories report `isDirectory() === false` on that API shape, so a symlinked plugin is silently skipped during discovery. v0.10.0's `cmdSetupOpenClaw` therefore copies the plugin source into `~/.openclaw/extensions/clawmem/` with `cpSync(..., { recursive: true, dereference: true })`. A `--link` opt-in flag preserves the old symlink behavior for local development and for older OpenClaw versions, with a warning that v2026.4.11+ discovery will skip the symlink. Setup is idempotent: any existing plugin directory or stale symlink is removed before the new copy is written.
+- **Multi-user ownership check (OpenClaw v2026.4.11+).** If the gateway runs as a dedicated system user (e.g. `openclaw`) and you run `clawmem setup openclaw` as a different user (e.g. `sciros`), the copied plugin directory is owned by the installer user, but OpenClaw's ownership check rejects it with `suspicious ownership (uid=1001, expected uid=997 or root)`. This is a security feature that prevents a privileged gateway process from loading code a less-privileged user dropped into its extensions directory. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs where you ARE the gateway user are not affected — your own user owns the copy, and the ownership check passes.
+
+### Rollback
+
+Rolling back to v0.9.0 is a `git checkout v0.9.0 && clawmem setup openclaw --link` away. The `--link` flag produces the old symlink layout, which is what v0.9.0 expected. If you are rolling back because you are on an OpenClaw version older than v2026.4.11, the symlink layout will still work (pre-v2026.4.11 discovery did not require the `package.json` file and did not have the `dirent.isDirectory()` gate). You do not need to downgrade OpenClaw.
+
+If you rolled back and still see `context engine 'clawmem' is not registered`, remove the stale slot config: `openclaw config set plugins.slots.memory ""` and `openclaw config set plugins.slots.contextEngine clawmem`, then restart the gateway.
+
+### What you do NOT need to run
+
+- `clawmem embed` — embedding contract is unchanged
+- `clawmem reindex` — document storage is unchanged
+- `clawmem reindex --enrich` — no new enrichment stages in v0.10.0
+- `clawmem build-graphs` — no new graph edge types
+- `clawmem setup hooks` — Claude Code hook configuration is unchanged
+- `bun install` / `npm install` — no dependency changes
 
 ---
 

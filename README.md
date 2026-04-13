@@ -185,31 +185,31 @@ clawmem setup mcp      # Register MCP server in ~/.claude.json (31 tools)
 
 #### OpenClaw
 
-ClawMem registers as a native OpenClaw plugin. Same 90/10 automatic retrieval, delivered through OpenClaw's lifecycle system instead of Claude Code hooks.
-
-> **Plugin slot note:** OpenClaw exposes two plugin kinds — `memory` and `context-engine` — and ClawMem currently registers against the `context-engine` slot for historical reasons. Semantically, ClawMem is a cross-session memory layer (same role as its Hermes `MemoryProvider` integration), and a future release will migrate it to dual-kind registration (`memory` + `context-engine`) so the memory slot is the primary home and the context-engine slot remains available for the `compact()` / `afterTurn()` lifecycle hooks. No action needed for existing installs.
+ClawMem registers as a native OpenClaw memory plugin (`kind: memory`, v0.10.0+). Same 90/10 automatic retrieval, delivered through OpenClaw's plugin-hook bus instead of Claude Code hooks.
 
 ```bash
-clawmem setup openclaw   # Auto-installs plugin, prints remaining steps
+clawmem setup openclaw   # Installs plugin into ~/.openclaw/extensions/clawmem (copy, not symlink)
 ```
 
 **What the plugin provides:**
-- **`before_prompt_build` hook** - prompt-aware retrieval (context-surfacing + session-bootstrap)
-- **`ContextEngine.afterTurn()`** - decision extraction, handoff generation, feedback loop
-- **`ContextEngine.compact()`** - pre-compaction state preservation, delegates real compaction to legacy engine
+- **`before_prompt_build` hook (load-bearing)** - prompt-aware retrieval (context-surfacing + session-bootstrap) AND the pre-emptive `precompact-extract` run when token usage approaches the compaction threshold. This is the authoritative path for precompact state capture because it runs synchronously before the LLM call that would trigger compaction, so it cannot race the compactor.
+- **`agent_end` hook** - decision extraction, handoff generation, feedback loop (parallel, fire-and-forget at the OpenClaw call site)
+- **`before_compaction` hook (defense-in-depth fallback)** - fires `precompact-extract` again for the rare case where `before_prompt_build`'s proximity heuristic missed a sudden token-count jump. Fire-and-forget at OpenClaw's call site, so it races the compactor and offers no correctness guarantee on its own — the `before_prompt_build` path is what actually holds the invariant.
+- **`session_start` hook** - session registration + cached first-turn bootstrap context
 - **5 agent tools** - `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
-- **Session lifecycle hooks** - `session_start`, `session_end`, `before_reset` safety net
 
 Disable OpenClaw's native memory search to avoid duplicate injection:
 ```bash
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
-ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.ai/concepts/active-memory) plugin (v2026.4.10+) — they search different backends and inject into different prompt regions, so both can run simultaneously without conflict. See the [OpenClaw plugin guide](docs/guides/openclaw-plugin.md#coexistence-with-openclaw-active-memory) for details.
+ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.ai/concepts/active-memory) plugin (v2026.4.10+). They search different backends and inject into different prompt regions, so both can run simultaneously without conflict. See the [OpenClaw plugin guide](docs/guides/openclaw-plugin.md#coexistence-with-openclaw-active-memory) for details.
 
-> **OpenClaw v2026.4.10+** recommended — fixes a config normalization bug where `plugins.slots.contextEngine` was silently dropped (#64192).
+**Pair ClawMem (memory) with a context-engine plugin (v0.10.0+).** OpenClaw and Hermes maintainers have converged on a two-surface plugin model: one slot for memory plugins (cross-session, retrieval-first) and a separate slot for context-engine plugins (in-session, compression/compaction-first). Under that model ClawMem is a memory layer — it has always been one in Hermes via the `MemoryProvider` ABC, and v0.10.0 moves the OpenClaw integration to the same semantic slot. You can now run ClawMem in the `memory` slot alongside an LCM-style compression plugin (for example, `lossless-claw`) in the `context-engine` slot. The two plugins do not overlap: one persists across sessions, the other reshapes the live window. See the [OpenClaw plugin guide — memory vs context engine](docs/guides/openclaw-plugin.md#memory-vs-context-engine--the-dual-plugin-surface) for the full rationale.
 
-**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
+> **OpenClaw v2026.4.11+ recommended (required for ClawMem v0.10.0+).** v2026.4.11 introduced a new plugin discovery contract that requires each plugin directory to ship a `package.json` with `openclaw.extensions` declared, and that rejects symlinked plugin directories. ClawMem v0.10.0 includes both fixes. Older ClawMem versions (< v0.10.0) on OpenClaw v2026.4.11+ will fail to discover silently — upgrade ClawMem, then re-run `clawmem setup openclaw`. See [docs/guides/upgrading.md](docs/guides/upgrading.md#v090--v0100).
+
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `agent_end` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
 
 #### Hermes Agent
 
@@ -1090,9 +1090,14 @@ clawmem install-service --enable
 #### OpenClaw-specific
 
 ```bash
-# Install the OpenClaw plugin (auto-symlinks into ~/.openclaw/extensions/)
+# Install the OpenClaw plugin (v0.10.0+: recursively copies into ~/.openclaw/extensions/clawmem)
 clawmem setup openclaw
-# Then follow the printed next steps: restart gateway, set slot, configure GPU endpoints
+# Then follow the printed next steps:
+#   1. openclaw plugins enable clawmem   (switches memory slot + disables memory-core)
+#   2. openclaw gateway restart
+#   3. Configure GPU endpoints if needed (see setup openclaw output)
+# Multi-user installs also need: sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem
+# Requires OpenClaw v2026.4.11+.
 ```
 
 Index your content directories with `clawmem bootstrap` as above. The OpenClaw plugin shares the same vault as Claude Code hooks.

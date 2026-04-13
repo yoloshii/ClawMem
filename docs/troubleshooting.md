@@ -227,11 +227,32 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## OpenClaw
 
-**"plugin not found: clawmem" / "Context engine 'clawmem' is not registered"**
-- OpenClaw can't find the ClawMem plugin files. This happens when `clawmem setup openclaw` wasn't run, or the symlink is broken/missing.
-- Fix: Run `clawmem setup openclaw` — this auto-creates the symlink at `~/.openclaw/extensions/clawmem` pointing to the plugin source. Then follow the printed next steps: restart the gateway, set the context engine slot, and start the REST API.
-- If re-running setup doesn't help: check the symlink exists (`ls -la ~/.openclaw/extensions/clawmem`), verify it points to a directory containing `openclaw.plugin.json` and `index.ts`, and confirm the `openclaw.plugin.json` file has `"id": "clawmem"`.
-- OpenClaw v2026.4.10+ required for reliable `plugins.slots.contextEngine` handling. Earlier versions silently drop the contextEngine slot during config normalization (openclaw/openclaw#64192). Upgrade with `sudo npm i -g openclaw@latest`.
+**"plugin not found: clawmem" / gateway ready line omits clawmem (OpenClaw v2026.4.11+)**
+- Most common root cause on current OpenClaw releases: a symlinked plugin directory. OpenClaw v2026.4.11 tightened its discovery path to `readdirSync({ withFileTypes: true })` with `dirent.isDirectory()`, and symlinks to directories report `isDirectory() === false` on that API shape. A symlinked `~/.openclaw/extensions/clawmem` is silently skipped during discovery. Pre-ClawMem-v0.10.0 setup always produced a symlink, which worked on OpenClaw v2026.3.x but started failing silently when OpenClaw released v2026.4.11.
+- Fix: upgrade ClawMem to v0.10.0 or later and re-run `clawmem setup openclaw`. The v0.10.0 setup command defaults to recursive copy (`cpSync(..., { recursive: true, dereference: true })`) instead of symlink. The copy is checked into the `~/.openclaw/extensions/clawmem/` directory as a real directory, not a link.
+- Second cause: missing `package.json`. OpenClaw v2026.4.11+ reads `package.json` for the `openclaw.extensions: ["./index.ts"]` field as part of discovery. `openclaw.plugin.json` alone is not enough. v0.10.0 ships `src/openclaw/package.json` with the required manifest, and setup refuses to install if it is missing. If you are on v0.10.0 and the file is there (verify with `ls ~/.openclaw/extensions/clawmem/package.json`) but discovery still fails, see the next two entries.
+- External report: yoloshii/ClawMem#5 — fresh install of OpenClaw v2026.4.11 reproduced this symptom on a machine that did not share any state with the ClawMem development environment. Resolved in ClawMem v0.10.0.
+
+**"blocked plugin candidate: suspicious ownership" (multi-user installs)**
+- Gateway journal shows a line like `[plugins] clawmem: blocked plugin candidate: suspicious ownership (/home/<user>/.openclaw/extensions/clawmem, uid=1001, expected uid=997 or root)`. OpenClaw v2026.4.11+ enforces that plugin directories be owned by the current runtime user or root. This is a security feature that prevents a privileged gateway process from loading code that a less-privileged user dropped into its extensions directory.
+- Common trigger: the gateway runs as a dedicated system user (e.g. `openclaw`) that is different from the user who ran `clawmem setup openclaw` (e.g. your admin account). Setup copies the plugin as the installer user, so the new directory is owned by the installer and rejected by the gateway.
+- Fix: after running setup, chown the plugin directory to the gateway user or root. `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Then restart the gateway. `sudo systemctl restart openclaw-gateway.service` (or whatever your gateway unit is called).
+- Single-user installs where you ARE the gateway user are not affected — your own user owns the plugin copy and the ownership check passes automatically.
+- The inverse situation also happens: if you later run `openclaw plugins inspect clawmem` from a different shell user than the gateway, the CLI's own ownership check may reject the plugin (`expected uid=<your uid> or root`) even though the gateway is loading it fine at runtime. Trust the gateway journal over the CLI inspect output when they disagree — the journal is the authoritative runtime state.
+
+**Gateway fails to start with "Missing config. Run `openclaw setup` or set gateway.mode=local"**
+- On system-service OpenClaw deployments where the gateway runs as a different user than the owner of `~/<gateway-user's-home>/.openclaw/`, the gateway cannot traverse into its own config directory if the directory is 700 (`drwx------`). The error is misleading — the config file itself is readable (correctly chowned by the systemd `ExecStartPre` step), but the parent directory has no group-execute bit, so the gateway user cannot even `cd` into it to open the file.
+- Verify: `sudo stat /home/<installer>/.openclaw | grep Access` — if it shows `(0700/drwx------)`, this is the cause.
+- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with a `sciros:sciros`-owned home directory and an `openclaw:openclaw` gateway that is also in the `sciros` group, `chmod 750` is enough.
+- Single-user installs are not affected — the gateway IS the home directory owner and has full access regardless of group perms.
+
+**"plugins.entries.clawmem: plugin not found (stale config entry ignored)"**
+- OpenClaw saw a `plugins.entries.clawmem: { enabled: true }` entry in its config but could not find a corresponding plugin directory under `~/.openclaw/extensions/`. This typically means the plugin directory was deleted or moved without running `openclaw config unset plugins.entries.clawmem`.
+- Fix: re-run `clawmem setup openclaw` to restore the plugin directory, then the stale entry resolves. Or, if you intentionally uninstalled the plugin and want to keep it gone, `openclaw config unset plugins.entries.clawmem` + `openclaw config unset plugins.slots.memory` (which restores the default `memory-core`).
+
+**Older OpenClaw version notes**
+- **v2026.4.10:** fixed a config normalization bug where `plugins.slots.contextEngine` was silently dropped during config processing (openclaw/openclaw#64192). Only relevant on ClawMem < v0.10.0, which used the `contextEngine` slot. ClawMem v0.10.0+ uses the `memory` slot and is not affected by #64192.
+- **v2026.4.11:** introduced the new plugin discovery contract (`readdirSync({ withFileTypes: true })` + `dirent.isDirectory()`) and the plugin ownership check described above. Required for ClawMem v0.10.0+. Upgrade OpenClaw with `sudo npm i -g openclaw@latest`.
 
 **REST API tools return no results**
 - The `clawmem serve` process may not be running. The plugin auto-starts it, but it doesn't survive plugin crashes.
