@@ -190,7 +190,7 @@ Hooks handle ~90% of retrieval. Zero agent effort.
 
 | Hook | Trigger | Budget | Content |
 |------|---------|--------|---------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800) | retrieval gate -> **multi-turn query** (v0.8.1: current + up to 2 recent same-session priors from `context_usage.query_text`, 10-min max age, 2000-char cap with current-first, used only for discovery — not rerank/scoring/snippet) -> profile-driven hybrid search (vector if `useVector`, timeout from profile) -> FTS supplement -> file-aware search (E13, raw current) -> snooze filter -> noise filter -> spreading activation (E11) -> memory type diversification (E10) -> tiered injection (HOT/WARM/COLD) -> `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships></vault-context>` (v0.7.1: instruction always prepended; relationships list memory-graph edges where BOTH endpoints are in the surfaced set; relationships truncated first when over budget) + optional `<vault-routing>` hint. Budget, max results, vector timeout, min score all driven by `CLAWMEM_PROFILE`. Raw prompt persisted to `context_usage.query_text` for future lookback — gated skip paths (slash commands, heartbeats, too-short prompts) withhold the text for privacy. |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 + factsTokens sub-budget) | retrieval gate -> **multi-turn query** (v0.8.1: current + up to 2 recent same-session priors, discovery only) -> **session focus topic resolution** (v0.9.0 §11.4: reads `~/.cache/clawmem/sessions/<id>.focus`, threaded as intent hint to expansion/rerank/snippet) -> profile-driven hybrid search -> FTS supplement -> file-aware search (E13) -> snooze/noise filters -> spreading activation (E11) -> composite scoring -> **session focus topic boost** (v0.9.0 §11.4: 1.4x match / 0.75x demote, NO-OP on zero matches) -> adaptive threshold -> memory type diversification (E10) -> tiered injection (HOT/WARM/COLD) -> `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships><vault-facts>...</vault-facts></vault-context>` (v0.7.1: instruction always prepended; relationships = memory-graph edges where BOTH endpoints are in the surfaced set, truncated first when over budget. **v0.9.0 §11.1:** `<vault-facts>` appends raw SPO triple lines when the prompt mentions known entities via three-path extraction (canonical-id regex + proper-noun validation + longer-first n-grams), dedicated `factsTokens` sub-budget per profile (speed=0, balanced=200, deep=250), cross-entity triple dedup, truncate-at-triple-boundary, fail-open on every error path) + optional `<vault-routing>` hint. Budget, max results, vector timeout, min score, facts sub-budget all driven by `CLAWMEM_PROFILE`. Raw prompt persisted to `context_usage.query_text` for future lookback — gated skip paths withhold the text for privacy. |
 | `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
@@ -759,6 +759,19 @@ clawmem reflect [N]             # Cross-session reflection (last N days, default
                                 # Recurring themes, antipatterns, co-activation clusters
 clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
                                 # Jaccard similarity within same collection
+```
+
+### Session Focus Topic (v0.9.0 §11.4)
+
+Per-session topic biasing for context-surfacing. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and post-composite-score topic boost (1.4x match / 0.75x demote, NO-OP on zero matches). Session-isolated — never writes to SQLite or lifecycle columns. Session ID resolved from `--session-id <id>` > `CLAUDE_SESSION_ID` env > `CLAWMEM_SESSION_ID` env.
+
+**When to use:** user says "focus on X for this session" / "only surface Y right now" / "let's work on Z." Clear at end of subsession to return to baseline.
+
+```bash
+clawmem focus set "authentication flow"                       # uses CLAUDE_SESSION_ID env
+clawmem focus set "authentication flow" --session-id abc123   # explicit session id
+clawmem focus show --session-id abc123
+clawmem focus clear --session-id abc123
 ```
 
 

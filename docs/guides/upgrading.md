@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.8.5**.
+Guide for upgrading between released versions. Current: **v0.9.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -21,23 +21,91 @@ Hooks (spawned fresh per Claude Code invocation) and the MCP stdio server (respa
 
 ### What auto-applies on first open
 
-All schema changes from v0.7.1 → v0.8.5 are additive and idempotent:
+All schema changes from v0.7.1 → v0.9.0 are additive and idempotent:
 
 - New tables via `CREATE TABLE IF NOT EXISTS`
 - New columns via `ALTER TABLE ADD COLUMN` wrapped in `try/catch`
+- New indexes via `CREATE INDEX IF NOT EXISTS` (v0.9.0 adds `idx_entity_nodes_lower_name` on `entity_nodes(LOWER(name), vault)` — built idempotently on first open)
 - A per-database feature-detect cache so ad-hoc stores that skip the migration path degrade transparently (they never write columns that don't exist)
 
 The first time any v0.7.1+ process opens an existing vault, the migrations run silently. Hook invocations alone are sufficient — you do not need a manual upgrade command.
 
 ### What you do NOT need to run
 
-- `clawmem embed` — embedding contract and fragment boundaries are unchanged across v0.7.x → v0.8.x
+- `clawmem embed` — embedding contract and fragment boundaries are unchanged across v0.7.x → v0.9.0
 - `clawmem reindex` — document storage is unchanged
-- `clawmem reindex --enrich` — no new enrichment stages added
+- `clawmem reindex --enrich` — no new enrichment stages added in v0.9.0
 - `clawmem build-graphs` — no new graph edge types
 - `clawmem setup hooks` — hook configuration is unchanged (no new hooks, no renamed hooks, no changed budgets)
-- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.8.5
+- `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.9.0
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
+
+---
+
+## v0.8.5 → v0.9.0
+
+v0.9.0 adds two new context-surfacing features — `<vault-facts>` KG injection and session-scoped focus topic boost — and is **drop-in safe**. One idempotent expression-index migration, no breaking API changes, no schema rewrites, no reindex/embed/graph-build needed. All behavior changes on existing code paths are additive and fail-open: if the new stages don't fire (no entity seeds from the prompt, no focus file set), the `<vault-context>` output is byte-identical to v0.8.5.
+
+### Quick path
+
+```bash
+bun update -g clawmem   # or: npm update -g clawmem
+# Or source install:
+cd ~/clawmem && git pull
+
+# Restart long-lived daemons so they pick up the new context-surfacing stages
+systemctl --user restart clawmem-watcher.service
+# If you run `clawmem serve` or `clawmem watch` in systemd, restart those too.
+```
+
+Hooks + MCP stdio pick up new code automatically on next invocation — no restart needed for those.
+
+### What changes on first open
+
+- **Expression index migration** — `store.ts` runs `CREATE INDEX IF NOT EXISTS idx_entity_nodes_lower_name ON entity_nodes(LOWER(name), vault)` on first open. Idempotent. Backs the §11.1 batch `LOWER(name) IN (...) AND vault = ?` lookup on the entity-detection hot path. Without this index the batch query would degrade to a full scan on large vaults. No action needed from you — the migration runs once on the first process that opens the vault.
+- **Profile config** — `PROFILES` gains a new `factsTokens` field. Defaults: `speed=0` (stage off), `balanced=200`, `deep=250`. If you have a custom profile wrapper or override `PROFILES` in code, add the field. Default behavior unchanged.
+
+### New `<vault-facts>` block in `<vault-context>`
+
+When the user's prompt mentions entities already known to the vault (via `entity_nodes`), `context-surfacing` now appends a token-bounded `<vault-facts>` block of raw SPO triple lines to `<vault-context>`, alongside the existing `<facts>` / `<relationships>` blocks. This feeds the model current-state knowledge about entities the user is talking about, without requiring the agent to call `kg_query` explicitly.
+
+- **Three-path entity seeding** — canonical-ID regex (e.g. `default:project:clawmem`) → proper-noun extraction via `resolveEntityTypeExact` → longer-first n-gram scan (3-gram > 2-gram > 1-gram) for lowercase/hyphenated vocabulary like `forge-stack`, `oauth2`, `vm 202`. All three paths run prompt-only — entity seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block.
+- **Profile-gated token sub-budget** — `factsTokens=0` on `speed` disables the stage entirely. `balanced` uses 200 tokens, `deep` uses 250. The sub-budget is dedicated — `<vault-facts>` cannot steal budget from `<facts>` or `<relationships>`.
+- **Truncation** — at the triple boundary, never mid-triple, never emits an empty block.
+- **Fail-open** — empty entity set → skip. Budget too small → drop block. Per-entity DB error → skip that entity. Any exception in the stage → return baseline `vault-context` unchanged.
+
+No configuration required. You can verify the block appears by running `echo "tell me about <some entity from entity_nodes>" | clawmem surface --context --stdin` after upgrade.
+
+### New `clawmem focus` CLI — session-scoped topic boost
+
+Three new subcommands write a per-session focus file that steers context-surfacing for that session only:
+
+```bash
+clawmem focus set "authentication flow"                       # uses CLAUDE_SESSION_ID env var
+clawmem focus set "authentication flow" --session-id abc123   # explicit
+clawmem focus show --session-id abc123
+clawmem focus clear --session-id abc123
+```
+
+When a focus topic is set:
+
+- Threaded as `intent` hint to `expandQuery` / `rerank` / `extractSnippet` (the existing query-time lever).
+- Post-composite-score boost: 1.4× match, 0.75× demote (floor 50%), applied AFTER `applyCompositeScoring` and BEFORE the adaptive threshold filter.
+- **Zero matches in the current result set → NO-OP.** The topic boost early-returns without mutating `compositeScore`, so the baseline threshold filter sees byte-identical ordering and the result set never shrinks because of a non-matching topic. Locked in by hook-level integration tests.
+
+Session isolation contract: the focus file is keyed by `sessionId` and never writes to SQLite, never mutates `confidence` / `status` / `snoozed_until` / any lifecycle column. Concurrent sessions on the same host cannot cross-contaminate each other's topic biasing. `CLAWMEM_SESSION_FOCUS` env var is a debug-only override that does NOT provide per-session scoping — do not rely on it in multi-session deployments. `CLAWMEM_FOCUS_ROOT` override is available for hermetic testing.
+
+### What you do NOT need to run
+
+- `clawmem embed` — no embedding changes
+- `clawmem reindex` — no document storage changes
+- `clawmem reindex --enrich` — no new enrichment stages
+- `clawmem build-graphs` — §11.1 reads from existing `entity_triples` populated by the v0.8.5 SPO pipeline
+- `clawmem setup hooks` — hook configuration is unchanged; Claude Code invokes `${binPath} hook ${name}` at runtime, so upgrading the binary propagates the new context-surfacing behavior automatically
+
+### Rollback
+
+If you need to roll back to v0.8.5, the `idx_entity_nodes_lower_name` index is harmless on pre-v0.9.0 code — SQLite will simply ignore it. No data cleanup required, no compatibility shim needed.
 
 ---
 

@@ -31,6 +31,12 @@ import { sanitizeSnippet } from "../promptguard.ts";
 import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
 import { writeRecallEvents, hashQuery } from "../recall-buffer.ts";
+import { resolveSessionTopic, applyTopicBoost } from "../session-focus.ts";
+import {
+  extractPromptEntities,
+  buildVaultFactsBlock,
+  type VaultFactsTriple,
+} from "../vault-facts.ts";
 
 // =============================================================================
 // Config
@@ -143,6 +149,20 @@ export async function contextSurfacing(
   const tokenBudget = profile.tokenBudget;
   const startTime = Date.now();
 
+  // §11.4: Resolve session-scoped focus topic. Primary signal is the
+  // per-session focus file at ~/.cache/clawmem/sessions/<id>.focus
+  // (file > env var precedence via resolveSessionTopic). Env var
+  // CLAWMEM_SESSION_FOCUS is a debug-only override and does NOT
+  // provide per-session scoping on multi-session hosts. Used as
+  // (a) optional `intent` on expandQuery/rerank/extractSnippet call
+  // sites below, and (b) the driver for the post-composite topic
+  // boost stage. Fail-open: missing / unreadable / corrupt / empty /
+  // oversized focus file → undefined → every consumer no-ops.
+  const sessionTopic = resolveSessionTopic(
+    input.sessionId,
+    process.env.CLAWMEM_SESSION_FOCUS
+  );
+
   const isRecency = hasRecencyIntent(prompt);
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : profile.minScore;
 
@@ -239,7 +259,7 @@ export async function contextSurfacing(
     if (elapsed < profile.escalationBudgetMs) {
       try {
         // Phase 1: Query expansion — discover candidates BM25+vector missed
-        const expanded = await store.expandQuery(retrievalQuery, DEFAULT_QUERY_MODEL);
+        const expanded = await store.expandQuery(retrievalQuery, DEFAULT_QUERY_MODEL, sessionTopic);
         if (expanded.length > 0) {
           const seen = new Set(results.map(r => r.filepath));
           for (const eq of expanded.slice(0, 3)) {
@@ -263,7 +283,7 @@ export async function contextSurfacing(
             file: r.filepath,
             text: (r.body || "").slice(0, 2000),
           }));
-          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL);
+          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL, sessionTopic);
           if (reranked.length > 0) {
             const rerankedMap = new Map(reranked.map(r => [r.file, r.score]));
             // Blend: 60% original score + 40% reranker score for stability
@@ -335,6 +355,15 @@ export async function contextSurfacing(
   // Apply composite scoring
   const allScored = applyCompositeScoring(enriched, prompt);
 
+  // §11.4: Session-scoped topic boost — post-composite, pre-threshold.
+  // Boosts docs whose title/path/body match all tokens of the declared
+  // session focus topic (1.4×); demotes non-matching docs (0.75×, floor
+  // 50%). Mutates compositeScore in place and re-sorts. Fail-open: no
+  // topic set → no-op (byte-identical pre-§11.4 output).
+  if (sessionTopic) {
+    applyTopicBoost(allScored, sessionTopic, { boostFactor: 1.4, demoteFactor: 0.75 });
+  }
+
   // Threshold filtering — adaptive (ratio-based) or absolute (legacy)
   let scored: typeof allScored;
   if (profile.thresholdMode === "adaptive") {
@@ -400,7 +429,7 @@ export async function contextSurfacing(
   // in afterward using whatever budget remains and are the first thing
   // truncated when the payload would overflow.
   const factsBudget = Math.max(0, tokenBudget - INSTRUCTION_TOKEN_COST);
-  const { context, paths, tokens } = buildContext(scored, prompt, factsBudget);
+  const { context, paths, tokens } = buildContext(scored, prompt, factsBudget, sessionTopic);
 
   if (!context) {
     logEmptyTurn(store, input, prompt);
@@ -489,9 +518,60 @@ export async function contextSurfacing(
   );
   const vaultInner = buildVaultContextInner(context, relationSnippets, relationBudget);
 
+  // §11.1 (v0.9.0): `<vault-facts>` KG injection.
+  //
+  // Stage ordering (frozen in BACKLOG.md §11.1): retrieval + rerank +
+  // scoring + topic boost (§11.4) + threshold + diversification → build
+  // <facts>/<relationships> → compute remaining facts-block budget →
+  // inject <vault-facts> if entities resolve AND budget allows.
+  //
+  // Prompt-only seeding (HARD CONSTRAINT): entity seeds come from the
+  // raw user prompt ONLY, never from `surfacedDocs[i].body`, snippets,
+  // or any retrieval-phase field. Without this, a topic-boosted
+  // off-topic doc (§11.4) could pollute the facts block with facts
+  // about entities that have nothing to do with the user's actual
+  // prompt.
+  //
+  // Profile-gated via `profile.factsTokens`: `speed` profile sets this
+  // to 0, which naturally disables the stage. `balanced`/`deep` get a
+  // dedicated sub-budget that cannot steal from <facts>/<relationships>.
+  //
+  // Fail-open: any DB error, empty entity set, empty triple set, or
+  // budget-too-small case returns the baseline `vaultInner` unchanged
+  // (byte-identical pre-§11.1 output).
+  let vaultInnerWithFacts = vaultInner;
+  if (profile.factsTokens > 0) {
+    try {
+      const entities = extractPromptEntities(prompt, store.db, "default");
+      if (entities.length > 0) {
+        const queryTriples = (entityId: string): VaultFactsTriple[] =>
+          store
+            .queryEntityTriples(entityId)
+            .map(t => ({
+              subject: t.subject,
+              predicate: t.predicate,
+              object: t.object,
+              validTo: t.validTo,
+              confidence: t.confidence,
+            }));
+        const factsBlock = buildVaultFactsBlock(
+          entities,
+          queryTriples,
+          profile.factsTokens,
+          { estimateTokens }
+        );
+        if (factsBlock) {
+          vaultInnerWithFacts = `${vaultInner}\n${factsBlock}`;
+        }
+      }
+    } catch {
+      /* fail-open: degraded vault behaves identically to pre-§11.1 */
+    }
+  }
+
   const parts: string[] = [];
   if (routingHint) parts.push(`<vault-routing>${routingHint}</vault-routing>`);
-  parts.push(`<vault-context>\n${vaultInner}\n</vault-context>`);
+  parts.push(`<vault-context>\n${vaultInnerWithFacts}\n</vault-context>`);
   if (nudge) parts.push(`<vault-nudge>${NUDGE_TEXT}</vault-nudge>`);
 
   return makeContextOutput("context-surfacing", parts.join("\n"));
@@ -552,7 +632,8 @@ function detectRoutingHint(prompt: string): string | null {
 function buildContext(
   scored: ScoredResult[],
   query: string,
-  budget: number = DEFAULT_TOKEN_BUDGET
+  budget: number = DEFAULT_TOKEN_BUDGET,
+  intent?: string
 ): { context: string; paths: string[]; tokens: number } {
   const lines: string[] = [];
   const paths: string[] = [];
@@ -579,7 +660,7 @@ function buildContext(
       if (sanitized === "[content filtered for security]") continue;
 
       const snippet = smartTruncate(
-        extractSnippet(sanitized, query, tier.snippetLen, r.chunkPos).snippet,
+        extractSnippet(sanitized, query, tier.snippetLen, r.chunkPos, intent).snippet,
         tier.snippetLen
       );
       entry = `**${safeTitle}**${typeTag}\n${safePath}\n${snippet}`;

@@ -84,12 +84,23 @@ export interface ProfileConfig {
   deepEscalation: boolean;
   /** Max time (ms) allowed for the fast path before escalation is considered */
   escalationBudgetMs: number;
+  /**
+   * §11.1 (v0.9.0): sub-budget for the `<vault-facts>` KG injection block.
+   * Dedicated token allowance so `<vault-facts>` cannot steal budget from
+   * the existing `<facts>` / `<relationships>` blocks. `speed` profile is
+   * gated off (factsTokens=0 → stage skipped entirely). `balanced` / `deep`
+   * get 200 / 250 respectively. If the serialized facts would exceed this
+   * sub-budget, truncation happens at the triple boundary. If the total
+   * hook output would push past `tokenBudget + factsTokens`, the whole
+   * `<vault-facts>` block is dropped (established blocks take priority).
+   */
+  factsTokens: number;
 }
 
 export const PROFILES: Record<PerformanceProfile, ProfileConfig> = {
-  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, minScoreRatio: 0.65, absoluteFloor: 0.18, activationFloor: 0.24, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0 },
-  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, minScoreRatio: 0.55, absoluteFloor: 0.15, activationFloor: 0.20, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0 },
-  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.25, minScoreRatio: 0.45, absoluteFloor: 0.12, activationFloor: 0.16, thresholdMode: "adaptive", deepEscalation: true,  escalationBudgetMs: 4000 },
+  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, minScoreRatio: 0.65, absoluteFloor: 0.18, activationFloor: 0.24, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0,    factsTokens: 0   },
+  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, minScoreRatio: 0.55, absoluteFloor: 0.15, activationFloor: 0.20, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0,    factsTokens: 200 },
+  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.25, minScoreRatio: 0.45, absoluteFloor: 0.12, activationFloor: 0.16, thresholdMode: "adaptive", deepEscalation: true,  escalationBudgetMs: 4000, factsTokens: 250 },
 };
 
 export function getActiveProfile(): ProfileConfig {

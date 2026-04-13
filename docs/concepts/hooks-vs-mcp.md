@@ -8,7 +8,7 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 
 | Hook | Trigger | Budget | What it does |
 |------|---------|--------|-------------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML with three inner blocks: `<instruction>` (framing — always present), `<facts>` (the surfaced docs), and `<relationships>` (memory-graph edges between surfaced docs, v0.7.1). |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens + factsTokens sub-budget) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML with four inner blocks: `<instruction>` (framing — always present), `<facts>` (the surfaced docs), `<relationships>` (memory-graph edges between surfaced docs, v0.7.1), and `<vault-facts>` (raw SPO triples for prompt-seeded entities, v0.9.0 §11.1). Also applies a session-scoped topic boost when a focus file is set for the session (v0.9.0 §11.4). |
 | `postcompact-inject` | SessionStart (after compact) | 1200 tokens | Re-injects authoritative state after context window compaction. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
 | `precompact-extract` | PreCompact | — | Extracts decisions, file paths, and open questions before compaction. Writes `precompact-state.md`. |
@@ -20,24 +20,31 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 
 1. Validate prompt (skip slash commands, greetings, heartbeats, duplicates)
 2. Load performance profile (`speed` / `balanced` / `deep`) for budget and thresholds
-3. Search: vector (if profile enables it, with profile-driven timeout) + BM25 supplement
-4. Filter: exclude private paths, snoozed documents, noise
-5. Score: composite scoring (relevance + recency + confidence + quality)
-6. Build facts block within `tokenBudget - instructionCost` so the always-on `<instruction>` frame fits
-7. Fetch relationship snippets from `memory_relations` for edges where BOTH endpoints are in the surfaced doc set — these become a `<relationships>` block, the first thing dropped when the payload would overflow budget
-8. Inject as `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships></vault-context>` XML in the prompt
+3. **Resolve session focus topic** (v0.9.0 §11.4) — read `~/.cache/clawmem/sessions/<id>.focus` if present. If set, thread as `intent` hint to the next stages
+4. Search: vector (if profile enables it, with profile-driven timeout) + BM25 supplement
+5. Filter: exclude private paths, snoozed documents, noise
+6. Score: composite scoring (relevance + recency + confidence + quality)
+7. **Apply session focus topic boost** (v0.9.0 §11.4) — if a focus topic was resolved, multiply matching docs' compositeScore by 1.4× and non-matching by 0.75× (floor 50%). NO-OP when zero docs match — the baseline ordering passes through unchanged, so the threshold filter never shrinks the result set because of a non-matching topic
+8. Adaptive threshold + memory-type diversification
+9. Build facts block within `tokenBudget - instructionCost` so the always-on `<instruction>` frame fits
+10. Fetch relationship snippets from `memory_relations` for edges where BOTH endpoints are in the surfaced doc set — these become a `<relationships>` block, the first thing dropped when the payload would overflow budget
+11. **Seed entities from the prompt** (v0.9.0 §11.1) — three-path extraction (canonical-id regex → proper-noun validation via `resolveEntityTypeExact` → longer-first n-gram scan). Prompt-only: seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block
+12. **Query SPO triples for seeded entities**, dedupe by `(subject, predicate, object)` across all entities, emit a token-bounded `<vault-facts>` block using the dedicated `factsTokens` sub-budget (speed=0 disables the stage, balanced=200, deep=250). Truncate at triple boundary, never mid-triple, never emit an empty block. Fail-open on every error path
+13. Inject as `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships><vault-facts>...</vault-facts></vault-context>` XML in the prompt
 
-The `<instruction>` frame tells the model to treat the surfaced facts as background knowledge it already holds unless the user corrects them, reducing prompt-level ambiguity about how to use the injected context. The `<relationships>` block exposes the vault's knowledge graph (semantic, supporting, contradicts, causal, temporal edges) directly in-prompt so the model can reason over document connections without having to call `intent_search`. Both additions landed in v0.7.1.
+The `<instruction>` frame tells the model to treat the surfaced facts as background knowledge it already holds unless the user corrects them, reducing prompt-level ambiguity about how to use the injected context. The `<relationships>` block exposes the vault's knowledge graph (semantic, supporting, contradicts, causal, temporal edges) directly in-prompt so the model can reason over document connections without having to call `intent_search`. The `<vault-facts>` block adds raw SPO triples for prompt-seeded entities so the model has structured "what is currently true about these entities" without needing an explicit `kg_query`. `<vault-facts>` / `<relationships>` landed in v0.9.0 / v0.7.1 respectively.
 
 ### Tuning context-surfacing with profiles
 
 Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's behavior:
 
-| Profile | Token budget | Max results | Vector | Vector timeout | Score ratio | Activation floor | Deep escalation |
-|---------|-------------|-------------|--------|----------------|-------------|-----------------|-----------------|
-| `speed` | 400 | 5 | Off | — | 65% | 0.24 | No |
-| `balanced` (default) | 800 | 10 | On | 900ms | 55% | 0.20 | No |
-| `deep` | 1200 | 15 | On | 2000ms | 45% | 0.16 | Yes |
+| Profile | Token budget | `factsTokens` | Max results | Vector | Vector timeout | Score ratio | Activation floor | Deep escalation |
+|---------|-------------|---------------|-------------|--------|----------------|-------------|-----------------|-----------------|
+| `speed` | 400 | 0 (disabled) | 5 | Off | — | 65% | 0.24 | No |
+| `balanced` (default) | 800 | 200 | 10 | On | 900ms | 55% | 0.20 | No |
+| `deep` | 1200 | 250 | 15 | On | 2000ms | 45% | 0.16 | Yes |
+
+`factsTokens` is a dedicated sub-budget for the `<vault-facts>` KG injection block (v0.9.0 §11.1) that cannot steal from the main `tokenBudget`. Setting `factsTokens: 0` on a profile disables the stage entirely.
 
 Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
 
@@ -64,6 +71,27 @@ On the `deep` profile, context-surfacing uses a budget-aware escalation strategy
 Both phases have a hard stop at 6 seconds (leaving 2 seconds of headroom within the hook timeout). If GPU services are unavailable or either phase times out, the hook falls back to the fast-path results. On a GPU system, expansion typically takes ~300ms and reranking ~200ms, so both phases fire on nearly every prompt. On CPU-only systems, the fast path alone usually consumes most of the 4-second budget, so escalation skips naturally.
 
 The effect: `deep` profile hooks produce results closer to what the `query` MCP tool returns (which always runs expansion + reranking), while `speed` and `balanced` continue using the fast path only.
+
+### Session focus topic boost (v0.9.0 §11.4)
+
+The session focus topic is a per-session bias that steers context-surfacing toward a declared topic for the duration of a working session, without writing to SQLite or mutating any lifecycle column. Use it when the user asks to focus on one thing ("let's focus on the auth refactor for this session" / "only surface X-related docs right now") — the topic biases retrieval toward matching docs while leaving the underlying vault state untouched. Clearing the focus at the end of the subsession returns surfacing to baseline.
+
+Set / show / clear with the CLI:
+
+```bash
+clawmem focus set "authentication flow" --session-id abc123
+clawmem focus show --session-id abc123
+clawmem focus clear --session-id abc123
+```
+
+The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID` — Claude Code exposes `CLAUDE_SESSION_ID` natively so the env-var path works automatically inside a Claude Code session. The focus file lives at `~/.cache/clawmem/sessions/<session_id>.focus`.
+
+When a focus topic is active:
+
+- **Intent-threaded retrieval** — the topic is passed as `intent` to `expandQuery`, `rerank`, and `extractSnippet`. Query expansion generates topic-aware variants, rerank prioritizes topic-aligned segments, and snippet extraction prefers sentences containing the topic tokens. Same `intent` lever that already exists on the query-time pipeline.
+- **Post-composite-score topic boost** — after `applyCompositeScoring` and before the adaptive threshold filter, docs that match all topic tokens (bag-of-word against title/path/body[:800], case-insensitive) get a 1.4× multiplier on `compositeScore`; non-matching docs get a 0.75× demote (clamped at a 0.5 floor). Boost fires per-result so it interacts cleanly with the adaptive threshold — matching docs surface higher, non-matching docs drop.
+- **Zero-match NO-OP** — if no docs in the scored result set match the topic, the boost stage is a no-op. The baseline ordering is returned unchanged, so the adaptive threshold sees byte-identical input and the result set never shrinks because of a non-matching focus. This fail-open contract is locked in by hook-level integration tests that assert byte-equality between a non-matching-topic run and a no-topic run.
+- **Session isolation** — the focus file is keyed by `sessionId`, never touches SQLite, and concurrent sessions on the same host cannot cross-contaminate each other's topic biasing. `CLAWMEM_SESSION_FOCUS` env var is a debug-only override that does NOT provide per-session scoping — do not rely on it for multi-session deployments.
 
 ### Hook blind spots
 

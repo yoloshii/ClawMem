@@ -64,6 +64,12 @@ import { precompactExtract } from "./hooks/precompact-extract.ts";
 import { postcompactInject } from "./hooks/postcompact-inject.ts";
 import { pretoolInject } from "./hooks/pretool-inject.ts";
 import { curatorNudge } from "./hooks/curator-nudge.ts";
+import {
+  readSessionFocus,
+  writeSessionFocus,
+  clearSessionFocus,
+  focusFilePath,
+} from "./session-focus.ts";
 
 enableProductionMode();
 
@@ -1906,6 +1912,91 @@ async function cmdProfile(args: string[]) {
   }
 }
 
+// §11.4 (v0.9.0): session-scoped focus topic — read/write/clear the
+// per-session focus file at ~/.cache/clawmem/sessions/<session_id>.focus.
+// The file is the primary signal read by context-surfacing for topic
+// boosting; the CLAWMEM_SESSION_FOCUS env var is a debug-only override
+// that does NOT provide per-session scoping on multi-session hosts.
+async function cmdFocus(args: string[]) {
+  const subCmd = args[0];
+
+  function resolveSessionId(rest: string[]): string {
+    const sidIdx = rest.indexOf("--session-id");
+    if (sidIdx >= 0 && rest[sidIdx + 1]) return rest[sidIdx + 1]!;
+    const envSid = (
+      process.env.CLAUDE_SESSION_ID ||
+      process.env.CLAWMEM_SESSION_ID ||
+      ""
+    ).trim();
+    if (envSid) return envSid;
+    die(
+      "No session id. Pass --session-id <id>, or set CLAUDE_SESSION_ID " +
+        "(Claude Code exposes this) or CLAWMEM_SESSION_ID env var before " +
+        "invoking this command."
+    );
+  }
+
+  function stripSessionIdArg(rest: string[]): string[] {
+    const sidIdx = rest.indexOf("--session-id");
+    if (sidIdx < 0) return rest;
+    return [...rest.slice(0, sidIdx), ...rest.slice(sidIdx + 2)];
+  }
+
+  switch (subCmd) {
+    case "set": {
+      const rest = args.slice(1);
+      const sessionId = resolveSessionId(rest);
+      const positional = stripSessionIdArg(rest);
+      const topic = positional.join(" ").trim();
+      if (!topic) {
+        die("Usage: clawmem focus set <topic> [--session-id <id>]");
+      }
+      try {
+        writeSessionFocus(sessionId, topic);
+      } catch (err: any) {
+        die(`Failed to set focus: ${err?.message ?? err}`);
+      }
+      console.log(
+        `${c.green}Focus set${c.reset} for session ${c.cyan}${sessionId}${c.reset}: ${topic}`
+      );
+      console.log(`${c.dim}File: ${focusFilePath(sessionId)}${c.reset}`);
+      break;
+    }
+    case "show": {
+      const rest = args.slice(1);
+      const sessionId = resolveSessionId(rest);
+      const topic = readSessionFocus(sessionId);
+      if (topic) {
+        console.log(
+          `${c.green}Focus${c.reset} for session ${c.cyan}${sessionId}${c.reset}: ${topic}`
+        );
+        console.log(`${c.dim}File: ${focusFilePath(sessionId)}${c.reset}`);
+      } else {
+        console.log(
+          `${c.yellow}No focus${c.reset} set for session ${c.cyan}${sessionId}${c.reset}.`
+        );
+        console.log(
+          `${c.dim}Expected file: ${focusFilePath(sessionId)}${c.reset}`
+        );
+      }
+      break;
+    }
+    case "clear": {
+      const rest = args.slice(1);
+      const sessionId = resolveSessionId(rest);
+      clearSessionFocus(sessionId);
+      console.log(
+        `${c.green}Focus cleared${c.reset} for session ${c.cyan}${sessionId}${c.reset}.`
+      );
+      break;
+    }
+    default:
+      die(
+        "Usage: clawmem focus <set|show|clear> [<topic>] [--session-id <id>]"
+      );
+  }
+}
+
 // =============================================================================
 // Main dispatch
 // =============================================================================
@@ -1993,6 +2084,9 @@ async function main() {
         break;
       case "profile":
         await cmdProfile(subArgs);
+        break;
+      case "focus":
+        await cmdFocus(subArgs);
         break;
       case "update-context":
         await cmdUpdateContext();
@@ -2644,6 +2738,9 @@ ${c.bold}Memory:${c.reset}
   clawmem log [--last N]               Session history
   clawmem profile                      Show user profile
   clawmem profile rebuild              Force profile rebuild
+  clawmem focus set <topic> [--session-id ID]   Set per-session focus topic (steers context-surfacing)
+  clawmem focus show [--session-id ID]          Show current focus topic
+  clawmem focus clear [--session-id ID]         Clear focus topic
 
 ${c.bold}Hooks:${c.reset}
   clawmem hook <name>                  Run hook (stdin JSON)

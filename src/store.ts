@@ -711,6 +711,11 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_type ON entity_nodes(entity_type)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_vault ON entity_nodes(vault)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_mentions ON entity_nodes(mention_count DESC)`);
+  // §11.1 (v0.9.0): expression index backing the `LOWER(name) IN (...) AND vault = ?`
+  // batch lookup used by the context-surfacing entity-detection hot path.
+  // Without this index the batch query devolves into a full scan on large vaults.
+  // Idempotent via IF NOT EXISTS — existing vaults pick it up on next open.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_nodes_lower_name ON entity_nodes(LOWER(name), vault)`);
 
   // Entity mentions: entity ↔ document junction table
   db.exec(`

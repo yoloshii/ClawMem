@@ -124,6 +124,21 @@ clawmem reflect [N]             # Cross-session reflection (last N days, default
 clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
 ```
 
+## Session focus topic (v0.9.0)
+
+Per-session topic biasing for the context-surfacing hook. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and applies a post-composite-score topic boost (1.4× match, 0.75× demote, NO-OP on zero matches). Session-scoped — never writes to SQLite or mutates any lifecycle column.
+
+```bash
+clawmem focus set "<topic>"                        # uses CLAUDE_SESSION_ID / CLAWMEM_SESSION_ID env
+clawmem focus set "<topic>" --session-id <id>      # explicit session id
+clawmem focus show                                 # reads session id from env
+clawmem focus show --session-id <id>
+clawmem focus clear                                # uses env-resolved session id
+clawmem focus clear --session-id <id>
+```
+
+The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID`. `CLAWMEM_SESSION_FOCUS` env var is a debug-only override that does NOT provide per-session scoping on multi-session hosts. `CLAWMEM_FOCUS_ROOT` overrides the focus file root directory for hermetic testing.
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -151,6 +166,8 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 | `CLAWMEM_HEAVY_LANE_OBS_LIMIT` | `100` | **v0.8.0.** Phase 2 stale-first observation batch size for the heavy lane. |
 | `CLAWMEM_HEAVY_LANE_DED_LIMIT` | `40` | **v0.8.0.** Phase 3 stale-first deductive candidate batch size for the heavy lane. |
 | `CLAWMEM_HEAVY_LANE_SURPRISAL` | `false` | **v0.8.0.** When `true`, seed Phase 2 with k-NN anomaly-ranked doc ids from `computeSurprisalScores` instead of stale-first ordering. Degrades to stale-first on vaults without embeddings. |
+| `CLAWMEM_SESSION_FOCUS` | — | **v0.9.0 §11.4.** Debug-only override for the session focus topic. NOT session-scoped — do not use in multi-session deployments. Use `clawmem focus set <topic> --session-id <id>` instead. |
+| `CLAWMEM_FOCUS_ROOT` | `~/.cache/clawmem/sessions` | **v0.9.0 §11.4.** Override directory for per-session focus files. Primarily for hermetic testing. |
 | `INDEX_PATH` | `~/.cache/clawmem/index.sqlite` | Override default vault path |
 
 The `bin/clawmem` wrapper sets endpoint defaults. Always use it instead of `bun run src/clawmem.ts` directly.
