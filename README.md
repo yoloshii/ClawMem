@@ -1,4 +1,4 @@
-# ClawMem — Context engine for Claude Code, OpenClaw, and Hermes agents
+# ClawMem — On-device memory layer for Claude Code, OpenClaw, and Hermes agents
 
 <p align="center">
   <img src="docs/clawmem_hero.jpg" alt="ClawMem" width="100%">
@@ -8,7 +8,7 @@
 
 ClawMem fuses recent research into a retrieval-augmented memory layer that agents actually use. The hybrid architecture combines [QMD](https://github.com/tobi/qmd)-derived multi-signal retrieval (BM25 + vector search + reciprocal rank fusion + query expansion + cross-encoder reranking), [SAME](https://github.com/sgx-labs/statelessagent)-inspired composite scoring (recency decay, confidence, content-type half-lives, co-activation reinforcement), [MAGMA](https://arxiv.org/abs/2501.13956)-style intent classification with multi-graph traversal (semantic, temporal, and causal beam search), and [A-MEM](https://arxiv.org/abs/2510.02178) self-evolving memory notes that enrich documents with keywords, tags, and causal links between entries. Pattern extraction from [Engram](https://github.com/Gentleman-Programming/engram) adds deduplication windows, frequency-based durability scoring, and temporal navigation.
 
-Integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client), a native OpenClaw ContextEngine plugin, or a Hermes Agent MemoryProvider plugin. All paths write to the same local SQLite vault. A decision captured during a Claude Code session shows up immediately when an OpenClaw or Hermes agent picks up the same project.
+Integrates via Claude Code hooks, an MCP server (works with any MCP-compatible client), a native OpenClaw plugin, or a Hermes Agent `MemoryProvider` plugin. All paths write to the same local SQLite vault. A decision captured during a Claude Code session shows up immediately when an OpenClaw or Hermes agent picks up the same project.
 
 TypeScript on Bun. MIT License.
 
@@ -47,7 +47,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Syncs project issues** from Beads issue trackers into searchable memory
 - **Runs a quiet-window heavy maintenance lane** — a second consolidation worker, off by default behind `CLAWMEM_HEAVY_LANE=true`, that runs on a longer interval only inside a configurable hour window. Gated by `context_usage` query-rate so it never competes for CPU/GPU with interactive sessions, scoped exclusively via DB-backed `worker_leases`, stale-first by default with an optional surprisal selector, and journals every attempt in `maintenance_runs` for operator visibility (v0.8.0)
 
-Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, as an OpenClaw ContextEngine plugin, or as a Hermes Agent MemoryProvider plugin. All modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
+Runs fully local with no API keys and no cloud services. Integrates via Claude Code hooks and MCP tools, as a native OpenClaw plugin, or as a Hermes Agent `MemoryProvider` plugin. All modes share the same vault for cross-runtime memory. Works with any MCP-compatible client.
 
 Full version history is in [RELEASE_NOTES.md](RELEASE_NOTES.md). Upgrade instructions for existing vaults are in [docs/guides/upgrading.md](docs/guides/upgrading.md).
 
@@ -83,8 +83,8 @@ Full version history is in [RELEASE_NOTES.md](RELEASE_NOTES.md). Upgrade instruc
 **Optional integrations:**
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — for hooks + MCP integration
-- [OpenClaw](https://github.com/openclaw/openclaw) — for ContextEngine plugin integration
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — for MemoryProvider plugin integration
+- [OpenClaw](https://github.com/openclaw/openclaw) — for native plugin integration
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — for `MemoryProvider` plugin integration
 - [bd CLI](https://github.com/dolthub/dolt) v0.58.0+ — for Beads issue tracker sync (only if using Beads)
 
 ### Install from npm (recommended)
@@ -185,7 +185,9 @@ clawmem setup mcp      # Register MCP server in ~/.claude.json (31 tools)
 
 #### OpenClaw
 
-ClawMem registers as a native ContextEngine plugin - OpenClaw's pluggable interface for context management. Same 90/10 automatic retrieval, delivered through OpenClaw's lifecycle system instead of Claude Code hooks.
+ClawMem registers as a native OpenClaw plugin. Same 90/10 automatic retrieval, delivered through OpenClaw's lifecycle system instead of Claude Code hooks.
+
+> **Plugin slot note:** OpenClaw exposes two plugin kinds — `memory` and `context-engine` — and ClawMem currently registers against the `context-engine` slot for historical reasons. Semantically, ClawMem is a cross-session memory layer (same role as its Hermes `MemoryProvider` integration), and a future release will migrate it to dual-kind registration (`memory` + `context-engine`) so the memory slot is the primary home and the context-engine slot remains available for the `compact()` / `afterTurn()` lifecycle hooks. No action needed for existing installs.
 
 ```bash
 clawmem setup openclaw   # Auto-installs plugin, prints remaining steps
@@ -207,7 +209,7 @@ ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.a
 
 > **OpenClaw v2026.4.10+** recommended — fixes a config normalization bug where `plugins.slots.contextEngine` was silently dropped (#64192).
 
-**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's ContextEngine lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The ContextEngine plugin is recommended for new OpenClaw setups; MCP is available as an additional or standalone integration.
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `afterTurn()` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
 
 #### Hermes Agent
 
@@ -1088,7 +1090,7 @@ clawmem install-service --enable
 #### OpenClaw-specific
 
 ```bash
-# Install the ContextEngine plugin (auto-symlinks into ~/.openclaw/extensions/)
+# Install the OpenClaw plugin (auto-symlinks into ~/.openclaw/extensions/)
 clawmem setup openclaw
 # Then follow the printed next steps: restart gateway, set slot, configure GPU endpoints
 ```
