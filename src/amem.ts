@@ -59,6 +59,32 @@ export function parseMemoryNoteFromLLM(raw: string): MemoryNote | null {
 }
 
 
+export function parseLinkGenerationFromLLM(raw: string): Array<{
+  target_idx: number;
+  link_type: 'semantic' | 'supporting' | 'contradicts';
+  confidence: number;
+  reasoning: string;
+}> | null {
+  const parsed = extractJsonFromLLM(raw) as Array<{
+    target_idx: number;
+    link_type: 'semantic' | 'supporting' | 'contradicts';
+    confidence: number;
+    reasoning: string;
+  }> | {
+    result?: Array<{
+      target_idx: number;
+      link_type: 'semantic' | 'supporting' | 'contradicts';
+      confidence: number;
+      reasoning: string;
+    }>;
+  } | null;
+
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && Array.isArray(parsed.result)) return parsed.result;
+  return null;
+}
+
+
 function tryParseJsonWithCommaRepair(text: string): any | null {
   const repaired = text
     .replace(/(\]|\}|"(?:[^"\\]|\\.)*"|\d(?:[\d.eE+-])*)(\s*\n\s*")/g, '$1,$2')
@@ -356,14 +382,9 @@ Return between 0 and ${neighbors.length} items. Use an empty JSON array [] if no
       return 0;
     }
 
-    const parsed = extractJsonFromLLM(result.text) as Array<{
-      target_idx: number;
-      link_type: 'semantic' | 'supporting' | 'contradicts';
-      confidence: number;
-      reasoning: string;
-    }> | null;
+    const parsed = parseLinkGenerationFromLLM(result.text);
 
-    if (!Array.isArray(parsed)) {
+    if (!parsed) {
       console.log(`[amem] RAW link generation output for docId ${docId}:`);
       console.log(result.text);
       console.log(`[amem] Invalid/unparseable JSON for link generation docId ${docId}`);

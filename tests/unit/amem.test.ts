@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
-import { extractJsonFromLLM, parseMemoryNoteFromLLM } from "../../src/amem.ts";
+
+import { extractJsonFromLLM, parseLinkGenerationFromLLM, parseMemoryNoteFromLLM } from "../../src/amem.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
 
@@ -107,5 +108,20 @@ describe("parseMemoryNoteFromLLM repair", () => {
       tags: ["tag1", "tag2"],
       context: "Brief summary",
     });
+  });
+});
+
+describe("parseLinkGenerationFromLLM", () => {
+  it("unwraps object-wrapped result arrays", () => {
+    const raw = `{"status":"valid","confidence":0.95,"result":[{"target_idx":1,"link_type":"semantic","confidence":0.85,"reasoning":"Brief explanation"}]}`;
+    const result = parseLinkGenerationFromLLM(raw);
+    expect(result).toEqual([
+      {
+        target_idx: 1,
+        link_type: "semantic",
+        confidence: 0.85,
+        reasoning: "Brief explanation",
+      },
+    ]);
   });
 });
