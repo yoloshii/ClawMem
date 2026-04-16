@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { extractJsonFromLLM } from "../../src/amem.ts";
+import { extractJsonFromLLM, parseMemoryNoteFromLLM } from "../../src/amem.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
 
@@ -59,5 +59,53 @@ describe("extractJsonFromLLM", () => {
     const raw = '```json\n[{"key": "value"}]';
     const result = extractJsonFromLLM(raw);
     expect(result).toEqual([{ key: "value" }]);
+  });
+});
+
+describe("parseMemoryNoteFromLLM", () => {
+  it("salvages partial JSON missing tags and context", () => {
+    const raw = '```json\n{"keywords":["scheduled reports design"]}\n```';
+    const result = parseMemoryNoteFromLLM(raw);
+    expect(result).toEqual({
+      keywords: ["scheduled reports design"],
+      tags: [],
+      context: "",
+    });
+  });
+
+  it("salvages lex vec hyde fallback output", () => {
+    const raw = [
+      'lex: scheduled reports v2 design',
+      'lex: scheduled reports v2 documentation',
+      'vec: scheduled reports v2 design pattern implementation',
+      'hyde: Here are some code examples for scheduled reports v2.',
+    ].join('\n');
+    const result = parseMemoryNoteFromLLM(raw);
+    expect(result).toEqual({
+      keywords: [
+        'scheduled reports v2 design',
+        'scheduled reports v2 documentation',
+      ],
+      tags: [],
+      context: 'Here are some code examples for scheduled reports v2.',
+    });
+  });
+});
+
+describe("parseMemoryNoteFromLLM repair", () => {
+  it("repairs missing commas between top-level object fields", () => {
+    const raw = [
+      '{',
+      '  "keywords": ["scheduled reports design"]',
+      '  "tags": ["tag1", "tag2"]',
+      '  "context": "Brief summary"',
+      '}',
+    ].join('\n');
+    const result = parseMemoryNoteFromLLM(raw);
+    expect(result).toEqual({
+      keywords: ["scheduled reports design"],
+      tags: ["tag1", "tag2"],
+      context: "Brief summary",
+    });
   });
 });

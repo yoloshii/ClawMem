@@ -22,6 +22,56 @@ const EMPTY_NOTE: MemoryNote = {
   context: ""
 };
 
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+export function parseMemoryNoteFromLLM(raw: string): MemoryNote | null {
+  const parsed = extractJsonFromLLM(raw) as Partial<MemoryNote> | null;
+  if (parsed && Array.isArray(parsed.keywords)) {
+    return {
+      keywords: parsed.keywords.filter((v): v is string => typeof v === 'string'),
+      tags: Array.isArray(parsed.tags) ? parsed.tags.filter((v): v is string => typeof v === 'string') : [],
+      context: typeof parsed.context === 'string' ? parsed.context : '',
+    };
+  }
+
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const keywords = uniqueStrings(lines.filter((line) => line.startsWith('lex:')).map((line) => line.slice(4).trim()));
+  const context = lines.find((line) => line.startsWith('hyde:'))?.slice(5).trim() ?? '';
+  if (keywords.length === 0 && !context) {
+    return null;
+  }
+
+  return {
+    keywords,
+    tags: [],
+    context,
+  };
+}
+
+
+function tryParseJsonWithCommaRepair(text: string): any | null {
+  const repaired = text
+    .replace(/(\]|\}|"(?:[^"\\]|\\.)*"|\d(?:[\d.eE+-])*)(\s*\n\s*")/g, '$1,$2')
+    .replace(/(\]|\}|"(?:[^"\\]|\\.)*"|\d(?:[\d.eE+-])*)(\s+")/g, '$1,$2');
+  if (repaired === text) return null;
+  try {
+    return JSON.parse(repaired);
+  } catch {
+    return null;
+  }
+}
+
+
 /**
  * Extract and parse JSON from LLM output, handling:
  * - Markdown code blocks (```json ... ```)
@@ -31,10 +81,12 @@ const EMPTY_NOTE: MemoryNote = {
 export function extractJsonFromLLM(raw: string): any | null {
   let text = raw.trim();
 
-  // Strip markdown code blocks
-  const codeBlock = text.match(/```(?:json)?\s*\n?([\s\S]*?)(?:\n```|$)/);
-  if (codeBlock) {
-    text = codeBlock[1]!.trim();
+  // Strip markdown code blocks only when output starts with fenced JSON
+  if (text.startsWith('```')) {
+    const codeBlock = text.match(/```(?:json)?\s*\n?([\s\S]*?)(?:\n```|$)/);
+    if (codeBlock) {
+      text = codeBlock[1]!.trim();
+    }
   }
 
   // Find the first [ or { to skip leading prose
@@ -49,23 +101,23 @@ export function extractJsonFromLLM(raw: string): any | null {
   try {
     return JSON.parse(text);
   } catch {
-    // Attempt truncated JSON repair
+    // Try lightweight repairs before truncation handling
   }
 
-  // Repair truncated arrays: find last complete object, close the array
+  const commaRepaired = tryParseJsonWithCommaRepair(text);
+  if (commaRepaired !== null) return commaRepaired;
+
+  // Attempt truncated JSON repair
   if (text.startsWith('[')) {
     const lastBrace = text.lastIndexOf('}');
     if (lastBrace > 0) {
       const repaired = text.slice(0, lastBrace + 1) + ']';
       try { return JSON.parse(repaired); } catch { /* continue */ }
     }
-    // Might be an empty or trivial array
     try { return JSON.parse(text.replace(/,\s*$/, '') + ']'); } catch { /* continue */ }
   }
 
-  // Repair truncated objects: find last complete value, close the object
   if (text.startsWith('{')) {
-    // Try closing at each } from the end
     for (let i = text.length - 1; i > 0; i--) {
       if (text[i] === '}' || text[i] === '"' || text[i] === '0' || text[i] === '1' ||
           text[i] === '2' || text[i] === '3' || text[i] === '4' || text[i] === '5' ||
@@ -142,9 +194,11 @@ Return ONLY valid JSON in this exact format:
       return EMPTY_NOTE;
     }
 
-    const parsed = extractJsonFromLLM(result.text) as MemoryNote | null;
+    const parsed = parseMemoryNoteFromLLM(result.text);
 
-    if (!parsed || !Array.isArray(parsed.keywords) || !Array.isArray(parsed.tags) || typeof parsed.context !== 'string') {
+    if (!parsed) {
+      console.log(`[amem] RAW memory note output for docId ${docId}:`);
+      console.log(result.text);
       console.log(`[amem] Invalid/unparseable JSON for docId ${docId}`);
       return EMPTY_NOTE;
     }
@@ -290,7 +344,7 @@ Return ONLY valid JSON array in this exact format:
   }
 ]
 
-Include all ${neighbors.length} neighbors in your response.`;
+Return between 0 and ${neighbors.length} items. Use an empty JSON array [] if no meaningful links exist. Do not include explanations outside JSON.`;
 
     const result = await llm.generate(prompt, {
       temperature: 0.3,
@@ -310,6 +364,8 @@ Include all ${neighbors.length} neighbors in your response.`;
     }> | null;
 
     if (!Array.isArray(parsed)) {
+      console.log(`[amem] RAW link generation output for docId ${docId}:`);
+      console.log(result.text);
       console.log(`[amem] Invalid/unparseable JSON for link generation docId ${docId}`);
       return 0;
     }
