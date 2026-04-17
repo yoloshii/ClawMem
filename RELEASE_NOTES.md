@@ -183,6 +183,10 @@ Fixes the OpenClaw plugin setup workflow that caused issue #5 ("plugin not found
 
 No breaking changes. Existing users who previously ran the manual symlink steps are unaffected — `setup openclaw` detects the existing correct symlink and skips re-creation.
 
+### External credit
+
+- **@saschabuehrle** — opened yoloshii/ClawMem#6 with the gateway-restart-before-slot-assignment fix and the correct diagnosis of the `Context engine "clawmem" is not registered` failure path. The PR was closed as superseded because v0.8.4 ended up shipping a broader auto-install fix, but the restart-ordering insight is preserved verbatim in v0.8.4's printed next-steps and the code comment that documents the constraint.
+
 ---
 
 ## v0.8.3 — Content-Type-Aware Entity Cap + Self-Loop Guard + Docs Restructure
