@@ -4,6 +4,62 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.1 — Hermes agent_context isolation + OpenClaw v2026.4.18 / Hermes v2026.4.16+ doc maintenance
+
+v0.10.1 is a small patch release. The retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, and OpenClaw plugin registration shape are all unchanged from v0.10.0. The release covers two upstream changelog reviews against the OpenClaw and Hermes runtimes ClawMem integrates with — neither produced any breaking changes — plus one correctness fix in the Hermes plugin and a small set of doc updates that keep the public-facing surfaces aligned with the runtimes users are actually running.
+
+Vaults from v0.10.0 are byte-identical at rest. No schema migration, no new env vars, no new dependencies. Pure `git pull` upgrade for Claude Code users; `clawmem setup openclaw` re-run is optional (no plugin code changes that affect runtime behavior); Hermes users on a non-primary `agent_context` (subagent, cron, flush) get a quiet correctness improvement.
+
+### Hermes Agent — `agent_context` isolation in `src/hermes/__init__.py`
+
+Hermes's `MemoryProvider` ABC docstring is explicit: *"Providers should skip writes for non-primary contexts (cron system prompts would corrupt user representations)."* Hermes's `run_agent.py` passes an `agent_context` kwarg to every `MemoryProvider.initialize()` call with one of `"primary"`, `"subagent"`, `"cron"`, or `"flush"`. Pre-v0.10.1 the ClawMem plugin absorbed the kwarg via `**kwargs` and ran the full lifecycle for every context — including writing transcript turns and running decision-extractor / handoff-generator / feedback-loop / precompact-extract on cron and subagent passes. The vault's `saveMemory` dedup limited the blast radius, but the cleaner answer is the one the ABC asks for.
+
+v0.10.1 honours the contract. The plugin now reads `agent_context` in `initialize()` and gates only the **write-side** surfaces; the **read-side** surfaces still run for every context so non-primary agents continue to benefit from retrieval:
+
+| Surface | Direction | `agent_context != "primary"` |
+|---|---|---|
+| `session-bootstrap` (in `initialize`) | Read | Runs |
+| `prefetch()` / `queue_prefetch()` (`context-surfacing`) | Read | Runs |
+| `system_prompt_block()` | Read | Runs |
+| Agent tools (REST: `clawmem_retrieve` etc.) | Read | Runs |
+| `sync_turn()` (transcript append) | Write | **Suppressed** |
+| `on_session_end()` (extraction trio) | Write | **Suppressed** |
+| `on_pre_compress()` (precompact-extract) | Write | **Suppressed** |
+
+When the active context is non-primary, `initialize()` logs a single info-level line for operator visibility:
+
+```
+clawmem: agent_context=cron — reads enabled, writes suppressed
+```
+
+Net effect: subagents and cron agents read the vault as before; they no longer write back into it. For installs that run only `agent_context="primary"` (the default for interactive CLI / Telegram / Discord platforms), behavior is unchanged.
+
+### Hermes Agent — preferred install path now `$HERMES_HOME/plugins/clawmem/`
+
+Hermes #10529 (in v2026.4.13+) added user-plugin discovery: `plugins/memory/__init__.py` now scans `$HERMES_HOME/plugins/<name>/` in addition to the bundled `hermes-agent/plugins/memory/<name>/`. Both paths still work; the user-plugin path is preferred because it survives `git pull` of hermes-agent and avoids the dual-registration trap that previously caused duplicate tool names with strict providers. Discovery heuristic = grep `__init__.py` for `register_memory_provider` or `MemoryProvider`; both already present in `src/hermes/__init__.py`. `README.md` Install + Setup blocks, `docs/guides/hermes-plugin.md`, `CLAUDE.md`, `AGENTS.md`, and `SKILL.md` now lead with the user-plugin path and document the bundled path as a still-supported alternative.
+
+### OpenClaw v2026.4.18 — three relevant changes (all compatible)
+
+A v2026.4.11 → v2026.4.18 changelog survey (1,794 commits) ran against ClawMem v0.10.0's plugin. Verdict: no breaking changes. Three changes touch surfaces ClawMem consumes; all are documented in this release:
+
+- **Synchronous `register()` enforcement (`2a283e87a7`, in `v2026.4.19-beta.1`).** OpenClaw now throws `"plugin register must be synchronous"` if a plugin's `register()` returns a Promise. ClawMem's `register(api)` in `src/openclaw/index.ts` is and always has been synchronous (no `async`, no top-level `await`, returns void) — every `await` lives inside per-event handlers, never in registration itself. Companion change: register failures now atomically roll back side effects, so any future throw inside `register()` will leave OpenClaw in a clean state. The constraint is now documented as a load-bearing invariant in `CLAUDE.md` / `AGENTS.md`.
+- **`memory-core` dreaming sidecar coexistence (`5fde14b844`, #65411, in v2026.4.18).** When ClawMem owns the `memory` slot AND `plugins.entries.memory-core.config.dreaming.enabled = true`, OpenClaw now loads `memory-core`'s dreaming engine alongside ClawMem instead of unloading it entirely. Two valid configurations: ClawMem-only (default after `openclaw plugins enable clawmem`, with `dreaming.enabled = false`) or ClawMem + dreaming sidecar (opt-in, set `dreaming.enabled = true`). Documented in `docs/guides/openclaw-plugin.md` (new "Coexistence with memory-core dreaming sidecar" section), `README.md`, `CLAUDE.md`, `AGENTS.md`, `SKILL.md`.
+- **`attempt.ts` line drift.** OpenClaw's `before_prompt_build` is still awaited; `agent_end` is still fire-and-forget. Their line numbers shifted between v2026.4.11 and v2026.4.18 (`:1661 → :1642` and `:2226-2249 → :2198-2224`). The four references in `src/openclaw/index.ts` (file docstring + correctness-contract comments) were updated accordingly. No semantic change.
+
+### `on_memory_write` deliberately not opted into
+
+Hermes #10507 added an `on_memory_write` bridge to the sequential tool execution path; the commit message names ClawMem as a beneficiary. v0.10.1 deliberately stays opted out. ClawMem's filesystem watcher already indexes Hermes's `MEMORY.md` / `USER.md` if those files live under a configured collection — layering an `on_memory_write` shell-out on top duplicates filesystem watching and introduces a remove-semantics mismatch (a hook event saying "this entry was removed" cannot be cleanly translated into ClawMem's content-addressed vault). The `docs/guides/hermes-plugin.md` lifecycle table now documents this rationale instead of the prior "future" framing.
+
+### v0.8.4 retroactive credit
+
+`### External credit` subsection added to v0.8.4 in this file naming `@saschabuehrle` (Lemony.ai founder) for PR #6 (`fix/issue-5`). The PR was closed-as-superseded on 2026-04-11 because v0.8.4 ended up shipping the broader auto-install fix, but the gateway-restart-before-slot-assignment insight is preserved verbatim in v0.8.4's printed next-steps and the code comment that documents the constraint. Matches the v0.10.0 `### External credit` precedent set for `@withx`. The credit landed in the working tree before the v0.10.1 cut and rides this release.
+
+### Test coverage
+
+No new tests in v0.10.1 — the `agent_context` guard's behavior is observable only against a live Hermes runtime, and the rest of the release is documentation. Full v0.10.0 baseline holds: 1204 pass / 0 fail, 2339 expect() calls across 66 test files.
+
+---
+
 ## v0.10.0 — OpenClaw Pure-Memory Migration (§14.3) + v2026.4.11 Packaging Fix
 
 v0.10.0 is the OpenClaw pure-memory migration. ClawMem's OpenClaw plugin is no longer a `kind: context-engine` plugin wrapping a `ClawMemContextEngine` class. It is a `kind: memory` plugin that wires every lifecycle event (`before_prompt_build`, `agent_end`, `before_compaction`, `session_start`) through OpenClaw's plugin-hook bus directly. This matches the direction OpenClaw's own `context-engine` slot has taken since v2026.4.x (narrowed to runtime compaction) and moves ClawMem to the slot it was always logically targeting: the exclusive `memory` slot, alongside `memory-core` and `memory-lancedb` (which it automatically displaces when enabled).

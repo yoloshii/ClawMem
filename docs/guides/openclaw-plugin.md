@@ -130,6 +130,21 @@ Both can run simultaneously. Active Memory handles casual personal recall ("what
 
 **No configuration changes needed.** If Active Memory is enabled, ClawMem continues working as before. The deployment options below control ClawMem's relationship with OpenClaw's *native memory search* (`memorySearch.extraPaths`), which is separate from Active Memory.
 
+## Coexistence with memory-core dreaming sidecar
+
+OpenClaw v2026.4.18 (#65411) made the `memory-core` dreaming engine load *alongside* an external memory slot owner instead of being unloaded with the rest of `memory-core`. This means ClawMem and `memory-core` dreaming can run side-by-side, similar to the Active Memory pattern above.
+
+Two valid configurations:
+
+| Configuration | `plugins.entries.memory-core.config.dreaming.enabled` | Behavior |
+|---|---|---|
+| **ClawMem only** (default after `openclaw plugins enable clawmem`) | `false` | `memory-core` is fully unloaded. ClawMem owns memory end-to-end. |
+| **ClawMem + dreaming sidecar** | `true` | ClawMem owns the memory slot; `memory-core` loads its dreaming engine *only*. Dreaming continues writing to `memory/dreaming/{phase}/YYYY-MM-DD.md` (separate from ClawMem's vault). |
+
+Pick the sidecar configuration if you previously used `memory-core` dreaming and want to keep that output stream when migrating to ClawMem. Pick the default if you want a single memory system. ClawMem's own consolidation workers (`CLAWMEM_ENABLE_CONSOLIDATION` + `CLAWMEM_HEAVY_LANE`) are independent of `memory-core` dreaming and run regardless.
+
+There is no double-injection conflict because dreaming writes to its own files and doesn't compete for prompt regions with ClawMem's `before_prompt_build` retrieval injection. On older OpenClaw (pre-v2026.4.18), the sidecar mode was not available — `memory-core` was unloaded as soon as another plugin owned the memory slot.
+
 ### OpenClaw version note
 
 **OpenClaw v2026.4.11+ recommended (required for ClawMem v0.10.0+).**

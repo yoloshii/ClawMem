@@ -203,7 +203,7 @@ Disable OpenClaw's native memory search to avoid duplicate injection:
 openclaw config set agents.defaults.memorySearch.extraPaths "[]"
 ```
 
-ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.ai/concepts/active-memory) plugin (v2026.4.10+). They search different backends and inject into different prompt regions, so both can run simultaneously without conflict. See the [OpenClaw plugin guide](docs/guides/openclaw-plugin.md#coexistence-with-openclaw-active-memory) for details.
+ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.ai/concepts/active-memory) plugin (v2026.4.10+) and, on OpenClaw v2026.4.18+ (#65411), with the `memory-core` dreaming sidecar — both run alongside ClawMem instead of being mutually exclusive. They search different backends and inject into different prompt regions, so they do not conflict. See the [OpenClaw plugin guide — Active Memory coexistence](docs/guides/openclaw-plugin.md#coexistence-with-openclaw-active-memory) and the [memory-core dreaming sidecar section](docs/guides/openclaw-plugin.md#coexistence-with-memory-core-dreaming-sidecar) for the two patterns.
 
 **Pair ClawMem (memory) with a context-engine plugin (v0.10.0+).** OpenClaw and Hermes maintainers have converged on a two-surface plugin model: one slot for memory plugins (cross-session, retrieval-first) and a separate slot for context-engine plugins (in-session, compression/compaction-first). Under that model ClawMem is a memory layer — it has always been one in Hermes via the `MemoryProvider` ABC, and v0.10.0 moves the OpenClaw integration to the same semantic slot. You can now run ClawMem in the `memory` slot alongside an LCM-style compression plugin (for example, `lossless-claw`) in the `context-engine` slot. The two plugins do not overlap: one persists across sessions, the other reshapes the live window. See the [OpenClaw plugin guide — memory vs context engine](docs/guides/openclaw-plugin.md#memory-vs-context-engine--the-dual-plugin-surface) for the full rationale.
 
@@ -218,11 +218,16 @@ ClawMem integrates as a native MemoryProvider plugin — Hermes's pluggable inte
 **Install:**
 
 ```bash
-# Copy or symlink the plugin into Hermes's plugin directory
+# Preferred — user-plugin path (Hermes #10529, v2026.4.13+).
+# Survives `git pull` of hermes-agent and avoids dual-registration with bundled providers.
+cp -r /path/to/ClawMem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
+
+# Or, the bundled-style path (always supported, takes precedence on name collisions).
+# Recommended only when you actively work in the hermes-agent source tree.
 cp -r /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
 
-# Or symlink for development
-ln -s /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+# Symlink alternative for in-place development (either path).
+ln -s /path/to/ClawMem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
 ```
 
 **Configure** in your Hermes profile's `.env` or environment:
@@ -1105,8 +1110,12 @@ Index your content directories with `clawmem bootstrap` as above. The OpenClaw p
 #### Hermes-specific
 
 ```bash
-# Install the memory provider plugin (symlink or copy)
-ln -s $(npm root -g)/clawmem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+# Install the memory provider plugin.
+# Preferred: $HERMES_HOME/plugins/clawmem/ (user-plugin path, Hermes #10529, v2026.4.13+).
+ln -s $(npm root -g)/clawmem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
+
+# Bundled-style path is also supported (takes precedence on name collisions):
+#   ln -s $(npm root -g)/clawmem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
 
 # Start the REST API (required for Hermes tool calls)
 clawmem serve --port 7438 &

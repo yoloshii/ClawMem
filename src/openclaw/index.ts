@@ -37,8 +37,8 @@
  *   4. REST API service (`clawmem serve`) lifecycle — unchanged.
  *
  * §14.3 critical correctness contract: `agent_end` is fire-and-forget at
- * `attempt.ts:2226-2249`. Precompact-extract MUST run inside
- * `handleBeforePromptBuild` (which IS awaited at `attempt.ts:1661`), gated
+ * `attempt.ts:2198-2224`. Precompact-extract MUST run inside
+ * `handleBeforePromptBuild` (which IS awaited at `attempt.ts:1642`), gated
  * by the proximity heuristic in `compaction-threshold.ts`. See `engine.ts`
  * top-of-file comment for the full rationale.
  */
@@ -89,7 +89,7 @@ const clawmemPlugin = {
   name: "ClawMem",
   description:
     "On-device hybrid memory layer for OpenClaw — composite scoring, graph traversal, lifecycle management, and pre-emptive compaction state extraction",
-  version: "0.10.0",
+  version: "0.10.1",
   kind: "memory" as const,
 
   register(api: any) {
@@ -154,7 +154,7 @@ const clawmemPlugin = {
     // ----- Plugin Hook: before_prompt_build (AWAITED — load-bearing path) -----
     // Both context-surfacing retrieval injection and pre-emptive precompact
     // extraction live here. handleBeforePromptBuild is async and the OpenClaw
-    // attempt path awaits the result at attempt.ts:1661 before building the
+    // attempt path awaits the result at attempt.ts:1642 before building the
     // effective prompt. precompact-extract therefore runs strictly before
     // the LLM call that could trigger compaction on this turn.
     api.on(
@@ -168,7 +168,7 @@ const clawmemPlugin = {
     // ----- Plugin Hook: agent_end (FIRE-AND-FORGET in core) -----
     // Decision-extractor, handoff-generator, and feedback-loop run here.
     // These writes are eventually-consistent (saveMemory dedupes), so the
-    // fire-and-forget context at attempt.ts:2226-2249 is acceptable.
+    // fire-and-forget context at attempt.ts:2198-2224 is acceptable.
     // precompact-extract is intentionally NOT in this handler — it lives
     // in handleBeforePromptBuild for correctness reasons.
     api.on("agent_end", async (event: AgentEndEvent, ctx: AgentEndContext) => {

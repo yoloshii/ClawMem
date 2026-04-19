@@ -4,13 +4,23 @@ ClawMem integrates with Hermes Agent as a native MemoryProvider plugin, giving H
 
 ## Install
 
-```bash
-# Copy the plugin into Hermes's plugin directory
-cp -r /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+Hermes scans two directories for memory provider plugins (since Hermes #10529, in v2026.4.13+):
 
-# Or symlink for development
-ln -s /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+1. **User plugins** at `$HERMES_HOME/plugins/<name>/` — typically `~/.hermes/plugins/<name>/`. **Preferred.** Survives `git pull` of hermes-agent and avoids the dual-registration trap that previously caused duplicate tool names with strict providers.
+2. **Bundled plugins** at `hermes-agent/plugins/memory/<name>/` — always supported. Bundled-first precedence on name collisions.
+
+```bash
+# Preferred — user-plugin path
+cp -r /path/to/ClawMem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
+
+# Or symlink for development (either path)
+ln -s /path/to/ClawMem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
+
+# Bundled-style — only when working in the hermes-agent source tree
+cp -r /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
 ```
+
+Discovery is heuristic — Hermes looks for `register_memory_provider` or `MemoryProvider` substrings in `__init__.py`. Both are present in `src/hermes/__init__.py`, so the plugin is discovered correctly under either path.
 
 Verify discovery:
 ```bash
@@ -86,6 +96,28 @@ export CLAWMEM_SERVE_MODE=managed
 
 Suitable for development. Not recommended for production — the process doesn't survive plugin crashes or Hermes restarts.
 
+## Agent-context isolation
+
+Hermes's `run_agent.py` passes an `agent_context` kwarg to every `MemoryProvider.initialize()` call with one of four values: `"primary"`, `"subagent"`, `"cron"`, or `"flush"`. The `MemoryProvider` ABC docstring is explicit about why this matters: *"Providers should skip writes for non-primary contexts (cron system prompts would corrupt user representations)."*
+
+The plugin honours this contract by gating only the **write-side** surfaces — read-side hooks always run so non-primary agents still benefit from retrieval:
+
+| Surface | Direction | `agent_context != "primary"` behaviour |
+|---|---|---|
+| `session-bootstrap` (in `initialize`) | Read | Runs — context still surfaced |
+| `prefetch()` / `queue_prefetch()` (`context-surfacing`) | Read | Runs — context still surfaced |
+| `system_prompt_block()` | Read | Runs — provider info still injected |
+| Agent tools (REST) | Read | Runs — agents can still call `clawmem_retrieve` etc. |
+| `sync_turn()` (transcript append) | Write | **Suppressed** |
+| `on_session_end()` (extraction) | Write | **Suppressed** |
+| `on_pre_compress()` (precompact) | Write | **Suppressed** |
+
+Net effect: subagents, cron jobs, and flush passes get the benefit of vault recall without contaminating the vault with intermediate state or system-prompt reasoning. The `initialize()` log line records the active context for operator visibility:
+
+```
+clawmem: agent_context=cron — reads enabled, writes suppressed
+```
+
 ## Hermes built-in memory coexistence
 
 Hermes always runs its built-in memory provider (MEMORY.md / USER.md) alongside the external provider. ClawMem is additive — it does not replace or disable built-in memory. Both inject into the context independently.
@@ -133,16 +165,16 @@ systemctl --user status clawmem-watcher.service
 | Hermes MemoryProvider | ClawMem equivalent | Notes |
 |---|---|---|
 | `is_available()` | PATH check for `clawmem` binary | No network calls |
-| `initialize(session_id)` | `session-bootstrap` hook | Creates transcript, caches bootstrap context |
+| `initialize(session_id, **kwargs)` | `session-bootstrap` hook | Creates transcript, caches bootstrap context. Reads `agent_context` and `hermes_home` from kwargs. Other kwargs Hermes passes (`platform`, `agent_identity`, `agent_workspace`, `parent_session_id`, `user_id`, `gateway_session_key`, `session_title`) are absorbed via `**kwargs` and currently unused. |
 | `system_prompt_block()` | Static text | Provider active, tool names |
 | `prefetch(query)` | `context-surfacing` hook output | Returns cached result from background thread |
 | `queue_prefetch(query)` | `context-surfacing` hook | Background thread, generation-safe |
-| `sync_turn(user, assistant)` | Transcript JSONL append | Bridges Hermes turn pairs to ClawMem file format |
-| `on_turn_start()` | — | Not wired in Hermes run_agent.py |
-| `on_session_end(messages)` | `decision-extractor` + `handoff-generator` + `feedback-loop` | Parallel, 30s timeout each |
-| `on_pre_compress(messages)` | `precompact-extract` | Side effect only (Hermes ignores return) |
-| `on_memory_write()` | No-op | Avoids duplication with built-in memory |
-| `on_delegation()` | No-op | Future: subagent observation |
+| `sync_turn(user, assistant)` | Transcript JSONL append | Bridges Hermes turn pairs to ClawMem file format. Suppressed when `agent_context != "primary"`. |
+| `on_turn_start()` | — | Not overridden — base no-op |
+| `on_session_end(messages)` | `decision-extractor` + `handoff-generator` + `feedback-loop` | Parallel, 30s timeout each. Suppressed when `agent_context != "primary"`. |
+| `on_pre_compress(messages)` | `precompact-extract` | Side effect only (Hermes ignores return). Suppressed when `agent_context != "primary"`. |
+| `on_memory_write()` | No-op | Avoids duplication with built-in memory (filesystem watcher already indexes MEMORY.md / USER.md if they live under a configured collection). |
+| `on_delegation()` | No-op | Subagent observation handled at the parent's primary context already; nothing useful to add here. |
 | `get_tool_schemas()` | 5 REST-backed tools | retrieve, get, session_log, timeline, similar |
 | `handle_tool_call()` | REST API dispatch | Bearer auth when `CLAWMEM_API_TOKEN` is set |
 | `shutdown()` | Thread cleanup + managed serve stop | Joins prefetch thread, terminates managed process |

@@ -16,6 +16,17 @@ Config via environment variables:
   CLAWMEM_EMBED_URL     — GPU embedding server URL (optional)
   CLAWMEM_LLM_URL       — GPU LLM server URL (optional)
   CLAWMEM_RERANK_URL    — GPU reranker server URL (optional)
+
+Agent-context isolation:
+  Hermes ``run_agent.py`` passes ``agent_context`` to ``initialize()``
+  with one of "primary", "subagent", "cron", or "flush". Per the
+  ``MemoryProvider`` ABC contract ("Providers should skip writes for
+  non-primary contexts (cron system prompts would corrupt user
+  representations)"), this plugin treats the read-side hooks
+  (session-bootstrap, context-surfacing) as always safe but routes the
+  write-side surfaces (transcript appends in ``sync_turn``, extraction
+  in ``on_session_end`` and ``on_pre_compress``) through a primary-only
+  guard. Non-primary contexts get retrieval but no vault writes.
 """
 
 from __future__ import annotations
@@ -223,6 +234,10 @@ class ClawMemProvider(MemoryProvider):
         self._serve_mode: str = "external"
         self._serve_proc: Optional[subprocess.Popen] = None
         self._env_extra: dict = {}
+        # Agent-context isolation. "primary" = full read+write; everything else
+        # ("subagent", "cron", "flush") = reads OK, writes suppressed. See file
+        # docstring for the ABC contract this implements.
+        self._agent_context: str = "primary"
 
         # Prefetch state (generation counter prevents stale overwrites)
         self._prefetch_result: str = ""
@@ -301,6 +316,12 @@ class ClawMemProvider(MemoryProvider):
             self._port = _DEFAULT_PORT
         self._serve_mode = os.environ.get("CLAWMEM_SERVE_MODE", "external")
         self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
+        self._agent_context = str(kwargs.get("agent_context", "primary") or "primary")
+        if self._agent_context != "primary":
+            logger.info(
+                "clawmem: agent_context=%s — reads enabled, writes suppressed",
+                self._agent_context,
+            )
 
         # Build env for hook shell-outs (GPU endpoints, profile)
         for var in ("CLAWMEM_EMBED_URL", "CLAWMEM_LLM_URL", "CLAWMEM_RERANK_URL", "CLAWMEM_PROFILE"):
@@ -410,7 +431,11 @@ class ClawMemProvider(MemoryProvider):
         """Append turn to plugin-managed transcript JSONL.
 
         Writes in Claude Code transcript format so ClawMem hooks can read it.
+        Suppressed for non-primary agent contexts (subagent/cron/flush) so the
+        vault never absorbs system-prompt or background-task content.
         """
+        if self._agent_context != "primary":
+            return
         if not self._transcript_path:
             return
 
@@ -441,7 +466,15 @@ class ClawMemProvider(MemoryProvider):
     # -- Session end / compression hooks ---------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Run extraction hooks in parallel."""
+        """Run extraction hooks in parallel.
+
+        Suppressed for non-primary agent contexts (subagent/cron/flush) — the
+        decision-extractor / handoff-generator / feedback-loop pipeline would
+        otherwise capture cron system prompts or subagent intermediate state
+        as if it were primary-agent reasoning.
+        """
+        if self._agent_context != "primary":
+            return
         if not self._bin or not self._transcript_path:
             return
 
@@ -470,7 +503,13 @@ class ClawMemProvider(MemoryProvider):
         logger.info("clawmem: session %s extraction complete", self._session_id[:8])
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Run precompact-extract (side effect only — Hermes ignores return)."""
+        """Run precompact-extract (side effect only — Hermes ignores return).
+
+        Suppressed for non-primary agent contexts so the precompact state file
+        in auto-memory never picks up cron/subagent context as primary state.
+        """
+        if self._agent_context != "primary":
+            return ""
         if not self._bin or not self._transcript_path:
             return ""
 
