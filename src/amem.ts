@@ -34,6 +34,34 @@ function uniqueStrings(values: string[]): string[] {
   return out;
 }
 
+type LinkRelationType = 'semantic' | 'supporting' | 'contradicts';
+
+type ParsedLinkGeneration = {
+  target_idx: number;
+  link_type: LinkRelationType;
+  confidence: number;
+  reasoning: string;
+};
+
+
+function isLinkRelationType(value: unknown): value is LinkRelationType {
+  return value === 'semantic' || value === 'supporting' || value === 'contradicts';
+}
+
+function isUnitIntervalNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function isParsedLinkGeneration(value: unknown): value is ParsedLinkGeneration {
+  if (!value || typeof value !== 'object') return false;
+  const link = value as Record<string, unknown>;
+  return Number.isInteger(link.target_idx) &&
+    (link.target_idx as number) > 0 &&
+    isLinkRelationType(link.link_type) &&
+    isUnitIntervalNumber(link.confidence) &&
+    typeof link.reasoning === 'string';
+}
+
 export function parseMemoryNoteFromLLM(raw: string): MemoryNote | null {
   const parsed = extractJsonFromLLM(raw) as Partial<MemoryNote> | null;
   if (parsed && Array.isArray(parsed.keywords)) {
@@ -58,37 +86,26 @@ export function parseMemoryNoteFromLLM(raw: string): MemoryNote | null {
   };
 }
 
+export function parseLinkGenerationFromLLM(raw: string): ParsedLinkGeneration[] | null {
+  const parsed = extractJsonFromLLM(raw) as { result?: unknown } | unknown[] | null;
+  const wrapped = parsed && typeof parsed === 'object' ? parsed as { result?: unknown } : null;
+  const items = Array.isArray(parsed)
+    ? parsed
+    : wrapped && Array.isArray(wrapped.result)
+      ? wrapped.result
+      : null;
 
-export function parseLinkGenerationFromLLM(raw: string): Array<{
-  target_idx: number;
-  link_type: 'semantic' | 'supporting' | 'contradicts';
-  confidence: number;
-  reasoning: string;
-}> | null {
-  const parsed = extractJsonFromLLM(raw) as Array<{
-    target_idx: number;
-    link_type: 'semantic' | 'supporting' | 'contradicts';
-    confidence: number;
-    reasoning: string;
-  }> | {
-    result?: Array<{
-      target_idx: number;
-      link_type: 'semantic' | 'supporting' | 'contradicts';
-      confidence: number;
-      reasoning: string;
-    }>;
-  } | null;
-
-  if (Array.isArray(parsed)) return parsed;
-  if (parsed && Array.isArray(parsed.result)) return parsed.result;
-  return null;
+  if (!items) return null;
+  const validItems = items.filter(isParsedLinkGeneration);
+  return validItems.length === items.length ? validItems : null;
 }
 
-
 function tryParseJsonWithCommaRepair(text: string): any | null {
-  const repaired = text
-    .replace(/(\]|\}|"(?:[^"\\]|\\.)*"|\d(?:[\d.eE+-])*)(\s*\n\s*")/g, '$1,$2')
-    .replace(/(\]|\}|"(?:[^"\\]|\\.)*"|\d(?:[\d.eE+-])*)(\s+")/g, '$1,$2');
+  // Repair missing commas between object fields without rewriting adjacent array strings.
+  const repaired = text.replace(
+    /(\]|\}|"(?:[^"\\]|\\.)*"|-?\d(?:[\d.eE+-])*|true|false|null)(\s*"[^"\n]+"\s*:)/g,
+    '$1,$2'
+  );
   if (repaired === text) return null;
   try {
     return JSON.parse(repaired);
@@ -97,25 +114,49 @@ function tryParseJsonWithCommaRepair(text: string): any | null {
   }
 }
 
+function extractBalancedJsonCandidate(text: string): string | null {
+  if (text[0] !== '{' && text[0] !== '[') return null;
 
-/**
- * Extract and parse JSON from LLM output, handling:
- * - Markdown code blocks (```json ... ```)
- * - Leading/trailing prose around JSON
- * - Truncated JSON from token limits (repairs arrays/objects)
- */
-export function extractJsonFromLLM(raw: string): any | null {
-  let text = raw.trim();
+  const stack: string[] = [text[0]!];
+  let inString = false;
+  let escaped = false;
 
-  // Strip markdown code blocks only when output starts with fenced JSON
-  if (text.startsWith('```')) {
-    const codeBlock = text.match(/```(?:json)?\s*\n?([\s\S]*?)(?:\n```|$)/);
-    if (codeBlock) {
-      text = codeBlock[1]!.trim();
+  for (let i = 1; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '{' || ch === '[') {
+      stack.push(ch);
+      continue;
+    }
+
+    if (ch === '}' || ch === ']') {
+      const expected = ch === '}' ? '{' : '[';
+      if (stack[stack.length - 1] !== expected) return null;
+      stack.pop();
+      if (stack.length === 0) return text.slice(0, i + 1);
     }
   }
 
-  // Find the first [ or { to skip leading prose
+  return null;
+}
+
+function parseJsonCandidate(raw: string): any | null {
+  let text = raw.trim();
   const arrStart = text.indexOf('[');
   const objStart = text.indexOf('{');
   if (arrStart === -1 && objStart === -1) return null;
@@ -123,17 +164,25 @@ export function extractJsonFromLLM(raw: string): any | null {
   const start = arrStart === -1 ? objStart : objStart === -1 ? arrStart : Math.min(arrStart, objStart);
   text = text.slice(start);
 
-  // Try parsing as-is first
   try {
     return JSON.parse(text);
   } catch {
-    // Try lightweight repairs before truncation handling
+    // Try extracting the first balanced JSON value before lighter repairs.
+  }
+
+  const balancedCandidate = extractBalancedJsonCandidate(text);
+  if (balancedCandidate && balancedCandidate !== text) {
+    try {
+      return JSON.parse(balancedCandidate);
+    } catch {
+      const repairedBalanced = tryParseJsonWithCommaRepair(balancedCandidate);
+      if (repairedBalanced !== null) return repairedBalanced;
+    }
   }
 
   const commaRepaired = tryParseJsonWithCommaRepair(text);
   if (commaRepaired !== null) return commaRepaired;
 
-  // Attempt truncated JSON repair
   if (text.startsWith('[')) {
     const lastBrace = text.lastIndexOf('}');
     if (lastBrace > 0) {
@@ -153,6 +202,200 @@ export function extractJsonFromLLM(raw: string): any | null {
         try { return JSON.parse(candidate); } catch { /* continue */ }
       }
     }
+  }
+
+  return null;
+}
+
+function collectFenceBlocks(text: string): Array<{ start: number; end: number; tag: string | null; body: string }> {
+  const lines = text.split('\n');
+  const fences: Array<{ start: number; end: number; tag: string | null; body: string }> = [];
+  let offset = 0;
+  let open: { start: number; tag: string | null; bodyLines: string[] } | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const lineStart = offset;
+    const lineEnd = offset + line.length;
+
+    if (!open) {
+      const match = trimmed.match(/^```([^\s`]*)?\s*$/);
+      if (match) {
+        open = { start: lineStart, tag: match[1] || null, bodyLines: [] };
+      }
+    } else if (trimmed === '```') {
+      fences.push({
+        start: open.start,
+        end: Math.min(text.length, lineEnd + 1),
+        tag: open.tag,
+        body: open.bodyLines.join('\n').trim(),
+      });
+      open = null;
+    } else {
+      open.bodyLines.push(line);
+    }
+
+    offset = lineEnd + 1;
+  }
+
+  if (open) {
+    fences.push({
+      start: open.start,
+      end: text.length,
+      tag: open.tag,
+      body: open.bodyLines.join('\n').trim(),
+    });
+  }
+
+  return fences;
+}
+
+function stripAnyFences(text: string): string {
+  const ranges = collectAnyFenceRanges(text);
+  if (ranges.length === 0) return text.trim();
+
+  let out = '';
+  let cursor = 0;
+  for (const range of ranges) {
+    out += text.slice(cursor, range.start);
+    cursor = range.end;
+  }
+  out += text.slice(cursor);
+  return out.trim();
+}
+
+function collectStructuralFences(text: string): Array<{ body: string; isJson: boolean; start: number; end: number }> {
+  return collectFenceBlocks(text)
+    .filter((fence) => fence.tag === null || fence.tag === 'json')
+    .map((fence) => ({
+      body: fence.body,
+      isJson: fence.tag === 'json',
+      start: fence.start,
+      end: fence.end,
+    }));
+}
+
+function collectAnyFenceRanges(text: string): Array<{ start: number; end: number }> {
+  return collectFenceBlocks(text).map((fence) => ({ start: fence.start, end: fence.end }));
+}
+
+function findFirstJsonStartOutsideFences(
+  text: string,
+  fences: Array<{ start: number; end: number }>
+ ): number {
+  let fenceIndex = 0;
+  for (let i = 0; i < text.length; i++) {
+    while (fenceIndex < fences.length && i >= fences[fenceIndex]!.end) {
+      fenceIndex++;
+    }
+    if (fenceIndex < fences.length) {
+      const fence = fences[fenceIndex]!;
+      if (i >= fence.start && i < fence.end) {
+        i = fence.end - 1;
+        continue;
+      }
+    }
+    if (text[i] === '[' || text[i] === '{') return i;
+  }
+  return -1;
+}
+
+function hasExampleCueBefore(text: string, index: number): boolean {
+  let end = index;
+  while (end > 0 && /\s/.test(text[end - 1]!)) end--;
+  const lineStart = text.lastIndexOf('\n', end - 1) + 1;
+  const cue = text.slice(lineStart, end).toLowerCase();
+  return cue.includes('example') || cue.includes('e.g.');
+}
+
+function hasPayloadCueBefore(text: string, index: number): boolean {
+  let end = index;
+  while (end > 0 && /\s/.test(text[end - 1]!)) end--;
+  const lineStart = text.lastIndexOf('\n', end - 1) + 1;
+  const cue = text.slice(lineStart, end).trim().toLowerCase();
+  return /^(actual|result|final|answer)(?:\s+(json|answer|response|payload))?[:\-]?$/.test(cue);
+}
+/**
+ * Extract and parse JSON from LLM output, handling:
+ * - Markdown code blocks (```json ... ```)
+ * - Leading/trailing prose around JSON
+ * - Truncated JSON from token limits (repairs arrays/objects)
+ */
+export function extractJsonFromLLM(raw: string): any | null {
+  const text = raw.trim();
+  if (!text) return null;
+
+  const fences = collectStructuralFences(text);
+  const jsonFences = fences.filter((fence) => fence.isJson);
+  const anyFenceRanges = collectAnyFenceRanges(text);
+  const outsideJsonStart = findFirstJsonStartOutsideFences(text, anyFenceRanges);
+  const outsideLooksLikeExample = outsideJsonStart !== -1 && hasExampleCueBefore(text, outsideJsonStart);
+  const outsideLooksLikePayload = outsideJsonStart !== -1 && hasPayloadCueBefore(text, outsideJsonStart);
+  const preferredJsonFences = jsonFences.filter((fence) =>
+    !hasExampleCueBefore(text, fence.start) &&
+    !(text.startsWith('```') && fence.start === fences[0]?.start && outsideLooksLikePayload)
+  );
+  const preferredUntaggedFences = fences.filter((fence) => !fence.isJson && !hasExampleCueBefore(text, fence.start));
+  const firstPreferredJsonFence = preferredJsonFences[0] ?? null;
+  const firstPreferredUntaggedFence = preferredUntaggedFences[0] ?? null;
+  const untaggedFenceLooksLikeExample = firstPreferredUntaggedFence ? hasExampleCueBefore(text, firstPreferredUntaggedFence.start) : false;
+  const tryOutsideBeforeJsonFences = outsideJsonStart !== -1 &&
+    (!firstPreferredJsonFence || outsideJsonStart < firstPreferredJsonFence.start) &&
+    !outsideLooksLikeExample;
+
+  if (text.startsWith('```') && fences[0]?.start === 0 && !outsideLooksLikePayload && (fences[0]!.isJson || preferredJsonFences.length === 0)) {
+    const parsedLeadingFence = parseJsonCandidate(fences[0]!.body);
+    if (parsedLeadingFence !== null) return parsedLeadingFence;
+  }
+
+  const tryOutsideFences = () => {
+    const withoutFences = stripAnyFences(text);
+    if (!withoutFences || withoutFences === text) return null;
+    return parseJsonCandidate(withoutFences);
+  };
+
+  if (!text.startsWith('```') && !firstPreferredJsonFence && firstPreferredUntaggedFence && outsideLooksLikeExample && !untaggedFenceLooksLikeExample) {
+    const parsedUntaggedFence = parseJsonCandidate(firstPreferredUntaggedFence.body);
+    if (parsedUntaggedFence !== null) return parsedUntaggedFence;
+  }
+
+  if (tryOutsideBeforeJsonFences) {
+    const parsedOutsideFences = tryOutsideFences();
+    if (parsedOutsideFences !== null) return parsedOutsideFences;
+  }
+
+  for (const fence of preferredJsonFences) {
+    const parsedJsonFence = parseJsonCandidate(fence.body);
+    if (parsedJsonFence !== null) return parsedJsonFence;
+  }
+
+  if (!tryOutsideBeforeJsonFences) {
+    const parsedOutsideFences = tryOutsideFences();
+    if (parsedOutsideFences !== null) return parsedOutsideFences;
+  }
+
+  if (fences.length === 0) {
+    const parsedRaw = parseJsonCandidate(text);
+    if (parsedRaw !== null) return parsedRaw;
+  }
+
+  const fallbackFences = preferredJsonFences.length === 0
+    ? [
+        ...preferredUntaggedFences,
+        ...jsonFences.filter((fence) => hasExampleCueBefore(text, fence.start)),
+        ...(text.startsWith('```')
+          ? fences.slice(1).filter((fence) => !fence.isJson && hasExampleCueBefore(text, fence.start))
+          : fences.filter((fence) => !fence.isJson && hasExampleCueBefore(text, fence.start))),
+      ]
+    : [
+        ...jsonFences.filter((fence) => hasExampleCueBefore(text, fence.start)),
+        ...(text.startsWith('```')
+          ? fences.slice(1).filter((fence) => !fence.isJson)
+          : fences.filter((fence) => !fence.isJson)),
+      ];
+  for (const fence of fallbackFences) {
+    const parsedFence = parseJsonCandidate(fence.body);
+    if (parsedFence !== null) return parsedFence;
   }
 
   return null;
@@ -370,7 +613,7 @@ Return ONLY valid JSON array in this exact format:
   }
 ]
 
-Return between 0 and ${neighbors.length} items. Use an empty JSON array [] if no meaningful links exist. Do not include explanations outside JSON.`;
+Include all ${neighbors.length} neighbors in your response.`;
 
     const result = await llm.generate(prompt, {
       temperature: 0.3,
@@ -391,22 +634,35 @@ Return between 0 and ${neighbors.length} items. Use an empty JSON array [] if no
       return 0;
     }
 
+    const expectedTargetIndexes = new Set<number>();
+    for (const link of parsed) {
+      if (link.target_idx > neighbors.length || expectedTargetIndexes.has(link.target_idx)) {
+        console.log(`[amem] RAW link generation output for docId ${docId}:`);
+        console.log(result.text);
+        console.log(`[amem] Incomplete/invalid link batch for docId ${docId}`);
+        return 0;
+      }
+      expectedTargetIndexes.add(link.target_idx);
+    }
+    if (expectedTargetIndexes.size !== neighbors.length) {
+      console.log(`[amem] RAW link generation output for docId ${docId}:`);
+      console.log(result.text);
+      console.log(`[amem] Incomplete/invalid link batch for docId ${docId}`);
+      return 0;
+    }
+
     // Insert links into memory_relations
     let linksCreated = 0;
     const now = new Date().toISOString();
 
     for (const link of parsed) {
-      // Validate link structure
-      if (typeof link.target_idx !== 'number' ||
-          link.target_idx < 1 ||
-          link.target_idx > neighbors.length ||
-          !['semantic', 'supporting', 'contradicts'].includes(link.link_type) ||
-          typeof link.confidence !== 'number') {
-        continue;
-      }
-
       const neighbor = neighbors[link.target_idx - 1];
-      if (!neighbor) continue;
+      if (!neighbor) {
+        console.log(`[amem] RAW link generation output for docId ${docId}:`);
+        console.log(result.text);
+        console.log(`[amem] Missing neighbor for validated link batch docId ${docId}`);
+        return 0;
+      }
 
       // Insert link with INSERT OR IGNORE for idempotency
       store.db.prepare(`
