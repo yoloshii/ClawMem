@@ -1491,6 +1491,7 @@ async function cmdSetupOpenClaw(args: string[]) {
   console.log(`  3. Configure GPU endpoints (if not using defaults):`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlm http://YOUR_GPU:8089${c.reset}`);
+  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlmModel qwen3${c.reset}`);
   console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuRerank http://YOUR_GPU:8090${c.reset}`);
   console.log();
   console.log(`  4. Start the REST API (for agent tools):`);

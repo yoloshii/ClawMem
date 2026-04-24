@@ -41,6 +41,23 @@
       "help": "URL for ClawMem LLM (query expansion, extraction)",
       "advanced": true
     },
+    "gpuLlmModel": {
+      "label": "LLM Model",
+      "placeholder": "qwen3",
+      "help": "Model name sent to the configured LLM endpoint",
+      "advanced": true
+    },
+    "gpuLlmReasoningEffort": {
+      "label": "Reasoning Effort",
+      "placeholder": "(unset)",
+      "help": "Optional top-level reasoning_effort for Chat Completions endpoints that support it. Unset omits the field.",
+      "advanced": true
+    },
+    "gpuLlmNoThink": {
+      "label": "Append /no_think",
+      "help": "Append /no_think to remote LLM prompts (default: true). Disable for standard OpenAI models.",
+      "advanced": true
+    },
     "gpuRerank": {
       "label": "Reranker Endpoint",
       "placeholder": "http://localhost:8090",
@@ -77,6 +94,16 @@
       },
       "gpuLlm": {
         "type": "string"
+      },
+      "gpuLlmModel": {
+        "type": "string"
+      },
+      "gpuLlmReasoningEffort": {
+        "type": "string",
+        "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+      },
+      "gpuLlmNoThink": {
+        "type": "boolean"
       },
       "gpuRerank": {
         "type": "string"

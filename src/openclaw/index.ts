@@ -107,6 +107,13 @@ const clawmemPlugin = {
       env: {
         ...(pluginCfg.gpuEmbed ? { CLAWMEM_EMBED_URL: pluginCfg.gpuEmbed as string } : {}),
         ...(pluginCfg.gpuLlm ? { CLAWMEM_LLM_URL: pluginCfg.gpuLlm as string } : {}),
+        ...(pluginCfg.gpuLlmModel ? { CLAWMEM_LLM_MODEL: pluginCfg.gpuLlmModel as string } : {}),
+        ...(pluginCfg.gpuLlmReasoningEffort
+          ? { CLAWMEM_LLM_REASONING_EFFORT: pluginCfg.gpuLlmReasoningEffort as string }
+          : {}),
+        ...(pluginCfg.gpuLlmNoThink !== undefined
+          ? { CLAWMEM_LLM_NO_THINK: String(pluginCfg.gpuLlmNoThink) }
+          : {}),
         ...(pluginCfg.gpuRerank ? { CLAWMEM_RERANK_URL: pluginCfg.gpuRerank as string } : {}),
         CLAWMEM_PROFILE: profile,
       },

@@ -208,6 +208,7 @@ If GPU services run on a different machine, add environment overrides to both se
 [Service]
 Environment=CLAWMEM_EMBED_URL=http://gpu-host:8088
 Environment=CLAWMEM_LLM_URL=http://gpu-host:8089
+Environment=CLAWMEM_LLM_MODEL=qwen3
 Environment=CLAWMEM_RERANK_URL=http://gpu-host:8090
 ```
 
@@ -219,6 +220,7 @@ cat > ~/.config/systemd/user/clawmem-watcher.service.d/gpu.conf << 'EOF'
 [Service]
 Environment=CLAWMEM_EMBED_URL=http://gpu-host:8088
 Environment=CLAWMEM_LLM_URL=http://gpu-host:8089
+Environment=CLAWMEM_LLM_MODEL=qwen3
 Environment=CLAWMEM_RERANK_URL=http://gpu-host:8090
 EOF
 systemctl --user daemon-reload

@@ -106,7 +106,9 @@ Point `CLAWMEM_LLM_URL` at a more capable model for all LLM tasks (query expansi
 
 ```bash
 # Example: use a 7B+ model instead of QMD 1.7B
-CLAWMEM_LLM_URL=http://localhost:8091 clawmem reindex --enrich
+CLAWMEM_LLM_URL=http://localhost:8091 \
+CLAWMEM_LLM_MODEL=your-7b-model \
+clawmem reindex --enrich
 ```
 
 Trade-off: query expansion is already well-served by QMD — a larger model is slower for the same task with marginal gains. Entity extraction benefits more.
@@ -117,7 +119,9 @@ Point the LLM at a cloud endpoint for higher-quality extraction. Any OpenAI-comp
 
 ```bash
 # Example: use an OpenAI-compatible API
-CLAWMEM_LLM_URL=https://api.example.com/v1 clawmem reindex --enrich
+CLAWMEM_LLM_URL=https://api.example.com/v1 \
+CLAWMEM_LLM_MODEL=gpt-5.4-mini \
+clawmem reindex --enrich
 ```
 
 Trade-off: cloud API calls have per-token costs. With 261 documents at ~2000 tokens each, a full re-enrichment is roughly 500K input tokens.
