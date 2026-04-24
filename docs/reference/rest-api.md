@@ -195,6 +195,7 @@ For remote GPU setups, add environment overrides (same pattern as the [watcher s
 ```ini
 Environment=CLAWMEM_EMBED_URL=http://gpu-host:8088
 Environment=CLAWMEM_LLM_URL=http://gpu-host:8089
+Environment=CLAWMEM_LLM_MODEL=qwen3
 Environment=CLAWMEM_RERANK_URL=http://gpu-host:8090
 ```
 

@@ -238,6 +238,23 @@ export type LlamaCppConfig = {
    */
   remoteLlmUrl?: string;
   /**
+   * Remote LLM model name to send with chat completion requests.
+   * Env: CLAWMEM_LLM_MODEL
+   */
+  remoteLlmModel?: string;
+  /**
+   * Optional top-level reasoning_effort field for Chat Completions endpoints that support it.
+   * Example values: none, minimal, low, medium, high, xhigh.
+   * Env: CLAWMEM_LLM_REASONING_EFFORT
+   */
+  remoteLlmReasoningEffort?: string;
+  /**
+   * Whether to append /no_think to remote LLM prompts.
+   * Defaults to true to preserve current behavior with Qwen3-compatible endpoints.
+   * Env: CLAWMEM_LLM_NO_THINK
+   */
+  remoteLlmNoThink?: boolean;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -259,6 +276,23 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 2 minutes
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
+const ALLOWED_REMOTE_LLM_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+function normalizeRemoteLlmReasoningEffort(value?: string): string | null {
+  const raw = (value || "").trim().toLowerCase();
+  if (!raw) return null;
+  if (!ALLOWED_REMOTE_LLM_REASONING_EFFORTS.has(raw)) {
+    console.warn(`[clawmem] Ignoring unsupported remoteLlmReasoningEffort=${raw}`);
+    return null;
+  }
+  return raw;
+}
+
+function buildRemoteChatCompletionsUrl(remoteLlmUrl: string): string {
+  const baseUrl = remoteLlmUrl.replace(/\/+$/, "");
+  const endpoint = baseUrl.endsWith("/v1") ? "/chat/completions" : "/v1/chat/completions";
+  return `${baseUrl}${endpoint}`;
+}
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
@@ -276,6 +310,9 @@ export class LlamaCpp implements LLM {
   private remoteEmbedApiKey: string | null;
   private remoteEmbedModel: string;
   private remoteLlmUrl: string | null;
+  private remoteLlmModel: string;
+  private remoteLlmReasoningEffort: string | null;
+  private remoteLlmNoThink: boolean;
 
   // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -306,6 +343,10 @@ export class LlamaCpp implements LLM {
     this.remoteEmbedApiKey = config.remoteEmbedApiKey || null;
     this.remoteEmbedModel = config.remoteEmbedModel || "embedding";
     this.remoteLlmUrl = config.remoteLlmUrl || null;
+    const normalizedRemoteLlmModel = config.remoteLlmModel?.trim();
+    this.remoteLlmModel = normalizedRemoteLlmModel || "qwen3";
+    this.remoteLlmReasoningEffort = normalizeRemoteLlmReasoningEffort(config.remoteLlmReasoningEffort);
+    this.remoteLlmNoThink = config.remoteLlmNoThink ?? true;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -921,15 +962,19 @@ export class LlamaCpp implements LLM {
     // Re-check: concurrent call may have set cooldown while we were awaited
     if (this.isRemoteLlmDown()) return null;
     try {
-      const resp = await fetch(`${this.remoteLlmUrl}/v1/chat/completions`, {
+      const body: Record<string, unknown> = {
+        model: this.remoteLlmModel,
+        messages: [{ role: "user", content: this.remoteLlmNoThink ? `${prompt} /no_think` : prompt }],
+        max_tokens: maxTokens,
+        temperature,
+      };
+      if (this.remoteLlmReasoningEffort) {
+        body.reasoning_effort = this.remoteLlmReasoningEffort;
+      }
+      const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "qwen3",
-          messages: [{ role: "user", content: `${prompt} /no_think` }],
-          max_tokens: maxTokens,
-          temperature,
-        }),
+        body: JSON.stringify(body),
         signal,
       });
 
@@ -1254,6 +1299,13 @@ export function getDefaultLlamaCpp(): LlamaCpp {
       remoteEmbedApiKey: embedApiKey,
       remoteEmbedModel: process.env.CLAWMEM_EMBED_MODEL || undefined,
       remoteLlmUrl: process.env.CLAWMEM_LLM_URL || undefined,
+      remoteLlmModel: process.env.CLAWMEM_LLM_MODEL?.trim() || undefined,
+      remoteLlmReasoningEffort: process.env.CLAWMEM_LLM_REASONING_EFFORT || undefined,
+      remoteLlmNoThink: (() => {
+        const raw = (process.env.CLAWMEM_LLM_NO_THINK || "").trim().toLowerCase();
+        if (!raw) return undefined;
+        return !["0", "false", "no", "off"].includes(raw);
+      })(),
     });
   }
   return defaultLlamaCpp;
@@ -1276,4 +1328,3 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     defaultLlamaCpp = null;
   }
 }
-
