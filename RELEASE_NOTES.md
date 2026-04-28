@@ -4,6 +4,58 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.2 — Configurable remote LLM endpoints + doc maintenance
+
+v0.10.2 is a small patch release. The retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, and OpenClaw plugin registration shape are all unchanged from v0.10.0/v0.10.1. The release adds three opt-in env vars for users running ClawMem against OpenAI-compatible remote LLM proxies, fixes a `/v1` URL-doubling edge case in the remote LLM transport, and applies two small doc updates that were sitting in the working tree.
+
+Vaults from v0.10.1 are byte-identical at rest. No schema migration. **Default behavior is byte-identical for users with no new env vars set** — same hard-coded `qwen3` model, same `/no_think` suffix, same request body field order, same `http://localhost:8089/v1/chat/completions` URL. Pure `git pull` upgrade.
+
+### Configurable remote LLM endpoints (PR #8 by @DrJsPBs)
+
+The remote LLM transport in `src/llm.ts` previously hard-coded `model: "qwen3"` and the `/no_think` prompt suffix in the `/v1/chat/completions` request body. That worked for the QMD native combo (qmd-query-expansion-1.7B on `:8089` via `llama-server`) but blocked anyone wanting to point ClawMem at an OpenAI-compatible proxy with a different model name or at a non-Qwen endpoint that treats `/no_think` as literal prompt text. v0.10.2 adds three opt-in env vars to make all three knobs user-configurable while preserving the existing defaults exactly:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent in the request body. Override for OpenAI-compatible proxies (e.g. `gpt-5.4-mini`). |
+| `CLAWMEM_LLM_REASONING_EFFORT` | (unset, field omitted) | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it. Validated against the enum `none / minimal / low / medium / high / xhigh`; unsupported values log a warning and are ignored. Leave unset for llama-server / vLLM unless your serving stack explicitly accepts the field. |
+| `CLAWMEM_LLM_NO_THINK` | `true` | Append `/no_think` to remote prompts. Set `false` for standard OpenAI models and other endpoints that reject or treat the Qwen-style suffix as literal prompt text. |
+
+The settings are threaded through both plugin layers:
+
+- **OpenClaw plugin** — `src/openclaw/openclaw.plugin.json` exposes `gpuLlmModel`, `gpuLlmReasoningEffort` (with the same enum constraint), and `gpuLlmNoThink` config keys. `src/openclaw/index.ts` maps each to the corresponding `CLAWMEM_LLM_*` env var only when the user explicitly set it (so unset config falls through to the runtime default rather than overriding it with an empty string).
+- **Hermes plugin** — `src/hermes/__init__.py` adds the three keys to its `get_config_schema()` (all `secret: False`) and to the env-passthrough tuple in `initialize()`. The module docstring lists them alongside the existing `CLAWMEM_LLM_URL`.
+
+#### `/v1` URL doubling fix
+
+The pre-PR transport posted to `${remoteLlmUrl}/v1/chat/completions` unconditionally. If a user set `CLAWMEM_LLM_URL=https://api.example.com/v1` (a common shape for OpenAI-compatible proxies that document their base URL with `/v1` already included), the request went to `https://api.example.com/v1/v1/chat/completions` and 404'd. v0.10.2 introduces `buildRemoteChatCompletionsUrl()` which strips trailing slashes, detects an existing `/v1` suffix, and only appends `/chat/completions` in that case. All four shapes now resolve correctly: `http://host`, `http://host/`, `http://host/v1`, `http://host/v1/`.
+
+#### Validation centralization
+
+`normalizeRemoteLlmReasoningEffort()` is now the single normalization point for the reasoning-effort value. Previously the env-bootstrap path did its own `.trim().toLowerCase() + Set check` and the constructor did nothing — so a direct caller passing `LlamaCpp({remoteLlmReasoningEffort: "  HIGH  "})` would have posted `"reasoning_effort":"  HIGH  "` to the endpoint while the env path correctly normalized it to `"high"`. The constructor now calls the helper for both paths, so env and direct config behave identically. `CLAWMEM_LLM_MODEL` is also trimmed at both surfaces (defense-in-depth — whitespace-padded values from `.env`-style configs no longer post `"model":" gpt-5.4-mini "`).
+
+### Doc maintenance
+
+Two small doc changes that were sitting in the working tree from the v2026.4.18 / v2026.4.16-920 changelog surveys ride this release:
+
+- **`docs/guides/hermes-plugin.md`** — preventive warning added to the Install section: do NOT add `clawmem` to `plugins.enabled` in `~/.hermes/config.yaml`. Hermes #11xxx onwards made all general plugins opt-in by default; `plugins.enabled` is the general-plugin opt-in roster, not the memory-provider activation channel. Memory providers are activated via `memory.provider: clawmem`, completely separate from the general plugin loader. Adding `clawmem` to `plugins.enabled` would cause the general loader to import it as a `kind: standalone` plugin and call `register(ctx)` against the general `PluginContext` — which doesn't expose `register_memory_provider`, so the import errors and a warning gets logged. Harmless but noisy. The warning heads off the easy mistake for users reading the install path docs literally and conflating the two settings.
+- **`src/openclaw/index.ts`** — cosmetic line-ref drift fix in the file-header docstring and correctness-contract comments. OpenClaw's `before_prompt_build` is still awaited at `attempt.ts:1873` (was `:1642` at v2026.4.18 cutoff); `agent_end` is still fire-and-forget at `attempt.ts:2470-2496` (was `:2198-2224`). No semantic change — the await/fire-and-forget contracts hold; only the line numbers in our reference comments shifted.
+
+### External credit
+
+- **@DrJsPBs / @DrJLabs** — opened yoloshii/ClawMem#8 with the configurable remote LLM env vars, the OpenClaw + Hermes plumbing, the `/v1` URL doubling fix, the validation centralization, and 5 new contract tests covering whitespace handling, URL normalization, env-vs-direct config consistency, and the byte-identical default-preservation contract. The PR went through two adversarial review rounds (gpt-5.4 high reasoning each side); the contributor independently identified and folded in fork-review extras (the `/v1` fix being the standout) within the same PR scope. Cross-validated in their downstream `DrJLabs/ClawMem` fork before opening upstream — exactly the integration discipline the v0.7.x community-contributor track has been rewarding.
+
+### Test coverage
+
+PR #8 adds three new test files:
+
+- `tests/unit/llm-remote-config.test.ts` (new) — the contract tests for the new env vars and the `/v1` URL builder
+- `tests/unit/hermes-plugin.test.ts` (new) — covers the schema additions
+- `tests/unit/openclaw-plugin.test.ts` extended — covers the env-mapping consistency
+
+Targeted suite: **97 pass / 0 fail / 171 expect() calls** across the three files (was 92 pre-PR; +5 new tests).
+
+---
+
 ## v0.10.1 — Hermes agent_context isolation + OpenClaw v2026.4.18 / Hermes v2026.4.16+ doc maintenance
 
 v0.10.1 is a small patch release. The retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, and OpenClaw plugin registration shape are all unchanged from v0.10.0. The release covers two upstream changelog reviews against the OpenClaw and Hermes runtimes ClawMem integrates with — neither produced any breaking changes — plus one correctness fix in the Hermes plugin and a small set of doc updates that keep the public-facing surfaces aligned with the runtimes users are actually running.

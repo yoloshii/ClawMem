@@ -22,6 +22,10 @@ cp -r /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
 
 Discovery is heuristic — Hermes looks for `register_memory_provider` or `MemoryProvider` substrings in `__init__.py`. Both are present in `src/hermes/__init__.py`, so the plugin is discovered correctly under either path.
 
+Activate via `memory.provider: clawmem` in `~/.hermes/config.yaml` (or run `hermes memory setup` and pick `clawmem`). Memory providers are an exclusive category — exactly one is active at a time, selected via `memory.provider`, completely separate from the general plugin loader.
+
+> **Do NOT add `clawmem` to `plugins.enabled` in `config.yaml`.** That list is the general-plugin opt-in roster (Hermes #11xxx onwards made all general plugins opt-in by default). Memory providers have their own activation channel via `memory.provider` and the general loader explicitly skips bundled `plugins/memory/` and treats user-installed memory providers as separate from the standalone-plugin gate. Adding `clawmem` to `plugins.enabled` would make the general loader try to import it as a `kind: standalone` plugin and call `register(ctx)` against the general `PluginContext` — which doesn't expose `register_memory_provider`, so the import errors and the warning gets logged. Harmless but noisy.
+
 Verify discovery:
 ```bash
 hermes memory list   # Should show "clawmem" as available

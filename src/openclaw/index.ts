@@ -37,8 +37,8 @@
  *   4. REST API service (`clawmem serve`) lifecycle — unchanged.
  *
  * §14.3 critical correctness contract: `agent_end` is fire-and-forget at
- * `attempt.ts:2198-2224`. Precompact-extract MUST run inside
- * `handleBeforePromptBuild` (which IS awaited at `attempt.ts:1642`), gated
+ * `attempt.ts:2470-2496`. Precompact-extract MUST run inside
+ * `handleBeforePromptBuild` (which IS awaited at `attempt.ts:1873`), gated
  * by the proximity heuristic in `compaction-threshold.ts`. See `engine.ts`
  * top-of-file comment for the full rationale.
  */
@@ -161,7 +161,7 @@ const clawmemPlugin = {
     // ----- Plugin Hook: before_prompt_build (AWAITED — load-bearing path) -----
     // Both context-surfacing retrieval injection and pre-emptive precompact
     // extraction live here. handleBeforePromptBuild is async and the OpenClaw
-    // attempt path awaits the result at attempt.ts:1642 before building the
+    // attempt path awaits the result at attempt.ts:1873 before building the
     // effective prompt. precompact-extract therefore runs strictly before
     // the LLM call that could trigger compaction on this turn.
     api.on(
@@ -175,7 +175,7 @@ const clawmemPlugin = {
     // ----- Plugin Hook: agent_end (FIRE-AND-FORGET in core) -----
     // Decision-extractor, handoff-generator, and feedback-loop run here.
     // These writes are eventually-consistent (saveMemory dedupes), so the
-    // fire-and-forget context at attempt.ts:2198-2224 is acceptable.
+    // fire-and-forget context at attempt.ts:2470-2496 is acceptable.
     // precompact-extract is intentionally NOT in this handler — it lives
     // in handleBeforePromptBuild for correctness reasons.
     api.on("agent_end", async (event: AgentEndEvent, ctx: AgentEndContext) => {
