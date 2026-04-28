@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 
-import { extractJsonFromLLM, parseLinkGenerationFromLLM, parseMemoryNoteFromLLM } from "../../src/amem.ts";
+import { extractJsonFromLLM, generateMemoryLinks, parseLinkGenerationFromLLM, parseMemoryNoteFromLLM } from "../../src/amem.ts";
+import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
 
@@ -181,6 +182,29 @@ describe("extractJsonFromLLM", () => {
     const result = extractJsonFromLLM(raw);
     expect(result).toEqual([{ key: "value" }]);
   });
+
+  it("prefers fenced payloads over earlier prose bracket literals", () => {
+    const raw = 'Return empty array [] if no structured facts found.\n```json\n[{"title":"T","contentType":"decision","narrative":"N"}]\n```';
+    const result = extractJsonFromLLM(raw);
+    expect(result).toEqual([{ title: "T", contentType: "decision", narrative: "N" }]);
+  });
+
+  it("prefers fenced payloads when the conversation-synthesis prompt is echoed first", () => {
+    const raw = [
+      "The instruction was: Return ONLY valid JSON array. Return empty array [] if no structured facts found.",
+      "```json",
+      '[{"title":"T","contentType":"decision","narrative":"N"}]',
+      "```",
+    ].join("\n");
+    const result = extractJsonFromLLM(raw);
+    expect(result).toEqual([{ title: "T", contentType: "decision", narrative: "N" }]);
+  });
+
+  it("prefers later raw payloads over earlier prose schema literals", () => {
+    const raw = 'Schema: {"target_idx":1,"link_type":"semantic","confidence":0.9,"reasoning":"example"}\n[{"target_idx":1,"link_type":"semantic","confidence":0.8,"reasoning":"real"}]';
+    const result = extractJsonFromLLM(raw);
+    expect(result).toEqual([{ target_idx: 1, link_type: "semantic", confidence: 0.8, reasoning: "real" }]);
+  });
 });
 
 describe("parseMemoryNoteFromLLM", () => {
@@ -293,5 +317,76 @@ describe("parseLinkGenerationFromLLM", () => {
         reasoning: "one",
       },
     ]);
+  });
+
+  it("parses real link arrays after prose schema examples", () => {
+    const raw = 'Schema: {"target_idx":1,"link_type":"semantic","confidence":0.9,"reasoning":"example"}\n[{"target_idx":1,"link_type":"semantic","confidence":0.8,"reasoning":"real"}]';
+    const result = parseLinkGenerationFromLLM(raw);
+    expect(result).toEqual([
+      {
+        target_idx: 1,
+        link_type: "semantic",
+        confidence: 0.8,
+        reasoning: "real",
+      },
+    ]);
+  });
+});
+
+describe("generateMemoryLinks", () => {
+  it("inserts valid partial link batches instead of requiring all neighbors", async () => {
+    const store = createTestStore();
+    try {
+      const ids = seedDocuments(store, [
+        { path: "source.md", title: "Source", body: "source" },
+        { path: "n1.md", title: "Neighbor 1", body: "one" },
+        { path: "n2.md", title: "Neighbor 2", body: "two" },
+        { path: "n3.md", title: "Neighbor 3", body: "three" },
+        { path: "n4.md", title: "Neighbor 4", body: "four" },
+        { path: "n5.md", title: "Neighbor 5", body: "five" },
+      ]);
+
+      store.db.prepare("UPDATE documents SET amem_context = title").run();
+      store.ensureVecTable(2);
+
+      const rows = store.db.prepare("SELECT id, hash FROM documents ORDER BY id").all() as Array<{ id: number; hash: string }>;
+      const embeddings = new Map<number, [number, number]>([
+        [ids[0]!, [1, 0]],
+        [ids[1]!, [0.99, 0.01]],
+        [ids[2]!, [0.98, 0.02]],
+        [ids[3]!, [0.97, 0.03]],
+        [ids[4]!, [0.96, 0.04]],
+        [ids[5]!, [0.95, 0.05]],
+      ]);
+
+      for (const row of rows) {
+        const embedding = embeddings.get(row.id);
+        if (!embedding) throw new Error(`missing embedding for doc ${row.id}`);
+        store.insertEmbedding(row.hash, 0, 0, new Float32Array(embedding), "test", new Date().toISOString());
+      }
+
+      const llm = {
+        generate: async () => ({
+          text: JSON.stringify([
+            { target_idx: 1, link_type: "semantic", confidence: 0.8, reasoning: "one" },
+            { target_idx: 2, link_type: "supporting", confidence: 0.7, reasoning: "two" },
+            { target_idx: 3, link_type: "semantic", confidence: 0.6, reasoning: "three" },
+            { target_idx: 4, link_type: "contradicts", confidence: 0.5, reasoning: "four" },
+            { target_idx: 2, link_type: "contradicts", confidence: 0.9, reasoning: "duplicate" },
+            { target_idx: 99, link_type: "semantic", confidence: 0.4, reasoning: "out of range" },
+          ]),
+        }),
+      };
+
+      const created = await generateMemoryLinks(store, llm as any, ids[0]!, 5);
+      expect(created).toBe(4);
+
+      const relationCount = store.db.prepare(
+        "SELECT COUNT(*) as count FROM memory_relations WHERE source_id = ?"
+      ).get(ids[0]!) as { count: number };
+      expect(relationCount.count).toBe(4);
+    } finally {
+      store.close();
+    }
   });
 });

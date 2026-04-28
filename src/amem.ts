@@ -155,29 +155,95 @@ function extractBalancedJsonCandidate(text: string): string | null {
   return null;
 }
 
+function parseBalancedJsonValue(candidate: string): any | null {
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return tryParseJsonWithCommaRepair(candidate);
+  }
+}
+
+function jsonStartsAtTrimmedLineStart(text: string, index: number): boolean {
+  const lineStart = text.lastIndexOf('\n', index - 1) + 1;
+  return text.slice(lineStart, index).trim().length === 0;
+}
+
+function findLineStartJsonAfter(text: string, index: number): number {
+  for (let i = index; i < text.length; i++) {
+    if ((text[i] === '{' || text[i] === '[') && jsonStartsAtTrimmedLineStart(text, i)) return i;
+  }
+  return -1;
+}
+
+function isLikelyInlineProseLiteral(text: string, index: number): boolean {
+  return !jsonStartsAtTrimmedLineStart(text, index) && !hasPayloadCueBefore(text, index);
+}
+
+function collectParseableBalancedJsonCandidates(
+  text: string,
+  startIndex: number
+): Array<{ start: number; parsed: any }> {
+  const candidates: Array<{ start: number; parsed: any }> = [];
+  for (let i = startIndex; i < text.length; i++) {
+    if (text[i] !== '{' && text[i] !== '[') continue;
+
+    const balancedCandidate = extractBalancedJsonCandidate(text.slice(i));
+    if (!balancedCandidate) continue;
+
+    const parsed = parseBalancedJsonValue(balancedCandidate);
+    if (parsed !== null) candidates.push({ start: i, parsed });
+
+    i += balancedCandidate.length - 1;
+  }
+  return candidates;
+}
+
+function selectBalancedJsonCandidate(text: string, candidates: Array<{ start: number; parsed: any }>): any | null {
+  if (candidates.length === 0) return null;
+
+  const payloadCandidate = candidates.find((candidate) => hasPayloadCueBefore(text, candidate.start));
+  if (payloadCandidate) return payloadCandidate.parsed;
+
+  const first = candidates[0]!;
+  if (candidates.length > 1 && (hasExampleCueBefore(text, first.start) || isLikelyInlineProseLiteral(text, first.start))) {
+    const laterPayload = candidates.find((candidate) =>
+      !hasExampleCueBefore(text, candidate.start) && !isLikelyInlineProseLiteral(text, candidate.start)
+    );
+    if (laterPayload) return laterPayload.parsed;
+  }
+
+  return first.parsed;
+}
+
 function parseJsonCandidate(raw: string): any | null {
-  let text = raw.trim();
-  const arrStart = text.indexOf('[');
-  const objStart = text.indexOf('{');
+  const trimmed = raw.trim();
+  const arrStart = trimmed.indexOf('[');
+  const objStart = trimmed.indexOf('{');
   if (arrStart === -1 && objStart === -1) return null;
 
   const start = arrStart === -1 ? objStart : objStart === -1 ? arrStart : Math.min(arrStart, objStart);
-  text = text.slice(start);
+  const text = trimmed.slice(start);
 
   try {
     return JSON.parse(text);
   } catch {
-    // Try extracting the first balanced JSON value before lighter repairs.
+    // Try extracting balanced JSON values before lighter repairs.
   }
 
-  const balancedCandidate = extractBalancedJsonCandidate(text);
-  if (balancedCandidate && balancedCandidate !== text) {
-    try {
-      return JSON.parse(balancedCandidate);
-    } catch {
-      const repairedBalanced = tryParseJsonWithCommaRepair(balancedCandidate);
-      if (repairedBalanced !== null) return repairedBalanced;
+  const firstBalancedCandidate = extractBalancedJsonCandidate(text);
+  if (firstBalancedCandidate) {
+    if (hasExampleCueBefore(trimmed, start) || isLikelyInlineProseLiteral(trimmed, start)) {
+      const laterLineStartJson = findLineStartJsonAfter(trimmed, start + firstBalancedCandidate.length);
+      if (laterLineStartJson !== -1) {
+        const laterParsed = parseJsonCandidate(trimmed.slice(laterLineStartJson));
+        if (laterParsed !== null) return laterParsed;
+      }
     }
+    const balancedParsed = selectBalancedJsonCandidate(
+      trimmed,
+      collectParseableBalancedJsonCandidates(trimmed, start)
+    );
+    if (balancedParsed !== null) return balancedParsed;
   }
 
   const commaRepaired = tryParseJsonWithCommaRepair(text);
@@ -305,7 +371,7 @@ function hasExampleCueBefore(text: string, index: number): boolean {
   while (end > 0 && /\s/.test(text[end - 1]!)) end--;
   const lineStart = text.lastIndexOf('\n', end - 1) + 1;
   const cue = text.slice(lineStart, end).toLowerCase();
-  return cue.includes('example') || cue.includes('e.g.');
+  return cue.includes('example') || cue.includes('e.g.') || cue.includes('schema');
 }
 
 function hasPayloadCueBefore(text: string, index: number): boolean {
@@ -339,9 +405,10 @@ export function extractJsonFromLLM(raw: string): any | null {
   const firstPreferredJsonFence = preferredJsonFences[0] ?? null;
   const firstPreferredUntaggedFence = preferredUntaggedFences[0] ?? null;
   const untaggedFenceLooksLikeExample = firstPreferredUntaggedFence ? hasExampleCueBefore(text, firstPreferredUntaggedFence.start) : false;
+  const outsidePrecedesPreferredJsonFence = !!firstPreferredJsonFence && outsideJsonStart < firstPreferredJsonFence.start;
   const tryOutsideBeforeJsonFences = outsideJsonStart !== -1 &&
-    (!firstPreferredJsonFence || outsideJsonStart < firstPreferredJsonFence.start) &&
-    !outsideLooksLikeExample;
+    !outsideLooksLikeExample &&
+    (!outsidePrecedesPreferredJsonFence || outsideLooksLikePayload);
 
   if (text.startsWith('```') && fences[0]?.start === 0 && !outsideLooksLikePayload && (fences[0]!.isJson || preferredJsonFences.length === 0)) {
     const parsedLeadingFence = parseJsonCandidate(fences[0]!.body);
@@ -634,35 +701,23 @@ Include all ${neighbors.length} neighbors in your response.`;
       return 0;
     }
 
-    const expectedTargetIndexes = new Set<number>();
-    for (const link of parsed) {
-      if (link.target_idx > neighbors.length || expectedTargetIndexes.has(link.target_idx)) {
-        console.log(`[amem] RAW link generation output for docId ${docId}:`);
-        console.log(result.text);
-        console.log(`[amem] Incomplete/invalid link batch for docId ${docId}`);
-        return 0;
-      }
-      expectedTargetIndexes.add(link.target_idx);
-    }
-    if (expectedTargetIndexes.size !== neighbors.length) {
-      console.log(`[amem] RAW link generation output for docId ${docId}:`);
-      console.log(result.text);
-      console.log(`[amem] Incomplete/invalid link batch for docId ${docId}`);
-      return 0;
-    }
 
     // Insert links into memory_relations
     let linksCreated = 0;
     const now = new Date().toISOString();
+    const linkedTargetIndexes = new Set<number>();
 
     for (const link of parsed) {
       const neighbor = neighbors[link.target_idx - 1];
       if (!neighbor) {
-        console.log(`[amem] RAW link generation output for docId ${docId}:`);
-        console.log(result.text);
-        console.log(`[amem] Missing neighbor for validated link batch docId ${docId}`);
-        return 0;
+        console.log(`[amem] Skipping out-of-range link target ${link.target_idx} for docId ${docId}`);
+        continue;
       }
+      if (linkedTargetIndexes.has(link.target_idx)) {
+        console.log(`[amem] Skipping duplicate link target ${link.target_idx} for docId ${docId}`);
+        continue;
+      }
+      linkedTargetIndexes.add(link.target_idx);
 
       // Insert link with INSERT OR IGNORE for idempotency
       store.db.prepare(`
