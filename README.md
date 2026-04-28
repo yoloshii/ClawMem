@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/yoloshii-clawmem-badge.png)](https://mseep.ai/app/yoloshii-clawmem)
+
 # ClawMem — On-device memory layer for Claude Code, OpenClaw, and Hermes agents
 
 <p align="center">
