@@ -108,6 +108,42 @@ describe("LLM Remote Fallback", () => {
       expect(fetchCalled).toBe(true);
     });
 
+    it("reachable HTTP errors do not fall through to local generation", async () => {
+      const llm = createLlm();
+      const ensureGenerateModel = spyOn(llm as any, "ensureGenerateModel").mockImplementation(
+        () => {
+          throw new Error("should not fall through to local generation");
+        }
+      );
+
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Internal Server Error", { status: 500 }))
+      ) as any;
+
+      const result = await llm.generate("test prompt");
+      expect(result).toBeNull();
+      expect(ensureGenerateModel).not.toHaveBeenCalled();
+      ensureGenerateModel.mockRestore();
+    });
+
+    it("transport cooldown still logs once in remote-only mode", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+
+      globalThis.fetch = (() => {
+        const err = new Error("connect ECONNREFUSED");
+        (err as any).code = "ECONNREFUSED";
+        throw err;
+      }) as any;
+
+      await llm.generate("test prompt");
+      await llm.generate("test prompt 2");
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("cooldown 60s");
+      warnSpy.mockRestore();
+    });
     it("AbortError does NOT trigger cooldown", async () => {
       const llm = createLlm();
       process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
