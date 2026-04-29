@@ -332,6 +332,8 @@ export class LlamaCpp implements LLM {
   // Resets after cooldown expires — one network hiccup doesn't permanently disable GPU.
   private remoteEmbedDownUntil = 0;
   private remoteLlmDownUntil = 0;
+  private remoteEmbedFallbackNotifiedUntil = 0;
+  private remoteLlmFallbackNotifiedUntil = 0;
   private static readonly REMOTE_COOLDOWN_MS = 60_000; // 60s cooldown on transport failure
 
   constructor(config: LlamaCppConfig = {}) {
@@ -616,13 +618,21 @@ export class LlamaCpp implements LLM {
       if (result) return result;
       // Cloud providers don't fall back — if API key is set, the user chose cloud
       if (this.isCloudEmbedding()) return null;
+      // HTTP/API errors mean the endpoint is reachable; only transport
+      // failures set cooldown and fall through to local fallback.
+      if (!this.isRemoteEmbedDown()) return null;
       // Transport failure already set cooldown in embedRemote — fall through
     }
 
     // Remote is in cooldown or was never configured — try local fallback
     if (this.remoteEmbedUrl && this.isRemoteEmbedDown()) {
       if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") return null;
-      console.error("[embed] Remote embed in cooldown, using in-process fallback");
+      this.noteRemoteFallback(
+        "embed",
+        this.isLoopbackUrl(this.remoteEmbedUrl)
+          ? "[embed] Local embedding endpoint unavailable; using in-process fallback during cooldown"
+          : "[embed] Remote embed in cooldown, using in-process fallback"
+      );
     }
 
     // In-process fallback via node-llama-cpp (auto-downloads EmbeddingGemma on first use)
@@ -645,13 +655,21 @@ export class LlamaCpp implements LLM {
       if (results.some(r => r !== null)) return results;
       // Cloud providers don't fall back
       if (this.isCloudEmbedding()) return results;
+      // HTTP/API errors mean the endpoint is reachable; only transport
+      // failures set cooldown and fall through to local fallback.
+      if (!this.isRemoteEmbedDown()) return results;
       // Transport failure already set cooldown in embedRemoteBatch — fall through
     }
 
     // Remote is in cooldown or was never configured — try local fallback
     if (this.remoteEmbedUrl && this.isRemoteEmbedDown()) {
       if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") return texts.map(() => null);
-      console.error("[embed] Remote embed in cooldown, using in-process fallback");
+      this.noteRemoteFallback(
+        "embed",
+        this.isLoopbackUrl(this.remoteEmbedUrl)
+          ? "[embed] Local embedding endpoint unavailable; using in-process fallback during cooldown"
+          : "[embed] Remote embed in cooldown, using in-process fallback"
+      );
     }
 
     // In-process fallback via node-llama-cpp
@@ -717,7 +735,9 @@ export class LlamaCpp implements LLM {
         code === "UND_ERR_CONNECT_TIMEOUT") return true;
     const msg = String((error as any)?.message || "").toLowerCase();
     if (msg.includes("econnrefused") || msg.includes("etimedout") || msg.includes("enotfound") ||
-        msg.includes("ehostunreach") || msg.includes("enetunreach")) return true;
+        msg.includes("ehostunreach") || msg.includes("enetunreach") ||
+        msg.includes("unable to connect") || msg.includes("connectionrefused") ||
+        msg.includes("connection refused")) return true;
     return false;
   }
 
@@ -734,12 +754,41 @@ export class LlamaCpp implements LLM {
     return Date.now() < this.remoteEmbedDownUntil;
   }
 
+  private isLoopbackUrl(url: string | null | undefined): boolean {
+    if (!url) return false;
+    try {
+      const parsed = new URL(url);
+      return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1";
+    } catch {
+      const lower = url.toLowerCase();
+      return lower.includes("localhost") || lower.includes("127.0.0.1") || lower.includes("[::1]");
+    }
+  }
+
+  private noteRemoteFallback(kind: "embed" | "llm", message: string): void {
+    const now = Date.now();
+    if (kind === "embed") {
+      if (now < this.remoteEmbedFallbackNotifiedUntil) return;
+      this.remoteEmbedFallbackNotifiedUntil = this.remoteEmbedDownUntil || (now + LlamaCpp.REMOTE_COOLDOWN_MS);
+      if (this.isLoopbackUrl(this.remoteEmbedUrl)) console.warn(message);
+      else console.error(message);
+      return;
+    }
+
+    if (now < this.remoteLlmFallbackNotifiedUntil) return;
+    this.remoteLlmFallbackNotifiedUntil = this.remoteLlmDownUntil || (now + LlamaCpp.REMOTE_COOLDOWN_MS);
+    if (this.isLoopbackUrl(this.remoteLlmUrl)) console.warn(message);
+    else console.error(message);
+  }
+
   private markRemoteLlmDown(): void {
     this.remoteLlmDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+    this.remoteLlmFallbackNotifiedUntil = 0;
   }
 
   private markRemoteEmbedDown(): void {
     this.remoteEmbedDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+    this.remoteEmbedFallbackNotifiedUntil = 0;
   }
 
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
@@ -840,7 +889,6 @@ export class LlamaCpp implements LLM {
         };
       } catch (error) {
         if (this.isTransportError(error)) {
-          console.error("[embed] Remote embed server unreachable, cooldown 60s");
           this.markRemoteEmbedDown();
         } else {
           console.error("[embed] Remote embed error:", error);
@@ -892,7 +940,6 @@ export class LlamaCpp implements LLM {
         return results;
       } catch (error) {
         if (this.isTransportError(error)) {
-          console.error("[embed] Remote batch embed server unreachable, cooldown 60s");
           this.markRemoteEmbedDown();
         } else {
           console.error("[embed] Remote batch embed error:", error);
@@ -920,7 +967,12 @@ export class LlamaCpp implements LLM {
     // Remote is in cooldown or was never configured — try local fallback
     if (this.remoteLlmUrl && this.isRemoteLlmDown()) {
       if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") return null;
-      console.error("[generate] Remote LLM in cooldown, falling back to in-process generation");
+      this.noteRemoteFallback(
+        "llm",
+        this.isLoopbackUrl(this.remoteLlmUrl)
+          ? "[generate] Local LLM endpoint unavailable; using in-process generation during cooldown"
+          : "[generate] Remote LLM in cooldown, falling back to in-process generation"
+      );
     }
 
     // Local fallback via node-llama-cpp (CPU)
@@ -1000,7 +1052,6 @@ export class LlamaCpp implements LLM {
         return null;
       }
       if (this.isTransportError(error)) {
-        console.error("[generate] Remote LLM server unreachable, cooldown 60s");
         this.markRemoteLlmDown();
       } else {
         console.error("[generate] Remote LLM error:", error);
@@ -1089,7 +1140,12 @@ Output:`;
         if (includeLexical) fallback.unshift({ type: 'lex', text: query });
         return fallback;
       }
-      console.error("[expandQuery] Remote LLM in cooldown, falling back to in-process grammar expansion");
+      this.noteRemoteFallback(
+        "llm",
+        this.isLoopbackUrl(this.remoteLlmUrl)
+          ? "[expandQuery] Local LLM endpoint unavailable; using in-process grammar expansion during cooldown"
+          : "[expandQuery] Remote LLM in cooldown, falling back to in-process grammar expansion"
+      );
     }
 
     const llama = await this.ensureLlama();

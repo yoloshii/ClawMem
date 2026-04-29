@@ -1,5 +1,7 @@
 import { describe, it, expect } from "bun:test";
-import { extractJsonFromLLM } from "../../src/amem.ts";
+import { extractJsonFromLLM, generateMemoryLinks } from "../../src/amem.ts";
+import { insertContent, insertDocument } from "../../src/store.ts";
+import { createTestStore } from "../helpers/test-store.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
 
@@ -59,5 +61,36 @@ describe("extractJsonFromLLM", () => {
     const raw = '```json\n[{"key": "value"}]';
     const result = extractJsonFromLLM(raw);
     expect(result).toEqual([{ key: "value" }]);
+  });
+});
+
+// ─── generateMemoryLinks vector readiness ───────────────────────────
+
+describe("generateMemoryLinks", () => {
+  it("returns 0 when vectors_vec is not ready", async () => {
+    const store = createTestStore();
+    store.db.exec("DROP TABLE IF EXISTS vectors_vec");
+
+    const now = new Date().toISOString();
+    insertContent(store.db, "hash-a", "Profile facts", now);
+    insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
+    const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
+
+    const count = await generateMemoryLinks(store, {} as any, row.id);
+    expect(count).toBe(0);
+  });
+
+  it("returns 0 when the source document has no vector row yet", async () => {
+    const store = createTestStore();
+    store.db.exec("DROP TABLE IF EXISTS vectors_vec");
+    store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+
+    const now = new Date().toISOString();
+    insertContent(store.db, "hash-a", "Profile facts", now);
+    insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
+    const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
+
+    const count = await generateMemoryLinks(store, {} as any, row.id);
+    expect(count).toBe(0);
   });
 });
