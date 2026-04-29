@@ -254,6 +254,26 @@ export type ScoredResult = EnrichedResult & {
 
 export type CoActivationFn = (path: string) => { path: string; count: number }[];
 
+const STABLE_PROFILE_PATTERNS = [
+  /\b(pronouns?|timezone|time\s*zone|location|locale|home\s+base)\b/i,
+  /\b(preferences?|prefers?|identity|profile|bio|about\s+me)\b/i,
+  /\b(who\s+(am\s+i|is\s+\w+)|what\s+(do\s+i|does\s+\w+)\s+(prefer|use|avoid))\b/i,
+];
+
+function hasStableProfileIntent(query: string): boolean {
+  return STABLE_PROFILE_PATTERNS.some(p => p.test(query));
+}
+
+function canonicalMemoryMultiplier(path: string, contentType: string, query: string): number {
+  if (hasRecencyIntent(query) || !hasStableProfileIntent(query)) return 1.0;
+
+  const lower = path.toLowerCase();
+  if (/(^|\/)(core\/memory|memory\/core|profile|identity|soul)\.md$/.test(lower)) return 1.14;
+  if (/(^|\/)users\/[^/]+\.md$/.test(lower)) return 1.14;
+  if (contentType === "preference") return 1.08;
+  return 1.0;
+}
+
 export function applyCompositeScoring(
   results: EnrichedResult[],
   query: string,
@@ -290,6 +310,8 @@ export function applyCompositeScoring(
     const freqSignal = revisions * 2 + duplicates; // revisions weighted 2x
     const freqBoost = freqSignal > 0 ? Math.min(0.10, Math.log1p(freqSignal) * 0.03) : 0;
     adjusted *= (1 + freqBoost);
+
+    adjusted *= canonicalMemoryMultiplier(r.displayPath, r.contentType, query);
 
     // Pin boost: +0.3 additive, capped at 1.0
     if (r.pinned) {

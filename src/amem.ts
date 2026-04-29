@@ -198,6 +198,14 @@ export interface MemoryLink {
   reasoning: string;
 }
 
+function isVectorIndexUnavailable(error: unknown): boolean {
+  const message = String((error as any)?.message ?? error).toLowerCase();
+  return message.includes("no such table: vectors_vec") ||
+    message.includes("no such column:") ||
+    message.includes("no such function: vec_distance_cosine") ||
+    message.includes("no such module: vec0");
+}
+
 /**
  * Generate typed memory links for a document based on semantic similarity.
  * Finds k-nearest neighbors and uses LLM to determine relationship types.
@@ -227,26 +235,49 @@ export async function generateMemoryLinks(
       return 0;
     }
 
+    // Indexing may run before vector tables/embeddings are ready.
+    // Degrade quietly here instead of surfacing misleading SQL errors.
+    const vecTableExists = !!store.db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+    ).get();
+    if (!vecTableExists) return 0;
+
     // Find k-nearest neighbors using vector similarity
-    const neighbors = store.db.prepare(`
-      SELECT
-        d2.id as target_id,
-        d2.title as target_title,
-        d2.amem_context as target_context,
-        vec_distance_cosine(v1.embedding, v2.embedding) as distance
-      FROM vectors_vec v1, vectors_vec v2
-      JOIN documents d2 ON v2.hash_seq = d2.hash || '_0'
-      WHERE v1.hash_seq = ? || '_0'
-        AND d2.id != ?
-        AND d2.active = 1
-      ORDER BY distance
-      LIMIT ?
-    `).all(sourceDoc.hash, sourceDoc.id, kNeighbors) as {
+    let neighbors: {
       target_id: number;
       target_title: string;
       target_context: string | null;
       distance: number;
-    }[];
+    }[] = [];
+    try {
+      const sourceVectorExists = !!store.db.prepare(
+        `SELECT 1 FROM vectors_vec WHERE hash_seq = ? LIMIT 1`
+      ).get(`${sourceDoc.hash}_0`);
+      if (!sourceVectorExists) return 0;
+
+      neighbors = store.db.prepare(`
+        SELECT
+          d2.id as target_id,
+          d2.title as target_title,
+          d2.amem_context as target_context,
+          vec_distance_cosine(v1.embedding, v2.embedding) as distance
+        FROM vectors_vec v1, vectors_vec v2
+        JOIN documents d2 ON v2.hash_seq = d2.hash || '_0'
+        WHERE v1.hash_seq = ? || '_0'
+          AND d2.id != ?
+          AND d2.active = 1
+        ORDER BY distance
+        LIMIT ?
+      `).all(sourceDoc.hash, sourceDoc.id, kNeighbors) as {
+        target_id: number;
+        target_title: string;
+        target_context: string | null;
+        distance: number;
+      }[];
+    } catch (error) {
+      if (isVectorIndexUnavailable(error)) return 0;
+      throw error;
+    }
 
     if (neighbors.length === 0) {
       console.log(`[amem] No neighbors found for docId ${docId}`);

@@ -334,6 +334,42 @@ describe("applyCompositeScoring", () => {
     const scored = applyCompositeScoring([note, decision], "last session");
     expect(scored[0]!.contentType).toBe("decision");
   });
+
+  it("nudges canonical profile memory above same-score daily notes for stable-profile queries", () => {
+    const canonical = makeEnrichedResult({
+      displayPath: "pilot-memory/users/cooper.md",
+      filepath: "clawmem://pilot-memory/users/cooper.md",
+      title: "Cooper",
+      score: 0.7,
+    });
+    const daily = makeEnrichedResult({
+      displayPath: "pilot-memory/memory/2026-04-29.md",
+      filepath: "clawmem://pilot-memory/memory/2026-04-29.md",
+      title: "Daily",
+      score: 0.7,
+    });
+
+    const scored = applyCompositeScoring([daily, canonical], "What are Cooper's pronouns and timezone?");
+    expect(scored[0]!.displayPath).toBe("pilot-memory/users/cooper.md");
+  });
+
+  it("does not apply canonical profile nudge to recency-oriented queries", () => {
+    const canonical = makeEnrichedResult({
+      displayPath: "pilot-memory/users/cooper.md",
+      filepath: "clawmem://pilot-memory/users/cooper.md",
+      title: "Cooper",
+      score: 0.7,
+    });
+    const daily = makeEnrichedResult({
+      displayPath: "pilot-memory/memory/2026-04-29.md",
+      filepath: "clawmem://pilot-memory/memory/2026-04-29.md",
+      title: "Daily",
+      score: 0.71,
+    });
+
+    const scored = applyCompositeScoring([canonical, daily], "what happened today with Cooper?");
+    expect(scored[0]!.displayPath).toBe("pilot-memory/memory/2026-04-29.md");
+  });
 });
 
 // ─── New content types (v0.5.0) ─────────────────────────────────────
