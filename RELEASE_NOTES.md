@@ -4,6 +4,53 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.3 — A-MEM parser hardening for noisy llama-server output (PR #7) + batched doc maintenance
+
+v0.10.3 is a small patch release. The retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration shape, and Hermes plugin contract are all unchanged from v0.10.2. The release hardens the A-MEM JSON parser against a class of noisy llama-server outputs that v0.10.2 mishandled (parser silently picked an example/schema literal over the real payload, link-generation batches got zeroed when the LLM under-delivered), and bundles four sitting-in-tree doc updates that were waiting for the next release.
+
+Vaults from v0.10.2 are byte-identical at rest. No schema migration. **Default behavior is byte-identical for users whose llama-server outputs were already parsing cleanly** — the parser only changes what it returns on inputs that previously fell through to repair paths or to zeroed link batches. Pure `bun add -g clawmem` upgrade.
+
+### A-MEM parser hardening (PR #7 by @cymkd / Veljko Simakovic)
+
+The pre-PR parser had two real-world failure modes when the llama-server LLM emitted prompt-shaped prose alongside the real payload:
+
+1. **Prose-balanced literal won over the real payload.** When the model echoed phrases like `Return empty array [] if no structured facts found.` before the real fenced JSON answer, the parser locked onto the prose `[]` and returned it as the result. Conversation-synthesis runs that included the actual prompt wording in the assistant context exhibited this regularly. After the fix, the later real payload wins via a precedence order that walks all parseable balanced JSON candidates in source order, prefers payload-cued candidates (`Actual:`, `Result:`, `Final answer:`, `Answer:`), then avoids example-cued (`example`, `e.g.`, `schema`) and inline-prose literals, then falls back to the first candidate. `parseJsonCandidate` now searches forward for a later line-start `[`/`{` when the first balanced candidate sits behind an example cue or at a non-line-start position with no payload cue. `extractJsonFromLLM` tightens its precedence so that outside-of-fences JSON before a preferred `json` fence requires a payload cue rather than winning by virtue of position.
+2. **Link-generation under-delivery zeroed the batch.** The pre-PR `generateMemoryLinks` enforced an all-or-nothing completeness gate: if the LLM returned 4 valid links for a 5-neighbor prompt, or repeated a `target_idx`, or referenced an out-of-range index, the entire batch was discarded and `0` links were created. After the fix, partial-valid insertion semantics are restored: a 5-neighbor prompt with 4 valid returned links inserts 4 rows. Duplicate `target_idx` entries are logged (`Skipping duplicate link target N`) and skipped after the first valid link for that neighbor. Out-of-range entries are logged (`Skipping out-of-range link target N`) and skipped instead of aborting already-valid links. The commit message includes the directive "Do not reintroduce all-or-nothing link generation without corpus measurements" to lock the contract.
+
+Item-shape validation in `parseLinkGenerationFromLLM` (`src/amem.ts:55,99`) is unchanged and continues to reject malformed items strictly (missing fields, wrong types, non-finite confidence, bad relation type, non-positive/non-integer `target_idx`) before they reach the insert loop.
+
+The PR went through three adversarial review rounds: Turn 1 surfaced 3 findings (1 HIGH on the prose-precedence behavior + 2 Medium on the under-delivery zeroing path and a sanitization edge), Turn 2 confirmed Findings 2-3 fixed and surfaced 1 HIGH on a regressed prose-fence ordering case + 1 MEDIUM on an un-flagged completeness gate that wasn't parser-level. Turn 3 verified both Turn 2 findings fixed (cymkd ran an independent GPT-5.5 high-reasoning pass before pushing the Turn 2 follow-up commit) and surfaced 2 LOW findings deferred to a future release (see below).
+
+### Two known LOW limitations deferred to v0.10.4+
+
+Both LOWs were surfaced by the Turn 3 GPT-5.5 high-reasoning review pass and are explicit-acceptance candidates per the contributor's own "intentionally broad for this repro; can be tightened later" framing:
+
+1. **Outside-JSON-before-`json`-fence precedence change.** The new `outsidePrecedesPreferredJsonFence` gate causes raw line-start JSON before a non-example `json` fence to lose to the fence. Repro: `[{"key":"real"}]\n` followed by a `json` fence containing `[]` parses as `[]`. Real behavior change from "first raw JSON wins," but the affected pattern is narrow — well-formed raw payload immediately followed by a non-example `json` fence is uncommon in observed llama-server output, and the broader fix the gate enables (the prose-before-fence repro above) is the more frequent failure mode.
+2. **`schema` cue breadth.** `hasExampleCueBefore` recognizes `schema` alongside `example` and `e.g.` to fix the reported `Schema: {...}\n[{...real...}]` repro, but the substring match is broad enough to suppress real fenced payloads following phrases like `Schema validation result:`. A tighter `schema:` / `json schema:` boundary regex would close the false-positive without losing the original repro coverage.
+
+Both will be addressed in the next release with measurement-backed fixes — either tightening the heuristics with a corpus-measurement pass over real llama-server output, or accepting them with regression tests locking in the new contract. That decision belongs with the data, not this PR.
+
+### Batched doc maintenance (rides this release per option-(a) standing direction)
+
+Four user-facing doc updates that accumulated in the working tree across the v0.10.2 → v0.10.3 window, all from in-session OpenClaw delta surveys:
+
+- **`src/openclaw/index.ts` line-ref drift** (cosmetic, no behavior change). OpenClaw advanced from v2026.4.21 to HEAD `1f724bc50b` (2026-05-04, post-v2026.4.26 untagged) across two consecutive surveys. `attempt.ts` was reorganized under `src/agents/pi-embedded-runner/run/` as part of a runner refactor; line refs in our doc-comment correctness contracts shifted twice: `before_prompt_build` await context `attempt.ts:1873` → `:2294` → `:2610`; `agent_end` fire-and-forget block `attempt.ts:2470-2496` → `:3023-3048` → `:3379-3402`. Both await/fire-and-forget contracts hold across both bumps; only line numbers shifted. 4 occurrences updated in the file header docstring and the `before_prompt_build` / `agent_end` handler comments.
+- **`README.md`, `CLAUDE.md`, `AGENTS.md`, `SKILL.md` — 30s `agent_end` void-hook timeout disclosure.** OpenClaw v2026.4.26 (commit `4d4c7c8ab3`) introduced `DEFAULT_VOID_HOOK_TIMEOUT_MS_BY_HOOK = { agent_end: 30_000 }` in `src/plugins/hooks.ts`. A timed-out handler is logged ("timed out after 30000ms") and the runner continues, but the plugin's underlying work is not cancelled. ClawMem's `agent_end` runs decision-extractor + handoff-generator + feedback-loop; warm-cache postrun is well under 30s, but cold-start indexing or LLM stalls could approach this. The disclosure is operational, not behavioral — it doesn't change what ClawMem does, only adds a log warning above the 30s threshold for users with cold-start scenarios that exceed it. Single-sentence insertion in each doc, adapted to surrounding tone, fail-open framing emphasized. CLAUDE.md and AGENTS.md remain byte-identical post-edit.
+
+Per the option-(a) standing direction these doc updates do not justify a release on their own; they ride PR #7 which is the next real-functionality release.
+
+### External credit
+
+- **Veljko Simakovic / @cymkd** — opened yoloshii/ClawMem#7 with the four-commit progressive parser hardening (initial parse robustness, object-wrapped result handling, prose-vs-payload preservation, and the Turn 2 follow-up that fixed the regressed prose-fence ordering and removed the un-flagged completeness gate). The PR went through three adversarial review rounds (gpt-5.4 high reasoning Turns 1-2, gpt-5.5 high reasoning Turn 3); the contributor independently ran a gpt-5.5 high-reasoning pass on his own diff before pushing the Turn 2 follow-up, which surfaced and fixed several edge cases before they hit our review queue. Cross-validated against `tests/unit/amem.test.ts` + `tests/unit/conversation-synthesis.test.ts` + `tests/integration/conversation-synthesis-two-pass.integration.test.ts` (107 pass / 0 fail / 220 expect() calls, was 102 pre-PR; +5 new regression tests). Two Turn 3 LOW findings were explicitly deferred to the next release rather than chasing a fifth round, in line with cymkd's own forward-looking framing on the schema cue breadth.
+
+### Test coverage
+
+PR #7 adds five new regression tests in `tests/unit/amem.test.ts` covering: prose `[]` before a fenced real payload, the actual conversation-synthesis prompt wording echoed before a fenced payload, prose schema object before a later real raw array, `parseLinkGenerationFromLLM` parsing the later real link array instead of the schema object, and `generateMemoryLinks` inserting a valid partial batch while skipping duplicate/out-of-range targets.
+
+Targeted suite: **107 pass / 0 fail / 220 expect() calls** across the three test files (was 102 pre-PR; +5 new tests).
+
+---
+
 ## v0.10.2 — Configurable remote LLM endpoints + doc maintenance
 
 v0.10.2 is a small patch release. The retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, and OpenClaw plugin registration shape are all unchanged from v0.10.0/v0.10.1. The release adds three opt-in env vars for users running ClawMem against OpenAI-compatible remote LLM proxies, fixes a `/v1` URL-doubling edge case in the remote LLM transport, and applies two small doc updates that were sitting in the working tree.

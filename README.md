@@ -193,7 +193,7 @@ clawmem setup openclaw   # Installs plugin into ~/.openclaw/extensions/clawmem (
 
 **What the plugin provides:**
 - **`before_prompt_build` hook (load-bearing)** - prompt-aware retrieval (context-surfacing + session-bootstrap) AND the pre-emptive `precompact-extract` run when token usage approaches the compaction threshold. This is the authoritative path for precompact state capture because it runs synchronously before the LLM call that would trigger compaction, so it cannot race the compactor.
-- **`agent_end` hook** - decision extraction, handoff generation, feedback loop (parallel, fire-and-forget at the OpenClaw call site)
+- **`agent_end` hook** - decision extraction, handoff generation, feedback loop (parallel, fire-and-forget at the OpenClaw call site). OpenClaw v2026.4.26+ also enforces a 30s default void-hook timeout on `agent_end` — slow handlers are logged but the underlying postrun work is not cancelled (fail-open).
 - **`before_compaction` hook (defense-in-depth fallback)** - fires `precompact-extract` again for the rare case where `before_prompt_build`'s proximity heuristic missed a sudden token-count jump. Fire-and-forget at OpenClaw's call site, so it races the compactor and offers no correctness guarantee on its own — the `before_prompt_build` path is what actually holds the invariant.
 - **`session_start` hook** - session registration + cached first-turn bootstrap context
 - **5 agent tools** - `clawmem_search`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
