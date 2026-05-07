@@ -7,7 +7,15 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// ESM equivalent of CommonJS __dirname. This package declares
+// "type": "module", so __dirname is not defined when loaded by a plain
+// Node.js ESM loader (e.g. OpenClaw's plugin host). Bun shims __dirname
+// in ESM, which is why this regression is invisible under `bun test`.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // =============================================================================
 // Types
