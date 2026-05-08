@@ -188,7 +188,13 @@ clawmem setup mcp      # Register MCP server in ~/.claude.json (31 tools)
 ClawMem registers as a native OpenClaw memory plugin (`kind: memory`, v0.10.0+). Same 90/10 automatic retrieval, delivered through OpenClaw's plugin-hook bus instead of Claude Code hooks.
 
 ```bash
-clawmem setup openclaw   # Installs plugin into ~/.openclaw/extensions/clawmem (copy, not symlink)
+# v0.10.4+: profile-aware. Delegates to `openclaw plugins install --force` when the OpenClaw CLI
+# is on PATH (auto-enables the plugin, honors OPENCLAW_STATE_DIR, OPENCLAW_CONFIG_PATH, --profile).
+# Falls back to a recursive copy honoring OPENCLAW_STATE_DIR when the CLI is absent.
+clawmem setup openclaw
+
+# Custom profile (e.g. dev profile at ~/.openclaw-dev):
+OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
 ```
 
 **What the plugin provides:**
@@ -1099,13 +1105,16 @@ clawmem install-service --enable
 #### OpenClaw-specific
 
 ```bash
-# Install the OpenClaw plugin (v0.10.0+: recursively copies into ~/.openclaw/extensions/clawmem)
+# Install the OpenClaw plugin
+# v0.10.4+: delegates to `openclaw plugins install --force` when the CLI is on PATH (auto-enables;
+#   honors OPENCLAW_STATE_DIR / OPENCLAW_CONFIG_PATH / --profile). Falls back to recursive copy
+#   honoring OPENCLAW_STATE_DIR when the CLI is absent.
+# v0.10.0–v0.10.3: hardcoded recursive copy into ~/.openclaw/extensions/clawmem (issue #11).
 clawmem setup openclaw
-# Then follow the printed next steps:
-#   1. openclaw plugins enable clawmem   (switches memory slot + disables memory-core)
-#   2. openclaw gateway restart
-#   3. Configure GPU endpoints if needed (see setup openclaw output)
-# Multi-user installs also need: sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem
+# Then follow the printed next steps. The exact list depends on which path ran:
+#   Path 1 (delegated): plugin already auto-enabled — just `openclaw gateway restart` + GPU config
+#   Path 3 (CLI absent): manually `openclaw plugins enable clawmem`, then restart + GPU config
+# Multi-user installs also need: sudo chown -R <gateway-user>:<gateway-group> <extensions>/clawmem
 # Requires OpenClaw v2026.4.11+.
 ```
 

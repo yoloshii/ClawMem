@@ -83,9 +83,27 @@ clawmem watch                   # Start file watcher (indexes on .md changes)
 clawmem setup hooks             # Install Claude Code hooks
 clawmem setup hooks --remove    # Remove installed hooks
 clawmem setup mcp               # Register MCP server
-clawmem setup openclaw          # Install OpenClaw memory plugin (recursive copy, v2026.4.11+)
-clawmem setup openclaw --link   # Dev-mode symlink install (pre-v2026.4.11 only — v2026.4.11+ discovery skips symlinks)
-clawmem setup curator           # Install curator agent
+clawmem setup openclaw                   # Install OpenClaw memory plugin. v0.10.4+ delegates to `openclaw plugins install --force` when the CLI is on PATH (profile-aware via OPENCLAW_STATE_DIR; auto-enabled). Falls back to recursive copy honoring OPENCLAW_STATE_DIR when the CLI is absent.
+clawmem setup openclaw --link            # Load-path mode: delegates `openclaw plugins install -l` when CLI is on PATH (records source in plugins.load.paths — NOT a filesystem symlink). In CLI-absent fallback, creates a real symlink (note: OpenClaw v2026.4.11+ discovery skips fallback symlinks).
+clawmem setup openclaw --remove          # Uninstall. Tries `openclaw plugins uninstall clawmem --force` first; falls back to manual cleanup at the resolved extensions path for legacy unmanaged installs.
+clawmem setup openclaw --help            # Print full flag + env-var reference (v0.10.4+).
+clawmem setup curator                    # Install curator agent
+```
+
+### `setup openclaw` env vars (v0.10.4+)
+
+Both the delegated and fallback paths honor:
+
+| Env var | Effect |
+|---------|--------|
+| `OPENCLAW_STATE_DIR` | Override the OpenClaw config root. Plugin installs into `<OPENCLAW_STATE_DIR>/extensions/clawmem`. |
+| `OPENCLAW_CONFIG_PATH` | Override the OpenClaw config file path; config root becomes `dirname(OPENCLAW_CONFIG_PATH)`. |
+| `OPENCLAW_HOME` | Override the home directory used to resolve the default `~/.openclaw` root. |
+| `HOME` / `USERPROFILE` | Standard home-dir env vars; consulted in that order when `OPENCLAW_HOME` is unset. |
+
+```bash
+# Install ClawMem into the `dev` profile (~/.openclaw-dev/extensions/clawmem)
+OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
 ```
 
 ## Server

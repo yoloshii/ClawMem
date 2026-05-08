@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.10.0**.
+Guide for upgrading between released versions. Current: **v0.10.4**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -41,6 +41,50 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
 
 ---
+
+## v0.10.3 → v0.10.4
+
+v0.10.4 fixes [issue #11](https://github.com/yoloshii/ClawMem/issues/11) — `clawmem setup openclaw` previously hardcoded `~/.openclaw/extensions/clawmem` and ignored `OPENCLAW_STATE_DIR`, breaking installs into custom OpenClaw profiles. The fix is non-breaking: vault on disk is byte-identical, no schema changes, no env-var changes for users on the default profile, no retrieval-pipeline or hook changes. Pure `bun update -g clawmem`.
+
+### Behavior changes you should know about
+
+- **`clawmem setup openclaw` is now profile-aware.** When the `openclaw` CLI is on `PATH`, ClawMem delegates to `openclaw plugins install <pluginDir> --force`. OpenClaw owns destination resolution, which respects `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and any active `--profile` flag. The plugin is **auto-enabled** as part of the install (OpenClaw's `persistPluginInstall` writes install records, applies slot selection, and refreshes the registry). The post-install "Next steps" output no longer prints `openclaw plugins enable clawmem` because the install path already did it.
+- **CLI-absent fallback.** If `openclaw` is not on `PATH`, ClawMem falls back to a recursive copy that also honors `OPENCLAW_STATE_DIR` (via a faithful mirror of OpenClaw's `resolveConfigDir`). The fallback path keeps the original 4-step output including `openclaw plugins enable clawmem` because direct-copy doesn't auto-enable.
+- **`--link` mode now does the right thing in both paths.** The delegated path invokes `openclaw plugins install -l`, which records the source in `plugins.load.paths` (NOT a filesystem symlink) — discovery uses the load-path entry, so the v2026.4.11 symlink-discovery skip does NOT apply. The fallback path still creates a real filesystem symlink, which OpenClaw v2026.4.11+ skips during discovery; install OpenClaw to get the cleaner delegated behavior.
+- **`--remove` is legacy-compatible.** `clawmem setup openclaw --remove` first tries `openclaw plugins uninstall clawmem --force` (when the CLI is available) and falls back to manual cleanup at the resolved extensions path for legacy unmanaged installs from earlier ClawMem versions. On CLI uninstall failure ClawMem warns the user that OpenClaw config and install records may still need manual repair, then runs the fallback cleanup.
+- **`clawmem setup openclaw --help` works.** Pre-v0.10.4 ran the install instead of printing help. v0.10.4 short-circuits the `--help` / `-h` flag at the top of the handler and prints the full flag + env-var reference.
+
+### Custom profile users (the headline win)
+
+If you run OpenClaw with a non-default profile, the upgrade is now a one-liner:
+
+```bash
+# Pre-v0.10.4 (broken): installed into ~/.openclaw regardless of OPENCLAW_STATE_DIR
+OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
+
+# v0.10.4+: installs into ~/.openclaw-dev/extensions/clawmem as expected
+OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
+```
+
+If you previously worked around the bug by manually copying the plugin directory into your profile, you can now run `clawmem setup openclaw --remove` (in the affected profile via `OPENCLAW_STATE_DIR`) and then a fresh `clawmem setup openclaw` to land cleanly. Or leave the manual copy in place — v0.10.4 is backwards-compatible and `--remove` will fall back to manual cleanup if the CLI uninstall fails because the install isn't in OpenClaw's records.
+
+### Quick path
+
+```bash
+# Source install
+cd ~/clawmem && git pull
+
+# Or via npm/bun
+bun update -g clawmem
+
+# Re-run setup so any new behavior takes effect (idempotent)
+clawmem setup openclaw
+
+# Restart long-lived processes (only if you re-installed the plugin)
+sudo systemctl restart openclaw-gateway.service   # or your gateway unit
+```
+
+No schema migration. No vault changes. The OpenClaw plugin source under `src/openclaw/` is unchanged from v0.10.3 — the change is entirely in `cmdSetupOpenClaw` (and a new `src/openclaw-paths.ts` helper module that mirrors OpenClaw's path-resolution semantics for the CLI-absent fallback). See [docs/guides/openclaw-plugin.md](openclaw-plugin.md#install) for the full Install reference and [docs/troubleshooting.md](../troubleshooting.md#openclaw) for the symptom→fix entries this release closes.
 
 ## v0.9.0 → v0.10.0
 

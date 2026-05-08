@@ -10,13 +10,39 @@ ClawMem integrates with OpenClaw as a native memory plugin (`kind: memory`), giv
 clawmem setup openclaw
 ```
 
-This installs the plugin into `~/.openclaw/extensions/clawmem` by recursively copying the plugin source. Pass `--link` if you want a symlink instead (dev workflow only, see the note below). `setup openclaw --remove` uninstalls.
+`clawmem setup openclaw` chooses between two install paths:
 
-### Why a copy, not a symlink (v0.10.0+)
+- **Delegated path (preferred, v0.10.4+).** When `openclaw` is on `PATH`, ClawMem delegates to `openclaw plugins install <pluginDir> --force`. OpenClaw owns destination resolution (which respects `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and any active `--profile`), runs manifest validation + security scans, persists install records, applies slot selection, and refreshes the registry. The plugin is auto-enabled — you do not need to run `openclaw plugins enable clawmem` separately.
+- **Direct-copy fallback.** When `openclaw` is not on `PATH`, ClawMem prints a warning and falls back to a recursive copy honoring `OPENCLAW_STATE_DIR` (or `~/.openclaw/extensions/clawmem` by default). You will need to run `openclaw plugins enable clawmem` afterwards to assign the memory slot.
 
-OpenClaw v2026.4.11's plugin discoverer walks `~/.openclaw/extensions/` with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()` to decide which entries to descend into. Symlinks to directories report `isDirectory() === false` on that API shape, so a symlinked plugin is silently skipped during discovery and never registers. ClawMem versions prior to v0.10.0 installed the plugin as a symlink, which worked on OpenClaw v2026.3.x but stopped discovering the plugin on v2026.4.11.
+`setup openclaw --remove` uninstalls (also tries `openclaw plugins uninstall clawmem --force` first when the CLI is available, falling back to manual cleanup for legacy unmanaged installs from earlier ClawMem versions). `setup openclaw --help` prints the full flag and env-var reference.
 
-`clawmem setup openclaw` defaults to `cpSync(..., { recursive: true, dereference: true })` on v0.10.0+. If you prefer the old symlink behavior (for example, to edit plugin source in place and pick up changes without re-running setup), pass `--link`. The command prints a warning noting that discovery on v2026.4.11+ will skip the symlink.
+### Custom OpenClaw profiles (v0.10.4+)
+
+If you run OpenClaw with a non-default profile (e.g. `openclaw --profile dev`, which uses `~/.openclaw-dev/`), ClawMem v0.10.4+ installs into the matching extensions directory automatically — both paths honor `OPENCLAW_STATE_DIR`:
+
+```bash
+# Default profile
+clawmem setup openclaw
+
+# Custom profile via env var (works in both delegated and fallback paths)
+OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
+
+# Equivalent for users who prefer the OpenClaw --profile flag (delegated path only):
+# the openclaw subprocess inherits its own profile resolution
+openclaw --profile dev plugins install ~/path/to/clawmem/src/openclaw --force
+```
+
+Pre-v0.10.4 versions hardcoded `~/.openclaw/extensions/clawmem` and ignored both env vars and the `--profile` flag — that bug is fixed in v0.10.4 (see [issue #11](https://github.com/yoloshii/ClawMem/issues/11)).
+
+### `--link` mode: load-path vs filesystem symlink (v0.10.4+)
+
+`--link` behavior depends on which path runs:
+
+- **Delegated path (`openclaw` on PATH):** ClawMem invokes `openclaw plugins install <pluginDir> -l`, which records the plugin source in `plugins.load.paths` (an OpenClaw load-path entry, **not a filesystem symlink**). Discovery uses the recorded path entry directly — the v2026.4.11 symlink-discovery skip does NOT apply here. Use this for local development when you want edits to the source dir to take effect on the next gateway restart without re-running setup.
+- **Fallback path (no `openclaw` on PATH):** ClawMem creates a real filesystem symlink at `<extensions>/clawmem`. **Warning:** OpenClaw v2026.4.11+'s plugin discoverer walks `<extensions>/` with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()`, which reports `false` for symlinks to directories. A symlinked plugin in the fallback path is silently skipped during discovery and never registers. Use the default (recursive copy) here, or install OpenClaw and let the delegated path handle linked installs cleanly.
+
+ClawMem versions prior to v0.10.0 always created a filesystem symlink (which worked on OpenClaw v2026.3.x but stopped discovering on v2026.4.11). v0.10.0 changed the default to recursive copy and added the `--link` opt-in. v0.10.4 lets the delegated path handle `--link` correctly via OpenClaw's load-path tracking.
 
 ### Required: `openclaw.extensions` in `package.json`
 

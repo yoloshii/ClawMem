@@ -70,6 +70,10 @@ import {
   clearSessionFocus,
   focusFilePath,
 } from "./session-focus.ts";
+import {
+  resolveExtensionsDirNoOpenClaw,
+  printSetupOpenClawHelp,
+} from "./openclaw-paths.ts";
 
 enableProductionMode();
 
@@ -1324,13 +1328,26 @@ function readOpenClawConfigValue(key: string): string | undefined {
 }
 
 async function cmdSetupOpenClaw(args: string[]) {
+  // §28.2 — short-circuit on --help / -h before any spawn or filesystem work.
+  if (args.includes("--help") || args.includes("-h")) {
+    printSetupOpenClawHelp();
+    return;
+  }
+
   const remove = args.includes("--remove");
   const linkMode = args.includes("--link");
   const pluginDir = pathResolve(import.meta.dir, "openclaw");
-  const extensionsDir = pathResolve(process.env.HOME || "~", ".openclaw", "extensions");
+
+  // Resolve the extensions/clawmem path we would touch directly. Both Path 1
+  // link-mode pre-cleanup and Path 3 direct-copy install need this. Path 1
+  // copy-mode delegation does NOT use linkPath because OpenClaw's
+  // `--force` install owns the destination resolution there.
+  const extensionsDir = resolveExtensionsDirNoOpenClaw();
   const linkPath = pathResolve(extensionsDir, "clawmem");
 
-  // Check if openclaw CLI is available
+  // Probe whether the openclaw CLI is on PATH. Used to choose between
+  // delegation (Path 1) and direct-copy fallback (Path 3) for installs,
+  // and between CLI uninstall and manual cleanup for --remove.
   const hasOpenClawCli = (() => {
     try {
       const r = Bun.spawnSync(["openclaw", "--version"], { stdout: "pipe", stderr: "pipe" });
@@ -1339,27 +1356,65 @@ async function cmdSetupOpenClaw(args: string[]) {
   })();
 
   if (remove) {
-    // Actually uninstall — mirror of install behavior
+    // §28.1 H3 / R1 / R4: try-and-fall-back uninstall + constrained stale
+    // cleanup. CLI uninstall is preferred (handles managed config + slot
+    // resets); manual cleanup is the legacy fallback for unmanaged
+    // direct-cpSync installs from older ClawMem versions. On CLI failure we
+    // fall through AND emit a warning so the user knows config/install
+    // records may need manual repair.
+    let cliUninstallSucceeded = false;
+    let cliUninstallFailed = false;
+    if (hasOpenClawCli) {
+      const r = Bun.spawnSync(
+        ["openclaw", "plugins", "uninstall", "clawmem", "--force"],
+        { stdout: "inherit", stderr: "inherit" },
+      );
+      if (r.exitCode === 0) {
+        cliUninstallSucceeded = true;
+      } else {
+        cliUninstallFailed = true;
+        console.log(
+          `${c.yellow}Warning: openclaw plugins uninstall clawmem failed (exit ${r.exitCode}).${c.reset}`,
+        );
+        console.log(
+          `${c.yellow}  OpenClaw config and install records may still reference clawmem.${c.reset}`,
+        );
+        console.log(
+          `${c.yellow}  Falling back to manual cleanup of the install directory.${c.reset}`,
+        );
+      }
+    }
+
+    // Constrained stale cleanup (R3 in BACKLOG §28.1): even if CLI uninstall
+    // succeeded, an old unmanaged direct-copy directory at the same path
+    // could still be present (managed-link + unmanaged-copy side-by-side).
+    // Always check the exact extensions/clawmem path and remove if present.
     let removed = false;
     try {
-      const stat = await import("fs").then(m => m.lstatSync(linkPath));
-      if (stat.isSymbolicLink() || stat.isDirectory()) {
-        const { unlinkSync, rmSync } = await import("fs");
-        if (stat.isSymbolicLink()) {
-          unlinkSync(linkPath);
-        } else {
-          rmSync(linkPath, { recursive: true });
-        }
-        console.log(`${c.green}Removed plugin from ${linkPath}${c.reset}`);
+      const { lstatSync, unlinkSync, rmSync } = await import("fs");
+      const stat = lstatSync(linkPath);
+      if (stat.isSymbolicLink()) {
+        unlinkSync(linkPath);
+        console.log(`${c.green}Removed plugin symlink at ${linkPath}${c.reset}`);
+        removed = true;
+      } else if (stat.isDirectory()) {
+        rmSync(linkPath, { recursive: true });
+        console.log(`${c.green}Removed plugin directory at ${linkPath}${c.reset}`);
         removed = true;
       }
     } catch (e: any) {
       if (e.code !== "ENOENT") throw e;
-      console.log(`${c.dim}Plugin not installed at ${linkPath}${c.reset}`);
+      if (!cliUninstallSucceeded && !cliUninstallFailed) {
+        // Truly nothing to do — no CLI, no directory.
+        console.log(`${c.dim}Plugin not installed at ${linkPath}${c.reset}`);
+      }
     }
 
+    // Slot reset: only meaningful if the CLI is reachable. CLI uninstall
+    // already clears the memory slot if it succeeded, but if uninstall
+    // failed we still attempt slot reset because config slots can be
+    // populated separately from install records.
     if (hasOpenClawCli) {
-      // Reset the memory slot if ClawMem owned it (post-§14.3-migration installs).
       const memSlot = readOpenClawConfigValue("plugins.slots.memory");
       if (memSlot === "clawmem") {
         Bun.spawnSync(["openclaw", "config", "unset", "plugins.slots.memory"], { stdout: "inherit", stderr: "inherit" });
@@ -1378,7 +1433,8 @@ async function cmdSetupOpenClaw(args: string[]) {
     return;
   }
 
-  // Verify plugin source files exist
+  // Verify plugin source files exist (cheap defense-in-depth — surfaces
+  // ClawMem packaging bugs immediately, before any spawn).
   if (!existsSync(pathResolve(pluginDir, "index.ts"))) {
     die(`OpenClaw plugin files not found at ${pluginDir}`);
   }
@@ -1389,44 +1445,103 @@ async function cmdSetupOpenClaw(args: string[]) {
     die(`Plugin package.json not found at ${pluginDir}/package.json — required for OpenClaw v2026.4.11+ discovery`);
   }
 
-  // Create extensions directory
-  if (!existsSync(extensionsDir)) {
-    mkdirSync(extensionsDir, { recursive: true });
-  }
-
-  // Remove any stale install (symlink or directory) before re-installing.
-  // OpenClaw v2026.4.11+ discovery (discoverInDirectory in ids-*.js) uses
-  // readdirSync({ withFileTypes: true }) where symlinks report
-  // isDirectory() === false and get silently skipped, so copy mode is the
-  // default. The --link flag keeps symlink behavior for older OpenClaw
-  // versions or local development workflows where editing the live source
-  // should take effect without re-running setup.
-  try {
-    const { lstatSync, unlinkSync, rmSync } = await import("fs");
-    const stat = lstatSync(linkPath);
-    if (stat.isSymbolicLink()) {
-      unlinkSync(linkPath);
-      console.log(`${c.dim}Replaced stale symlink at ${linkPath}${c.reset}`);
-    } else if (stat.isDirectory()) {
-      rmSync(linkPath, { recursive: true });
-      console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
+  // §28.1 H1/H2: choose path. Path 1 = openclaw plugins install delegation;
+  // Path 3 = direct-copy fallback honoring OPENCLAW_STATE_DIR.
+  let delegated = false;
+  if (hasOpenClawCli) {
+    // Path 1: delegate to OpenClaw. Auto-enables, writes install records,
+    // applies slot selection, refreshes registry.
+    if (linkMode) {
+      // §28.1 H2 link-mode: OpenClaw rejects --force with --link, so we do
+      // manual stale cleanup before delegating to preserve idempotence.
+      try {
+        const { lstatSync, unlinkSync, rmSync } = await import("fs");
+        const stat = lstatSync(linkPath);
+        if (stat.isSymbolicLink()) {
+          unlinkSync(linkPath);
+          console.log(`${c.dim}Replaced stale symlink at ${linkPath}${c.reset}`);
+        } else if (stat.isDirectory()) {
+          rmSync(linkPath, { recursive: true });
+          console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
+        }
+      } catch (e: any) {
+        if (e.code !== "ENOENT") throw e;
+      }
+      const r = Bun.spawnSync(
+        ["openclaw", "plugins", "install", pluginDir, "-l"],
+        { stdout: "inherit", stderr: "inherit" },
+      );
+      if (r.exitCode !== 0) {
+        die(`openclaw plugins install -l failed (exit ${r.exitCode}); aborting setup`);
+      }
+      // OpenClaw's `plugins install -l` records the source path in
+      // plugins.load.paths and persists a path install record (not a
+      // filesystem symlink). The v2026.4.11 symlink-discovery skip does
+      // NOT apply to this mode — discovery uses the load-path entry.
+      console.log(`${c.green}Linked local plugin path via openclaw plugins install -l (profile-aware, auto-enabled)${c.reset}`);
+      console.log(`${c.dim}  Source recorded in plugins.load.paths — edits to ${pluginDir} take effect on next gateway restart.${c.reset}`);
     } else {
-      die(`${linkPath} exists but is not a symlink or directory. Remove it manually and re-run setup.`);
+      // §28.1 H2 copy-mode: --force makes OpenClaw replace existing target,
+      // preserving idempotence across reruns.
+      const r = Bun.spawnSync(
+        ["openclaw", "plugins", "install", pluginDir, "--force"],
+        { stdout: "inherit", stderr: "inherit" },
+      );
+      if (r.exitCode !== 0) {
+        die(`openclaw plugins install --force failed (exit ${r.exitCode}); aborting setup`);
+      }
+      console.log(`${c.green}Installed plugin via openclaw plugins install --force (profile-aware, auto-enabled)${c.reset}`);
     }
-  } catch (e: any) {
-    if (e.code !== "ENOENT") throw e;
-  }
-
-  if (linkMode) {
-    const { symlinkSync } = await import("fs");
-    symlinkSync(pluginDir, linkPath);
-    console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir} (symlink)${c.reset}`);
-    console.log(`${c.yellow}  Warning: symlink mode. OpenClaw v2026.4.11+ discovery skips${c.reset}`);
-    console.log(`${c.yellow}  symlinks silently. Re-run without --link on current releases.${c.reset}`);
+    delegated = true;
   } else {
-    const { cpSync } = await import("fs");
-    cpSync(pluginDir, linkPath, { recursive: true, dereference: true });
-    console.log(`${c.green}Installed plugin: ${linkPath} (copied from ${pluginDir})${c.reset}`);
+    // Path 3: direct-copy fallback. Honors OPENCLAW_STATE_DIR via the
+    // resolveExtensionsDirNoOpenClaw helper. Profile awareness is limited
+    // to env vars (no manifest validation, no security scan, no install
+    // records) — surface that to the user.
+    console.log(`${c.yellow}openclaw CLI not on PATH — using direct-copy install.${c.reset}`);
+    console.log(`${c.yellow}  Profile awareness limited to OPENCLAW_STATE_DIR / OPENCLAW_CONFIG_PATH${c.reset}`);
+    console.log(`${c.yellow}  env vars. Install OpenClaw to enable manifest validation, security${c.reset}`);
+    console.log(`${c.yellow}  scans, and full plugin lifecycle management.${c.reset}`);
+
+    // Create extensions directory.
+    if (!existsSync(extensionsDir)) {
+      mkdirSync(extensionsDir, { recursive: true });
+    }
+
+    // Remove any stale install (symlink or directory) before re-installing.
+    // OpenClaw v2026.4.11+ discovery (discoverInDirectory in ids-*.js) uses
+    // readdirSync({ withFileTypes: true }) where symlinks report
+    // isDirectory() === false and get silently skipped, so copy mode is the
+    // default. The --link flag keeps symlink behavior for older OpenClaw
+    // versions or local development workflows where editing the live source
+    // should take effect without re-running setup.
+    try {
+      const { lstatSync, unlinkSync, rmSync } = await import("fs");
+      const stat = lstatSync(linkPath);
+      if (stat.isSymbolicLink()) {
+        unlinkSync(linkPath);
+        console.log(`${c.dim}Replaced stale symlink at ${linkPath}${c.reset}`);
+      } else if (stat.isDirectory()) {
+        rmSync(linkPath, { recursive: true });
+        console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
+      } else {
+        die(`${linkPath} exists but is not a symlink or directory. Remove it manually and re-run setup.`);
+      }
+    } catch (e: any) {
+      if (e.code !== "ENOENT") throw e;
+    }
+
+    if (linkMode) {
+      const { symlinkSync } = await import("fs");
+      symlinkSync(pluginDir, linkPath);
+      console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir} (symlink)${c.reset}`);
+      console.log(`${c.yellow}  Warning: symlink mode. OpenClaw v2026.4.11+ discovery skips${c.reset}`);
+      console.log(`${c.yellow}  symlinks silently. Re-run without --link on current releases.${c.reset}`);
+    } else {
+      const { cpSync } = await import("fs");
+      cpSync(pluginDir, linkPath, { recursive: true, dereference: true });
+      console.log(`${c.green}Installed plugin: ${linkPath} (copied from ${pluginDir})${c.reset}`);
+    }
   }
 
   // ----- §14.3 upgrade migration -----
@@ -1472,30 +1587,45 @@ async function cmdSetupOpenClaw(args: string[]) {
   console.log(`have a bug where plugins.slots.contextEngine is silently dropped`);
   console.log(`during config normalization (openclaw/openclaw#64192).`);
 
-  // Remaining steps. CLI discovery finds the plugin immediately because the
-  // plugin dir now ships a package.json with openclaw.extensions declared, so
-  // `openclaw plugins enable clawmem` can run before any gateway restart.
-  // The enable command switches the exclusive memory slot to clawmem and
-  // disables memory-core/memory-lancedb automatically. Then the gateway
-  // restart applies the new slot assignment.
+  // §28.1 H1: dual next-steps output. Path 1 (delegated) auto-enables via
+  // persistPluginInstall, so the legacy "Step 1: enable" instruction is
+  // redundant and would mislead users. Path 3 (direct copy) writes only
+  // the plugin files; the user must still run `openclaw plugins enable`
+  // themselves, so the original 4-step output is preserved verbatim.
   console.log();
   console.log(`${c.bold}Next steps:${c.reset}`);
   console.log();
-  console.log(`  1. Enable ClawMem as the active memory plugin:`);
-  console.log(`     ${c.cyan}openclaw plugins enable clawmem${c.reset}`);
-  console.log(`     ${c.dim}(Switches plugins.slots.memory to clawmem and disables memory-core if active.)${c.reset}`);
-  console.log();
-  console.log(`  2. Restart the gateway to apply:`);
-  console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
-  console.log();
-  console.log(`  3. Configure GPU endpoints (if not using defaults):`);
-  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
-  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlm http://YOUR_GPU:8089${c.reset}`);
-  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlmModel qwen3${c.reset}`);
-  console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuRerank http://YOUR_GPU:8090${c.reset}`);
-  console.log();
-  console.log(`  4. Start the REST API (for agent tools):`);
-  console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
+  if (delegated) {
+    // Path 1 — plugin already enabled and registered by openclaw plugins install.
+    console.log(`  1. Restart the gateway to apply:`);
+    console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
+    console.log();
+    console.log(`  2. Configure GPU endpoints (if not using defaults):`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlm http://YOUR_GPU:8089${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlmModel qwen3${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuRerank http://YOUR_GPU:8090${c.reset}`);
+    console.log();
+    console.log(`  3. Start the REST API (for agent tools):`);
+    console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
+  } else {
+    // Path 3 — direct-copy install. User still needs to enable + restart.
+    console.log(`  1. Enable ClawMem as the active memory plugin:`);
+    console.log(`     ${c.cyan}openclaw plugins enable clawmem${c.reset}`);
+    console.log(`     ${c.dim}(Switches plugins.slots.memory to clawmem and disables memory-core if active.)${c.reset}`);
+    console.log();
+    console.log(`  2. Restart the gateway to apply:`);
+    console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
+    console.log();
+    console.log(`  3. Configure GPU endpoints (if not using defaults):`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuEmbed http://YOUR_GPU:8088${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlm http://YOUR_GPU:8089${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuLlmModel qwen3${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.gpuRerank http://YOUR_GPU:8090${c.reset}`);
+    console.log();
+    console.log(`  4. Start the REST API (for agent tools):`);
+    console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
+  }
   console.log();
   console.log(`${c.bold}Important: keep dreaming disabled${c.reset}`);
   console.log(`  ClawMem runs its own consolidation workers (CLAWMEM_ENABLE_CONSOLIDATION`);
@@ -2844,7 +2974,7 @@ ${c.bold}Setup:${c.reset}
   clawmem collection remove <name>
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
-  clawmem setup openclaw [--remove]    Show OpenClaw plugin installation steps
+  clawmem setup openclaw [--link] [--remove]   Install/remove ClawMem as OpenClaw memory plugin
   clawmem install-service [--enable]   Install systemd watcher service
 
 ${c.bold}Indexing:${c.reset}

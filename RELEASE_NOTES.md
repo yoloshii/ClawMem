@@ -4,6 +4,58 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.4 — Profile-aware `setup openclaw` + `--help` short-circuit (issue #11)
+
+v0.10.4 fixes [yoloshii/ClawMem#11](https://github.com/yoloshii/ClawMem/issues/11). Two bugs reported by @elquercarlos:
+
+1. **`clawmem setup openclaw` ignored `OPENCLAW_STATE_DIR` and OpenClaw's `--profile` flag.** Pre-v0.10.4 hardcoded `~/.openclaw/extensions/clawmem` and never consulted env vars or OpenClaw's own destination-resolution logic. Users running OpenClaw with a non-default profile (e.g. `~/.openclaw-dev`) got the plugin installed in the wrong directory, where their active profile couldn't see it.
+2. **`clawmem setup openclaw --help` ran setup instead of printing help.** The handler had no argv short-circuit for `--help` / `-h`.
+
+Both bugs close on this release. Vault on disk is byte-identical to v0.10.3. No schema changes, no env-var changes for default-profile users, no retrieval-pipeline or hook changes. Pure `bun update -g clawmem` upgrade.
+
+### `cmdSetupOpenClaw` — three-path install (§28.1)
+
+The setup command now picks one of three paths at runtime:
+
+- **Delegated copy mode (default, OpenClaw CLI on `PATH`).** Spawns `openclaw plugins install <pluginDir> --force`. OpenClaw owns destination resolution (which respects `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and the `--profile` flag), runs manifest validation + security scans, persists install records, applies slot selection, and refreshes the registry. The plugin is **auto-enabled** by the install — the post-install "Next steps" output no longer prints `openclaw plugins enable clawmem`. `--force` makes the install idempotent across re-runs (OpenClaw's default install mode rejects existing targets).
+- **Delegated link mode (`--link` flag, OpenClaw CLI on `PATH`).** Spawns `openclaw plugins install <pluginDir> -l`, which records the source in `plugins.load.paths` — a load-path entry, **not a filesystem symlink**. Discovery uses the recorded load-path entry directly, so the v2026.4.11 symlink-discovery skip does NOT apply here. ClawMem does manual stale-install cleanup before delegating because OpenClaw rejects `--force` with `--link`.
+- **Direct-copy fallback (CLI absent).** Falls back to recursive `cpSync` (or filesystem symlink with `--link`) at a destination resolved by a faithful mirror of OpenClaw's `resolveConfigDir`: `OPENCLAW_STATE_DIR` → `OPENCLAW_CONFIG_PATH` (config root = `dirname(file)`) → `OPENCLAW_HOME`/`HOME`/`USERPROFILE`/`os.homedir()`/`cwd` → `~/.openclaw`. The user gets a warning surfacing reduced capability (no manifest validation, no security scan, no install records). Filesystem symlink in the fallback's `--link` path is still subject to OpenClaw v2026.4.11+'s discovery skip — install OpenClaw to get the cleaner delegated behavior.
+
+The faithful-mirror resolver matches OpenClaw exactly, including the asymmetry where `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH` apply only `.trim()` (so `OPENCLAW_STATE_DIR="undefined"` is a literal directory name) while home-resolution env vars filter the literal strings `"undefined"` / `"null"` (matching OpenClaw's `home-dir.ts:normalize`). Diverging here would mean the delegated path and the fallback path install into different locations for the same env, which is exactly the bug class §28.1 set out to fix.
+
+### `--remove` — legacy-compatible uninstall
+
+`clawmem setup openclaw --remove` now tries `openclaw plugins uninstall clawmem --force` first (when the CLI is available) and falls back to manual cleanup at the resolved extensions path. The fallback runs in two cases:
+
+1. CLI uninstall fails (typically because the install was a legacy unmanaged direct-copy from pre-v0.10.4 ClawMem and isn't tracked in OpenClaw's plugin install records). On failure, ClawMem **warns the user** that OpenClaw config and install records may still need manual repair, then runs the manual cleanup. We do not silently mask managed-uninstall failures.
+2. CLI uninstall succeeds (managed install). Even on success, ClawMem then checks the exact `extensions/clawmem` path and removes any remaining symlink or directory — a "constrained stale cleanup" that handles the side-by-side case of a managed-link install plus a leftover unmanaged-copy directory from an earlier ClawMem version.
+
+### `--help` / `-h` short-circuit (§28.2)
+
+`cmdSetupOpenClaw` short-circuits `--help` / `-h` at the top of the handler before any spawn or filesystem work and prints the full flag + env-var reference. Documents: `--link` (with separate behavior in delegated load-path mode vs filesystem-symlink fallback), `--remove`, env vars consulted (`OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, `OPENCLAW_HOME`, `HOME`, `USERPROFILE`), and example invocations including the headline `OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw`.
+
+### Verification
+
+The change set was validated against four turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~292K tokens) under `codex exec`. All findings — three HIGH (delegated-install auto-enable messaging, idempotence-via-`--force`, legacy-compatible `--remove`), two MEDIUM (resolver fidelity, real-stub-binary integration tests), two LOW (assertion tightening, main `--help` line) — were addressed before final clearance. The Turn 4 verdict was an explicit "zero remaining concerns, ready to ship v0.10.4."
+
+Test coverage: 8 unit tests (`tests/unit/openclaw-paths.test.ts`) on the resolver helpers, including precedence (`OPENCLAW_STATE_DIR` over `OPENCLAW_CONFIG_PATH`), tilde expansion, `OPENCLAW_HOME` priority, `os.homedir()` failure → cwd fallback, and the asymmetric `"undefined"` / `"null"` literal handling that mirrors OpenClaw exactly. 6 integration tests (`tests/integration/setup-openclaw.integration.test.ts`) exercise the real subprocess boundary via a per-command shell stub on a sandboxed `PATH`: copy mode passes `--force` and not `-l`; link mode passes `-l` and not `--force`; install failure aborts (no silent fallback to direct copy); `--remove` with a managed install runs CLI uninstall AND constrained stale cleanup; `--remove` with a legacy install falls back to manual cleanup with the user-visible warning; CLI absent honors `OPENCLAW_STATE_DIR` in direct-copy mode. Two further integration tests prove the dual next-steps messaging differs between paths and that `--help` short-circuits before the `openclaw --version` probe.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration shape (`kind: memory`), and Hermes plugin contract are all unchanged.
+- The §14.3 contextEngine→memory upgrade migration block is preserved verbatim.
+- Plugin source files (`src/openclaw/`) are unchanged. The change is entirely in `cmdSetupOpenClaw` and a new `src/openclaw-paths.ts` helper module.
+- Existing regression-gate tests in `tests/unit/openclaw-plugin.test.ts` (84 source-text assertions) all still pass — the Path 3 fallback branch preserves the original next-steps output verbatim.
+
+### Cross-references
+
+- Issue: https://github.com/yoloshii/ClawMem/issues/11 (@elquercarlos)
+- BACKLOG: `BACKLOG.md` Source 28 — full scope including the codex-validated implementation plan
+- OpenClaw delegation surfaces: `openclaw/src/cli/plugins-install-command.ts:669` (linked-path branch), `openclaw/src/cli/plugins-install-persist.ts:182` (auto-enable + slot selection), `openclaw/src/utils.ts:119` (`resolveConfigDir`)
+- Helper module: `src/openclaw-paths.ts` (mirrors OpenClaw's path-resolution semantics for the fallback path)
+
+---
+
 ## v0.10.3 — A-MEM parser hardening for noisy llama-server output (PR #7) + batched doc maintenance
 
 v0.10.3 is a small patch release. The retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration shape, and Hermes plugin contract are all unchanged from v0.10.2. The release hardens the A-MEM JSON parser against a class of noisy llama-server outputs that v0.10.2 mishandled (parser silently picked an example/schema literal over the real payload, link-generation batches got zeroed when the LLM under-delivered), and bundles four sitting-in-tree doc updates that were waiting for the next release.
