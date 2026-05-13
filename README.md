@@ -217,6 +217,8 @@ ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.a
 
 **Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `agent_end` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
 
+**Optional X/Twitter source plugin:** If the same OpenClaw workspace needs public X/Twitter signals, install [TweetClaw](https://github.com/Xquik-dev/tweetclaw) separately with `openclaw plugins install @xquik/tweetclaw` via [ClawHub](https://clawhub.ai/kriptoburak/xquik-tweetclaw). Use it to search tweets, search tweet replies, export followers, create monitors, deliver webhooks, and capture giveaway data, then save concise summaries, source queries, tweet IDs or URLs, and follow-up decisions into a ClawMem-indexed collection or handoff. Keep raw timelines and credentials out of the vault; post tweets or post tweet replies should stay approval-gated user actions, not memory writes.
+
 #### Hermes Agent
 
 ClawMem integrates as a native MemoryProvider plugin — Hermes's pluggable interface for agent memory. Same automatic retrieval and extraction, delivered through Hermes's memory lifecycle instead of Claude Code hooks.
