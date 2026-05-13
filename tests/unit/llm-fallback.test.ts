@@ -351,6 +351,34 @@ describe("LLM Remote Fallback", () => {
       const result = await llm.embed("test 2");
       expect(fetchCalled).toBe(true);
     });
+
+    it("reachable HTTP embed errors do not fall through to local embedding", async () => {
+      const llm = createLlm();
+
+      const embedLocalSpy = spyOn(llm as any, "embedLocal").mockImplementation(async () => {
+        throw new Error("should not fall through to local embedding");
+      });
+      const embedLocalBatchSpy = spyOn(llm as any, "embedLocalBatch").mockImplementation(async () => {
+        throw new Error("should not fall through to local batch embedding");
+      });
+
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Internal Server Error", { status: 500 }))
+      ) as any;
+
+      try {
+        const single = await llm.embed("test");
+        expect(single).toBeNull();
+        expect(embedLocalSpy).not.toHaveBeenCalled();
+
+        const batch = await llm.embedBatch(["a", "b"]);
+        expect(batch).toEqual([null, null]);
+        expect(embedLocalBatchSpy).not.toHaveBeenCalled();
+      } finally {
+        embedLocalSpy.mockRestore();
+        embedLocalBatchSpy.mockRestore();
+      }
+    });
   });
 
   // ─── Cross-service isolation ───────────────────────────────────────
