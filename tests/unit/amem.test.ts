@@ -1,6 +1,12 @@
 import { describe, it, expect } from "bun:test";
 
-import { extractJsonFromLLM, generateMemoryLinks, parseLinkGenerationFromLLM, parseMemoryNoteFromLLM } from "../../src/amem.ts";
+import {
+  extractJsonFromLLM,
+  generateMemoryLinks,
+  parseLinkGenerationFromLLM,
+  parseMemoryNoteFromLLM,
+} from "../../src/amem.ts";
+import { insertContent, insertDocument } from "../../src/store.ts";
 import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
@@ -388,5 +394,78 @@ describe("generateMemoryLinks", () => {
     } finally {
       store.close();
     }
+  });
+});
+
+// ─── generateMemoryLinks vector readiness ───────────────────────────
+
+describe("generateMemoryLinks vector readiness", () => {
+  it("returns 0 when vectors_vec is not ready", async () => {
+    const store = createTestStore();
+    store.db.exec("DROP TABLE IF EXISTS vectors_vec");
+
+    const now = new Date().toISOString();
+    insertContent(store.db, "hash-a", "Profile facts", now);
+    insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
+    const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
+
+    const count = await generateMemoryLinks(store, {} as any, row.id);
+    expect(count).toBe(0);
+  });
+
+  it("returns 0 when the source document has no vector row yet", async () => {
+    const store = createTestStore();
+    store.db.exec("DROP TABLE IF EXISTS vectors_vec");
+    store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+
+    const now = new Date().toISOString();
+    insertContent(store.db, "hash-a", "Profile facts", now);
+    insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
+    const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
+
+    const count = await generateMemoryLinks(store, {} as any, row.id);
+    expect(count).toBe(0);
+  });
+
+  it("returns 0 when the vector neighbor query throws for vector columns", async () => {
+    const store = createTestStore();
+    store.db.exec("DROP TABLE IF EXISTS vectors_vec");
+    store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY)");
+
+    const now = new Date().toISOString();
+    insertContent(store.db, "hash-a", "Profile facts", now);
+    insertContent(store.db, "hash-b", "More profile facts", now);
+    insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
+    insertDocument(store.db, "test", "notes/peer.md", "Peer", "hash-b", now, now);
+    store.db.prepare("INSERT INTO vectors_vec (hash_seq) VALUES (?)").run("hash-a_0");
+    store.db.prepare("INSERT INTO vectors_vec (hash_seq) VALUES (?)").run("hash-b_0");
+    const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
+
+    const count = await generateMemoryLinks(store, {} as any, row.id);
+    expect(count).toBe(0);
+  });
+
+  it("rethrows non-vector SQL errors from the neighbor query", async () => {
+    const store = createTestStore();
+    store.db.exec("DROP TABLE IF EXISTS vectors_vec");
+    store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+
+    const now = new Date().toISOString();
+    insertContent(store.db, "hash-a", "Profile facts", now);
+    insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
+    store.db.prepare("INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)").run("hash-a_0", new Uint8Array([1, 2, 3]));
+    const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
+
+    const originalPrepare = store.db.prepare.bind(store.db);
+    (store.db as any).prepare = (sql: string) => {
+      if (sql.includes("vec_distance_cosine")) {
+        throw new Error("no such column: d2.active");
+      }
+      return originalPrepare(sql);
+    };
+
+    await expect(generateMemoryLinks(store, {} as any, row.id)).rejects.toThrow(
+      "no such column: d2.active"
+    );
   });
 });
