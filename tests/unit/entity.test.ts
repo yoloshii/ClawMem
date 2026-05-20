@@ -166,6 +166,53 @@ describe("Levenshtein fuzzy matching", () => {
   });
 });
 
+describe("entity FTS prefix starvation", () => {
+  // Bug-first (codex IMPL T2): the entities_fts query builder prefixed every
+  // token (`"${t}"*`). A short/punctuation name like "C++" tokenizes to the
+  // 1-char token "c", so the query "c"* prefix-matched every entity whose name
+  // begins with c. Because the SQL LIMIT is applied BEFORE Levenshtein ranking,
+  // the exact "C++" row was starved out of the candidate pool. Fix: do not
+  // prefix 1-char tokens (multi-char prefix recall is retained).
+  it("resolveEntityCanonical finds C++ despite many same-prefix entities", () => {
+    for (let i = 0; i < 30; i++) upsertEntity(store.db, `Cache${i}`, "tool", "default");
+    const cppId = upsertEntity(store.db, "C++", "tool", "default");
+    const match = resolveEntityCanonical(store.db, "C++", "tool", "default");
+    expect(match).toBe(cppId);
+  });
+
+  it("searchEntities surfaces C++, not same-prefix noise", () => {
+    // Cache* get a higher mention_count so they out-rank C++ in the
+    // ORDER BY mention_count DESC LIMIT — a too-broad prefix would starve C++.
+    for (let i = 0; i < 30; i++) {
+      upsertEntity(store.db, `Cache${i}`, "tool", "default");
+      upsertEntity(store.db, `Cache${i}`, "tool", "default");
+    }
+    upsertEntity(store.db, "C++", "tool", "default");
+    const results = searchEntities(store.db, "C++", 5);
+    expect(results.some(r => r.name === "C++")).toBe(true);
+  });
+
+  // The 1-char rule alone was insufficient (codex IMPL T3): the same starvation
+  // hits short MULTI-char exact names. "Go" -> "go"* matches every "Golang*", so
+  // exact "Go" is starved from the LIMIT-20 pool. The exact-first lookup fixes it.
+  it("resolveEntityCanonical finds the short multi-char name Go despite same-prefix entities", () => {
+    for (let i = 0; i < 30; i++) upsertEntity(store.db, `Golang${i}`, "tool", "default");
+    const goId = upsertEntity(store.db, "Go", "tool", "default");
+    const match = resolveEntityCanonical(store.db, "Go", "tool", "default");
+    expect(match).toBe(goId);
+  });
+
+  it("searchEntities surfaces Go, not same-prefix Golang noise", () => {
+    for (let i = 0; i < 30; i++) {
+      upsertEntity(store.db, `Golang${i}`, "tool", "default");
+      upsertEntity(store.db, `Golang${i}`, "tool", "default");
+    }
+    upsertEntity(store.db, "Go", "tool", "default");
+    const results = searchEntities(store.db, "Go", 5);
+    expect(results.some(r => r.name === "Go")).toBe(true);
+  });
+});
+
 describe("entity graph neighbors", () => {
   it("returns empty for docs with no entity mentions", () => {
     const [docId] = seedDocuments(store, [{ path: "test.md", title: "Test", body: "content" }]);

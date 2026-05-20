@@ -4,6 +4,54 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.6 — FTS keyword-search tokenization: split separators instead of stripping them
+
+v0.10.6 fixes an internally-found bug in the BM25 keyword-search path: the query builder silently returned **zero rows for any compound / path / snake_case / dotted / hyphenated query** — exactly the config-name, hook-name, filename, and identifier searches the system is meant to serve.
+
+`src/store.ts:sanitizeFTS5Term()` removed every non-alphanumeric character from each whitespace token, which **concatenated** separator-delimited word-parts into a token that was never indexed. The FTS index (`documents_fts`, `tokenize='porter unicode61'`) does the opposite — it **splits** stored text on `_ - . / '` and all punctuation. So query and index tokenization disagreed:
+
+- `before_compaction` → `beforecompaction` → `MATCH "beforecompaction"*` → **0 rows** (the index holds `before` and `compaction` as separate tokens)
+- `src/store.ts` → `srcstorets` → **0 rows**; `q4_k_m`/`v0.8.2` → `q4km`/`v082` → **0 rows**
+
+Vector recall partially masked this in the hybrid `query` path, but pure `search` (BM25-only) and the raw file-path supplemental lookup in `context-surfacing` returned nothing. CLAUDE.md, AGENTS.md, and SKILL.md already documented "code identifiers work" — this release makes the implementation match that promise.
+
+Vault on disk is unchanged. **No reindex required** — a query-build change only, so it fixes every existing vault the moment you upgrade. No schema migration, no env-var change, no public API change. Pure `bun add -g clawmem` upgrade.
+
+### The fix — split, don't strip
+
+`sanitizeFTS5Term` is replaced by `tokenizeForFTS5`, which splits on the same boundaries the index tokenizer uses:
+
+```ts
+export function tokenizeForFTS5(query: string): string[] {
+  return query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0);
+}
+```
+
+`buildFTS5Query` keeps the existing AND-of-prefixes semantics (`"before"* AND "compaction"*`). One-character tokens are kept (needed for `q4_k_m`, `v0.8.2`, `a/b`); AND makes them a precision constraint, not noise. The split regex consumes every FTS5 syntax character, so each surviving token is alphanumeric and quoted — at least as injection-safe as the prior strip approach.
+
+### Entity FTS — exact-first candidate gathering
+
+The same `tokenizeForFTS5` is shared with the two `entities_fts` MATCH builders (`src/entity.ts`). Adversarial review surfaced that a naïve prefix query there starves short exact names: `entities_fts` applies its `LIMIT` **before** the Levenshtein / mention-count ranking, so a broad prefix (`"go"*` matching 30 `Golang*` rows, or `"c"*` for `C++`) fills the candidate pool and drops the exact row before it can be ranked. `resolveEntityCanonical` and `searchEntities` now gather **exact-token matches first**, then top up with deduped prefix matches only while under the limit (`gatherEntityFTSCandidates`). The exact row is always present for ranking; multi-char prefix recall (`clawme`* → `clawmem`) is preserved as a supplement.
+
+### Verification
+
+Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e4595-43b3-7b40-b8a0-bc684f22e2e6`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
+
+Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts` (compound, non-adjacent AND, slash-path via the filepath column, 1-char tokens, apostrophe behavior-lock, FTS5-specials no-throw, punctuation-only → empty) + 4 entity starvation regression tests in `tests/unit/entity.test.ts` (`C++` and `Go`, each across `resolveEntityCanonical` and `searchEntities`). Five of the store tests fail on the pre-fix code; all pass after. Full suite: 1298 pass / 0 fail. `tsc --noEmit` clean for the changed files.
+
+### What didn't change
+
+- Retrieval pipeline shape, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration (`kind: memory`), and the Hermes plugin contract are all unchanged from v0.10.5.
+- No reindex, no schema migration, no public API change, no config or env-var change.
+- The `store ⇄ entity` import added for the shared tokenizer is runtime-safe (hoisted `function` declaration, called only at runtime).
+
+### Cross-references
+
+- Codex review session: `019e4595-43b3-7b40-b8a0-bc684f22e2e6` (4 turns; T2 caught the entity regression, T4 zero remaining findings)
+- Primary surfaces: `src/store.ts` (`tokenizeForFTS5`, `buildFTS5Query`), `src/entity.ts` (`gatherEntityFTSCandidates`, both `entities_fts` sites)
+
+---
+
 ## v0.10.5 — Issue #13: SQLite PRAGMA ordering race fix + openclaw doc-comment line-ref bump
 
 v0.10.5 fixes [yoloshii/ClawMem#13](https://github.com/yoloshii/ClawMem/issues/13). One bug reported by @jcgau (first-time contributor):

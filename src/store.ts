@@ -3082,14 +3082,20 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+// Split on any run of non-token chars so query tokenization mirrors the FTS
+// index tokenizer (unicode61) which treats _ - . / ' and all punctuation as
+// token boundaries. Stripping the separators (the old behavior) concatenated
+// word-parts into a token that was never indexed — e.g. "before_compaction"
+// became "beforecompaction" and matched nothing. Shared with entities_fts in
+// entity.ts. Must stay a hoisted `function` declaration: entity.ts imports it
+// across the store<->entity module cycle, which only resolves for hoisted
+// bindings (it is called at runtime, never at module-eval time).
+export function tokenizeForFTS5(query: string): string[] {
+  return query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0);
 }
 
 function buildFTS5Query(query: string): string | null {
-  const terms = query.split(/\s+/)
-    .map(t => sanitizeFTS5Term(t))
-    .filter(t => t.length > 0);
+  const terms = tokenizeForFTS5(query);
   if (terms.length === 0) return null;
   if (terms.length === 1) return `"${terms[0]}"*`;
   return terms.map(t => `"${t}"*`).join(' AND ');

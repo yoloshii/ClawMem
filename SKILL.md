@@ -332,7 +332,7 @@ The query string directly feeds BM25 (which probes first and can short-circuit t
 **For keyword recall (BM25 path):**
 - 2-5 precise terms, no filler words
 - Code identifiers work: `handleError async`
-- BM25 tokenizes on whitespace and AND's all terms as prefix matches (`perf` matches "performance")
+- BM25 tokenizes on whitespace and separators (`_ - . /` etc., mirroring the index), then AND's all terms as prefix matches (`perf` matches "performance"; `before_compaction` matches docs containing `before` and `compaction`)
 - No phrase search or negation syntax — all terms are positive prefix matches
 - A strong keyword hit (score >= 0.85 with gap >= 0.15) skips expansion entirely — faster results
 

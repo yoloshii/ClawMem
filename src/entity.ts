@@ -11,6 +11,7 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "crypto";
 import type { LLM } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
+import { tokenizeForFTS5 } from "./store.ts";
 
 // =============================================================================
 // Types
@@ -287,6 +288,33 @@ Return ONLY the JSON array. /no_think`;
 // =============================================================================
 
 /**
+ * Exact-first entity FTS candidate gathering.
+ *
+ * `entities_fts` is queried with a LIMIT applied BEFORE the downstream
+ * Levenshtein / mention-count ranking. A pure prefix query (`"tok"*`) can match
+ * a large set (e.g. "Go" -> "go"* matches every "Golang*"), filling the LIMIT
+ * pool and starving the exact row out before it can be ranked. So we gather
+ * exact-token matches first, then top up with prefix matches (deduped by
+ * entity_id) only while under the limit — the exact row is therefore always
+ * present for ranking, and multi-char prefix recall (e.g. "clawme"* ->
+ * "clawmem") is preserved as a supplement. `runMatch` runs the caller's own SQL
+ * because vault scoping / ordering / selected columns differ per call site.
+ */
+function gatherEntityFTSCandidates<T extends { entity_id: string }>(
+  tokens: string[],
+  limit: number,
+  runMatch: (matchExpr: string, lim: number) => T[],
+): T[] {
+  if (tokens.length === 0) return [];
+  const exact = runMatch(tokens.map(t => `"${t}"`).join(' OR '), limit);
+  if (exact.length >= limit) return exact;
+  const seen = new Set(exact.map(r => r.entity_id));
+  const prefix = runMatch(tokens.map(t => `"${t}"*`).join(' OR '), limit)
+    .filter(r => !seen.has(r.entity_id));
+  return exact.concat(prefix).slice(0, limit);
+}
+
+/**
  * Resolve an entity name to its canonical form.
  * Uses FTS5 candidate lookup + Levenshtein fuzzy matching.
  *
@@ -316,13 +344,14 @@ export function resolveEntityCanonical(
   // Step 1: FTS5 candidate lookup — type-agnostic, vault-scoped
   let candidates: { entity_id: string; name: string; entity_type: string }[] = [];
   try {
-    candidates = db.prepare(`
-      SELECT f.entity_id, f.name, f.entity_type
-      FROM entities_fts f
-      JOIN entity_nodes e ON e.entity_id = f.entity_id
-      WHERE entities_fts MATCH ? AND e.vault = ?
-      LIMIT 20
-    `).all(normalizedName.split(/\s+/).map(w => `"${w}"`).join(' OR '), vault) as typeof candidates;
+    candidates = gatherEntityFTSCandidates(tokenizeForFTS5(normalizedName), 20, (matchExpr, lim) =>
+      db.prepare(`
+        SELECT f.entity_id, f.name, f.entity_type
+        FROM entities_fts f
+        JOIN entity_nodes e ON e.entity_id = f.entity_id
+        WHERE entities_fts MATCH ? AND e.vault = ?
+        LIMIT ?
+      `).all(matchExpr, vault, lim) as typeof candidates);
   } catch {
     // FTS5 match may fail on special chars — fall back to LIKE on entity_nodes directly
     candidates = db.prepare(`
@@ -853,14 +882,15 @@ export function searchEntities(
   // Try FTS first
   let results: { entity_id: string; name: string; entity_type: string; mention_count: number }[] = [];
   try {
-    results = db.prepare(`
-      SELECT e.entity_id, e.name, e.entity_type, e.mention_count
-      FROM entities_fts f
-      JOIN entity_nodes e ON e.entity_id = f.entity_id
-      WHERE entities_fts MATCH ?
-      ORDER BY e.mention_count DESC
-      LIMIT ?
-    `).all(normalizedQuery.split(/\s+/).map(w => `"${w}"`).join(' OR '), limit) as typeof results;
+    results = gatherEntityFTSCandidates(tokenizeForFTS5(normalizedQuery), limit, (matchExpr, lim) =>
+      db.prepare(`
+        SELECT e.entity_id, e.name, e.entity_type, e.mention_count
+        FROM entities_fts f
+        JOIN entity_nodes e ON e.entity_id = f.entity_id
+        WHERE entities_fts MATCH ?
+        ORDER BY e.mention_count DESC
+        LIMIT ?
+      `).all(matchExpr, lim) as typeof results);
   } catch {
     // Fallback to LIKE
     results = db.prepare(`
