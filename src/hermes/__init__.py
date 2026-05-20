@@ -422,15 +422,20 @@ class ClawMemProvider(MemoryProvider):
         if not self._bin or not query or len(query) < 5:
             return
 
-        # Increment generation so older threads can't overwrite newer results
+        # Increment generation so older threads can't overwrite newer results,
+        # and snapshot the session id + transcript path under the same lock so a
+        # concurrent on_session_switch() can't make the worker read a torn
+        # (new id / old path) pair — the worker uses the snapshot, never live state.
         with self._prefetch_lock:
             self._prefetch_generation += 1
             my_gen = self._prefetch_generation
+            run_session_id = self._session_id
+            run_transcript_path = self._transcript_path
 
         def _run():
             hook_input = {
-                "session_id": self._session_id,
-                "transcript_path": self._transcript_path,
+                "session_id": run_session_id,
+                "transcript_path": run_transcript_path,
                 "prompt": query,
                 "hook_event_name": "UserPromptSubmit",
             }
@@ -530,6 +535,50 @@ class ClawMemProvider(MemoryProvider):
             t.join(timeout=_HOOK_TIMEOUT + 5)
 
         logger.info("clawmem: session %s extraction complete", self._session_id[:8])
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        **kwargs,
+    ) -> None:
+        """Refresh session-derived state when Hermes rotates session_id mid-process.
+
+        Fires on /new (reset=True), /resume, /branch, and compression (reset=False).
+        ClawMem reads _session_id and the session-keyed _transcript_path live in
+        queue_prefetch / sync_turn / on_session_end / on_pre_compress, so a switch
+        must repoint them and drop the prior session's prefetch + bootstrap context
+        (unconditional — NOT gated on reset, or stale recall leaks into the new
+        session). Cache coherence, not a vault write, so it runs for all contexts.
+        """
+        new_id = str(new_session_id or "").strip()
+        if not new_id or not self._bin:
+            return
+        # Idempotent re-fire (duplicate dispatch) with no reset is a no-op.
+        if new_id == self._session_id and not reset:
+            return
+
+        new_path = self._transcript_path
+        if self._hermes_home:
+            transcript_dir = Path(self._hermes_home) / "clawmem-transcripts"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            new_path = str(transcript_dir / f"{new_id}.jsonl")
+
+        with self._prefetch_lock:
+            self._session_id = new_id
+            self._transcript_path = new_path
+            # Bump generation MONOTONICALLY (never reset to 0): an in-flight
+            # prefetch worker then fails its `my_gen == _prefetch_generation`
+            # check and discards its result instead of leaking it into the new
+            # session. Advancing consumed_gen drops any already-cached result.
+            self._prefetch_generation += 1
+            self._prefetch_result = ""
+            self._prefetch_result_gen = 0
+            self._prefetch_consumed_gen = self._prefetch_generation
+            # Startup context is session-derived; must not cross session ids.
+            self._bootstrap_context = ""
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Run precompact-extract (side effect only — Hermes ignores return).

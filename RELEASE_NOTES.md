@@ -4,6 +4,21 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.7 — Hermes plugin: refresh session-derived state on `on_session_switch`
+
+v0.10.7 implements the `MemoryProvider.on_session_switch` hook in the Hermes plugin (`src/hermes/__init__.py`). Hermes Agent (v2026.5.16) wired this lifecycle hook to fire on `/new` (reset=True), `/resume`, `/branch`, and context compression — any mid-process `session_id` rotation that does not tear the provider down. ClawMem previously did not override it (the ABC default is a no-op), so after a switch the plugin kept using the `session_id` it cached at `initialize()`: extraction and handoff metadata carried the stale id, and the session-keyed transcript file (`{session_id}.jsonl`) kept collecting the new session's turns under the old name.
+
+The override repoints the cached `_session_id`, rebuilds `_transcript_path` for the new session, and **unconditionally** invalidates the prior session's prefetch + bootstrap caches so a recall queued under the old session cannot surface in the new one. To stay race-free with the background prefetch worker, `queue_prefetch` now snapshots the session id and transcript path under the prefetch lock at queue time (the worker uses the snapshot, never live state), and the switch bumps the prefetch generation monotonically so an in-flight worker discards its result instead of writing it into the new session. Retrieval is unaffected — the vault is path-keyed, not session-keyed — so this is metadata/transcript correctness, not a recall change.
+
+### Verification
+
+Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e46bc-0848-7540-a1ce-913000112da1`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration, and the Claude Code hook path are all unchanged from v0.10.6.
+- No reindex, no schema migration, no public API change, no config or env-var change. Pure `bun add -g clawmem` upgrade.
+
 ## v0.10.6 — FTS keyword-search tokenization: split separators instead of stripping them
 
 v0.10.6 fixes an internally-found bug in the BM25 keyword-search path: the query builder silently returned **zero rows for any compound / path / snake_case / dotted / hyphenated query** — exactly the config-name, hook-name, filename, and identifier searches the system is meant to serve.
