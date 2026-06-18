@@ -255,6 +255,11 @@ export type LlamaCppConfig = {
    */
   remoteLlmNoThink?: boolean;
   /**
+   * API key for remote LLM server. Sent as Bearer token.
+   * Env: CLAWMEM_LLM_API_KEY
+   */
+  remoteLlmApiKey?: string;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -313,6 +318,7 @@ export class LlamaCpp implements LLM {
   private remoteLlmModel: string;
   private remoteLlmReasoningEffort: string | null;
   private remoteLlmNoThink: boolean;
+  private remoteLlmApiKey: string | null;
 
   // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -349,6 +355,7 @@ export class LlamaCpp implements LLM {
     this.remoteLlmModel = normalizedRemoteLlmModel || "qwen3";
     this.remoteLlmReasoningEffort = normalizeRemoteLlmReasoningEffort(config.remoteLlmReasoningEffort);
     this.remoteLlmNoThink = config.remoteLlmNoThink ?? true;
+    this.remoteLlmApiKey = config.remoteLlmApiKey || null;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -1035,9 +1042,13 @@ export class LlamaCpp implements LLM {
       if (this.remoteLlmReasoningEffort) {
         body.reasoning_effort = this.remoteLlmReasoningEffort;
       }
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (this.remoteLlmApiKey) {
+        headers["Authorization"] = `Bearer ${this.remoteLlmApiKey}`;
+      }
       const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(body),
         signal,
       });
@@ -1374,6 +1385,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
         if (!raw) return undefined;
         return !["0", "false", "no", "off"].includes(raw);
       })(),
+      remoteLlmApiKey: process.env.CLAWMEM_LLM_API_KEY || undefined,
     });
   }
   return defaultLlamaCpp;
