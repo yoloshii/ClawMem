@@ -290,6 +290,7 @@ function normalizeRemoteLlmReasoningEffort(value?: string): string | null {
 
 function buildRemoteChatCompletionsUrl(remoteLlmUrl: string): string {
   const baseUrl = remoteLlmUrl.replace(/\/+$/, "");
+  if (baseUrl.endsWith("/chat/completions")) return baseUrl;
   const endpoint = baseUrl.endsWith("/v1") ? "/chat/completions" : "/v1/chat/completions";
   return `${baseUrl}${endpoint}`;
 }
