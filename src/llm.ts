@@ -1049,12 +1049,15 @@ export class LlamaCpp implements LLM {
       }
 
       const data = await resp.json() as {
-        choices: { message: { content: string } }[];
+        choices: { message: { content?: string; reasoning_content?: string } }[];
         model?: string;
       };
 
+      const msg = data.choices[0]?.message;
+      const text = msg?.content || msg?.reasoning_content || "";
+
       return {
-        text: data.choices[0]?.message?.content || "",
+        text,
         model: data.model || this.remoteLlmUrl!,
         done: true,
       };
