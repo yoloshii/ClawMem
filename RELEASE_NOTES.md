@@ -4,6 +4,28 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.11.0 — Embedding dimension-migration safety + lease-fenced, atomic vector writes
+
+v0.11.0 hardens the embedding write path against a class of **silent vector loss** surfaced by a real incident: a re-embed reported success, but pure-vector retrieval (`vsearch` / `find_similar`) returned nothing for the affected docs. Root-cause analysis found two layers — a model-serving quality issue (operator-side; see Troubleshooting → "weak or irrelevant results") and, in ClawMem itself, an **unsafe dimension migration**: when the embedding model's output dimension changed, `ensureVecTable` dropped the `vectors_vec` table while the metadata-based worklist (`getHashesNeedingFragments`) skipped the now-vectorless documents (their `content_vectors` rows still existed). The result was a vault whose vectors were silently wiped while `embed` reported "all done."
+
+What changed in the embedding write path:
+
+- **`ensureVecTable` never drops an existing table.** A dimension/schema mismatch now throws a fatal `VecDimensionMismatchError` and aborts the run instead of dropping. The only path that clears vectors is the explicit `clearAllEmbeddings`, reached only via `embed --force`.
+- **`embed` detects dimension AND model drift non-destructively.** An implicit (non-`--force`) run that sees a changed dimension — or a *different model at the same dimension*, which mixes a heterogeneous, similarity-meaningless vector space — aborts with instructions to run `--force`, never mutating. `embed --force` probes the endpoint **first** and aborts without clearing if it's unreachable, so a force rebuild against a dead server cannot wipe the vault. The whole run is bound to one `(dimension, model)`; every embedding is validated before it is stored.
+- **All vector mutations are atomic and lease-fenced.** `insertEmbedding`, `clearAllEmbeddings`, `cleanStaleEmbeddings`, and table creation each run in a single immediate-write-lock transaction that verifies a renewable, token-fenced **embedding lease** (`worker_leases`, name `embedding`, heartbeat-renewed) before mutating — so two concurrent embeds, or a process that lost its lease mid-run, cannot interleave a clear with an insert or mix two models into one index. A second concurrent `embed` skips cleanly.
+- **Crash-safe retry budget.** `embed_attempts` increments exactly once per attempt (at start), resets on a successful embed, and resets whenever a document's content changes (new hash) via a new `reset_embed_on_hash_change` trigger that covers *every* hash-changing path. A document can no longer be permanently excluded by stale failures from old content. Partial embeds are retried in full.
+- **`doctor` now reports content_vectors ↔ vectors_vec consistency** (a set-difference check, including the worst case where `vectors_vec` is absent but metadata rows remain), and flags a vault that contains mixed embedding models.
+- **`embed` exits non-zero** when a run aborts (dimension/model mismatch or lost lease), so the embed timer / `update --embed` can detect an incomplete run.
+
+### Verification
+
+Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec` (session `019eefbe`): a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, and OpenClaw/Hermes plugin registration are unchanged.
+- No public API change. **One behavior change:** `embed` now **aborts** on a dimension/model change instead of silently re-embedding into a dropped table — run `clawmem embed --force` to migrate. The only schema addition is the `reset_embed_on_hash_change` trigger, created automatically on store open (no manual migration).
+
 ## v0.10.7 — Hermes plugin: refresh session-derived state on `on_session_switch`
 
 v0.10.7 implements the `MemoryProvider.on_session_switch` hook in the Hermes plugin (`src/hermes/__init__.py`). Hermes Agent (v2026.5.16) wired this lifecycle hook to fire on `/new` (reset=True), `/resume`, `/branch`, and context compression — any mid-process `session_id` rotation that does not tear the provider down. ClawMem previously did not override it (the ABC default is a no-op), so after a switch the plugin kept using the `session_id` it cached at `initialize()`: extraction and handoff metadata carried the stale id, and the session-keyed transcript file (`{session_id}.jsonl`) kept collecting the new session's turns under the old name.

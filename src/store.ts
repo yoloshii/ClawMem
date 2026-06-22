@@ -592,6 +592,25 @@ function initializeDatabase(db: Database): void {
     }
   }
 
+  // Centralize the embed-lifecycle reset on content change: ANY path that updates
+  // documents.hash (updateDocument, reactivateDocument, indexer reactivation,
+  // decision/antipattern merges, saveMemory, beads sync, …) gets the doc's embed
+  // state reset, so the new content is re-embedded with a fresh retry budget and is
+  // never excluded by the OLD content's exhausted embed_attempts. One trigger covers
+  // every caller (codex HIGH, INCIDENT-2026-06-22). It fires only on an actual change
+  // (`IS NOT` is null-safe) and does not touch hash, so it cannot recurse. Created
+  // right after the embed_* column migrations above, so the columns it references
+  // exist. NOT wrapped in try/catch: a creation failure means this load-bearing
+  // reset is silently absent, so let it surface loudly rather than hide a footgun.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS reset_embed_on_hash_change
+    AFTER UPDATE OF hash ON documents
+    FOR EACH ROW WHEN OLD.hash IS NOT NEW.hash
+    BEGIN
+      UPDATE documents SET embed_state = 'pending', embed_attempts = 0, embed_error = NULL WHERE id = NEW.id;
+    END;
+  `);
+
   // Migration: add A-MEM columns to documents
   const amemMigrations: [string, string][] = [
     ["amem_keywords", "ALTER TABLE documents ADD COLUMN amem_keywords TEXT"],
@@ -923,32 +942,153 @@ function initializeDatabase(db: Database): void {
 }
 
 
-// Per-database dimension cache (WeakMap keyed by db object — no collisions for in-memory DBs)
-const vecTableDimsCache = new WeakMap<Database, number>();
-
 // v0.8.1 Ext 6b: per-database cache for the query_text column presence on
 // context_usage. Set once at migration time so insertUsageFn can pick the
 // correct INSERT shape without running PRAGMA on every write. Falls back
 // to `false` (safe — equivalent to pre-migration behavior) when absent.
 const contextUsageHasQueryTextCache = new WeakMap<Database, boolean>();
 
-function ensureVecTableInternal(db: Database, dimensions: number): void {
-  if (vecTableDimsCache.get(db) === dimensions) return;
+/**
+ * Fatal, non-recoverable vector-store errors. These abort the embed run rather
+ * than being swallowed as per-fragment failures. A dimension/schema mismatch must
+ * NEVER silently drop an existing table — the only path that clears vectors is the
+ * explicit clearAllEmbeddings (gated behind `embed --force`). See
+ * INCIDENT-2026-06-22 §12 + EMBED-LEASE-RENEWAL-DESIGN.md.
+ */
+export class FatalVectorError extends Error {}
 
-  const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
-  if (tableInfo) {
-    const match = tableInfo.sql.match(/float\[(\d+)\]/);
-    const hasHashSeq = tableInfo.sql.includes('hash_seq');
-    const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
-    const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
-    if (existingDims === dimensions && hasHashSeq && hasCosine) {
-      vecTableDimsCache.set(db, dimensions);
+export class VecDimensionMismatchError extends FatalVectorError {
+  constructor(public readonly existingDim: number, public readonly requestedDim: number) {
+    super(`Embedding dimension changed: vectors_vec is float[${existingDim}] but the model now returns float[${requestedDim}]. Run 'clawmem embed --force' to clear and rebuild the full vault.`);
+    this.name = "VecDimensionMismatchError";
+  }
+}
+
+export class VecSchemaError extends FatalVectorError {
+  constructor(message: string) {
+    super(message);
+    this.name = "VecSchemaError";
+  }
+}
+
+export class VecModelMismatchError extends FatalVectorError {
+  constructor(public readonly expectedModel: string, public readonly actualModel: string) {
+    super(`Embedding model changed mid-run: the vault is being built with "${expectedModel}" but the endpoint now returns "${actualModel}". Mixing different models in one vector space (even at the same dimension) makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild with the current model.`);
+    this.name = "VecModelMismatchError";
+  }
+}
+
+// A FatalVectorError so it propagates out of the per-fragment catch and aborts the
+// embed run. Thrown both by cmdEmbed (between fragments) and INSIDE insertEmbedding's
+// write transaction (atomic lease-token fence) when the lease was reclaimed.
+export class EmbedLeaseLostError extends FatalVectorError {
+  constructor() {
+    super("Embedding lease lost (another embed process took over). Re-run 'clawmem embed'.");
+    this.name = "EmbedLeaseLostError";
+  }
+}
+
+/** A held embedding-lease identity, passed into vector mutations so each can verify
+ *  ownership before mutating — a process that lost the lease cannot wipe/recreate/write
+ *  the vector store under the new holder. */
+export type LeaseGuard = { workerName: string; token: string };
+
+/**
+ * Throw EmbedLeaseLostError if the caller no longer holds the named lease. Call as the
+ * FIRST statement inside a write transaction (before any mutation), so the check and
+ * the writes are atomic under SQLite's single-writer serialization — no other holder
+ * can interleave a reclaim between the check and the mutation. No-op when leaseGuard
+ * is omitted (non-embed callers).
+ */
+function assertLeaseHeld(db: Database, leaseGuard?: LeaseGuard): void {
+  if (!leaseGuard) return;
+  const row = db.prepare(`SELECT lease_token FROM worker_leases WHERE worker_name = ?`).get(leaseGuard.workerName) as { lease_token: string } | null;
+  if (!row || row.lease_token !== leaseGuard.token) {
+    throw new EmbedLeaseLostError();
+  }
+}
+
+/**
+ * Single source of truth for vectors_vec schema validation. Reads the table DDL
+ * and returns:
+ *   - null      → table ABSENT
+ *   - <integer> → table VALID (vec0 schema: hash_seq + float[N] + cosine); the N
+ *   - throws VecSchemaError → table PRESENT but its schema is unexpected
+ *     (missing float[N], hash_seq, or distance_metric=cosine; malformed/legacy DDL).
+ * No caching: a stale per-process dim cache could bypass this validation when
+ * another process changed the table. The embed lease serializes embeds, and the
+ * old cache fast-path is removed so validation is unconditional on every call.
+ * Case-insensitive, whitespace-tolerant.
+ */
+function readVecTableDim(db: Database): number | null {
+  const info = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
+  if (!info) return null;
+  const m = info.sql.match(/float\s*\[\s*(\d+)\s*\]/i);
+  const hasHashSeq = /\bhash_seq\b/i.test(info.sql);
+  const hasCosine = /distance_metric\s*=\s*cosine/i.test(info.sql);
+  if (!m || !hasHashSeq || !hasCosine) {
+    throw new VecSchemaError(`vectors_vec exists but its schema is unexpected (need hash_seq + float[N] + distance_metric=cosine): ${info.sql}`);
+  }
+  return parseInt(m[1]!, 10);
+}
+
+function ensureVecTableInternal(db: Database, dimensions: number, leaseGuard?: LeaseGuard): void {
+  const existing = readVecTableDim(db); // null=absent, N=valid, throws VecSchemaError if malformed
+  if (existing !== null) {
+    // NEVER drop an existing table on a dimension mismatch — that silently destroys
+    // the vault's vectors while the metadata-based worklist skips the now-vectorless
+    // docs (INCIDENT-2026-06-22). Throw; the run aborts. Clear+rebuild happens only
+    // via clearAllEmbeddings (`embed --force`).
+    if (existing !== dimensions) throw new VecDimensionMismatchError(existing, dimensions);
+    return; // exists at the right dim + valid schema → nothing to do
+  }
+  // Table absent → create it ATOMICALLY. The lease assertion, a RE-CHECK of absence,
+  // and the CREATE run in ONE immediate-write-lock transaction, so no other process
+  // can clear/recreate between the check and the CREATE (closes the TOCTOU): a process
+  // that lost its lease cannot create an empty table at the wrong dimension under the
+  // new holder, and two creators cannot race. (vec0 CREATE works inside a transaction.)
+  db.transaction(() => {
+    assertLeaseHeld(db, leaseGuard);
+    const recheck = readVecTableDim(db);
+    if (recheck !== null) {
+      // Another holder created it while we waited for the write lock.
+      if (recheck !== dimensions) throw new VecDimensionMismatchError(recheck, dimensions);
       return;
     }
-    db.exec("DROP TABLE IF EXISTS vectors_vec");
-  }
-  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
-  vecTableDimsCache.set(db, dimensions);
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
+  }).immediate();
+}
+
+/**
+ * Public accessor for the vectors_vec dimension. Returns null if absent, the
+ * integer dimension if valid, or throws VecSchemaError if the table exists with
+ * a malformed/unexpected schema (see readVecTableDim).
+ */
+export function getVecTableDim(db: Database): number | null {
+  return readVecTableDim(db);
+}
+
+/**
+ * The DISTINCT non-empty embedding models stored in the vault (empty array if no
+ * embeddings exist). Used to detect model drift BETWEEN runs — a different model at
+ * the SAME dimension produces a heterogeneous vector space that dimension checks
+ * cannot catch. Returning ALL distinct models (not just the majority) lets callers
+ * also detect an ALREADY-heterogeneous vault (length > 1) instead of hiding the
+ * minority behind a majority match. The implicit embed path aborts and requires
+ * `embed --force` on any drift.
+ */
+export function getVecModels(db: Database): string[] {
+  // Join to ACTIVE documents so stale/orphaned content_vectors rows (an obsolete
+  // model on an inactive hash, not yet cleaned) cannot trigger a permanent
+  // "mixed models" abort that would block the very cleanup that removes them.
+  const rows = db.prepare(
+    `SELECT DISTINCT cv.model
+     FROM content_vectors cv
+     JOIN documents d ON d.hash = cv.hash AND d.active = 1
+     WHERE cv.model IS NOT NULL AND cv.model != ''
+     ORDER BY cv.model`
+  ).all() as { model: string }[];
+  return rows.map(r => r.model);
 }
 
 // =============================================================================
@@ -959,7 +1099,9 @@ export type Store = {
   db: Database;
   dbPath: string;
   close: () => void;
-  ensureVecTable: (dimensions: number) => void;
+  ensureVecTable: (dimensions: number, leaseGuard?: LeaseGuard) => void;
+  getVecTableDim: () => number | null;
+  getVecModels: () => string[];
 
   // Index health
   getHashesNeedingEmbedding: () => number;
@@ -976,7 +1118,6 @@ export type Store = {
   deleteLLMCache: () => number;
   deleteInactiveDocuments: () => number;
   cleanupOrphanedContent: () => number;
-  cleanupOrphanedVectors: () => number;
   vacuumDatabase: () => void;
 
   // Context
@@ -1025,9 +1166,10 @@ export type Store = {
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string }[];
-  clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => void;
-  cleanStaleEmbeddings: () => number;
+  clearAllEmbeddings: (leaseGuard?: LeaseGuard) => void;
+  getVectorConsistency: () => { cvCount: number; vvCount: number; cvMissingVv: number; vvOrphan: number; pending: number };
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard) => void;
+  cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => number;
 
   // SAME: Observation metadata
   updateObservationFields: (docPath: string, collectionName: string, fields: { observation_type?: string; facts?: string; narrative?: string; concepts?: string; files_read?: string; files_modified?: string }) => void;
@@ -1052,6 +1194,7 @@ export type Store = {
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
   // Embed state tracking
+  markEmbedStart: (hash: string) => void;
   markEmbedSynced: (hash: string) => void;
   markEmbedFailed: (hash: string, error: string) => void;
   getEmbedStats: () => { pending: number; synced: number; failed: number };
@@ -1150,7 +1293,9 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     db,
     dbPath: resolvedPath,
     close: () => db.close(),
-    ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
+    ensureVecTable: (dimensions: number, leaseGuard?: LeaseGuard) => ensureVecTableInternal(db, dimensions, leaseGuard),
+    getVecTableDim: () => getVecTableDim(db),
+    getVecModels: () => getVecModels(db),
 
     // Index health
     getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
@@ -1167,7 +1312,6 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     deleteLLMCache: () => deleteLLMCache(db),
     deleteInactiveDocuments: () => deleteInactiveDocuments(db),
     cleanupOrphanedContent: () => cleanupOrphanedContent(db),
-    cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
     // Context
@@ -1216,9 +1360,10 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     getHashesNeedingFragments: () => getHashesNeedingFragments(db),
-    clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId),
-    cleanStaleEmbeddings: () => cleanStaleEmbeddings(db),
+    clearAllEmbeddings: (leaseGuard?: LeaseGuard) => clearAllEmbeddings(db, leaseGuard),
+    getVectorConsistency: () => getVectorConsistency(db),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard),
+    cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => cleanStaleEmbeddings(db, leaseGuard),
 
     // SAME: Observation metadata
     updateObservationFields: (docPath: string, collectionName: string, fields) => updateObservationFieldsFn(db, docPath, collectionName, fields),
@@ -1243,11 +1388,23 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
 
     // Embed state tracking
+    markEmbedStart: (hash: string) => {
+      // Increment embed_attempts exactly ONCE per attempt, at the start, and set
+      // 'pending' so a crash mid-document leaves the doc retryable (and selected by
+      // getHashesNeedingFragments). The completion setters below are state-only — no
+      // further increment — so a start + a failure for the same attempt cannot
+      // double-count the retry budget.
+      db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(hash);
+    },
     markEmbedSynced: (hash: string) => {
-      db.prepare(`UPDATE documents SET embed_state = 'synced' WHERE hash = ? AND active = 1`).run(hash);
+      // Success resets the retry budget: embed_attempts counts CONSECUTIVE failures
+      // of the current content, so a successful (re-)embed must clear it — otherwise
+      // a doc re-embedded many times (repeated content edits) accumulates attempts
+      // and is wrongly excluded by the worklist's `embed_attempts < 3` guard.
+      db.prepare(`UPDATE documents SET embed_state = 'synced', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`).run(hash);
     },
     markEmbedFailed: (hash: string, error: string) => {
-      db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ?, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(error, hash);
+      db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ? WHERE hash = ? AND active = 1`).run(error, hash);
     },
     getEmbedStats: () => {
       const stats = db.prepare(`
@@ -1923,51 +2080,9 @@ export function cleanupOrphanedContent(db: Database): number {
   return result.changes;
 }
 
-/**
- * Remove orphaned vector embeddings that are not referenced by any active document.
- * Returns the number of orphaned embedding chunks deleted.
- */
-export function cleanupOrphanedVectors(db: Database): number {
-  // Check if vectors_vec table exists
-  const tableExists = db.prepare(`
-    SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
-  `).get();
-
-  if (!tableExists) {
-    return 0;
-  }
-
-  // Count orphaned vectors first
-  const countResult = db.prepare(`
-    SELECT COUNT(*) as c FROM content_vectors cv
-    WHERE NOT EXISTS (
-      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-    )
-  `).get() as { c: number };
-
-  if (countResult.c === 0) {
-    return 0;
-  }
-
-  // Delete from vectors_vec first
-  db.exec(`
-    DELETE FROM vectors_vec WHERE hash_seq IN (
-      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-      )
-    )
-  `);
-
-  // Delete from content_vectors
-  db.exec(`
-    DELETE FROM content_vectors WHERE hash NOT IN (
-      SELECT hash FROM documents WHERE active = 1
-    )
-  `);
-
-  return countResult.c;
-}
+// (Removed cleanupOrphanedVectors — an exposed, unfenced, non-transactional vector
+// mutation with no production caller. Use cleanStaleEmbeddings, which is lease-fenced
+// and atomic. See INCIDENT-2026-06-22 / codex review.)
 
 /**
  * Run VACUUM to reclaim unused space in the database.
@@ -1996,35 +2111,40 @@ export function canonicalDocId(collection: string, path: string): string {
  * to any active document. Also cleans the corresponding vectors_vec rows.
  * Returns the number of stale embeddings removed.
  */
-export function cleanStaleEmbeddings(db: Database): number {
-  // Find orphaned hashes in content_vectors that have no active document
-  const staleRows = db.prepare(`
-    SELECT DISTINCT cv.hash
-    FROM content_vectors cv
-    LEFT JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    WHERE d.id IS NULL
-  `).all() as { hash: string }[];
+export function cleanStaleEmbeddings(db: Database, leaseGuard?: LeaseGuard): number {
+  // Atomic + lease-fenced: the ownership check and the deletes share one transaction
+  // so a process that lost its lease cannot delete vectors out from under the new holder.
+  return db.transaction(() => {
+    assertLeaseHeld(db, leaseGuard);
+    // Find orphaned hashes in content_vectors that have no active document
+    const staleRows = db.prepare(`
+      SELECT DISTINCT cv.hash
+      FROM content_vectors cv
+      LEFT JOIN documents d ON d.hash = cv.hash AND d.active = 1
+      WHERE d.id IS NULL
+    `).all() as { hash: string }[];
 
-  if (staleRows.length === 0) return 0;
+    if (staleRows.length === 0) return 0;
 
-  const staleHashes = staleRows.map(r => r.hash);
+    const staleHashes = staleRows.map(r => r.hash);
 
-  // Get all hash_seq keys for stale rows to clean vectors_vec
-  const placeholders = staleHashes.map(() => '?').join(',');
-  const staleVecKeys = db.prepare(`
-    SELECT hash || '_' || seq as hash_seq FROM content_vectors WHERE hash IN (${placeholders})
-  `).all(...staleHashes) as { hash_seq: string }[];
+    // Get all hash_seq keys for stale rows to clean vectors_vec
+    const placeholders = staleHashes.map(() => '?').join(',');
+    const staleVecKeys = db.prepare(`
+      SELECT hash || '_' || seq as hash_seq FROM content_vectors WHERE hash IN (${placeholders})
+    `).all(...staleHashes) as { hash_seq: string }[];
 
-  // Delete from vectors_vec
-  if (staleVecKeys.length > 0) {
-    const vecPlaceholders = staleVecKeys.map(() => '?').join(',');
-    db.prepare(`DELETE FROM vectors_vec WHERE hash_seq IN (${vecPlaceholders})`).run(...staleVecKeys.map(r => r.hash_seq));
-  }
+    // Delete from vectors_vec
+    if (staleVecKeys.length > 0) {
+      const vecPlaceholders = staleVecKeys.map(() => '?').join(',');
+      db.prepare(`DELETE FROM vectors_vec WHERE hash_seq IN (${vecPlaceholders})`).run(...staleVecKeys.map(r => r.hash_seq));
+    }
 
-  // Delete from content_vectors
-  db.prepare(`DELETE FROM content_vectors WHERE hash IN (${placeholders})`).run(...staleHashes);
+    // Delete from content_vectors
+    db.prepare(`DELETE FROM content_vectors WHERE hash IN (${placeholders})`).run(...staleHashes);
 
-  return staleVecKeys.length;
+    return staleVecKeys.length;
+  }).immediate(); // immediate write lock: assert ownership under the lock before the deletes
 }
 
 // =============================================================================
@@ -2410,6 +2530,8 @@ export function reactivateDocument(
   modifiedAt: string
 ): void {
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  // The reset_embed_on_hash_change trigger resets embed_state/attempts/error iff the
+  // hash actually changes, so re-adding unchanged content preserves its valid vectors.
   db.prepare(`UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(safeTitle, hash, modifiedAt, documentId);
 }
@@ -2439,6 +2561,8 @@ export function updateDocument(
   modifiedAt: string
 ): void {
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  // The reset_embed_on_hash_change trigger resets embed_state/attempts/error when the
+  // hash actually changes, so this only needs to set the content fields.
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(safeTitle, hash, modifiedAt, documentId);
 }
@@ -3305,6 +3429,9 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
 export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string }[] {
   // Select docs that either have no fragments at all OR are missing the primary (seq=0) fragment.
   // The seq=0 embedding is critical — surprisal scoring, semantic graph, and health checks depend on it.
+  // Also retry docs left 'pending' (crash mid-doc) or 'failed' (partial fragment failure) so partial
+  // embeds are not permanently silent — bounded by embed_attempts < 3. The OR-branch is parenthesized
+  // so embed_attempts < 3 and d.active = 1 always apply to every selected row (SQL precedence).
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection
     FROM documents d
@@ -3312,8 +3439,8 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.fragment_type IS NOT NULL
     LEFT JOIN content_vectors v0 ON d.hash = v0.hash AND v0.seq = 0
     WHERE d.active = 1
-      AND (v.hash IS NULL OR v0.hash IS NULL)
       AND COALESCE(d.embed_attempts, 0) < 3
+      AND ((v.hash IS NULL OR v0.hash IS NULL) OR d.embed_state IN ('pending', 'failed'))
     GROUP BY d.hash
   `).all() as { hash: string; body: string; path: string; title: string; collection: string }[];
 }
@@ -3322,12 +3449,53 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
  * Clear all embeddings from the database (force re-index).
  * Deletes all rows from content_vectors and drops the vectors_vec table.
  */
-export function clearAllEmbeddings(db: Database): void {
-  db.exec(`DELETE FROM content_vectors`);
-  db.exec(`DROP TABLE IF EXISTS vectors_vec`);
-  // Reset embed state so failed docs get retried after force re-embed
-  try { db.exec(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = 0 WHERE active = 1`); } catch { /* column may not exist yet */ }
-  vecTableDimsCache.delete(db);
+export function clearAllEmbeddings(db: Database, leaseGuard?: LeaseGuard): void {
+  // Atomic: the lease check + DELETE content_vectors + DROP vectors_vec + reset
+  // embed_state all commit together. The in-transaction assertLeaseHeld means a
+  // `--force` process that lost its lease during the endpoint probe cannot wipe the
+  // vault out from under the new holder (the destructive op is the highest-risk
+  // mutation, so it MUST be fenced). A crash/concurrent reader never observes a
+  // half-cleared state.
+  db.transaction(() => {
+    assertLeaseHeld(db, leaseGuard);
+    db.exec(`DELETE FROM content_vectors`);
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    // Reset embed state so failed docs get retried after force re-embed
+    try { db.exec(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = 0 WHERE active = 1`); } catch { /* column may not exist yet */ }
+  }).immediate(); // immediate write lock: assert ownership under the lock before this destructive op
+}
+
+/**
+ * Vault-wide content_vectors ↔ vectors_vec consistency snapshot for `doctor`.
+ * Computes BOTH key-set differences (not just counts — one missing + one orphan
+ * cancel in a count check) under a single read transaction so both scans see the
+ * same committed snapshot. Any nonzero cvMissingVv / vvOrphan is an invariant
+ * violation (every content_vectors row must have a vectors_vec entry and vice-versa).
+ * `pending` is reported separately (pending docs are in neither table, so they are
+ * not a desync). See INCIDENT-2026-06-22 §12.
+ */
+export function getVectorConsistency(db: Database): {
+  cvCount: number; vvCount: number; cvMissingVv: number; vvOrphan: number; pending: number;
+} {
+  return db.transaction(() => {
+    const cvKeys = new Set<string>(
+      (db.prepare(`SELECT hash || '_' || seq AS k FROM content_vectors`).all() as { k: string }[]).map(r => r.k)
+    );
+    let vvKeys = new Set<string>();
+    try {
+      vvKeys = new Set<string>(
+        (db.prepare(`SELECT hash_seq FROM vectors_vec`).all() as { hash_seq: string }[]).map(r => r.hash_seq)
+      );
+    } catch { /* vectors_vec absent → empty set (cvMissingVv will surface it) */ }
+    let cvMissingVv = 0;
+    for (const k of cvKeys) if (!vvKeys.has(k)) cvMissingVv++;
+    let vvOrphan = 0;
+    for (const k of vvKeys) if (!cvKeys.has(k)) vvOrphan++;
+    const pending = (db.prepare(
+      `SELECT COUNT(*) AS n FROM documents WHERE active = 1 AND (embed_state = 'pending' OR embed_state IS NULL)`
+    ).get() as { n: number }).n;
+    return { cvCount: cvKeys.size, vvCount: vvKeys.size, cvMissingVv, vvOrphan, pending };
+  })();
 }
 
 /**
@@ -3344,16 +3512,31 @@ export function insertEmbedding(
   embeddedAt: string,
   fragmentType?: string,
   fragmentLabel?: string,
-  canonicalId?: string
+  canonicalId?: string,
+  leaseGuard?: LeaseGuard
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  // vec0 virtual tables don't support INSERT OR REPLACE — delete first if exists.
-  // Try-catch: table may not exist yet during dimension migration (ensureVecTable drops+recreates).
-  try { db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq); } catch {}
-  db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
-  db.prepare(
-    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
+  // Atomic vec0 + metadata write: the DELETE (vec0's "upsert" — no INSERT OR
+  // REPLACE on vec0), the vector INSERT, and the content_vectors UPSERT commit
+  // together, so an interruption can never leave a vector without its metadata
+  // row or vice-versa (the cv↔vv invariant the doctor check enforces).
+  // ensureVecTable is always called before this and now throws (never drops)
+  // on a dimension mismatch, so vectors_vec reliably exists here — the old
+  // DELETE error-suppression for the "table missing mid-migration" case is gone.
+  //
+  // leaseGuard (optional): an in-transaction embedding-lease fence. The token
+  // check and the writes share ONE transaction, so a process that lost the lease
+  // while awaiting the model (between its loop-level leaseLost check and this
+  // write) cannot commit a stale vector — SQLite serializes the transaction, so
+  // no other holder can interleave a reclaim between the check and the INSERTs.
+  db.transaction(() => {
+    assertLeaseHeld(db, leaseGuard);
+    db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
+    db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
+    db.prepare(
+      `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
+  }).immediate(); // immediate write lock: the lease assert reads under the lock, so a lost-lease write can't slip through
 }
 
 // =============================================================================

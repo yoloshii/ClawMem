@@ -84,12 +84,13 @@ describe("embed state tracking", () => {
     expect(row.embed_state).toBe("synced");
   });
 
-  it("markEmbedFailed updates state and records error", () => {
+  it("markEmbedFailed records failed state + error (attempts owned by markEmbedStart)", () => {
     const hash = hashContent("failed body");
     const now = new Date().toISOString();
     store.insertContent(hash, "failed body", now);
     store.insertDocument("test", "doc3.md", "Failed Doc", hash, now, now);
 
+    store.markEmbedStart(hash);            // attempt begins → embed_attempts = 1
     store.markEmbedFailed(hash, "GPU timeout");
     const row = store.db.prepare(
       `SELECT embed_state, embed_error, embed_attempts FROM documents WHERE hash = ? AND active = 1`
@@ -97,18 +98,21 @@ describe("embed state tracking", () => {
 
     expect(row.embed_state).toBe("failed");
     expect(row.embed_error).toBe("GPU timeout");
-    expect(row.embed_attempts).toBe(1);
+    expect(row.embed_attempts).toBe(1);    // incremented by markEmbedStart, NOT by markEmbedFailed
   });
 
-  it("markEmbedFailed increments attempts on subsequent calls", () => {
+  it("embed_attempts increments once per attempt (markEmbedStart), not per markEmbedFailed", () => {
     const hash = hashContent("retry body");
     const now = new Date().toISOString();
     store.insertContent(hash, "retry body", now);
     store.insertDocument("test", "doc4.md", "Retry Doc", hash, now, now);
 
-    store.markEmbedFailed(hash, "error 1");
-    store.markEmbedFailed(hash, "error 2");
-    store.markEmbedFailed(hash, "error 3");
+    // Three attempts: each starts (the single increment) then fails (state-only).
+    // markEmbedFailed must NOT also increment, or the retry budget is consumed
+    // twice as fast (codex MEDIUM, INCIDENT-2026-06-22).
+    store.markEmbedStart(hash); store.markEmbedFailed(hash, "error 1");
+    store.markEmbedStart(hash); store.markEmbedFailed(hash, "error 2");
+    store.markEmbedStart(hash); store.markEmbedFailed(hash, "error 3");
 
     const row = store.db.prepare(
       `SELECT embed_attempts, embed_error FROM documents WHERE hash = ? AND active = 1`

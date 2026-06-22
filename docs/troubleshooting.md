@@ -31,16 +31,29 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - Fix: Run llama-server on a GPU. Even a low-end NVIDIA card handles 1.7B models.
 
 **Some documents never get embedded (stuck after multiple sweeps)**
-- Documents with 3+ failed embedding attempts are skipped by the embed timer to prevent infinite retry loops. Run `clawmem embed --force` (which calls `clearAllEmbeddings()`) to reset all embed state and retry everything. Check `getEmbedStats()` via MCP `status` tool for pending/synced/failed counts.
-- If the primary fragment (seq=0) fails but later fragments succeed, the document is marked `failed` and retried — seq=0 is required for surprisal scoring, semantic graph, and health checks.
+- A document is skipped only after **3 consecutive failed** embedding attempts (to prevent infinite retry loops). As of v0.11.0 the retry budget resets on a successful embed and whenever the document's content changes (new hash, via a DB trigger), so a doc that later succeeds — or is edited — gets a fresh budget and can never be permanently excluded by stale failures.
+- Force a full retry of everything with `clawmem embed --force` (resets all embed state). Check pending/synced/failed counts via the MCP `status` tool (`getEmbedStats`).
+- A partial embed (some fragments failed) marks the document `failed` so it is retried in full next sweep — every fragment, not just the missing ones; seq=0 is required for surprisal scoring, semantic graph, and health checks.
 
 **Vector search returns no results but BM25 works**
 - Missing embeddings. The watcher indexes but does NOT embed.
 - Fix: Run `clawmem embed` or wait for the daily embed timer.
 
-**Vector search: "Dimension mismatch" error**
-- The vault was embedded with one model (e.g., zembed-1 at 2560d) but the query is being embedded with a different model (e.g., EmbeddingGemma at 768d). This happens when the GPU embedding server is unreachable and `node-llama-cpp` falls back to the default model, which has different dimensions.
-- Fix: Ensure the embedding server is running (`curl http://host:8088/health`). Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back to a mismatched model. If you switched models, re-embed the vault with `clawmem embed --force`.
+**`clawmem embed` aborts: "Embedding dimension changed (N → M)"**
+- The embedding model now returns a different vector dimension than the vault was built with — you switched models, or the GPU server is down and `node-llama-cpp` fell back to a different default. As of v0.11.0, `embed` refuses to mix dimensions and aborts **non-destructively**. (Previously the first new-dimension insert dropped the `vectors_vec` table while the metadata-based worklist skipped the now-vectorless docs, silently wiping the vault's vectors — the dimension-migration safety fix; see RELEASE_NOTES v0.11.0.)
+- Fix: decide which model you want, then `clawmem embed --force` to clear and rebuild the whole vault at the new dimension. `--force` probes the endpoint **first** and aborts without clearing if it's unreachable, so a force re-embed against a dead server cannot wipe the vault. To keep the old model, point `CLAWMEM_EMBED_URL` back at it and set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent a silent fallback to a mismatched default.
+
+**`clawmem embed` aborts: "Embedding model changed (X → Y) at the same dimension"**
+- A different embedding model is being used than the one the vault was built with, even though both produce the same dimension. Cosine similarity across two different models is meaningless, so `embed` refuses to mix them. `clawmem doctor` likewise flags a vault that already contains mixed models.
+- Fix: `clawmem embed --force` to rebuild with the current model, or point the endpoint back at the original model.
+
+**`clawmem doctor` reports a content_vectors ↔ vectors_vec desync**
+- `doctor` now runs a vault-wide consistency check: every `content_vectors` metadata row must have a matching `vectors_vec` entry and vice-versa. A nonzero "metadata rows missing a vector" / "orphan vectors" count (or "vectors_vec is MISSING but N content_vectors rows exist") means the two are out of sync — historically caused by an interrupted dimension migration on a pre-v0.11.0 build.
+- Fix: `clawmem embed --force` rebuilds both tables atomically from scratch.
+
+**Two `clawmem embed` runs at once / "Another embed is already in progress"**
+- As of v0.11.0, embed runs hold a renewable, token-fenced lease (`worker_leases`, name `embedding`) so two embeds (a manual run, the embed timer, `update --embed`) cannot run concurrently — concurrent runs could otherwise interleave a clear with an insert, or mix two models into one index. A second run prints "Another embed is already in progress; skipping" and exits.
+- Fix: this is intended. Re-run after the active embed finishes. A crashed embed's lease expires after its TTL and is reclaimable automatically.
 
 **Embedding fails with "input is too large to process"**
 - The `full` document fragment exceeds the model's token context (2048 tokens for EmbeddingGemma).
@@ -64,6 +77,12 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **search returns results but query returns nothing**
 - `query` applies stricter scoring (composite + MMR + expansion). If expansion LLM is down, the pipeline may return empty.
 - Fix: Check GPU connectivity. Use `search` or `vsearch` as a fallback.
+
+**Vector search returns weak or irrelevant results even though embeddings exist**
+- BM25/keyword search works and `doctor` shows vectors present + consistent, but `vsearch`/`find_similar` (and the vector half of `query`) return loosely-related results, or "the same few docs regardless of query." This is an embedding-**quality** problem, not a ClawMem index problem: the model is producing poorly-discriminating vectors. The most common cause is a **server-side pooling/normalization misconfiguration** — e.g. serving a last-token model (Qwen3-Embedding family) without `--pooling last`, or without L2 normalization. Mean-pooling a last-token model gives usable self-retrieval but collapsed semantic separation (paraphrases score ~0.5 instead of ~0.85).
+- Diagnose: embed two paraphrases and one unrelated sentence through your endpoint and compare cosine similarity. A healthy model scores the paraphrase pair > 0.75 and the unrelated pair < 0.45. If paraphrases score ~0.5 with weak separation, the model/serving is the problem, not ClawMem.
+- Fix: launch the embedding `llama-server` with the pooling its model requires (`--pooling last` for Qwen3-Embedding / last-token models) and ensure outputs are L2-normalized. Re-run the diagnostic; once separation is healthy, retrieval recovers. A re-embed is not required if the dimension is unchanged, though `clawmem embed --force` after the fix guarantees a clean rebuild.
+- Aside: auto-generated `_clawmem/` system docs (observations/deductions) sit near the embedding centroid and can dominate pure-vector tools when discrimination is weak — fixing the model is the real remedy, not filtering.
 
 **kg_query returns empty for every entity**
 - `entity_triples` is populated by the decision-extractor Stop hook from observer-emitted `<triples>` blocks. Zero rows typically means either (a) the Stop hook has never fired in this vault, or (b) the observer LLM is not emitting `<triples>` blocks.

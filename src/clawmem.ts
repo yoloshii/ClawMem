@@ -18,6 +18,10 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   extractSnippet,
+  FatalVectorError,
+  VecDimensionMismatchError,
+  VecModelMismatchError,
+  EmbedLeaseLostError,
 } from "./store.ts";
 import {
   getDefaultLlamaCpp,
@@ -28,6 +32,11 @@ import {
   LlamaCpp,
   type Queryable,
 } from "./llm.ts";
+import {
+  acquireWorkerLease,
+  releaseWorkerLease,
+  renewWorkerLease,
+} from "./worker-lease.ts";
 import {
   loadConfig,
   addCollection as collectionsAdd,
@@ -385,200 +394,331 @@ async function cmdEmbed(args: string[]) {
 
   const s = getStore();
 
-  if (values.force) {
-    console.log(`${c.yellow}Force mode: clearing all embeddings${c.reset}`);
-    s.clearAllEmbeddings();
-  }
-
-  // Clean stale embeddings (orphaned hashes from updated/deleted documents)
-  const cleaned = s.cleanStaleEmbeddings();
-  if (cleaned > 0) {
-    console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
-  }
-
-  // Use fragment-based pipeline: split documents into semantic fragments and embed each
-  const hashes = s.getHashesNeedingFragments();
-  if (hashes.length === 0) {
-    console.log(`${c.green}All documents already embedded${c.reset}`);
+  // Embedding lease: serialize embed commands (manual / embed timer / update --embed)
+  // so two embeds cannot run at once. It is RENEWABLE (token-fenced heartbeat), not a
+  // fixed-TTL lease — a full-vault rebuild outlasts any fixed TTL and would be reclaimed
+  // mid-run. Without serialization, two embeds using different same-dimension models can
+  // silently build a heterogeneous vector space (dimension checks can't catch that).
+  // See EMBED-LEASE-RENEWAL-DESIGN.md / INCIDENT-2026-06-22.
+  const LEASE_NAME = "embedding";
+  const LEASE_TTL_MS = 60_000;
+  const lease = acquireWorkerLease(s, LEASE_NAME, LEASE_TTL_MS);
+  if (!lease.acquired || !lease.token) {
+    console.log(`${c.yellow}Another embed is already in progress (lease held); skipping.${c.reset}`);
     return;
   }
+  const leaseToken = lease.token;
+  // Passed into every vector mutation (clear, stale-clean, table-create, insert) so
+  // each verifies ownership before mutating — a process that lost the lease mid-await
+  // cannot wipe/recreate/write the vector store under the new holder.
+  const leaseGuard = { workerName: LEASE_NAME, token: leaseToken };
+  let leaseLost = false;
+  const heartbeat = setInterval(() => {
+    if (!renewWorkerLease(s, LEASE_NAME, leaseToken, LEASE_TTL_MS)) leaseLost = true;
+  }, Math.floor(LEASE_TTL_MS / 2));
 
-  // Count total fragments first for ETA
-  let totalFragEstimate = 0;
-  const docFragCounts: number[] = [];
-  for (const { body, path } of hashes) {
-    let frontmatter: Record<string, any> | undefined;
-    try {
-      const parsed = parseDocument(body, path);
-      frontmatter = parsed.meta as any;
-    } catch { /* skip */ }
-    const frags = splitDocument(body, frontmatter);
-    docFragCounts.push(frags.length);
-    totalFragEstimate += frags.length;
-  }
-  console.log(`Embedding ${hashes.length} documents (${totalFragEstimate} fragments total)...`);
+  try {
+    const embedUrl = process.env.CLAWMEM_EMBED_URL;
+    if (embedUrl) {
+      console.log(`Using remote GPU embedding: ${embedUrl}`);
+    } else {
+      // Local CPU mode: disable inactivity timeout to prevent context disposal mid-batch
+      setDefaultLlamaCpp(new LlamaCpp({ inactivityTimeoutMs: 0 }));
+    }
+    const llm = getDefaultLlamaCpp();
 
-  const embedUrl = process.env.CLAWMEM_EMBED_URL;
-  if (embedUrl) {
-    console.log(`Using remote GPU embedding: ${embedUrl}`);
-  } else {
-    // Local CPU mode: disable inactivity timeout to prevent context disposal mid-batch
-    setDefaultLlamaCpp(new LlamaCpp({ inactivityTimeoutMs: 0 }));
-  }
-  const llm = getDefaultLlamaCpp();
-  let embedded = 0;
-  let totalFragments = 0;
-  let failedFragments = 0;
-  const batchStart = Date.now();
+    // Probe the live model's output dimension (+ model name). Returns null on ANY
+    // failure so a down/flaky endpoint can NEVER trigger a destructive clear.
+    const probeEmbed = async (): Promise<{ dim: number; model: string } | null> => {
+      try {
+        const r = await llm.embed("clawmem dimension probe");
+        return r && r.embedding && r.embedding.length > 0
+          ? { dim: r.embedding.length, model: r.model ?? "" }
+          : null;
+      } catch { return null; }
+    };
 
-  // Cloud API: global batch pacing state (persists across documents)
-  // TPM is the binding constraint, not RPM. 50 frags × ~800 tokens ≈ 40K tokens/batch → max ~2.5 batches/min at 100K TPM.
-  const isCloudEmbed = !!process.env.CLAWMEM_EMBED_API_KEY;
-  const CLOUD_BATCH_SIZE = 50;
-  const CLOUD_TPM_LIMIT = parseInt(process.env.CLAWMEM_EMBED_TPM_LIMIT || "100000", 10);
-  const CLOUD_TPM_SAFETY = 0.85; // use 85% of limit to leave headroom for retries
-  const CHARS_PER_TOKEN = 4;
-  let lastBatchSentAt = 0; // global timestamp of last batch send
+    // Bind the whole run to one (dim, model); every fragment is validated before it is
+    // stored. On a fresh vault these are set from the first successful fragment.
+    let expectedDim: number | null = null;
+    let expectedModel: string | null = null;
 
-  for (let docIdx = 0; docIdx < hashes.length; docIdx++) {
-    const { hash, body, path, title: docTitle, collection } = hashes[docIdx]!;
-    const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
-    const canId = canonicalDocId(collection, path);
-
-    // Parse frontmatter for fragment splitting
-    let frontmatter: Record<string, any> | undefined;
-    try {
-      const parsed = parseDocument(body, path);
-      frontmatter = parsed.meta as any;
-    } catch {
-      // No frontmatter or parsing error — fine, skip it
+    if (values.force) {
+      // Probe FIRST — validate the endpoint before destroying anything (so a force
+      // re-embed against a dead endpoint cannot clear the vault and then fail).
+      const probe = await probeEmbed();
+      if (!probe) {
+        console.error(`${c.red}Force re-embed aborted: could not reach the embedding endpoint. Nothing was cleared.${c.reset}`);
+        return;
+      }
+      console.log(`${c.yellow}Force mode: clearing all embeddings (rebuilding at dim ${probe.dim})${c.reset}`);
+      expectedDim = probe.dim;
+      expectedModel = probe.model || null;
+      s.clearAllEmbeddings(leaseGuard);
+    } else {
+      // Implicit run: NON-DESTRUCTIVE drift check (dimension AND model). Catches
+      // drift even when the worklist is empty (query embeddings would already be
+      // incompatible with the stored table). Never clears — aborts with instructions.
+      const existingDim = s.getVecTableDim(); // throws VecSchemaError on malformed DDL → caught below
+      if (existingDim !== null) {
+        const probe = await probeEmbed();
+        if (probe && probe.dim !== existingDim) {
+          console.error(`${c.red}Embedding dimension changed (${existingDim} → ${probe.dim}). Run 'clawmem embed --force' to clear and rebuild the full vault.${c.reset}`);
+          return;
+        }
+        // Same dimension but a DIFFERENT model still mixes the vector space (cosine
+        // across two models is meaningless) and the dim check cannot see it. Compare
+        // the probe's model against what the vault was built with; abort on mismatch.
+        const existingModels = s.getVecModels();
+        if (existingModels.length > 1) {
+          console.error(`${c.red}Vault already contains mixed embedding models: ${existingModels.join(", ")}. Run 'clawmem embed --force' to rebuild with a single model.${c.reset}`);
+          return;
+        }
+        if (probe && probe.model && existingModels.length === 1 && existingModels[0] !== probe.model) {
+          console.error(`${c.red}Embedding model changed (${existingModels[0]} → ${probe.model}) at the same dimension. Mixing models in one vector space breaks similarity. Run 'clawmem embed --force' to rebuild with the current model.${c.reset}`);
+          return;
+        }
+        expectedDim = existingDim;
+        if (probe && probe.model) expectedModel = probe.model;
+      }
     }
 
-    const fragments = splitDocument(body, frontmatter);
-    const docStart = Date.now();
-    const prevTotalFragments = totalFragments;
-    const prevFailedFragments = failedFragments;
-    let seq0Succeeded = false;
-    console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
+    // Clean stale embeddings (orphaned hashes from updated/deleted documents)
+    const cleaned = s.cleanStaleEmbeddings(leaseGuard);
+    if (cleaned > 0) {
+      console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
+    }
 
-    if (isCloudEmbed) {
-      // Batch mode: collect all texts, send in chunks of CLOUD_BATCH_SIZE
-      const allTexts: string[] = [];
-      for (const frag of fragments) {
-        const label = frag.label || title;
-        allTexts.push(formatDocForEmbedding(frag.content, label));
+    // Use fragment-based pipeline: split documents into semantic fragments and embed each
+    const hashes = s.getHashesNeedingFragments();
+    if (hashes.length === 0) {
+      console.log(`${c.green}All documents already embedded${c.reset}`);
+      return;
+    }
+
+    // Count total fragments first for ETA
+    let totalFragEstimate = 0;
+    const docFragCounts: number[] = [];
+    for (const { body, path } of hashes) {
+      let frontmatter: Record<string, any> | undefined;
+      try {
+        const parsed = parseDocument(body, path);
+        frontmatter = parsed.meta as any;
+      } catch { /* skip */ }
+      const frags = splitDocument(body, frontmatter);
+      docFragCounts.push(frags.length);
+      totalFragEstimate += frags.length;
+    }
+    console.log(`Embedding ${hashes.length} documents (${totalFragEstimate} fragments total)...`);
+
+    let embedded = 0;
+    let totalFragments = 0;
+    let failedFragments = 0;
+    const batchStart = Date.now();
+
+    // Cloud API: global batch pacing state (persists across documents)
+    // TPM is the binding constraint, not RPM. 50 frags × ~800 tokens ≈ 40K tokens/batch → max ~2.5 batches/min at 100K TPM.
+    const isCloudEmbed = !!process.env.CLAWMEM_EMBED_API_KEY;
+    const CLOUD_BATCH_SIZE = 50;
+    const CLOUD_TPM_LIMIT = parseInt(process.env.CLAWMEM_EMBED_TPM_LIMIT || "100000", 10);
+    const CLOUD_TPM_SAFETY = 0.85; // use 85% of limit to leave headroom for retries
+    const CHARS_PER_TOKEN = 4;
+    let lastBatchSentAt = 0; // global timestamp of last batch send
+
+    // Bind the run to one (dim, model) and validate every embedding before it is stored.
+    // The first successful fragment sets the binding on a fresh vault; any later drift —
+    // a dimension change OR a same-dimension model swap from a flapping endpoint — throws
+    // a fatal error that aborts the whole run (caught below). This is what dimension
+    // checks alone cannot do: catch a different 2560-d model.
+    const bindAndValidate = (result: { embedding: number[] | Float32Array; model?: string }) => {
+      const dim = result.embedding.length;
+      if (expectedDim === null) {
+        expectedDim = dim;
+        if (!expectedModel && result.model) expectedModel = result.model;
+      } else if (dim !== expectedDim) {
+        throw new VecDimensionMismatchError(expectedDim, dim);
+      }
+      if (expectedModel && result.model && result.model !== expectedModel) {
+        throw new VecModelMismatchError(expectedModel, result.model);
+      }
+    };
+
+    for (let docIdx = 0; docIdx < hashes.length; docIdx++) {
+      // Abort cleanly if the heartbeat reported the lease was reclaimed.
+      if (leaseLost) throw new EmbedLeaseLostError();
+
+      const { hash, body, path, title: docTitle, collection } = hashes[docIdx]!;
+      const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
+      const canId = canonicalDocId(collection, path);
+
+      // Parse frontmatter for fragment splitting
+      let frontmatter: Record<string, any> | undefined;
+      try {
+        const parsed = parseDocument(body, path);
+        frontmatter = parsed.meta as any;
+      } catch {
+        // No frontmatter or parsing error — fine, skip it
       }
 
-      for (let batchStart = 0; batchStart < allTexts.length; batchStart += CLOUD_BATCH_SIZE) {
-        // Global TPM-aware delay: compute required wait based on last batch's token count,
-        // then wait only the remaining time since lastBatchSentAt. Applies to ALL batches
-        // including first batch of each document (inter-document pacing).
-        if (lastBatchSentAt > 0) {
-          // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
-          //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
-          const batchEnd0 = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
-          const estimatedTokens = allTexts.slice(batchStart, batchEnd0)
-            .reduce((sum, t) => sum + Math.ceil(t.length / CHARS_PER_TOKEN), 0);
-          // Use current batch estimate (not previous batch actuals — previous batch may differ in size)
-          const batchTokens = estimatedTokens;
-          const safeTPM = CLOUD_TPM_LIMIT * CLOUD_TPM_SAFETY;
-          const requiredGapMs = Math.max(500, (batchTokens / safeTPM) * 60_000);
-          const elapsed = Date.now() - lastBatchSentAt;
-          const remainingMs = requiredGapMs - elapsed;
-          if (remainingMs > 0) {
-            const jittered = Math.floor(remainingMs * (0.85 + Math.random() * 0.3));
-            await new Promise(r => setTimeout(r, jittered));
-          }
+      const fragments = splitDocument(body, frontmatter);
+      const docStart = Date.now();
+      const prevFailedFragments = failedFragments;
+      let seq0Succeeded = false;
+
+      // Mark the doc 'pending' and increment embed_attempts ONCE before its first
+      // fragment, so a crash mid-document leaves it retryable (re-selected by
+      // getHashesNeedingFragments). Completion setters below are state-only.
+      s.markEmbedStart(hash);
+      console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
+
+      if (isCloudEmbed) {
+        // Batch mode: collect all texts, send in chunks of CLOUD_BATCH_SIZE
+        const allTexts: string[] = [];
+        for (const frag of fragments) {
+          const label = frag.label || title;
+          allTexts.push(formatDocForEmbedding(frag.content, label));
         }
 
-        const batchEnd = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
-        const batchTexts = allTexts.slice(batchStart, batchEnd);
-        lastBatchSentAt = Date.now();
-        const reqStart = Date.now();
+        for (let batchStartIdx = 0; batchStartIdx < allTexts.length; batchStartIdx += CLOUD_BATCH_SIZE) {
+          // Abort before each batch if the lease was reclaimed — a large document
+          // must not keep writing after another process took the lease (HIGH-3).
+          if (leaseLost) throw new EmbedLeaseLostError();
+          // Global TPM-aware delay: compute required wait based on last batch's token count,
+          // then wait only the remaining time since lastBatchSentAt. Applies to ALL batches
+          // including first batch of each document (inter-document pacing).
+          if (lastBatchSentAt > 0) {
+            // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
+            //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
+            const batchEnd0 = Math.min(batchStartIdx + CLOUD_BATCH_SIZE, allTexts.length);
+            const estimatedTokens = allTexts.slice(batchStartIdx, batchEnd0)
+              .reduce((sum, t) => sum + Math.ceil(t.length / CHARS_PER_TOKEN), 0);
+            // Use current batch estimate (not previous batch actuals — previous batch may differ in size)
+            const batchTokens = estimatedTokens;
+            const safeTPM = CLOUD_TPM_LIMIT * CLOUD_TPM_SAFETY;
+            const requiredGapMs = Math.max(500, (batchTokens / safeTPM) * 60_000);
+            const elapsed = Date.now() - lastBatchSentAt;
+            const remainingMs = requiredGapMs - elapsed;
+            if (remainingMs > 0) {
+              const jittered = Math.floor(remainingMs * (0.85 + Math.random() * 0.3));
+              await new Promise(r => setTimeout(r, jittered));
+            }
+          }
 
-        try {
-          const results = await llm.embedBatch(batchTexts);
-          const reqMs = Date.now() - reqStart;
-          const tokensUsed = llm.lastBatchTokens;
+          const batchEnd = Math.min(batchStartIdx + CLOUD_BATCH_SIZE, allTexts.length);
+          const batchTexts = allTexts.slice(batchStartIdx, batchEnd);
+          lastBatchSentAt = Date.now();
+          const reqStart = Date.now();
 
-          for (let i = 0; i < results.length; i++) {
-            const seq = batchStart + i;
-            const frag = fragments[seq]!;
-            const result = results[i];
+          try {
+            const results = await llm.embedBatch(batchTexts);
+            const reqMs = Date.now() - reqStart;
+            const tokensUsed = llm.lastBatchTokens;
+
+            for (let i = 0; i < results.length; i++) {
+              const seq = batchStartIdx + i;
+              const frag = fragments[seq]!;
+              const result = results[i];
+              if (result) {
+                bindAndValidate(result);
+                s.ensureVecTable(result.embedding.length, leaseGuard);
+                s.insertEmbedding(
+                  hash, seq, frag.startLine, new Float32Array(result.embedding),
+                  result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                  leaseGuard
+                );
+                totalFragments++;
+                if (seq === 0) seq0Succeeded = true;
+              } else {
+                failedFragments++;
+              }
+            }
+            console.error(`    batch ${batchStartIdx + 1}-${batchEnd}/${allTexts.length} (${results.filter(r => r).length} ok) ${reqMs}ms${tokensUsed ? ` ${tokensUsed} tok` : ""}`);
+          } catch (err) {
+            if (err instanceof FatalVectorError) throw err; // dim/model/schema mismatch → abort the whole run
+            failedFragments += batchTexts.length;
+            console.error(`${c.yellow}Warning: batch embed failed for ${path} frags ${batchStartIdx + 1}-${batchEnd}: ${err}${c.reset}`);
+          }
+        }
+      } else {
+        // Local mode: embed one at a time (no rate limit concern)
+        for (let seq = 0; seq < fragments.length; seq++) {
+          // Abort before each fragment if the lease was reclaimed — bounds any
+          // post-loss writing to at most one fragment of a large doc (HIGH-3).
+          if (leaseLost) throw new EmbedLeaseLostError();
+          const frag = fragments[seq]!;
+          const label = frag.label || title;
+          const text = formatDocForEmbedding(frag.content, label);
+
+          try {
+            const fragStart = Date.now();
+            const result = await llm.embed(text);
+            const fragMs = Date.now() - fragStart;
             if (result) {
-              s.ensureVecTable(result.embedding.length);
+              bindAndValidate(result);
+              s.ensureVecTable(result.embedding.length, leaseGuard);
               s.insertEmbedding(
                 hash, seq, frag.startLine, new Float32Array(result.embedding),
-                result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
+                result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                leaseGuard
               );
               totalFragments++;
               if (seq === 0) seq0Succeeded = true;
+              if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
+                console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) ${fragMs}ms [${text.length} chars]`);
+              }
             } else {
               failedFragments++;
+              console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) → null result [${text.length} chars]`);
             }
-          }
-          console.error(`    batch ${batchStart + 1}-${batchEnd}/${allTexts.length} (${results.filter(r => r).length} ok) ${reqMs}ms${tokensUsed ? ` ${tokensUsed} tok` : ""}`);
-        } catch (err) {
-          failedFragments += batchTexts.length;
-          console.error(`${c.yellow}Warning: batch embed failed for ${path} frags ${batchStart + 1}-${batchEnd}: ${err}${c.reset}`);
-        }
-      }
-    } else {
-      // Local mode: embed one at a time (no rate limit concern)
-      for (let seq = 0; seq < fragments.length; seq++) {
-        const frag = fragments[seq]!;
-        const label = frag.label || title;
-        const text = formatDocForEmbedding(frag.content, label);
-
-        try {
-          const fragStart = Date.now();
-          const result = await llm.embed(text);
-          const fragMs = Date.now() - fragStart;
-          if (result) {
-            s.ensureVecTable(result.embedding.length);
-            s.insertEmbedding(
-              hash, seq, frag.startLine, new Float32Array(result.embedding),
-              result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
-            );
-            totalFragments++;
-            if (seq === 0) seq0Succeeded = true;
-            if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
-              console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) ${fragMs}ms [${text.length} chars]`);
-            }
-          } else {
+          } catch (err) {
+            if (err instanceof FatalVectorError) throw err; // dim/model/schema mismatch → abort the whole run
             failedFragments++;
-            console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) → null result [${text.length} chars]`);
+            console.error(`${c.yellow}Warning: failed to embed fragment ${seq} (${frag.type}) of ${path}: ${err}${c.reset}`);
           }
-        } catch (err) {
-          failedFragments++;
-          console.error(`${c.yellow}Warning: failed to embed fragment ${seq} (${frag.type}) of ${path}: ${err}${c.reset}`);
         }
       }
+
+      // Embed-state completion: mark synced ONLY when the WHOLE document succeeded (no
+      // failed fragments) — a partial embed must not be silently permanent. Any failure
+      // → 'failed' (state-only; attempts already incremented at markEmbedStart) so the
+      // worklist retries it, bounded by embed_attempts < 3.
+      const docFragsFail = failedFragments - prevFailedFragments;
+      if (seq0Succeeded && docFragsFail === 0) {
+        s.markEmbedSynced(hash);
+      } else if (!seq0Succeeded) {
+        s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
+      } else {
+        s.markEmbedFailed(hash, `${docFragsFail} fragment(s) failed`);
+      }
+
+      embedded++;
+      const docMs = Date.now() - docStart;
+      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(0);
+      console.error(`  → doc done in ${(docMs / 1000).toFixed(1)}s | ${embedded}/${hashes.length} docs, ${totalFragments} frags, ${failedFragments} fails [${elapsed}s elapsed]`);
     }
 
-    // Track embed state per document — seq=0 (primary) must succeed for synced status
-    const docFragsOk = totalFragments - prevTotalFragments;
-    const docFragsFail = failedFragments - prevFailedFragments;
-    if (seq0Succeeded) {
-      s.markEmbedSynced(hash);
-    } else if (docFragsOk === 0 && docFragsFail > 0) {
-      s.markEmbedFailed(hash, "all fragments failed");
+    const totalSec = ((Date.now() - batchStart) / 1000).toFixed(1);
+    console.log();
+    console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
+  } catch (err) {
+    // Fatal aborts must NOT exit 0 — otherwise the embed timer / `update --embed`
+    // cannot tell the run was incomplete. Set a nonzero exit code (cleanup still
+    // runs in finally). Non-fatal errors propagate unchanged.
+    if (err instanceof EmbedLeaseLostError) {
+      // Checked before FatalVectorError because EmbedLeaseLostError extends it.
+      console.error(`${c.red}Embed aborted: lost the embedding lease (another embed process took over). Re-run 'clawmem embed'.${c.reset}`);
+      process.exitCode = 1;
+    } else if (err instanceof FatalVectorError) {
+      console.error(`${c.red}Embed aborted: ${(err as Error).message}${c.reset}`);
+      process.exitCode = 1;
     } else {
-      // seq=0 failed but some later fragments succeeded — mark failed so seq=0 gets retried
-      s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
+      throw err;
     }
-
-    embedded++;
-    const docMs = Date.now() - docStart;
-    const elapsed = ((Date.now() - batchStart) / 1000).toFixed(0);
-    console.error(`  → doc done in ${(docMs / 1000).toFixed(1)}s | ${embedded}/${hashes.length} docs, ${totalFragments} frags, ${failedFragments} fails [${elapsed}s elapsed]`);
+  } finally {
+    clearInterval(heartbeat);
+    releaseWorkerLease(s, LEASE_NAME, leaseToken);
+    await disposeDefaultLlamaCpp();
   }
-
-  const totalSec = ((Date.now() - batchStart) / 1000).toFixed(1);
-  console.log();
-  console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
-
-  await disposeDefaultLlamaCpp();
 }
 
 async function cmdStatus() {
@@ -1891,13 +2031,34 @@ async function cmdDoctor() {
     const s = getStore();
     const needsEmbed = s.getHashesNeedingEmbedding();
     const hasVectors = !!s.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'").get();
-    if (hasVectors) {
-      console.log(`${c.green}✓${c.reset} Vector index: exists (${needsEmbed} need embedding)`);
-    } else {
+    // ALWAYS run the consistency check — the WORST desync (content_vectors rows but
+    // vectors_vec entirely absent) lives in the no-table case, so it must not be
+    // skipped. set-diff, NOT counts (one missing + one orphan cancel in a count check).
+    // Pending docs are reported separately — they are in neither table, not a desync.
+    const vc = s.getVectorConsistency();
+    if (!hasVectors && vc.cvCount === 0) {
       console.log(`${c.yellow}!${c.reset} Vector index: not created yet (run 'clawmem embed')`);
+    } else if (!hasVectors) {
+      console.log(`${c.red}✗${c.reset} Vector index: vectors_vec is MISSING but ${vc.cvCount} content_vectors row(s) exist — full desync. Run 'clawmem embed --force' to rebuild.`);
+      issues++;
+    } else {
+      console.log(`${c.green}✓${c.reset} Vector index: exists (${needsEmbed} need embedding)`);
+      if (vc.cvMissingVv > 0 || vc.vvOrphan > 0) {
+        console.log(`${c.red}✗${c.reset} Vector consistency: ${vc.cvMissingVv} metadata row(s) missing a vector, ${vc.vvOrphan} orphan vector(s) (content_vectors=${vc.cvCount}, vectors_vec=${vc.vvCount}). Run 'clawmem embed --force' to rebuild.`);
+        issues++;
+      } else {
+        console.log(`${c.green}✓${c.reset} Vector consistency: ${vc.vvCount} vectors match ${vc.cvCount} metadata rows (${vc.pending} pending)`);
+      }
     }
-  } catch {
-    console.log(`${c.yellow}!${c.reset} Vector index: could not check`);
+    // Mixed embedding models = a heterogeneous vector space (cosine across different
+    // models is meaningless) even when keys/dimensions are consistent. Flag it.
+    const vecModels = s.getVecModels();
+    if (vecModels.length > 1) {
+      console.log(`${c.red}✗${c.reset} Embedding models: vault has MIXED models (${vecModels.join(", ")}) — heterogeneous vector space. Run 'clawmem embed --force' to rebuild with one model.`);
+      issues++;
+    }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Vector index: could not check (${(err as Error).message})`);
   }
 
   // 4. Content types

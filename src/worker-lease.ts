@@ -115,6 +115,40 @@ export function releaseWorkerLease(
 }
 
 /**
+ * Extend a lease's expiry if the caller's token still owns it. Returns `true`
+ * if THIS holder still owns the lease and the TTL was extended; `false` if the
+ * row is gone or was reclaimed by another token (we lost the lease). A long
+ * embed run renews on a heartbeat well inside its TTL; on a `false` result the
+ * caller MUST abort, because another process now holds the lease and could run
+ * concurrently. Token-fenced like releaseWorkerLease (the UPDATE matches only
+ * our own (worker_name, lease_token) row); any DB error → `false` (fail-safe:
+ * a renewal failure is treated as lease-lost → abort).
+ */
+export function renewWorkerLease(
+  store: Store,
+  workerName: string,
+  token: string,
+  ttlMs: number,
+  now: Date = new Date(),
+): boolean {
+  if (ttlMs <= 0) {
+    throw new Error(`renewWorkerLease: ttlMs must be positive, got ${ttlMs}`);
+  }
+  try {
+    const result = store.db.prepare(
+      `UPDATE worker_leases SET acquired_at = ?, expires_at = ?
+         WHERE worker_name = ? AND lease_token = ?`,
+    ).run(nowIso(now), futureIso(now, ttlMs), workerName, token);
+    return result.changes > 0;
+  } catch (err) {
+    console.error(
+      `[worker-lease] renew error for ${workerName}: ${(err as Error).message}`,
+    );
+    return false;
+  }
+}
+
+/**
  * Run `fn` under an exclusive lease on `workerName`. If the lease cannot
  * be acquired, returns `{acquired: false}` without invoking `fn`. The
  * lease is always released in a `finally` block, even if `fn` throws.
