@@ -629,19 +629,38 @@ This is the recommended entry point for ALL memory queries.`,
       const hasStrongSignal = !intent && initialFts.length > 0
         && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
 
-      // Step 2: Query expansion (skipped if strong signal)
-      const queries = hasStrongSignal
-        ? [query]
+      // Step 2: Query expansion (skipped if strong signal). Typed routing —
+      // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.
+      const expanded = hasStrongSignal
+        ? []
         : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent);
 
-      for (const q of queries) {
-        const ftsResults = q === query ? initialFts : store.searchFTS(q, 20, undefined, collections, dateRange);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+      // Original query — both backends, pushed FIRST so the positional 2× weight
+      // below lands on exactly the original's lists.
+      if (initialFts.length > 0) {
+        for (const r of initialFts) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+      }
+      if (hasVectors) {
+        const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
+        if (vecResults.length > 0) {
+          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
-        if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
+      }
+      // Lists contributed by the original query — these get the 2× RRF weight.
+      const numOriginalLists = rankedLists.length;
+
+      // Typed expansions — route by type: lex → FTS, vec/hyde → vector.
+      for (const eq of expanded) {
+        if (eq.type === 'lex') {
+          const ftsResults = store.searchFTS(eq.query, 20, undefined, collections, dateRange);
+          if (ftsResults.length > 0) {
+            for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+          }
+        } else if (hasVectors) {
+          const vecResults = await store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -705,8 +724,9 @@ This is the recommended entry point for ALL memory queries.`,
         }
       }
 
-      // Weight: original query BM25+vec get 2x, expanded queries get 1x, temporal/entity legs get 1x
-      const numOriginalLists = hasVectors ? 2 : 1; // first BM25 + first vector from original query
+      // Weight: the original query's lists (pushed first) get 2×; expansion, temporal,
+      // and entity legs get 1×. numOriginalLists (computed above) is the actual count
+      // the original contributed — robust to an empty BM25 or vector leg.
       const weights = rankedLists.map((_, i) => i < numOriginalLists ? 2.0 : 1.0);
       const fused = reciprocalRankFusion(rankedLists, weights);
       const candidates = fused.slice(0, candLimit);

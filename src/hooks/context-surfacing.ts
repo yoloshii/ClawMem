@@ -264,8 +264,14 @@ export async function contextSurfacing(
           const seen = new Set(results.map(r => r.filepath));
           for (const eq of expanded.slice(0, 3)) {
             if (Date.now() - startTime > 6000) break; // hard stop at 6s
-            const ftsExp = store.searchFTS(eq, 5);
-            for (const r of ftsExp) {
+            // Typed routing: lex → FTS; vec/hyde → vector (deep profile + time budget only).
+            let hits: SearchResult[] = [];
+            if (eq.type === 'lex') {
+              hits = store.searchFTS(eq.query, 5);
+            } else if (profile.useVector) {
+              try { hits = await store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 5); } catch { /* vector leg non-fatal */ }
+            }
+            for (const r of hits) {
               if (!seen.has(r.filepath)) {
                 seen.add(r.filepath);
                 results.push(r);

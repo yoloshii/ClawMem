@@ -523,7 +523,7 @@ The `memory_relations` table is populated by multiple independent sources:
 
 **Graph traversal asymmetry:** `adaptiveTraversal()` traverses all edge types outbound (source→target) but only `semantic` and `entity` edges inbound (target→source). Temporal and causal edges are directional only.
 
-**MPFP graph retrieval (v0.2.0):** Multi-Path Fact Propagation runs predefined meta-path patterns in parallel (`[semantic, semantic]`, `[entity, temporal]`, `[semantic, causal]`, etc.), fuses via RRF. Hop-synchronized edge cache batches DB queries per hop instead of per pattern. Forward Push with α=0.15 teleport probability bounds active nodes sublinearly. Tier 3 only (`query`/`intent_search`), not hooks. Patterns selected per MAGMA intent: WHY → `[semantic, causal]`, ENTITY → `[entity, semantic]`, WHEN → `[temporal, semantic]`.
+**MPFP graph retrieval (v0.2.0):** Multi-Path Fact Propagation runs predefined meta-path patterns in parallel (`[semantic, semantic]`, `[entity, temporal]`, `[semantic, causal]`, etc.), fuses via **max-score** (best supporting path wins). Note: meta-path fusion is max-score, NOT RRF — Forward Push yields absolute propagation mass where magnitude carries signal, so rank-only fusion would discard the difference between a strong path hit and a barely-surviving tail hit (`src/graph-traversal.ts:413-425`). This is distinct from the `query`/`intent_search` *outer* retrieval, which does fuse BM25+vector via RRF. Hop-synchronized edge cache batches DB queries per hop instead of per pattern. Forward Push with α=0.15 teleport probability bounds active nodes sublinearly. Tier 3 only (`query`/`intent_search`), not hooks. Patterns selected per MAGMA intent: WHY → `[semantic, causal]`, ENTITY → `[entity, semantic]`, WHEN → `[temporal, semantic]`.
 
 ### When to Run `build_graphs`
 
@@ -546,7 +546,7 @@ User Query + optional intent hint
   → Temporal Extraction (regex date range from query: "last week", "March 2026" → WHERE modified_at BETWEEN filters)
   → BM25 Probe → Strong Signal Check (skip expansion if top hit ≥ 0.85 with gap ≥ 0.15; disabled when intent provided)
   → Query Expansion (LLM generates text variants; intent steers expansion prompt)
-  → Parallel: BM25(original) + Vector(original) + BM25(each expanded) + Vector(each expanded)
+  → Parallel (typed routing): BM25(original) + Vector(original) + BM25(lex expansions) + Vector(vec/hyde expansions)
        + Temporal Proximity (date-range filtered, if temporal constraint extracted)
        + Entity Graph (conditional 1-hop entity walk from top seeds, if entity signals present)
   → Original query lists get positional 2× weight in RRF; expanded get 1×

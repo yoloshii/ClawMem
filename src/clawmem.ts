@@ -13,6 +13,7 @@ import {
   canonicalDocId,
   type Store,
   type SearchResult,
+  type ExpandedQuery,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -939,19 +940,13 @@ async function cmdQuery(args: string[]) {
   const secondScore = ftsResults[1]?.score ?? 0;
   const strongSignal = topScore >= 0.85 && (topScore - secondScore) >= 0.15;
 
-  // Step 2: Query expansion (skip if strong BM25 signal)
-  let expandedQueries: { type: string; text: string }[] = [];
+  // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
+  // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and
+  // the original query is no longer echoed back as a phantom "vec" expansion.
+  let expandedQueries: ExpandedQuery[] = [];
   if (!strongSignal) {
     try {
-      const expanded = await s.expandQuery(query, DEFAULT_QUERY_MODEL);
-      expandedQueries = expanded.map(text => {
-        // Parse "type: text" format from expansion
-        const colonIdx = text.indexOf(": ");
-        if (colonIdx > 0 && colonIdx < 5) {
-          return { type: text.slice(0, colonIdx), text: text.slice(colonIdx + 2) };
-        }
-        return { type: "vec", text };
-      });
+      expandedQueries = await s.expandQuery(query, DEFAULT_QUERY_MODEL);
     } catch {
       // Fallback: no expansion
     }
@@ -959,20 +954,27 @@ async function cmdQuery(args: string[]) {
 
   // Step 3: Parallel searches
   const allRanked: { results: RankedResult[]; weight: number }[] = [];
+  // Retain the raw SearchResult from every leg (original + typed expansions) so a
+  // candidate found ONLY via an expansion leg survives Step 8's resultMap lookup.
+  const candidateResults: SearchResult[] = [];
 
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
+  candidateResults.push(...ftsResults);
   const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, 20);
   allRanked.push({ results: vecResults.map(toRanked), weight: 2 });
+  candidateResults.push(...vecResults);
 
-  // Expanded queries (weight 1x)
+  // Expanded queries (weight 1x): lex → FTS, vec/hyde → vector
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
-      const r = s.searchFTS(eq.text, 20);
+      const r = s.searchFTS(eq.query, 20);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
+      candidateResults.push(...r);
     } else {
-      const r = await s.searchVec(eq.text, DEFAULT_EMBED_MODEL, 20);
+      const r = await s.searchVec(eq.query, DEFAULT_EMBED_MODEL, 20);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
+      candidateResults.push(...r);
     }
   }
 
@@ -1009,9 +1011,10 @@ async function cmdQuery(args: string[]) {
   });
   blended.sort((a, b) => b.score - a.score);
 
-  // Step 8: Map back to full results and apply composite scoring
+  // Step 8: Map back to full results and apply composite scoring. Build the map from
+  // ALL legs (incl. typed expansions) so expansion-only candidates aren't dropped.
   const resultMap = new Map(
-    [...ftsResults, ...vecResults].map(r => [r.filepath, r])
+    candidateResults.map(r => [r.filepath, r])
   );
   const fullResults = blended
     .map(b => resultMap.get(b.file))

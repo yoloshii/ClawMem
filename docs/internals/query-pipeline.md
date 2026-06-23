@@ -19,9 +19,10 @@ Query Expansion (LLM)
   │ Intent steers the expansion prompt
   │
   ▼
-Parallel Search
-  │ BM25(original) + Vector(original)
-  │ + BM25(each expanded) + Vector(each expanded)
+Parallel Search (typed routing)
+  │ BM25(original) + Vector(original)   ← original fans out to both
+  │ + BM25(lex expansions)              ← lex → BM25 only
+  │ + Vector(vec/hyde expansions)       ← vec/hyde → vector only
   │
   ▼
 Reciprocal Rank Fusion (k=60)
@@ -76,7 +77,9 @@ The bypass is disabled when `intent` is provided — intent implies the query is
 
 ## Query expansion
 
-The LLM generates lex (keyword), vec (semantic), and hyde (hypothetical answer) variants of the query. These are searched in parallel alongside the original query. The original query's results receive 2x weight in RRF fusion, ensuring it anchors the ranking.
+The LLM generates lex (keyword), vec (semantic), and hyde (hypothetical answer) variants of the query, each carried as a typed `ExpandedQuery`. Variants are **routed by type**: `lex` expansions are searched on BM25 only, `vec` and `hyde` on vector only. The original query is the only leg that fans out to *both* backends. All legs are searched in parallel and fused; the original query's two lists receive 2x weight in RRF, ensuring it anchors the ranking.
+
+Routing by type matters because a keyword expansion ("auth token refresh") is useless to a dense vector model, and a hypothetical-answer passage (hyde) is mostly stopword noise to BM25. Searching every variant on both backends — the earlier behavior — fed each leg the input it handles worst, diluting RRF with low-quality lists.
 
 ## Chunk selection
 

@@ -142,6 +142,88 @@ export type Queryable = {
 };
 
 /**
+ * Template-residue / leak patterns that indicate an expansion line is NOT a real
+ * query. The qmd-query-expansion finetune, when prompted out of distribution,
+ * echoed the old verbose prompt's format hints and leaked Qwen3 thinking tags;
+ * these never belong in a search query. Kept as a defensive guard even though the
+ * terse QMD-faithful prompt (expandQueryRemote, 2026-06-23) fixed generation.
+ */
+const EXPANSION_JUNK_PATTERNS: RegExp[] = [
+  /<\/?think>/i,
+  /keyword search terms \(/i,
+  /semantic search queries \(/i,
+  /hypothetical document passage that answers the query/i,
+];
+
+/** True if an expansion text is empty or matches a known template-residue pattern. */
+export function isJunkExpansion(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  return EXPANSION_JUNK_PATTERNS.some(re => re.test(t));
+}
+
+/**
+ * Strip stray Qwen3 `/no_think` / `/think` control tokens the model sometimes
+ * echoes mid-line (generateRemote appends ` /no_think`, and the finetune can copy
+ * it into a hyde passage). Only matches the token when it stands alone (start/space
+ * bounded) so real paths like `src/think.ts` are never touched. Unlike the `<think>`
+ * tag (which signals reasoning leakage → whole line rejected), a stray control token
+ * just gets cleaned out so the otherwise-good line survives.
+ */
+function stripControlTokens(text: string): string {
+  return text.replace(/(?:^|\s)\/(?:no_)?think(?=\s|$)/gi, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Shared guard for query-expansion output. Drops empty / template-residue /
+ * think-tag lines and de-duplicates by (type, text). Used by BOTH the llm.ts
+ * parsers and the store.ts wrapper (defense-in-depth across every provider).
+ * Does NOT inject a fallback — callers decide what to do with an empty result,
+ * and does NOT require the original query terms to appear (that would reject
+ * legitimate synonyms and keyword-only expansions, e.g. a future zegen lex leg).
+ */
+export function sanitizeExpandedQueries(items: Queryable[]): Queryable[] {
+  const seen = new Set<string>();
+  const out: Queryable[] = [];
+  for (const q of items) {
+    const text = stripControlTokens(q.text);
+    if (isJunkExpansion(text)) continue;
+    const key = `${q.type}:${text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ type: q.type, text });
+  }
+  return out;
+}
+
+/**
+ * Typed fallback expansion set, used when generation fails or sanitization leaves
+ * nothing usable. lex+vec reuse the original query; hyde gets a minimal stub so the
+ * vector leg still has a hypothetical-document signal.
+ */
+export function expansionFallback(query: string, includeLexical: boolean = true): Queryable[] {
+  const out: Queryable[] = [
+    { type: 'vec', text: query },
+    { type: 'hyde', text: `Information about ${query}` },
+  ];
+  if (includeLexical) out.unshift({ type: 'lex', text: query });
+  return out;
+}
+
+/**
+ * True if `items` is exactly the typed fallback set for `query` — i.e. what every
+ * llm.expandQuery failure path returns. The store wrapper uses this to detect a
+ * leaked generation failure so it can return an expansions-only form WITHOUT
+ * caching it (a transient failure must not poison the cache). Compares against the
+ * default (lexical-included) fallback, which is what the store always requests.
+ */
+export function isFallbackExpansion(items: Queryable[], query: string): boolean {
+  const fb = expansionFallback(query);
+  return items.length === fb.length
+    && items.every((q, i) => q.type === fb[i]!.type && q.text === fb[i]!.text);
+}
+
+/**
  * Document to rerank
  */
 export type RerankDocument = {
@@ -1074,24 +1156,22 @@ export class LlamaCpp implements LLM {
   }
 
   private async expandQueryRemote(query: string, includeLexical: boolean, context?: string, intent?: string): Promise<Queryable[]> {
-    const prompt = `Rewrite this search query for better retrieval. Output lines in format "type: text" where type is lex, vec, or hyde.
-- lex: keyword search terms (1-3 lines)
-- vec: semantic search queries (1-3 lines)
-- hyde: hypothetical document passage that answers the query (1 line)
-
-Query: ${query}${intent ? `\nQuery intent: ${intent}` : ""}${context ? `\nContext: ${context}` : ""}
-
-Output:`;
+    // QMD-faithful terse prompt. The qmd-query-expansion-1.7B finetune was trained
+    // on "/no_think Expand this search query: X" (cf. QMD src/llm.ts:1467). The prior
+    // verbose prose prompt was out-of-distribution: the model echoed the template
+    // ("lex: keyword search terms (") and leaked </think> (verified live 2026-06-23).
+    let prompt = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
+    if (context) prompt += `\nContext: ${context}`;
 
     const result = await this.generateRemote(prompt, 500, 0.7);
     if (!result?.text) {
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
+      return expansionFallback(query, includeLexical);
     }
 
     const lines = result.text.trim().split("\n");
-    const queryables: Queryable[] = lines.map(line => {
+    const parsed: Queryable[] = lines.map(line => {
       const colonIdx = line.indexOf(":");
       if (colonIdx === -1) return null;
       const type = line.slice(0, colonIdx).trim();
@@ -1101,16 +1181,11 @@ Output:`;
       return { type: type as QueryType, text };
     }).filter((q): q is Queryable => q !== null);
 
-    if (queryables.length === 0) {
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
-    }
-
-    if (!includeLexical) {
-      return queryables.filter(q => q.type !== 'lex');
-    }
-    return queryables;
+    // Drop template residue / <think> leaks / dups, then scope to requested types.
+    const cleaned = sanitizeExpandedQueries(parsed);
+    const scoped = includeLexical ? cleaned : cleaned.filter(q => q.type !== 'lex');
+    if (scoped.length === 0) return expansionFallback(query, includeLexical);
+    return scoped;
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
@@ -1148,10 +1223,8 @@ Output:`;
     // Remote is in cooldown (pre-existing or just set) — fall through to local
     if (this.remoteLlmUrl && this.isRemoteLlmDown()) {
       if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") {
-        // Can't fall back — return passthrough
-        const fallback: Queryable[] = [{ type: 'vec', text: query }];
-        if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-        return fallback;
+        // Can't fall back to local inference — return the typed passthrough set
+        return expansionFallback(query, includeLexical);
       }
       this.noteRemoteFallback(
         "llm",
@@ -1230,7 +1303,7 @@ Final Output:`;
       });
 
       const lines = result.trim().split("\n");
-      const queryables: Queryable[] = lines.map(line => {
+      const parsed: Queryable[] = lines.map(line => {
         const colonIdx = line.indexOf(":");
         if (colonIdx === -1) return null;
         const type = line.slice(0, colonIdx).trim();
@@ -1239,17 +1312,14 @@ Final Output:`;
         return { type: type as QueryType, text };
       }).filter((q): q is Queryable => q !== null);
 
-      // Filter out lex entries if not requested
-      if (!includeLexical) {
-        return queryables.filter(q => q.type !== 'lex');
-      }
-      return queryables;
+      // Same guard as the remote path — drop residue/dups, scope to requested types.
+      const cleaned = sanitizeExpandedQueries(parsed);
+      const scoped = includeLexical ? cleaned : cleaned.filter(q => q.type !== 'lex');
+      if (scoped.length === 0) return expansionFallback(query, includeLexical);
+      return scoped;
     } catch (error) {
       console.error("Structured query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
+      return expansionFallback(query, includeLexical);
     } finally {
       await genContext.dispose();
     }

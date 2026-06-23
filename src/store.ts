@@ -21,6 +21,9 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  sanitizeExpandedQueries,
+  expansionFallback,
+  isFallbackExpansion,
   type RerankDocument,
 } from "./llm.ts";
 import {
@@ -1139,7 +1142,7 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string, intent?: string) => Promise<string[]>;
+  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
@@ -3543,28 +3546,84 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<string[]> {
-  // Check cache first (include intent in cache key)
-  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
+/**
+ * A typed query-expansion result. Decoupled from llm.ts's internal Queryable —
+ * same information, but store.ts owns its own public API type and field name.
+ *
+ * Routing contract (every consumer MUST honor it):
+ *   - lex  → FTS (BM25) only
+ *   - vec  → vector only
+ *   - hyde → vector only (hypothetical-document embedding)
+ * The original query is searched on BOTH backends and is NOT included here —
+ * callers add it explicitly with the 2× RRF anchor weight.
+ */
+export type ExpandedQuery = {
+  type: 'lex' | 'vec' | 'hyde';
+  query: string;
+};
+
+// Cache version + provider fingerprint for query expansion. Bumping the version
+// invalidates every stale entry automatically: old newline-format and pre-terse-
+// prompt garbage simply never hit again and age out of llm_cache via LRU (no manual
+// purge). The provider fingerprint will distinguish qmd from a future zegen lex
+// provider (P4) so a provider swap also invalidates the cache by construction.
+const EXPAND_CACHE_VERSION = "v3-qmd-terse-typed";
+const EXPAND_PROVIDER_FINGERPRINT = "qmd-terse";
+
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+  // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
+  const cacheKey = getCacheKey(`expandQuery:${EXPAND_CACHE_VERSION}`, {
+    query,
+    model,
+    provider: EXPAND_PROVIDER_FINGERPRINT,
+    ...(intent && { intent }),
+  });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
-    const lines = cached.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    return [query, ...lines.slice(0, 2)];
+    try {
+      const parsed = JSON.parse(cached) as unknown;
+      // Accept ONLY a fully-valid, already-clean typed payload. A shape error on ANY
+      // element, an empty array, or anything sanitization would drop/rewrite → treat
+      // the entry as stale and re-expand (never return partial or dirty cached data).
+      if (Array.isArray(parsed) && parsed.length > 0
+        && parsed.every(r => r !== null && typeof r === "object"
+          && typeof (r as Record<string, unknown>).query === "string"
+          && ((r as Record<string, unknown>).type === "lex"
+            || (r as Record<string, unknown>).type === "vec"
+            || (r as Record<string, unknown>).type === "hyde"))) {
+        const rows = parsed as Array<{ type: ExpandedQuery["type"]; query: string }>;
+        const sanitized = sanitizeExpandedQueries(rows.map(r => ({ type: r.type, text: r.query })));
+        const clean = sanitized.length === rows.length
+          && sanitized.every((s, i) => s.type === rows[i]!.type && s.text === rows[i]!.query);
+        if (clean) return rows;
+      }
+    } catch {
+      // Malformed JSON — fall through and re-expand.
+    }
   }
 
   const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  // Pass intent to steer expansion when provided
+  // Note: LlamaCpp uses a hardcoded model; the model parameter is ignored here.
+  // Pass intent to steer expansion when provided.
   const results = await llm.expandQuery(query, { intent });
-  const queryTexts = results.map(r => r.text);
 
-  // Cache the expanded queries (excluding original)
-  const expandedOnly = queryTexts.filter(t => t !== query);
-  if (expandedOnly.length > 0) {
-    setCachedResult(db, cacheKey, expandedOnly.join('\n'));
+  // Defense-in-depth: re-run the shared guard (also covers the local GBNF path and
+  // any future provider), then drop entries that just echo the original query.
+  // llm.expandQuery substitutes its OWN typed fallback on any generation failure
+  // (remote-empty, cooldown under NO_LOCAL_MODELS, local parse-empty/error). Detect
+  // that leaked fallback AND the all-junk case, and return an expansions-only set
+  // that is NOT cached — a transient failure must not poison the cache or break the
+  // "expansions only, original excluded" contract.
+  const cleaned = sanitizeExpandedQueries(results).filter(r => r.text !== query);
+  if (cleaned.length === 0 || isFallbackExpansion(results, query)) {
+    return expansionFallback(query)
+      .filter(r => r.text !== query)   // expansions-only per the ExpandedQuery contract
+      .map(r => ({ type: r.type, query: r.text }));
   }
 
-  return Array.from(new Set([query, ...queryTexts]));
+  const expanded: ExpandedQuery[] = cleaned.map(r => ({ type: r.type, query: r.text }));
+  setCachedResult(db, cacheKey, JSON.stringify(expanded));
+  return expanded;
 }
 
 // =============================================================================
