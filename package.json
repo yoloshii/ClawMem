@@ -1,10 +1,10 @@
 {
   "name": "clawmem",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "On-device memory layer for AI agents. Claude Code, OpenClaw, and Hermes. Hooks + MCP server + hybrid RAG search.",
   "type": "module",
   "bin": {
-    "clawmem": "./bin/clawmem"
+    "clawmem": "bin/clawmem"
   },
   "files": [
     "bin/",

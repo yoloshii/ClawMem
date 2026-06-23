@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.11.2 — Packaging: `bin` path so `npm install -g` registers the `clawmem` command on npm 11
+
+v0.11.2 is a packaging-only fix. The `bin` map declared `"clawmem": "./bin/clawmem"`; npm 11's publish path rejects the `./`-prefixed form and **drops the bin entry from the tarball** (older npm silently rewrote it — the live v0.11.0 ships `bin/clawmem`), so a global install would land the files but expose no `clawmem` command. Changed to `"clawmem": "bin/clawmem"`, verified with `npm publish --dry-run` (no warning; the bin survives in the packed `package.json`).
+
+No source change from v0.11.1. **v0.11.1 was git-tagged but never reached npm** (the publish that surfaced this packaging issue also failed on an expired npm token), so on npm v0.11.2 supersedes v0.11.0 directly and carries the full v0.11.1 query-expansion fix documented below.
+
 ## v0.11.1 — Query expansion: typed lex/vec/hyde routing + terse qmd prompt (fixes garbage / mis-routed expansions)
 
 v0.11.1 fixes the LLM query-expansion stage, which had two compounding bugs that quietly degraded `query` / `intent_search` recall: the expansion model produced **garbage variants**, and the variants that were usable got **routed to the wrong search backend**.
