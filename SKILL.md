@@ -18,7 +18,7 @@ Two tiers: **hooks** handle automatic context flow (surfacing, extraction, compa
 
 ## Inference Services
 
-Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`.
+Three inference services (embedding, LLM, reranker). The **default** stack runs all three as `llama-server` instances; the **SOTA** stack serves the reranker as a transformers sidecar (same `/v1/rerank` contract). The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`.
 
 **Default (QMD native combo, any GPU or in-process):**
 
@@ -30,7 +30,7 @@ Three `llama-server` instances for neural inference. The `bin/clawmem` wrapper d
 
 All three models auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration (Metal/Vulkan); significantly slower on CPU-only.
 
-**SOTA upgrade (12GB+ GPU):** zembed-1-Q4_K_M (embedding, 2560d, ~4.4GB) + zerank-2-Q4_K_M (reranker, ~3.3GB). Total ~10GB with LLM. Distillation-paired via zELO. `-ub` must match `-b` for both. **CC-BY-NC-4.0** — non-commercial only.
+**SOTA upgrade (16GB+ GPU):** zembed-1-Q4_K_M (embedding, 2560d, ~4.4GB) + the **zerank-2 seq-cls sidecar** (reranker, bf16 ~9GB — see `extras/rerankers/zerank-2-seq/`). Total ~16GB with LLM. Distillation-paired via zELO. zembed-1's `-ub` must match `-b`. **CC-BY-NC-4.0** — non-commercial only. The older `zerank-2-Q4_K_M` GGUF reranker is **deprecated** (llama.cpp drops zerank's score head → inert reranking); use the sidecar.
 
 **Remote option:** Set `CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` to remote host. Set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent fallback downloads.
 
@@ -53,15 +53,14 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 
-# === SOTA upgrade (12GB+ GPU) — -ub must match -b ===
+# === SOTA upgrade (16GB+ GPU) ===
 
-# Embedding (zembed-1)
+# Embedding (zembed-1) — -ub must match -b
 llama-server -m zembed-1-Q4_K_M.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 
-# Reranker (zerank-2)
-llama-server -m zerank-2-Q4_K_M.gguf \
-  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 -b 2048 -ub 2048
+# Reranker (zerank-2) — seq-cls SIDECAR (transformers, bf16), NOT GGUF:
+#   see extras/rerankers/zerank-2-seq/  (the zerank-2 GGUF is deprecated — drops the score head)
 ```
 
 ### Verify Endpoints
@@ -791,7 +790,7 @@ clawmem focus clear --session-id abc123
 
 - QMD retrieval (BM25, vector, RRF, rerank, query expansion) is forked into ClawMem. Do not call standalone QMD tools.
 - SAME (composite scoring), MAGMA (intent + graph), A-MEM (self-evolving notes) layer on top of QMD substrate.
-- Three `llama-server` instances on local or remote GPU. Wrapper defaults to `localhost:8088/8089/8090`.
+- Three inference services on local or remote GPU — `llama-server` for all three in the default stack; the SOTA stack serves the reranker as a transformers sidecar. Wrapper defaults to `localhost:8088/8089/8090`.
 - `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process fallback. Set `true` for remote-only to fail fast.
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs and runs Phase 2 merge / Phase 3 deductive synthesis. **v0.8.2:** hosted by either `clawmem watch` (long-lived, canonical) or `clawmem mcp` (per-session fallback); every tick acquires a `light-consolidation` `worker_leases` row before doing work, so dual-hosting against the same vault is safe.
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.

@@ -114,8 +114,8 @@ After installing, here's the full journey from zero to working memory:
 | Step | What | How | Details |
 |------|------|-----|---------|
 | **1. Bootstrap** | Create a vault, index your first collection, embed, install hooks and MCP | `clawmem bootstrap ~/notes --name notes` | One command does it all. Or run each step manually (see below). |
-| **2. Choose models** | Pick embedding + reranker models based on your hardware | 12GB+ VRAM → SOTA stack (zembed-1 + zerank-2). Less → QMD native combo. No GPU → cloud embedding or CPU fallback. | [GPU Services](#gpu-services) |
-| **3. Download models** | Get the GGUF files for your chosen stack | `wget` from HuggingFace, or let `node-llama-cpp` auto-download the QMD native models on first use | [Embedding](#embedding), [LLM Server](#llm-server), [Reranker Server](#reranker-server) |
+| **2. Choose models** | Pick embedding + reranker models based on your hardware | 16GB+ VRAM → SOTA stack (zembed-1 + zerank-2 sidecar). Less → QMD native combo. No GPU → cloud embedding or CPU fallback. | [GPU Services](#gpu-services) |
+| **3. Download models** | Get the model files for your chosen stack (GGUFs for embedding/LLM/default-reranker; the zerank-2 SOTA reranker builds its own sidecar artifact) | `wget` from HuggingFace, let `node-llama-cpp` auto-download the QMD native models, or run the sidecar recipe | [Embedding](#embedding), [LLM Server](#llm-server), [Reranker Server](#reranker-server) |
 | **4. Start services** | Run GPU servers (if using dedicated GPU) and background services. Optionally enable the v0.8.2 background maintenance workers in the watcher unit so consolidation + deductive synthesis run automatically. | `llama-server` for each model. systemd units for watcher + embed timer. Drop-in for the watcher to enable workers + tune intervals + set the quiet window. | [systemd services](docs/guides/systemd-services.md), [background workers](docs/guides/systemd-services.md#background-maintenance-workers-v082) |
 | **5. Decide what to index** | Add collections for your projects, notes, research, and domain docs | `clawmem collection add ~/project --name project` | The more relevant markdown you index, the better retrieval works. See [building a rich context field](docs/introduction.md#building-a-rich-context-field). |
 | **6. Connect your agent** | Hook into Claude Code, OpenClaw, Hermes, or any MCP client | `clawmem setup hooks && clawmem setup mcp` for Claude Code. `clawmem setup openclaw` for OpenClaw. Copy `src/hermes/` to Hermes plugins for Hermes. | [Integration](#integration) |
@@ -305,17 +305,19 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### GPU Services
 
-ClawMem uses three `llama-server` (llama.cpp) instances for neural inference. All three have in-process fallbacks via `node-llama-cpp` (auto-downloads on first use), so ClawMem works without a dedicated GPU. `node-llama-cpp` auto-detects the best available backend — Metal on Apple Silicon, Vulkan where available, CPU as last resort. With GPU acceleration (Metal/Vulkan), in-process inference is fast for these small models (0.3B–1.7B); on CPU-only systems it is significantly slower. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback.
+ClawMem uses three inference services — embedding, LLM, and reranker. In the **default** stack all three run as `llama-server` (llama.cpp) instances, each with an in-process `node-llama-cpp` fallback (auto-downloads on first use), so ClawMem works without a dedicated GPU. (The **SOTA** reranker is the exception — it is a transformers sidecar, see [Reranker Server](#reranker-server).) `node-llama-cpp` auto-detects the best available backend — Metal on Apple Silicon, Vulkan where available, CPU as last resort. With GPU acceleration (Metal/Vulkan), in-process inference is fast for these small models (0.3B–1.7B); on CPU-only systems it is significantly slower. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback.
 
-**GPU with VRAM to spare (12GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~10GB VRAM.
+**GPU with VRAM to spare (16GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~16GB VRAM.
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
 | Embedding | 8088 | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) | ~4.4GB | SOTA embedding (2560d, 32K context). Distilled from zerank-2 via zELO. |
 | LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
-| Reranker | 8090 | [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) | ~3.3GB | SOTA reranker. Outperforms Cohere rerank-3.5. Optimal pairing with zembed-1. |
+| Reranker | 8090 | [zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/) | ~9GB (bf16) | SOTA reranker. NDCG@10 ahead of Cohere rerank-3.5. Optimal pairing with zembed-1. |
 
-**Important:** zembed-1 and zerank-2 use non-causal attention — `-ub` must equal `-b` on llama-server (e.g. `-b 2048 -ub 2048`). See [Reranker Server](#reranker-server) for details.
+**The SOTA reranker is a sidecar, not a GGUF.** It is served by the [zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/) (transformers, bf16). The previously-listed `zerank-2-Q4_K_M` GGUF is **deprecated** — llama.cpp's converter drops zerank's score head, so under `--reranking` it produces near-zero, uninformative scores (final ordering stays RRF-dominated). See the [sidecar README](extras/rerankers/zerank-2-seq/) and [Reranker Server](#reranker-server).
+
+**Important:** zembed-1 uses non-causal attention — `-ub` must equal `-b` on llama-server (e.g. `-b 2048 -ub 2048`). See [Embedding](#embedding) for details.
 
 **License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The QMD native models below have no such restriction.
 
@@ -466,15 +468,15 @@ Cross-encoder reranking for `query` and `intent_search` pipelines on port 8090. 
 
 Scores each candidate against the original query (cross-encoder architecture). `query` pipeline: 4000 char context per doc (deep reranking); `intent_search`: 200 char context per doc (fast reranking).
 
-**GPU with VRAM to spare (recommended):** [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) (2.4GB, ~3.3GB VRAM). Outperforms Cohere rerank-3.5 and Gemini 2.5 Flash. Optimal pairing with zembed-1 (same distillation architecture via zELO). **CC-BY-NC-4.0** — non-commercial only.
+**GPU with VRAM to spare (recommended):** the **[zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/)** (bf16, ~9GB VRAM). zerank-2's NDCG@10 is ahead of Cohere rerank-3.5 and Gemini 2.5 Flash. Optimal pairing with zembed-1 (same distillation architecture via zELO). **CC-BY-NC-4.0** — non-commercial only.
+
+zerank-2 is **not** servable as a llama.cpp GGUF — its CrossEncoder/LogitScore head is dropped by the GGUF converter (the model becomes a headless causal LM that produces near-zero, uninformative scores under `--reranking`, leaving final ordering RRF-dominated). The sidecar serves the real head via transformers, with a reproducible correctness gate:
 
 ```bash
-wget https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m/resolve/main/zerank-2-Q4_k_m.gguf
-
-# -ub must match -b for non-causal attention
-llama-server -m zerank-2-Q4_K_M.gguf \
-  --reranking --port 8090 --host 0.0.0.0 \
-  -ngl 99 -c 2048 -b 2048 -ub 2048
+cd extras/rerankers/zerank-2-seq
+docker compose build
+HF_TOKEN=hf_xxx docker compose run --rm convert   # download + convert + verify (all gates must pass)
+docker compose up -d reranker                      # serves /v1/rerank on :8090
 ```
 
 **CPU / GPU without VRAM to spare:** [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600MB, ~1.3GB VRAM). The QMD native reranker — auto-downloaded by `node-llama-cpp` if no server is running.
@@ -487,7 +489,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   -ngl 99 -c 2048 --batch-size 512
 ```
 
-**Note:** zerank-2 and zembed-1 use non-causal attention — `-ub` (ubatch) must equal `-b` (batch). Omitting `-ub` or setting it lower causes assertion crashes. qwen3-reranker-0.6B does not have this requirement. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
+**Note:** zembed-1 (embedding) uses non-causal attention — `-ub` (ubatch) must equal `-b` (batch); omitting `-ub` or setting it lower causes assertion crashes. The qwen3-reranker-0.6B GGUF does not have this requirement, and the zerank-2 sidecar is served via transformers (no llama.cpp batch flags). See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
 
 ### MCP Server
 
@@ -1151,7 +1153,7 @@ clawmem serve --port 7438 &
 
 ## Deployment
 
-Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box without a dedicated GPU (all models auto-download via `node-llama-cpp`, uses Metal on Apple Silicon). For best performance, run three `llama-server` instances — see [GPU Services](#gpu-services) for model tiers (SOTA vs QMD native) and [Cloud Embedding](#option-c-cloud-embedding-api) for cloud embedding alternatives.
+Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box without a dedicated GPU (all models auto-download via `node-llama-cpp`, uses Metal on Apple Silicon). For best performance, run the inference services on GPU (three `llama-server` instances in the default stack; the SOTA reranker is a transformers sidecar) — see [GPU Services](#gpu-services) for model tiers (SOTA vs QMD native) and [Cloud Embedding](#option-c-cloud-embedding-api) for cloud embedding alternatives.
 
 Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 7 Claude Code hooks installed by default (context injection, curator nudge, compaction support, decision extraction, handoffs, feedback). Optional `clawmem-curator` agent for on-demand lifecycle triage, retrieval health checks, and maintenance (`clawmem setup curator`).
 

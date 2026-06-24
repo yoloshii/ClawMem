@@ -1,0 +1,49 @@
+# ClawMem zerank-2 seq-cls reranker sidecar.
+#
+#   1. Build:              docker compose build
+#   2. Convert + verify:   HF_TOKEN=hf_xxx docker compose run --rm convert
+#   3. Serve on :8090:     docker compose up -d reranker
+#
+# Then point ClawMem at it:   export CLAWMEM_RERANK_URL=http://<this-host>:8090
+#
+# Requires the NVIDIA Container Toolkit. zerank-2 weights are CC-BY-NC-4.0 (non-commercial);
+# accept the model license on Hugging Face and pass HF_TOKEN for the one-off convert step.
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  reranker:                     # the live sidecar — serves the verified model on :8090
+    build: .
+    image: clawmem-zerank-2-seq
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./models:/models
+    environment:
+      ZR_OUT: /models/zerank-2-seq
+      ZR_PORT: "8090"
+    <<: *gpu
+
+  convert:                      # one-off: download + convert + run all gates into ./models
+    build: .
+    image: clawmem-zerank-2-seq
+    profiles: ["tools"]
+    environment:
+      ZR_SRC: zeroentropy/zerank-2-reranker
+      ZR_OUT: /models/zerank-2-seq
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./models:/models
+      - hf-cache:/root/.cache/huggingface
+    command: ["python3", "build_and_verify.py"]
+    <<: *gpu
+
+volumes:
+  hf-cache:

@@ -50,7 +50,7 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
  GPU Services (llama-server)
    ├── :8088 — Embedding (EmbeddingGemma-300M default, zembed-1 SOTA upgrade)
    ├── :8089 — LLM (qmd-query-expansion-1.7B)
-   └── :8090 — Reranker (qwen3-reranker-0.6B default, zerank-2 SOTA upgrade)
+   └── :8090 — Reranker (qwen3-reranker-0.6B default, zerank-2 seq-cls sidecar SOTA upgrade)
 ```
 
 ## Key design principles

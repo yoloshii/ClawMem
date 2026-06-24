@@ -2,7 +2,7 @@
 
 ## Inference Services
 
-ClawMem uses three `llama-server` instances for neural inference. By default, the `bin/clawmem` wrapper points at `localhost:8088/8089/8090`.
+ClawMem uses three inference services (embedding, LLM, reranker). The **default** stack runs all three as `llama-server` instances; the **SOTA** stack swaps the reranker for a transformers sidecar (same `/v1/rerank` contract). The `bin/clawmem` wrapper points at `localhost:8088/8089/8090`.
 
 **Default (QMD native combo, any GPU or in-process):**
 
@@ -14,15 +14,15 @@ ClawMem uses three `llama-server` instances for neural inference. By default, th
 
 All three models auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration (Metal/Vulkan); significantly slower on CPU-only.
 
-**SOTA upgrade (12GB+ GPU):** CC-BY-NC-4.0 — non-commercial only.
+**SOTA upgrade (16GB+ GPU):** CC-BY-NC-4.0 — non-commercial only.
 
 | Service | Port | Model | VRAM | Protocol |
 |---|---|---|---|---|
 | Embedding | 8088 | zembed-1-Q4_K_M | ~4.4GB | `/v1/embeddings` |
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
-| Reranker | 8090 | zerank-2-Q4_K_M | ~3.3GB | `/v1/rerank` |
+| Reranker | 8090 | zerank-2 seq-cls sidecar | ~9GB (bf16) | `/v1/rerank` |
 
-Total ~10GB VRAM. zembed-1 (2560d, 32K context, SOTA retrieval) distilled from zerank-2 via zELO. Optimal pairing.
+zembed-1 (2560d, 32K context, SOTA retrieval) distilled from zerank-2 via zELO — optimal pairing. The SOTA reranker is the **zerank-2 seq-cls sidecar** at `extras/rerankers/zerank-2-seq/` (transformers, bf16, ~9GB VRAM) — **not** a GGUF. The older `zerank-2-Q4_K_M` GGUF is **deprecated**: llama.cpp drops zerank's score head, so its scores are near-zero and uninformative (final ordering stays RRF-dominated). Full SOTA stack ≈ 16GB VRAM.
 
 **Remote option:** Set `CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` to the remote host. Set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent surprise fallback downloads.
 
@@ -36,7 +36,7 @@ Total ~10GB VRAM. zembed-1 (2560d, 32K context, SOTA retrieval) distilled from z
 |---|---|---|---|
 | Embedding | [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) (314MB, 768d) | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) (2.4GB, 2560d) | zembed-1: 32K context, SOTA retrieval. `-ub` must match `-b`. |
 | LLM | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) (~1.1GB) | Same | QMD's Qwen3-1.7B finetune for query expansion. |
-| Reranker | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600MB) | [zerank-2-Q4_K_M](https://huggingface.co/keisuke-miyako/zerank-2-gguf-q4_k_m) (2.4GB) | zerank-2: outperforms Cohere rerank-3.5. `-ub` must match `-b`. |
+| Reranker | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600MB) | [zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/) (bf16, ~9GB) | zerank-2: NDCG@10 ahead of Cohere rerank-3.5. Served via transformers sidecar, **not** GGUF (the GGUF drops the score head → inert). CC-BY-NC. |
 
 ### Server Setup (all three use llama-server)
 
@@ -55,15 +55,15 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 
-# === SOTA upgrade (12GB+ GPU) — -ub must match -b for non-causal attention ===
+# === SOTA upgrade (16GB+ GPU) ===
 
-# Embedding
+# Embedding (zembed-1) — -ub must match -b for non-causal attention
 llama-server -m zembed-1-Q4_K_M.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 
-# Reranker
-llama-server -m zerank-2-Q4_K_M.gguf \
-  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 -b 2048 -ub 2048
+# Reranker (zerank-2) — seq-cls SIDECAR (transformers, bf16), NOT a llama-server GGUF:
+#   cd extras/rerankers/zerank-2-seq && docker compose run --rm convert && docker compose up -d reranker
+# The zerank-2 GGUF is deprecated: llama.cpp drops its score head -> near-zero, uninformative scores.
 ```
 
 ### Verify Endpoints
@@ -734,7 +734,7 @@ clawmem focus clear --session-id abc123
 - **Entity resolution (v0.2.0+):** A-MEM enrichment extracts named entities via LLM, resolves to canonical forms using FTS5 + Levenshtein fuzzy matching with **type-agnostic compatibility buckets** (person, org, location stay separate; project/service/tool/concept merge freely as "tech" bucket). Quality filters reject title-as-entity, long names, template placeholders, and invalid locations. Entity edges use IDF-based specificity scoring (rare entities create edges; ubiquitous entities alone cannot). See `docs/internals/entity-resolution.md` for customization (extending type vocabulary and buckets).
 - QMD retrieval (BM25, vector, RRF, rerank, query expansion) is forked into ClawMem. Do not call standalone QMD tools.
 - SAME (composite scoring), MAGMA (intent + graph), A-MEM (self-evolving notes) layer on top of QMD substrate.
-- Three `llama-server` instances (embedding, LLM, reranker) on local or remote GPU. Wrapper defaults to `localhost:8088/8089/8090`.
+- Three inference services (embedding, LLM, reranker) on local or remote GPU — `llama-server` for all three in the default stack; the SOTA stack serves the reranker as a transformers sidecar. Wrapper defaults to `localhost:8088/8089/8090`.
 - `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process LLM/reranker fallback via `node-llama-cpp`. Set `true` for remote-only setups to fail fast on unreachable endpoints.
 - Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs with A-MEM notes + links. Only runs if the MCP process stays alive long enough to tick (every 5min).
 - Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+) for live issue data, creates markdown docs in `beads` collection, maps all dependency edge types into `memory_relations`, and triggers A-MEM enrichment for new docs. Watcher auto-triggers on `.beads/` directory changes; `beads_sync` MCP tool for manual sync. Requires `bd` binary on PATH or at `~/go/bin/bd`.

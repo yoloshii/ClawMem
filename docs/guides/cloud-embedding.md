@@ -107,15 +107,14 @@ llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 ```
 
-**SOTA upgrade (12GB+ GPU):** **ZeroEntropy zembed-1** (2560 dimensions, 32K context, SOTA retrieval quality, ~4.4GB VRAM) paired with **zerank-2** reranker (distillation-paired via zELO). **CC-BY-NC-4.0** — non-commercial only.
+**SOTA upgrade (16GB+ GPU):** **ZeroEntropy zembed-1** (2560 dimensions, 32K context, SOTA retrieval quality, ~4.4GB VRAM) paired with the **zerank-2 seq-cls reranker sidecar** (distillation-paired via zELO). **CC-BY-NC-4.0** — non-commercial only.
 
 ```bash
 llama-server -m zembed-1-Q4_K_M.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
-
-llama-server -m zerank-2-Q4_K_M.gguf \
-  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 -b 2048 -ub 2048
 ```
+
+The reranker is **not** a GGUF — serve it via the seq-cls sidecar (transformers, bf16): see [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/). The old `zerank-2-Q4_K_M` GGUF is deprecated (llama.cpp drops its score head → near-zero, uninformative scores; final ordering stays RRF-dominated).
 
 For cloud, **Jina AI `jina-embeddings-v5-text-small`** is recommended (1024 dimensions, 32K context, task-specific LoRA adapters for retrieval).
 

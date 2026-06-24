@@ -4,6 +4,27 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.11.3 — Reranker: deprecate the broken zerank-2 GGUF; ship the zerank-2 seq-cls sidecar (SOTA, non-commercial)
+
+The "SOTA upgrade" reranker — `zerank-2-Q4_K_M.gguf` served under `llama-server --reranking` — was silently broken. This release deprecates it across the docs and ships a working replacement as an opt-in recipe.
+
+Root cause: zerank-2 is a `Qwen3ForCausalLM` that scores a (query, document) pair on the logit of a single relevance token ("Yes", id 9454) via a sentence-transformers `LogitScore` head. llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when the model card contains the literal string `# Qwen3-Reranker`; zerank-2's card lacks it, so the previously-recommended GGUF — and any built by the current/standard llama.cpp converter — is a **headless causal LM**. Served with `--reranking` it returns near-zero, uninformative scores → reranking degrades to an inert RRF-dominated passthrough, with no error.
+
+What changed:
+
+- **New opt-in recipe** at `extras/rerankers/zerank-2-seq/` — converts `zeroentropy/zerank-2-reranker` to a `Qwen3ForSequenceClassification` (`num_labels=1`) whose score head is the tied-embedding row 9454, so the relevance logit is **identical by construction** to the native causal score. Served as a small transformers sidecar (`/v1/rerank`, `batch=1`, applies zerank's chat template, returns `sigmoid(logit/5)`) behind the existing `CLAWMEM_RERANK_URL` contract — drop-in, no ClawMem code change.
+- **Reproducible correctness gate** (`build_and_verify.py`) — the convert step refuses to finish unless it proves: fp32 score-head weight-equality (bf16 preserved, no fp16 downcast); served-tokenizer == source-tokenizer (including the truncation path); the assistant-generation prefix survives near-`MAXLEN` inputs; and the seq-cls logit equals the causal token-9454 logit bit-exactly over the real served path (including batched right-padded pooling and empty/whitespace-doc edges).
+- **Docs corrected** — `README.md`, `CLAUDE.md`/`AGENTS.md`, `SKILL.md`, `docs/quickstart.md`, `docs/introduction.md`, and `docs/guides/cloud-embedding.md` now point the SOTA reranker at the sidecar and explain the GGUF deprecation; `docs/guides/upgrading.md` gains a migration section. Full-SOTA-stack VRAM guidance moves 12GB → 16GB (the bf16 reranker is ~9GB).
+
+### Verification
+
+The conversion's correctness is enforced by `build_and_verify.py`, which the convert step runs before serving and which exits non-zero unless every gate passes: fp32 score-head weight-equality (bf16 preserved, no fp16 downcast); served-tokenizer == source-tokenizer identity (including the truncation path); assistant-prefix preservation under near-`MAXLEN` inputs; and seq-cls-vs-causal token-9454 logit equivalence over the real served path (batched right-padded pooling + empty/whitespace-doc edges). Verified live after deploy: relevant vs. irrelevant scores 0.96 / 0.08, matching the gate.
+
+### What didn't change
+
+- **zembed-1** (SOTA embedding) and **qwen3-reranker-0.6B** (default reranker) are unchanged — only the zerank-2 *reranker GGUF* is deprecated.
+- No `src/` change, no schema migration, no config/env-var change, no public API change. ClawMem's default reranker stays the permissively-licensed qwen3-reranker-0.6B; the sidecar is an opt-in upgrade. zerank-2 weights are **CC-BY-NC-4.0** (non-commercial) and are never bundled — the recipe downloads them for your own use.
+
 ## v0.11.2 — Packaging: `bin` path so `npm install -g` registers the `clawmem` command on npm 11
 
 v0.11.2 is a packaging-only fix. The `bin` map declared `"clawmem": "./bin/clawmem"`; npm 11's publish path rejects the `./`-prefixed form and **drops the bin entry from the tarball** (older npm silently rewrote it — the live v0.11.0 ships `bin/clawmem`), so a global install would land the files but expose no `clawmem` command. Changed to `"clawmem": "bin/clawmem"`, verified with `npm publish --dry-run` (no warning; the bin survives in the packed `package.json`).

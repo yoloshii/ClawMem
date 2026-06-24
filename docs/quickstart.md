@@ -5,7 +5,7 @@ Set up ClawMem as persistent memory for AI coding agents in under 5 minutes. By 
 ## Prerequisites
 
 - [Bun](https://bun.sh) v1.0+ — install via `curl -fsSL https://bun.sh/install | bash`, not snap (snap Bun has stdin restrictions that break hooks)
-- A GPU for local inference (default models need ~4GB VRAM; SOTA upgrade needs ~10GB). Or use [cloud embedding](guides/cloud-embedding.md)
+- A GPU for local inference (default models need ~4GB VRAM; the full SOTA stack needs ~16GB, the zerank-2 sidecar alone ~9GB). Or use [cloud embedding](guides/cloud-embedding.md)
 - Claude Code, OpenClaw, or any MCP-compatible client
 
 ## Install
@@ -70,7 +70,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
 
-> **SOTA upgrade (12GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`) and reranker with zerank-2-Q4_K_M (`-b 2048 -ub 2048`). See [GPU services](../README.md#gpu-services) for details.
+> **SOTA upgrade (16GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`). For the reranker, use the **zerank-2 seq-cls sidecar** (transformers, bf16) at [`extras/rerankers/zerank-2-seq/`](../extras/rerankers/zerank-2-seq/) — the `zerank-2-Q4_K_M` GGUF is deprecated (llama.cpp drops its score head). See [GPU services](../README.md#gpu-services). **CC-BY-NC-4.0** — non-commercial only.
 
 See [GPU services guide](guides/systemd-services.md) for systemd setup and remote GPU configuration.
 
