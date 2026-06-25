@@ -9,15 +9,17 @@ compositeScore = (w_search * searchScore + w_recency * recencyScore + w_confiden
                  * qualityMultiplier * coActivationBoost
 ```
 
-### Default weights
+### Weights
 
-| Signal | Normal | Recency intent |
-|--------|--------|---------------|
-| searchScore | 0.50 | 0.10 |
-| recencyScore | 0.25 | 0.70 |
-| confidenceScore | 0.25 | 0.20 |
+| Signal | Normal (default) | `query` tool | Recency intent |
+|--------|------------------|--------------|----------------|
+| searchScore | 0.50 | 0.70 | 0.10 |
+| recencyScore | 0.25 | 0.15 | 0.70 |
+| confidenceScore | 0.25 | 0.15 | 0.20 |
 
-Recency intent is detected automatically when queries contain "latest", "recent", "last session", etc.
+Recency intent is detected automatically when queries contain "latest", "recent", "last session", etc. — and **takes precedence over the `query`-tool weights**: a recency-phrased `query` call still uses the Recency-intent column.
+
+The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a held-out judged-relevance eval (v0.13.0) — more weight on topical relevance measurably improves graded NDCG@10 without demoting the newest-correct version of evolving docs. All other tools (`search`, `vsearch`, `memory_retrieve`, and the context-surfacing hook) use the **Normal** column.
 
 ## Signal breakdown
 

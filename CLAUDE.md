@@ -461,6 +461,8 @@ Recency intent detected ("latest", "recent", "last session"):
 compositeScore = (0.10 × searchScore + 0.70 × recencyScore + 0.20 × confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
+**`query` tool (v0.13.0+):** for non-recency queries the `query` tool uses retrieval-tuned weights `0.70 × searchScore + 0.15 × recencyScore + 0.15 × confidenceScore` (from a held-out judged eval). Recency intent still switches to the `0.10 / 0.70 / 0.20` weights above. `search`, `vsearch`, `memory_retrieve`, and the context-surfacing hook keep the `0.50 / 0.25 / 0.25` default.
+
 | Content Type | Half-Life | Effect |
 |--------------|-----------|--------|
 | decision, deductive, preference, hub | ∞ | Never decay |

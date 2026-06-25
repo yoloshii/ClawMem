@@ -185,6 +185,15 @@ export type CompositeWeights = {
 
 export const DEFAULT_WEIGHTS: CompositeWeights = { search: 0.5, recency: 0.25, confidence: 0.25 };
 export const RECENCY_WEIGHTS: CompositeWeights = { search: 0.1, recency: 0.7, confidence: 0.2 };
+// Query-tool retrieval weights (Phase B, 2026-06-25). A held-out judged eval (n=199, GLM-5.2 judge,
+// quadratic-weighted κ=0.681 vs an independent annotator) showed the default 0.50 search weight
+// under-weights topical relevance for a work-memory vault: w_search 0.70 lifts graded NDCG@10 by +0.064
+// (paired permutation p<1e-4, robust across precision/exploratory/temporal families) with ZERO freshness regression —
+// the newest-correct doc is never demoted in the supersession guard (demotionRate 0), whereas 0.80
+// demotes it out of the top-10 in 2/19 cases. Applied ONLY by the `query` tool's full hybrid+rerank
+// pipeline (the path the eval mirrored). NOT applied under recency intent — RECENCY_WEIGHTS wins by
+// construction in applyCompositeScoring. See BLEND-COMPOSITE-REBALANCE-DESIGN.md §11.12.
+export const QUERY_WEIGHTS: CompositeWeights = { search: 0.7, recency: 0.15, confidence: 0.15 };
 
 const RECENCY_PATTERNS = [
   /\brecent(ly)?\b/i,
@@ -274,13 +283,28 @@ function canonicalMemoryMultiplier(path: string, contentType: string, query: str
   return 1.0;
 }
 
+export type CompositeScoringOptions = {
+  /** Query-scoped weights override. Replaces DEFAULT_WEIGHTS; NOT applied under recency intent unless forceWeights. */
+  weights?: CompositeWeights;
+  /** Injected clock for deterministic scoring (tests/eval). Defaults to new Date(). */
+  now?: Date;
+  /** Test/experiment only: apply `weights` even under recency intent (bypass the RECENCY_WEIGHTS switch). */
+  forceWeights?: boolean;
+};
+
 export function applyCompositeScoring(
   results: EnrichedResult[],
   query: string,
-  coActivationFn?: CoActivationFn
+  coActivationFn?: CoActivationFn,
+  options?: CompositeScoringOptions
 ): ScoredResult[] {
-  const weights = hasRecencyIntent(query) ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS;
-  const now = new Date();
+  const recencyIntent = hasRecencyIntent(query);
+  // Recency intent keeps RECENCY_WEIGHTS (production contract) unless forceWeights overrides (experiments).
+  // A query-scoped `weights` override otherwise replaces DEFAULT_WEIGHTS; absent options => exact prior behavior.
+  const weights = (recencyIntent && !options?.forceWeights)
+    ? RECENCY_WEIGHTS
+    : (options?.weights ?? (recencyIntent ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS));
+  const now = options?.now ?? new Date();
 
   const scored = results.map(r => {
     const recency = recencyScore(r.modifiedAt, r.contentType, now, r.accessCount, r.lastAccessedAt);

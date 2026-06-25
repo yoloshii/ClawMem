@@ -50,7 +50,8 @@ Rerank / RRF Blend (blendRerank)
   │
   ▼
 Composite Scoring
-  │ (relevance * 0.50 + recency * 0.25 + confidence * 0.25)
+  │ (relevance * 0.70 + recency * 0.15 + confidence * 0.15)   ← query-tuned weights (v0.13.0)
+  │ recency-intent queries instead use 0.10 / 0.70 / 0.20
   │ × quality multiplier × co-activation boost
   │
   ▼

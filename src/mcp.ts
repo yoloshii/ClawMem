@@ -28,6 +28,7 @@ import {
 import {
   applyCompositeScoring,
   hasRecencyIntent,
+  QUERY_WEIGHTS,
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
@@ -807,7 +808,10 @@ This is the recommended entry point for ALL memory queries.`,
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, searchResults, query);
-      let scored = applyCompositeScoring(enriched, query, coFn)
+      // Phase B (§11.12): the `query` tool's hybrid+rerank pipeline uses QUERY_WEIGHTS (search 0.70) —
+      // the eval-validated re-weight. Recency intent still wins RECENCY_WEIGHTS by construction
+      // (applyCompositeScoring ignores options.weights when hasRecencyIntent(query) and !forceWeights).
+      let scored = applyCompositeScoring(enriched, query, coFn, { weights: QUERY_WEIGHTS })
         .filter(r => r.compositeScore >= (minScore || 0));
       if (diverse !== false) scored = applyMMRDiversity(scored);
       scored = scored.slice(0, limit || 10);
