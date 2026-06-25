@@ -59,6 +59,12 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.12.0: query reranking blend (no action required)
+
+v0.12.0 changes the `query` tool's rerank/RRF blend so the cross-encoder reranker can promote the best document to the top — the previous blend left RRF #1 mathematically immovable. It is a pure ranking-quality change: **no migration, no schema change, no config change.** It applies automatically on upgrade. Hooks and the per-session MCP stdio server pick it up on their next invocation; restart any long-lived `query` host — `clawmem serve` and persistent MCP/daemon processes — to pick up the improved ordering. The default reranker (`qwen3-reranker-0.6B`) is unchanged, and the blend improvement applies whatever reranker `:8090` serves. (`intent_search` and the context-surfacing hook keep their existing blends.)
+
+---
+
 ## v0.10.3 → v0.10.4
 
 v0.10.4 fixes [issue #11](https://github.com/yoloshii/ClawMem/issues/11) — `clawmem setup openclaw` previously hardcoded `~/.openclaw/extensions/clawmem` and ignored `OPENCLAW_STATE_DIR`, breaking installs into custom OpenClaw profiles. The fix is non-breaking: vault on disk is byte-identical, no schema changes, no env-var changes for users on the default profile, no retrieval-pipeline or hook changes. Pure `bun update -g clawmem`.

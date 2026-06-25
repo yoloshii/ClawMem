@@ -260,7 +260,7 @@ See the [REST API reference](../reference/rest-api.md) for endpoints and usage.
 
 ## GPU service units
 
-The three llama-server instances can also run as systemd services:
+The default stack's three inference servers can also run as systemd services:
 
 ```bash
 # Example: embedding server
@@ -282,7 +282,9 @@ WantedBy=default.target
 EOF
 ```
 
-Repeat for LLM (port 8089) and reranker (port 8090) with their respective models and flags.
+Repeat for the LLM (port 8089) and the **default** reranker (port 8090 — `qwen3-reranker-0.6B` via `--reranking`) with their respective models and flags.
+
+> **The SOTA reranker is not a `llama-server` unit.** The zerank-2 SOTA reranker runs as a transformers **sidecar** (a small container behind the same `/v1/rerank` contract), not a systemd `llama-server` instance — see [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/). The old `zerank-2-Q4_K_M` GGUF served via `--reranking` is deprecated (llama.cpp drops zerank's score head → near-zero, uninformative scores).
 
 ## Notes
 

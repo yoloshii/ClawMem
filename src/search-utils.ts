@@ -113,6 +113,51 @@ export function reciprocalRankFusion(
     .map(v => ({ ...v.result, score: v.score }));
 }
 
+// =============================================================================
+// Rerank / RRF Score Blend
+// =============================================================================
+
+/**
+ * Blend a cross-encoder reranker's scores with the upstream RRF ranking.
+ *
+ * The reranker is the dominant relevance signal; normalized RRF contributes a thin tiebreaker.
+ * An earlier blend used `w·(1/rrfRank)` with `w≥0.75` on the top tier, which made RRF rank-1
+ * mathematically immovable by the reranker (0.75·(1/1) exceeds any rank-2 ceiling) — the
+ * reranker could never promote the best document to the top. This blend normalizes the RRF
+ * score to [0,1] and gives the reranker the dominant weight, so a strong rerank score CAN
+ * promote a doc over RRF #1. Harness-validated 2026-06-25 against NL+KW known-item recall:
+ * lifts recall@1-5 and MRR@10 with no material pooled recall@10 regression.
+ *
+ * Falls back to pure RRF order when the reranker is unavailable or returned no usable signal
+ * (empty, or all-zero — e.g. a total remote+local failure). Maps over `candidates` (not the
+ * rerank output) so partial rerank coverage can never drop a candidate; an unscored doc takes
+ * rerank score 0 (so it sorts on its thin `(1-rerankWeight)·rrfNorm` term) and unscored docs
+ * preserve their relative RRF order among themselves.
+ *
+ * @param candidates - RRF-ordered candidates; `score` is the RRF fusion score (positive).
+ * @param reranked - reranker output `{file, score in [0,1]}`; may be empty/partial/all-zero.
+ * @param rerankWeight - weight on the reranker term (default 0.9; `1-rerankWeight` on RRF).
+ * @returns candidates re-scored and sorted by blended score descending.
+ */
+export function blendRerank(
+  candidates: { file: string; score: number }[],
+  reranked: { file: string; score: number }[],
+  rerankWeight: number = 0.9
+): { file: string; score: number }[] {
+  const rerankScoreMap = new Map(reranked.map(r => [r.file, r.score]));
+  const rerankUsable = reranked.length > 0 && reranked.some(r => Number.isFinite(r.score) && r.score > 0);
+  const maxRrf = candidates.reduce((m, c) => Math.max(m, c.score), 0) || 1;
+  return candidates
+    .map(c => {
+      const rrfNorm = c.score / maxRrf; // [0,1]
+      if (!rerankUsable) return { file: c.file, score: rrfNorm };
+      const rr = rerankScoreMap.get(c.file);
+      const rerankScore = Number.isFinite(rr) ? (rr as number) : 0;
+      return { file: c.file, score: (1 - rerankWeight) * rrfNorm + rerankWeight * rerankScore };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
 /**
  * Convert a SearchResult to a RankedResult for use in RRF.
  */

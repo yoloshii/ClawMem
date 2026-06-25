@@ -4,6 +4,23 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.12.0 — Query reranking: blend the cross-encoder as the dominant signal (fixes the immovable RRF #1)
+
+The `query` tool fused the cross-encoder reranker into the final ranking with a position-aware blend — `rrfWeight·(1/rrfRank) + (1-rrfWeight)·rerankScore`, with `rrfWeight` 0.75 / 0.60 / 0.40 by RRF rank. Because reranker scores are in `[0,1]`, RRF rank-1's floor (`0.75·(1/1)` = 0.750) exceeds RRF rank-2's ceiling (`0.75·(1/2) + 0.25·1` = 0.625): **RRF #1 was mathematically immovable by the reranker.** A strong reranker could reorder the tail but could never promote the best document to the top. With the now-faithful zerank-2 seq-cls reranker (v0.11.3), that ceiling was discarding the reranker's single largest win.
+
+What changed:
+
+- **New `blendRerank` blend** (`src/search-utils.ts`): `0.1·normalizedRRF + 0.9·rerank`. The cross-encoder is the dominant relevance signal; normalized RRF is a thin tiebreaker — so a strong rerank score *can* promote a document over RRF #1. It maps over the candidate set (so partial rerank coverage can never drop a candidate) and **falls back to pure RRF order** when the reranker is unavailable or returns no usable signal (empty / all-zero — e.g. a total remote+local failure, now also caught by a try/catch around the rerank call). Scoped to the `query` tool; `intent_search` is unchanged (its blend uses actual upstream scores, a different shape, measured separately).
+
+### Verification
+
+Harness-validated against known-item recall over two eval sets (NL n=45, KW n=50) on a frozen 3,743-doc snapshot with the live reranker, faithfully replicating the production query path (the harness's pre-rerank ranking reproduces the prior pipeline's exactly). At the blend stage the reranker lifts recall@1 from 0.22 (RRF alone) to 0.62 — and the old blend discarded all of it (blend@1 equalled RRF@1 to three decimals). The shipped 0.1/0.9 blend improves final recall@1–5 and MRR@10 on both eval sets with no material pooled recall@10 regression (NL @10 +0.044, KW @10 −0.04, pooled tie). New unit tests (`tests/unit/search-utils.blend.test.ts`) pin the two load-bearing contracts: a strong rerank score promotes above RRF #1, and empty/all-zero rerank preserves RRF order. Reviewed across design, results, and implementation by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+- `intent_search`, `search`, `vsearch`, the context-surfacing hook's deep-profile rerank blend, composite scoring, and MMR are unchanged — only the `query` tool's rerank/RRF blend. No schema migration, no config/env-var change, no API-shape change (result ordering for `query` shifts; scores remain `[0,1]`-scaled as before).
+- A separate, larger lever surfaced by this work — composite scoring's 50% non-search weighting, which caps how much the improved blend reaches the surfaced top-k — is **deferred** to a future release pending a judged-relevance / recency-aware eval (known-item recall alone can't adjudicate it). MMR was measured to be a near-no-op here and is left untouched.
+
 ## v0.11.3 — Reranker: deprecate the broken zerank-2 GGUF; ship the zerank-2 seq-cls sidecar (SOTA, non-commercial)
 
 The "SOTA upgrade" reranker — `zerank-2-Q4_K_M.gguf` served under `llama-server --reranking` — was silently broken. This release deprecates it across the docs and ships a working replacement as an opt-in recipe.

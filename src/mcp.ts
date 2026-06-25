@@ -31,7 +31,7 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, type RankedResult } from "./search-utils.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
@@ -753,19 +753,21 @@ This is the recommended entry point for ALL memory queries.`,
         return { file: c.file, text };
       });
 
-      const reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
+      let reranked: { file: string; score: number }[] = [];
+      try {
+        reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
+      } catch {
+        reranked = []; // reranker unavailable → blendRerank falls back to pure RRF order
+      }
 
       const candidateMap = new Map(candidates.map(c => [c.file, c]));
-      const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-      // Blend RRF + reranker scores (position-aware)
-      const blended = reranked.map(r => {
-        const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-        const rrfWeight = rrfRank <= 3 ? 0.75 : rrfRank <= 10 ? 0.60 : 0.40;
-        const blendedScore = rrfWeight * (1 / rrfRank) + (1 - rrfWeight) * r.score;
-        return { file: r.file, score: blendedScore };
-      });
-      blended.sort((a, b) => b.score - a.score);
+      // Blend the reranker (dominant signal) with a thin normalized-RRF tiebreaker; falls back
+      // to pure RRF order when the reranker is unavailable / all-zero. See blendRerank: the
+      // prior w·(1/rrfRank) blend made RRF rank-1 immovable by the reranker. Harness-validated
+      // 2026-06-25 (NL+KW known-item recall): lifts recall@1-5 + MRR@10 with no material pooled
+      // recall@10 regression.
+      const blended = blendRerank(candidates, reranked);
 
       // Map to SearchResults for composite scoring — hydrate from DB when needed
       const allSearchResults = [...store.searchFTS(query, 30)];

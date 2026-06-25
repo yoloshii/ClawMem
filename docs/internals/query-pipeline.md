@@ -43,9 +43,10 @@ Cross-Encoder Reranking
   │ Batch cap = 4
   │
   ▼
-Position-Aware Blending
-  │ α = 0.75 (top 3), 0.60 (mid), 0.40 (tail)
-  │ Blends original + reranked scores
+Rerank / RRF Blend (blendRerank)
+  │ 0.9 · reranker + 0.1 · normalized-RRF tiebreaker
+  │ Reranker is the dominant signal; can promote a doc over RRF #1
+  │ Falls back to pure RRF order if the reranker is unavailable / all-zero
   │
   ▼
 Composite Scoring

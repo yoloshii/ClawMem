@@ -813,7 +813,7 @@ User Query + optional intent hint
   → Reciprocal Rank Fusion → slice to candidateLimit (default 30)
   → Intent-Aware Chunk Selection (intent terms at 0.5× weight alongside query terms at 1.0×)
   → Cross-Encoder Reranking (4000 char context; intent prepended; chunk dedup; batch cap=4)
-  → Position-Aware Blending (α=0.75 top3, 0.60 mid, 0.40 tail)
+  → Rerank/RRF Blend (blendRerank: 0.9·reranker + 0.1·normalized-RRF tiebreaker; reranker can promote over RRF #1; falls back to RRF order if reranker unavailable)
   → SAME Composite Scoring ((search × 0.5 + recency × 0.25 + confidence × 0.25) × qualityMultiplier × lengthNorm × coActivationBoost + pinBoost)
   → MMR Diversity Filter (Jaccard bigram similarity > 0.6 → demoted)
   → Ranked Results

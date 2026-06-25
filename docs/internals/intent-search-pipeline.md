@@ -37,7 +37,9 @@ Cross-Encoder Reranking
   │
   ▼
 Position-Aware Blending
-  │ Same α curve as query pipeline
+  │ origWeight · upstream score + (1 − origWeight) · rerank
+  │ origWeight = 0.75 (top 3), 0.60 (mid), 0.40 (tail)
+  │ (intent_search keeps this curve; the query tool uses blendRerank instead)
   │
   ▼
 Composite Scoring
