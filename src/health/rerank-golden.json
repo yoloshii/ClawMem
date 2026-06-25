@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "_comment": "Reranker-health golden set. Each triple is (query, relevant, hardNegative) where the hard-negative is the SAME topic as the relevant doc but answers a different sub-question — a near-random reranker (e.g. the deprecated zerank-2 GGUF that scored ~1e-11) cannot consistently rank relevant>hardNegative on these, while a working cross-encoder does. Constraints: same-topic fine-grained negatives (off-topic negatives would pass even on a broken reranker); discriminating signal in the first ~400 chars (store.rerank truncates docs to 400); vault-independent + deterministic. See RERANKER-HEALTH-GUARD-DESIGN.md §4.",
+  "triples": [
+    {
+      "query": "how to fix a memory leak from an unclosed file handle in python",
+      "relevant": "Unclosed file handles leak file descriptors and their buffers. Always open files with a `with open(path) as f:` context manager so the file is closed automatically when the block exits, even on an exception. Forgetting to close files inside a long-running loop is a classic descriptor leak.",
+      "hardNegative": "A common Python memory leak comes from circular references that keep objects alive past their scope. The cyclic garbage collector usually reclaims them, but objects defining `__del__` inside a reference cycle can be left uncollected. Use weakref to break the cycle.",
+      "note": "same topic = python memory leaks; query targets the file-handle cause, negative is the circular-reference cause"
+    },
+    {
+      "query": "what is the difference between git rebase and git merge",
+      "relevant": "git rebase rewrites history by replaying your commits onto a new base, producing a linear history with no merge commit, whereas git merge creates a merge commit that ties two histories together and preserves both. Rebase changes commit hashes, so never rebase shared branches; merge keeps hashes intact.",
+      "hardNegative": "git cherry-pick copies a single commit from one branch and re-applies it onto your current branch as a new commit. It is the tool for porting one specific fix without merging or rebasing the entire source branch.",
+      "note": "same topic = git history operations; query is rebase-vs-merge, negative is cherry-pick"
+    },
+    {
+      "query": "what does the http 429 status code mean",
+      "relevant": "HTTP 429 Too Many Requests means the client has sent too many requests in a given window and is being rate limited. The response commonly carries a Retry-After header telling the client how long to wait before retrying.",
+      "hardNegative": "HTTP 503 Service Unavailable means the server is temporarily unable to handle the request, usually due to overload or maintenance. It is a server-side 5xx error and may also include a Retry-After header.",
+      "note": "same topic = HTTP status codes that carry Retry-After; query is 429 (client rate limit), negative is 503 (server unavailable)"
+    },
+    {
+      "query": "what are the steps of the tcp three-way handshake",
+      "relevant": "The TCP three-way handshake establishes a connection in three steps: the client sends SYN, the server replies SYN-ACK, and the client sends ACK. After that final ACK the connection is established and data can flow.",
+      "hardNegative": "TCP connection teardown uses a four-way exchange: one side sends FIN, the peer ACKs it, then the peer sends its own FIN which is ACKed in return. This closes each direction of the connection independently.",
+      "note": "same topic = TCP connection lifecycle; query is the handshake (setup), negative is teardown"
+    },
+    {
+      "query": "difference between inner join and left join in sql",
+      "relevant": "An INNER JOIN returns only rows that have a match in both tables. A LEFT JOIN returns every row from the left table plus matched rows from the right, filling NULLs where there is no match — so a LEFT JOIN keeps the unmatched left rows that an INNER JOIN drops.",
+      "hardNegative": "A SQL CROSS JOIN returns the Cartesian product of two tables — every row of the first paired with every row of the second — with no join condition. It is rarely intended unless you genuinely want all combinations.",
+      "note": "same topic = SQL join types; query is inner-vs-left, negative is cross join"
+    },
+    {
+      "query": "why would you use a tuple instead of a list in python",
+      "relevant": "Tuples are immutable, so they can be used as dictionary keys or set members and are safe to share without defensive copying. Their immutability also signals that the collection is not meant to change, and they are slightly more memory-efficient than lists.",
+      "hardNegative": "A list comprehension builds a new list from an iterable in a single expression, like [x*x for x in range(10)]. It is usually more readable and faster than an equivalent for-loop that repeatedly appends to a list.",
+      "note": "same topic = python sequences; query is tuple-vs-list (immutability), negative is list comprehension"
+    },
+    {
+      "query": "is the http put method idempotent",
+      "relevant": "Yes, HTTP PUT is idempotent: sending the same PUT request multiple times has the same effect as sending it once, because it replaces the target resource with the supplied representation. A client can safely retry a PUT after a network failure.",
+      "hardNegative": "HTTP POST is not idempotent: each POST typically creates a new resource or triggers a new action, so retrying a POST after a timeout can create duplicates. Use an idempotency key when you need safe retries.",
+      "note": "same topic = HTTP method idempotency; query is PUT (idempotent), negative is POST (not idempotent)"
+    },
+    {
+      "query": "what is the difference between a docker image and a docker container",
+      "relevant": "A Docker image is an immutable, layered template built from a Dockerfile. A container is a running (or stopped) instance of that image with a thin writable layer on top. Many containers can be started from a single image.",
+      "hardNegative": "A Docker volume is a persistent storage mechanism managed by Docker and mounted into a container so data survives container restarts and removals. Volumes are the preferred way to persist database files.",
+      "note": "same topic = docker concepts; query is image-vs-container, negative is volume"
+    }
+  ]
+}

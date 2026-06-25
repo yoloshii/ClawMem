@@ -1143,7 +1143,7 @@ export type Store = {
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -1337,7 +1337,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => rerank(query, documents, model, db, intent, options),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -3630,9 +3630,46 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
+/** Options for the reranker health probe. Production query/hook callers omit all of these. */
+export type RerankProbeOptions = {
+  /** Skip the rerank cache entirely — forces a live endpoint call (health probes). */
+  noCache?: boolean;
+  /** Throw RerankCoverageError if any input doc was not scored by the reranker (checked before zero-fill). */
+  requireLiveCoverage?: boolean;
+  /** Abort signal for the remote fetch. */
+  signal?: AbortSignal;
+  /** Convenience: derive AbortSignal.timeout(timeoutMs) for the remote fetch when no signal is given. */
+  timeoutMs?: number;
+};
+
+/** Thrown by rerank() when requireLiveCoverage is set and the reranker did not score every input doc. */
+export class RerankCoverageError extends Error {
+  constructor(public readonly missing: string[]) {
+    super(`rerank coverage incomplete: ${missing.length} document(s) not scored by the reranker`);
+    this.name = "RerankCoverageError";
+  }
+}
+
+/**
+ * Thrown by rerank() when requireLiveCoverage is set and the reranker's raw response violates the
+ * coverage contract: wrong result count, duplicate/out-of-range index, or a non-finite score. A
+ * malformed-but-responding reranker is exactly the failure a health probe must catch — it must not
+ * be silently accepted (and a duplicate index can otherwise leave a doc unscored, or an out-of-range
+ * index can crash the score apply).
+ */
+export class RerankMalformedResponseError extends Error {
+  constructor(public readonly problems: string[]) {
+    super(`rerank response malformed: ${problems.join("; ")}`);
+    this.name = "RerankMalformedResponseError";
+  }
+}
+
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, options?: RerankProbeOptions): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const noCache = options?.noCache === true;
+  // Health probes thread a timeout to the remote fetch (the production path is otherwise untimed).
+  const fetchSignal = options?.signal ?? (options?.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined);
 
   // Deduplicate identical chunk texts — same content from different files shares a single score
   const textToFiles = new Map<string, string[]>();
@@ -3650,16 +3687,22 @@ export async function rerank(query: string, documents: { file: string; text: str
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
-  // Check cache for each unique document
-  for (const doc of uniqueDocs) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
-    const cached = getCachedResult(db, cacheKey);
-    if (cached !== null) {
-      const score = parseFloat(cached);
-      // Apply score to all files sharing this text
-      for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, score);
-    } else {
-      uncachedDocs.push({ file: doc.file, text: doc.text });
+  // Check cache for each unique document. noCache (health probes) skips the cache entirely so the
+  // call always exercises the live endpoint — a cached probe would mask an endpoint silently
+  // reverted to a broken reranker.
+  if (noCache) {
+    for (const doc of uniqueDocs) uncachedDocs.push({ file: doc.file, text: doc.text });
+  } else {
+    for (const doc of uniqueDocs) {
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
+      const cached = getCachedResult(db, cacheKey);
+      if (cached !== null) {
+        const score = parseFloat(cached);
+        // Apply score to all files sharing this text
+        for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, score);
+      } else {
+        uncachedDocs.push({ file: doc.file, text: doc.text });
+      }
     }
   }
 
@@ -3684,13 +3727,50 @@ export async function rerank(query: string, documents: { file: string; text: str
               query: rerankQuery,
               documents: batch.map(d => d.text.slice(0, 400)),
             }),
+            signal: fetchSignal,
           });
           if (resp.ok) {
-            const data = await resp.json() as { results: { index: number; relevance_score: number }[] };
-            for (const r of data.results) {
-              const doc = batch[r.index]!;
-              const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
-              setCachedResult(db, cacheKey, r.relevance_score.toString());
+            let data: { results: { index: number; relevance_score: number }[] };
+            try {
+              data = await resp.json() as { results: { index: number; relevance_score: number }[] };
+            } catch {
+              // Invalid JSON from a 200 response. For a probe this is a malformed remote → surface it;
+              // for production treat it like a transport failure and fall through to local.
+              if (options?.requireLiveCoverage) throw new RerankMalformedResponseError(["response body is not valid JSON"]);
+              break;
+            }
+            // Strict contract for health probes: a results array of exactly batch.length, each with a
+            // unique in-range integer index and a finite numeric score. A malformed-but-responding
+            // reranker (including a null/primitive body) must surface, not be silently accepted.
+            if (options?.requireLiveCoverage) {
+              const problems: string[] = [];
+              if (data === null || typeof data !== "object" || !Array.isArray(data.results)) {
+                problems.push("response is not an object with a results array");
+              } else {
+                if (data.results.length !== batch.length) {
+                  problems.push(`batch expected ${batch.length} results, got ${data.results.length}`);
+                }
+                const seen = new Set<number>();
+                for (const r of data.results) {
+                  if (!Number.isInteger(r?.index) || r.index < 0 || r.index >= batch.length) problems.push(`index ${r?.index} out of range`);
+                  else if (seen.has(r.index)) problems.push(`duplicate index ${r.index}`);
+                  else seen.add(r.index);
+                  if (typeof r?.relevance_score !== "number" || !Number.isFinite(r.relevance_score)) problems.push(`non-finite score at index ${r?.index}`);
+                }
+              }
+              if (problems.length > 0) throw new RerankMalformedResponseError(problems);
+            }
+            // Defensive (all callers): guard a non-array body, and skip out-of-range/non-finite entries
+            // so a malformed response can never crash the score apply or store garbage. Under
+            // requireLiveCoverage the strict check above has already thrown; here a skipped entry just
+            // leaves the doc unscored (→ coverage error for probes, → zero-fill for production).
+            for (const r of (Array.isArray(data?.results) ? data.results : [])) {
+              const doc = batch[r.index];
+              if (!doc || typeof r.relevance_score !== "number" || !Number.isFinite(r.relevance_score)) continue;
+              if (!noCache) {
+                const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
+                setCachedResult(db, cacheKey, r.relevance_score.toString());
+              }
               // Apply score to all files sharing this text
               for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
             }
@@ -3699,8 +3779,11 @@ export async function rerank(query: string, documents: { file: string; text: str
           }
         }
         scored = cachedResults.size > 0;
-      } catch {
-        // Remote failed, fall through to local
+      } catch (e) {
+        // Network/transport failure → fall through to local. But a malformed-response error (only
+        // raised under requireLiveCoverage) is a probe FINDING about the remote endpoint — propagate
+        // it instead of masking it with the local fallback.
+        if (e instanceof RerankMalformedResponseError) throw e;
       }
     }
 
@@ -3712,8 +3795,10 @@ export async function rerank(query: string, documents: { file: string; text: str
         const rerankResult = await llm.rerank(rerankQuery, remaining, { model });
         for (const result of rerankResult.results) {
           const doc = remaining.find(d => d.file === result.file);
-          const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model });
-          setCachedResult(db, cacheKey, result.score.toString());
+          if (!noCache) {
+            const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model });
+            setCachedResult(db, cacheKey, result.score.toString());
+          }
           // Apply score to all files sharing this text
           if (doc) {
             for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, result.score);
@@ -3723,6 +3808,14 @@ export async function rerank(query: string, documents: { file: string; text: str
         }
       }
     }
+  }
+
+  // Coverage check BEFORE the zero-fill below (health probes only, via requireLiveCoverage).
+  // After the map, an omitted score and a true 0 are indistinguishable, so a partial endpoint
+  // would otherwise look fully covered. See RERANKER-HEALTH-GUARD-DESIGN.md §5 (H1/M4).
+  if (options?.requireLiveCoverage) {
+    const missing = documents.filter(doc => !cachedResults.has(doc.file)).map(doc => doc.file);
+    if (missing.length > 0) throw new RerankCoverageError(missing);
   }
 
   // Return all results sorted by score

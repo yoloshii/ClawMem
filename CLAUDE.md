@@ -200,6 +200,45 @@ systemctl --user status clawmem-watcher.service clawmem-embed.timer
 
 **Note:** The service files use `%h` (home directory specifier). If clawmem is installed elsewhere, update `ExecStart` paths. For remote GPU setups, add `Environment=CLAWMEM_EMBED_URL=http://host:8088` etc. to both service files (the `bin/clawmem` wrapper sets defaults).
 
+### Reranker health check (optional, recommended for remote-sidecar setups)
+
+`clawmem rerank-health` probes the reranker for **discrimination** (not just liveness) and exits non-zero when it is degenerate — catching the failure mode where a mis-converted reranker (e.g. the deprecated zerank-2 GGUF, whose llama.cpp conversion drops the score head) returns HTTP 200 + valid JSON but near-zero, non-discriminating scores, silently collapsing the final ranking to RRF. The same probe runs inside `clawmem doctor` (section 9); this scheduled unit alerts proactively without query traffic. Schedule it when the reranker is a remote sidecar that could be redeployed/reverted out from under you.
+
+```bash
+# clawmem-rerank-health.service — oneshot probe; exits 1 if the reranker is degenerate
+cat > ~/.config/systemd/user/clawmem-rerank-health.service << 'EOF'
+[Unit]
+Description=ClawMem reranker discrimination health check
+
+[Service]
+Type=oneshot
+# Hard outer bound — a hung reranker must not hang the check (the probe also times out per-request).
+TimeoutStartSec=120
+ExecStart=%h/clawmem/bin/clawmem rerank-health
+# Alert on failure: point this at your notifier unit (ntfy, mail, etc.).
+OnFailure=clawmem-rerank-health-alert@%n.service
+EOF
+
+# clawmem-rerank-health.timer — every 6h (the failure it guards is rare + infra-driven)
+cat > ~/.config/systemd/user/clawmem-rerank-health.timer << 'EOF'
+[Unit]
+Description=ClawMem reranker health check (every 6h)
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now clawmem-rerank-health.timer
+```
+
+For remote GPU setups, add `Environment=CLAWMEM_RERANK_URL=http://host:8090` (+ embed/LLM) to the `.service`. `OnFailure=` is the primary alert path; the `curator-nudge` SessionStart hook is a secondary "you missed the page" surface. Run `clawmem rerank-health` (or `--json`) manually any time to check on demand.
+
 ---
 
 ## OpenClaw Integration: Memory System Configuration

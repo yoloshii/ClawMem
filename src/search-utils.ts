@@ -7,6 +7,23 @@
 import type { Store, SearchResult } from "./store.ts";
 import type { EnrichedResult } from "./memory.ts";
 
+/**
+ * Runtime floor below which the whole reranker output is treated as degenerate (→ RRF fallback).
+ * Permissive by design: its only job is to catch the near-zero collapse (the deprecated zerank-2
+ * GGUF maxed at 8.03e-7), NOT to grade quality. A working zerank-2-seq scores >= ~0.1, so it never
+ * false-trips a healthy reranker. Distinct from the stricter doctor CALIB_FLOOR (rerank-health.ts).
+ */
+export const RERANK_DEGENERATE_FLOOR = 1e-4;
+
+export interface BlendRerankOptions {
+  /** Reranker dominance in the blend (default 0.9). */
+  rerankWeight?: number;
+  /** Reranker is treated as unusable (→ RRF fallback) unless some score exceeds this floor. */
+  degenerateFloor?: number;
+  /** Invoked when the reranker is unusable and the blend silently falls back to pure RRF order. */
+  onFallback?: (reason: string) => void;
+}
+
 // =============================================================================
 // Result Enrichment
 // =============================================================================
@@ -135,17 +152,31 @@ export function reciprocalRankFusion(
  * preserve their relative RRF order among themselves.
  *
  * @param candidates - RRF-ordered candidates; `score` is the RRF fusion score (positive).
- * @param reranked - reranker output `{file, score in [0,1]}`; may be empty/partial/all-zero.
- * @param rerankWeight - weight on the reranker term (default 0.9; `1-rerankWeight` on RRF).
+ * @param reranked - reranker output `{file, score in [0,1]}`; may be empty/partial/all-zero/degenerate.
+ * @param options - bare number (rerankWeight, back-compat) OR { rerankWeight, degenerateFloor, onFallback }.
  * @returns candidates re-scored and sorted by blended score descending.
  */
 export function blendRerank(
   candidates: { file: string; score: number }[],
   reranked: { file: string; score: number }[],
-  rerankWeight: number = 0.9
+  options: number | BlendRerankOptions = {}
 ): { file: string; score: number }[] {
+  const opts: BlendRerankOptions = typeof options === "number" ? { rerankWeight: options } : options;
+  const rerankWeight = opts.rerankWeight ?? 0.9;
+  const degenerateFloor = opts.degenerateFloor ?? RERANK_DEGENERATE_FLOOR;
+
   const rerankScoreMap = new Map(reranked.map(r => [r.file, r.score]));
-  const rerankUsable = reranked.length > 0 && reranked.some(r => Number.isFinite(r.score) && r.score > 0);
+  // Usable iff at least one score clears the degenerate floor. The old check (`> 0`) let the broken
+  // reranker's ~1e-11 scores through as "usable", contributing ~nothing at weight 0.9 — a silent
+  // collapse to RRF order. The floor closes that hole; onFallback makes the degrade visible.
+  const rerankUsable = reranked.length > 0 && reranked.some(r => Number.isFinite(r.score) && r.score > degenerateFloor);
+  if (!rerankUsable && opts.onFallback) {
+    opts.onFallback(
+      reranked.length === 0
+        ? "reranker returned no scores"
+        : `all ${reranked.length} rerank scores <= degenerate floor ${degenerateFloor}`
+    );
+  }
   const maxRrf = candidates.reduce((m, c) => Math.max(m, c.score), 0) || 1;
   return candidates
     .map(c => {

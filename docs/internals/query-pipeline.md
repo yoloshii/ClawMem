@@ -46,7 +46,9 @@ Cross-Encoder Reranking
 Rerank / RRF Blend (blendRerank)
   │ 0.9 · reranker + 0.1 · normalized-RRF tiebreaker
   │ Reranker is the dominant signal; can promote a doc over RRF #1
-  │ Falls back to pure RRF order if the reranker is unavailable / all-zero
+  │ Falls back to pure RRF order if the reranker is unavailable / degenerate
+  │ (no score above RERANK_DEGENERATE_FLOOR ≈ 1e-4); emits a rate-limited warning on fallback
+  │ (the reranker-health guard surfaces this — see `clawmem doctor` / `clawmem rerank-health`)
   │
   ▼
 Composite Scoring

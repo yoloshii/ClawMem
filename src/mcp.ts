@@ -48,6 +48,25 @@ import { listVaults, loadVaultConfig } from "./config.ts";
 import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
 
 // =============================================================================
+// Reranker fallback telemetry
+// =============================================================================
+
+// blendRerank silently degrades to RRF order when the reranker is degenerate (the deprecated
+// zerank-2 GGUF emitted ~1e-11 scores that contributed nothing at weight 0.9). This surfaces that
+// otherwise-invisible regression. Rate-limited to at most one stderr line per minute; the running
+// count is included so a persistent failure is obvious. Run `clawmem doctor` for the full probe.
+let rerankFallbackCount = 0;
+let lastRerankFallbackWarnAt = 0;
+function onRerankFallback(reason: string): void {
+  rerankFallbackCount++;
+  const now = Date.now();
+  if (now - lastRerankFallbackWarnAt > 60_000) {
+    lastRerankFallbackWarnAt = now;
+    console.error(`[clawmem] reranker degraded → RRF fallback (${reason}); ${rerankFallbackCount} occurrence(s) this process. Run 'clawmem doctor' to check the reranker.`);
+  }
+}
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -768,7 +787,7 @@ This is the recommended entry point for ALL memory queries.`,
       // prior w·(1/rrfRank) blend made RRF rank-1 immovable by the reranker. Harness-validated
       // 2026-06-25 (NL+KW known-item recall): lifts recall@1-5 + MRR@10 with no material pooled
       // recall@10 regression.
-      const blended = blendRerank(candidates, reranked);
+      const blended = blendRerank(candidates, reranked, { onFallback: onRerankFallback });
 
       // Map to SearchResults for composite scoring — hydrate from DB when needed
       const allSearchResults = [...store.searchFTS(query, 30)];

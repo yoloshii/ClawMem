@@ -4,6 +4,26 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.14.0 — Reranker health guard: detect a silently-degenerate reranker (doctor + scheduled check + runtime emit)
+
+v0.11.3 deprecated the broken zerank-2 GGUF and shipped a faithful sidecar; v0.12.0 made the reranker the dominant ranking signal. Together they raised the stakes of a *silent* reranker failure: the broken GGUF returned HTTP 200 + valid JSON + finite positive ~1e-11 scores — passing every liveness check — yet contributed nothing at weight 0.9 and silently collapsed the final ranking to RRF. `blendRerank`'s usability check was `score > 0`, which those ~1e-11 scores passed, and `clawmem doctor` had no reranker probe at all. This release makes that failure mode impossible to miss.
+
+What changed:
+
+- **`blendRerank` degenerate-floor trip + visible fallback** (`src/search-utils.ts`): the usability check widened from `> 0` to `> RERANK_DEGENERATE_FLOOR` (1e-4) — above the broken regime's 8e-7 ceiling, far below the weakest working score (~0.1) — so a near-zero collapse now routes to the RRF fallback instead of blending in ~nothing. The 3rd arg accepts an options object `{ rerankWeight, degenerateFloor, onFallback }` (numeric back-compat preserved); the `query` caller (`src/mcp.ts`) passes an `onFallback` that emits a rate-limited (≤1/min) stderr warning + running count, so the previously-silent degrade is surfaced.
+- **`clawmem doctor` section 9 — reranker discrimination** (`src/clawmem.ts`): an active probe that asserts the reranker *discriminates*, not just responds. Runs a shipped golden set of same-topic (query, relevant, hard-negative) pairs (`src/health/rerank-golden.json`) through the live reranker, cache-bypassed, and checks coverage + a calibration band + a per-pair discrimination margin.
+- **`clawmem rerank-health` command + scheduled unit** (`src/clawmem.ts`; `CLAUDE.md`/`AGENTS.md`): the same probe as a standalone command that exits non-zero on degeneracy, for a systemd `OnFailure=` alert (`clawmem-rerank-health.{service,timer}`, documented) — proactive detection of an endpoint reverted to the broken GGUF, independent of query traffic.
+- **`store.rerank` probe seam** (`src/store.ts`): an additive `{ noCache, requireLiveCoverage, signal, timeoutMs }` options param. `noCache` bypasses the rerank cache (so a probe always exercises the live endpoint); `signal`/`timeoutMs` bounds the remote fetch; `requireLiveCoverage` enforces the full coverage contract — exactly `batch.length` results, unique in-range integer indices, finite numeric scores, a valid JSON object body — **before** the score-apply zero-fill (after which an omitted score and a true 0 are indistinguishable), throwing `RerankCoverageError` / `RerankMalformedResponseError`. A defensive skip in the apply loop also hardens the production path against an out-of-range index or non-array body (previously a latent crash).
+
+### Verification
+
+Thresholds were calibrated from a live `zerank-2-seq` baseline (8-pair golden set): relevant scores 0.92–0.97, hard-negative ≤ 0.31, minimum margin 0.64, 0/8 inverted — vs the broken GGUF regime's max-ever 8.03e-7 (a 5–6 order-of-magnitude separation). Locked: `CALIB_FLOOR 0.05`, `DISCRIM_MARGIN 0.25` (2.5× below the live minimum margin), `RERANK_DEGENERATE_FLOOR 1e-4`. 24 new unit tests (`tests/unit/rerank-health.test.ts`) pin the load-bearing contracts: the degenerate-floor trip + `onFallback`, the options-object overload + 2-arg back-compat, coverage-before-zero-fill, the malformed-response contract (duplicate / out-of-range / wrong-count / non-numeric / invalid-JSON / null-body), the defensive non-probe skip, and the calibration-band-passes-but-margin-fails (constant-output) case. Full suite: 1363 pass / 1 pre-existing unrelated failure; `tsc --noEmit` clean. Reviewed across the design and the implementation by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+- **The healthy hot path is untouched.** A working reranker scores ≫ 1e-4, so `blendRerank` behaves exactly as in v0.12.0; the degenerate floor only changes behavior when the reranker has already collapsed (where the old code silently produced RRF order anyway — now it is explicit and surfaced). `store.rerank`'s no-options path (the `query`, `intent_search`, and context-surfacing callers) is byte-identical to before.
+- No schema migration, no config/env-var change, no breaking API change — the `store.rerank` options param and the `blendRerank` options object are additive, and the new CLI command, `doctor` section, golden set, and systemd recipe are all additive. The default reranker stays qwen3-reranker-0.6B.
+
 ## v0.13.0 — Query composite re-weight: search 0.70 for the `query` tool (the deferred lever from v0.12.0)
 
 v0.12.0 fixed the rerank blend but flagged a larger deferred lever: composite scoring's default `{search:0.50, recency:0.25, confidence:0.25}` puts half the weight on non-search signals, which caps how much the improved blend reaches the surfaced top-k. v0.12.0 deferred acting on it "pending a judged-relevance / recency-aware eval." This release runs that eval and acts on it — scoped to the `query` tool only.

@@ -2157,12 +2157,68 @@ async function cmdDoctor() {
     // openclaw CLI unavailable — skip silently
   }
 
+  // 9. Reranker discrimination (active probe — asserts the reranker DISCRIMINATES, not just
+  //    responds). Liveness is worthless here: the broken zerank-2 GGUF returned HTTP 200 + valid
+  //    JSON + finite positive ~1e-11 scores and passed every other check while silently collapsing
+  //    the final ranking to RRF. This routes a golden hard-pair set through the live reranker
+  //    (cache-bypassed, coverage-enforced) and checks calibration + per-pair discrimination.
+  try {
+    const s = getStore();
+    const { probeRerankHealth } = await import("./health/rerank-health.ts");
+    const health = await probeRerankHealth(s, { timeoutMs: 8000 });
+    if (health.ok) {
+      console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin})`);
+    } else {
+      console.log(`${c.red}✗${c.reset} Reranker: degenerate / not discriminating (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)})`);
+      for (const f of health.failures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
+      console.log(`   ${c.dim}Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".${c.reset}`);
+      issues++;
+    }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Reranker: could not probe (${(err as Error).message})`);
+  }
+
   console.log();
   if (issues > 0) {
     console.log(`${c.yellow}${issues} issue(s) found.${c.reset}`);
   } else {
     console.log(`${c.green}All checks passed.${c.reset}`);
   }
+}
+
+// =============================================================================
+// Reranker health (scheduled-check CLI)
+// =============================================================================
+
+// Oneshot reranker discrimination probe. Exits non-zero on degeneracy so a systemd OnFailure= (or
+// any scheduled check) can alert — the standalone counterpart to doctor section 9. Routes through
+// the live, cache-bypassed, coverage-enforced probe (src/health/rerank-health.ts).
+async function cmdRerankHealth(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      json: { type: "boolean", default: false },
+      "timeout-ms": { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const timeoutMs = values["timeout-ms"] ? parseInt(values["timeout-ms"] as string, 10) : undefined;
+  const store = getStore();
+  const { probeRerankHealth } = await import("./health/rerank-health.ts");
+  const health = await probeRerankHealth(store, timeoutMs ? { timeoutMs } : {});
+
+  if (values.json) {
+    console.log(JSON.stringify(health));
+  } else if (health.ok) {
+    console.log(`${c.green}✓ Reranker healthy${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin}`);
+  } else {
+    console.log(`${c.red}✗ Reranker degenerate / not discriminating${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)}`);
+    for (const f of health.failures) console.log(`  - ${f}`);
+    console.log(`Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".`);
+  }
+  // Non-zero exit on degeneracy so systemd OnFailure= / a scheduled check can alert. Use exitCode
+  // (not process.exit) so main()'s finally { closeStore() } still runs.
+  process.exitCode = health.ok ? 0 : 1;
 }
 
 // =============================================================================
@@ -2494,6 +2550,9 @@ async function main() {
         break;
       case "doctor":
         await cmdDoctor();
+        break;
+      case "rerank-health":
+        await cmdRerankHealth(subArgs);
         break;
       case "path":
         cmdPath();
@@ -3189,6 +3248,7 @@ ${c.bold}Integration:${c.reset}
   clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
+  clawmem rerank-health [--json]       Probe reranker discrimination (exit 1 if degenerate)
 
 ${c.bold}Options:${c.reset}
   -n, --num <N>        Number of results
