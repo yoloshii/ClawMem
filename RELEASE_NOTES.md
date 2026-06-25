@@ -104,7 +104,7 @@ What changed:
 
 ### Verification
 
-`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (impl-review session `019ef534`, separate from the design session `019eefbe`): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
+`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (a separate impl-review session from the design session): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
 
 ### What didn't change
 
@@ -128,7 +128,7 @@ What changed in the embedding write path:
 
 ### Verification
 
-Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec` (session `019eefbe`): a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
+Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec`: a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
 
 ### What didn't change
 
@@ -143,7 +143,7 @@ The override repoints the cached `_session_id`, rebuilds `_transcript_path` for 
 
 ### Verification
 
-Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e46bc-0848-7540-a1ce-913000112da1`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
+Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
 
 ### What didn't change
 
@@ -181,7 +181,7 @@ The same `tokenizeForFTS5` is shared with the two `entities_fts` MATCH builders 
 
 ### Verification
 
-Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e4595-43b3-7b40-b8a0-bc684f22e2e6`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
+Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
 
 Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts` (compound, non-adjacent AND, slash-path via the filepath column, 1-char tokens, apostrophe behavior-lock, FTS5-specials no-throw, punctuation-only → empty) + 4 entity starvation regression tests in `tests/unit/entity.test.ts` (`C++` and `Go`, each across `resolveEntityCanonical` and `searchEntities`). Five of the store tests fail on the pre-fix code; all pass after. Full suite: 1298 pass / 0 fail. `tsc --noEmit` clean for the changed files.
 
@@ -193,7 +193,7 @@ Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts`
 
 ### Cross-references
 
-- Codex review session: `019e4595-43b3-7b40-b8a0-bc684f22e2e6` (4 turns; T2 caught the entity regression, T4 zero remaining findings)
+- Codex review: 4 turns (T2 caught the entity regression, T4 zero remaining findings)
 - Primary surfaces: `src/store.ts` (`tokenizeForFTS5`, `buildFTS5Query`), `src/entity.ts` (`gatherEntityFTSCandidates`, both `entities_fts` sites)
 
 ---
@@ -216,7 +216,7 @@ The docstring in `initializeDatabase()` carries the rationale durably so a futur
 
 ### Verification
 
-The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`, session `019e2aeb-7995-74d0-b3f3-bbd32567eec2`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
+The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
 
 Test coverage: 3 new tests in `tests/integration/store-concurrent-init.test.ts` (NEW) + supporting `tests/helpers/concurrent-init-worker.ts` (NEW). Two source-text assertion gates (deterministic — catch the exact regression an accidental re-swap would introduce, anchored on the function body for `initializeDatabase` and on the `// Readonly:` comment marker for the readonly branch) plus one subprocess concurrent-init test (spawns 3 `bun run` worker processes against the same on-disk DB in `mkdtempSync(tmpdir())`, 60s timeout, asserts all 3 exit 0 without `SQLITE_BUSY` or "database is locked" in stderr).
 
@@ -243,7 +243,7 @@ No runtime change. Standing "doc-line-refs ride the next release" pattern from p
 ### Cross-references
 
 - Issue: https://github.com/yoloshii/ClawMem/issues/13 (@jcgau, first-time contributor)
-- Codex review session: `019e2aeb-7995-74d0-b3f3-bbd32567eec2` (Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings)
+- Codex review: Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings
 - Parallel Stop-hook fan-out sites covered by this fix: `src/openclaw/engine.ts:449` (`handleAgentEnd`), `src/openclaw/engine.ts:576` (`handleBeforeReset`), `src/hermes/__init__.py:518` (Python thread fan-out)
 - Companion 2026-05-14 OpenClaw upstream-survey driving the doc-comment line-ref bump: a local memory note (`memory/openclaw-v2026.4.x-analysis.md`)
 

@@ -276,7 +276,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **Gateway fails to start with "Missing config. Run `openclaw setup` or set gateway.mode=local"**
 - On system-service OpenClaw deployments where the gateway runs as a different user than the owner of `~/<gateway-user's-home>/.openclaw/`, the gateway cannot traverse into its own config directory if the directory is 700 (`drwx------`). The error is misleading — the config file itself is readable (correctly chowned by the systemd `ExecStartPre` step), but the parent directory has no group-execute bit, so the gateway user cannot even `cd` into it to open the file.
 - Verify: `sudo stat /home/<installer>/.openclaw | grep Access` — if it shows `(0700/drwx------)`, this is the cause.
-- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with a `sciros:sciros`-owned home directory and an `openclaw:openclaw` gateway that is also in the `sciros` group, `chmod 750` is enough.
+- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with an `appuser:appuser`-owned home directory and an `openclaw:openclaw` gateway that is also in the `appuser` group, `chmod 750` is enough.
 - Single-user installs are not affected — the gateway IS the home directory owner and has full access regardless of group perms.
 
 **"plugins.entries.clawmem: plugin not found (stale config entry ignored)"**
