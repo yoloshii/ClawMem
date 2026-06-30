@@ -70,7 +70,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
 
-> **SOTA upgrade (16GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`). For the reranker, use the **zerank-2 seq-cls sidecar** (transformers, bf16) at [`extras/rerankers/zerank-2-seq/`](../extras/rerankers/zerank-2-seq/) — the `zerank-2-Q4_K_M` GGUF is deprecated (llama.cpp drops its score head). See [GPU services](../README.md#gpu-services). **CC-BY-NC-4.0** — non-commercial only.
+> **SOTA upgrade (16GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`). For the reranker, use the **zerank-2 seq-cls sidecar** (transformers, bf16) at [`extras/rerankers/zerank-2-seq/`](../extras/rerankers/zerank-2-seq/) — the `zerank-2-Q4_K_M` GGUF is deprecated (llama.cpp drops its score head). See [the inference services guide](guides/inference-services.md). **CC-BY-NC-4.0** — non-commercial only.
 
 See [GPU services guide](guides/systemd-services.md) for systemd setup and remote GPU configuration.
 

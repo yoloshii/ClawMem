@@ -1,830 +1,267 @@
 ---
 name: clawmem
-description: |
-  ClawMem agent reference — detailed operational guidance for the on-device hybrid memory system. Use when: setting up collections/indexing/embedding, troubleshooting retrieval, tuning query optimization (4 levers), understanding pipeline behavior, managing memory lifecycle (pin/snooze/forget), building graphs, or any ClawMem operation beyond basic tool routing.
+description: "ClawMem operational reference for agents at query time — the 3-rule escalation gate, MCP tool routing, the 4 query-optimization levers, pipeline behavior (query vs intent_search), composite scoring, and memory lifecycle (pin/snooze/forget). Use when tuning retrieval, troubleshooting recall quality, or any ClawMem operation beyond the routing already in your global CLAUDE.md / this repo's AGENTS.md. NOT for setup — install / inference-server config / env vars / systemd / indexing config / internals live in AGENTS.md + docs/."
 allowed-tools: "mcp__clawmem__*"
 metadata:
   author: yoloshii
-  version: 1.0.0
+  version: 2.0.0
 ---
 
-# ClawMem Agent Reference
+# ClawMem Operational Reference
 
-## Architecture
+**Scope: agent-time operations only** — escalation, tool routing, query tuning, pipeline reasoning, composite scoring, lifecycle. Setup, inference-server config, env vars, systemd units, indexing/collection config, graph internals, and the OpenClaw/Hermes plugins are **deliberately not here** — they live in this repo's [`AGENTS.md`](AGENTS.md) + [`docs/`](docs/) (e.g. [`docs/guides/inference-services.md`](docs/guides/inference-services.md), [`docs/reference/configuration.md`](docs/reference/configuration.md), [`docs/troubleshooting.md`](docs/troubleshooting.md), [`docs/internals/`](docs/internals/)). Kept out to avoid drift between this skill and the package.
 
-Two tiers: **hooks** handle automatic context flow (surfacing, extraction, compaction survival). **MCP tools** handle explicit recall, write, and lifecycle operations.
+Routine memory needs neither this skill nor manual MCP calls — **hooks + the ClawMem routing already in `AGENTS.md` / your global `CLAUDE.md` handle ~90%.** Reach for this skill (and Tier-3 tools) only when that isn't enough.
 
----
+## Architecture (one-liner)
 
-## Inference Services
-
-Three inference services (embedding, LLM, reranker). The **default** stack runs all three as `llama-server` instances; the **SOTA** stack serves the reranker as a transformers sidecar (same `/v1/rerank` contract). The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`.
-
-**Default (QMD native combo, any GPU or in-process):**
-
-| Service | Port | Model | VRAM | Protocol |
-|---|---|---|---|---|
-| Embedding | 8088 | EmbeddingGemma-300M-Q8_0 | ~400MB | `/v1/embeddings` |
-| LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2GB | `/v1/chat/completions` |
-| Reranker | 8090 | qwen3-reranker-0.6B-Q8_0 | ~1.3GB | `/v1/rerank` |
-
-All three models auto-download via `node-llama-cpp` if no server is running (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration (Metal/Vulkan); significantly slower on CPU-only.
-
-**SOTA upgrade (16GB+ GPU):** zembed-1-Q4_K_M (embedding, 2560d, ~4.4GB) + the **zerank-2 seq-cls sidecar** (reranker, bf16 ~9GB — see `extras/rerankers/zerank-2-seq/`). Total ~16GB with LLM. Distillation-paired via zELO. zembed-1's `-ub` must match `-b`. **CC-BY-NC-4.0** — non-commercial only. The older `zerank-2-Q4_K_M` GGUF reranker is **deprecated** (llama.cpp drops zerank's score head → inert reranking); use the sidecar.
-
-**Remote option:** Set `CLAWMEM_EMBED_URL`, `CLAWMEM_LLM_URL`, `CLAWMEM_RERANK_URL` to remote host. Set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent fallback downloads.
-
-**Cloud embedding:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` for cloud providers. Supported: Jina AI (`jina-embeddings-v5-text-small`, 1024d), OpenAI, Voyage, Cohere. Batch embedding, TPM-aware pacing, provider-specific params auto-detected.
-
-### Server Setup
-
-```bash
-# === Default (QMD native combo) ===
-
-# Embedding (--embeddings flag required)
-llama-server -m embeddinggemma-300M-Q8_0.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
-
-# LLM (auto-downloads via node-llama-cpp if no server)
-llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
-  --port 8089 --host 0.0.0.0 -ngl 99 -c 4096 --batch-size 512
-
-# Reranker (auto-downloads via node-llama-cpp if no server)
-llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
-
-# === SOTA upgrade (16GB+ GPU) ===
-
-# Embedding (zembed-1) — -ub must match -b
-llama-server -m zembed-1-Q4_K_M.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
-
-# Reranker (zerank-2) — seq-cls SIDECAR (transformers, bf16), NOT GGUF:
-#   see extras/rerankers/zerank-2-seq/  (the zerank-2 GGUF is deprecated — drops the score head)
-```
-
-### Verify Endpoints
-
-```bash
-curl http://host:8088/v1/embeddings -d '{"input":"test","model":"embedding"}' -H 'Content-Type: application/json'
-curl http://host:8089/v1/models
-curl http://host:8090/v1/models
-```
-
-## Environment Variables
-
-| Variable | Default (via wrapper) | Effect |
-|---|---|---|
-| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server. Falls back to in-process `node-llama-cpp` if unset. |
-| `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
-| `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
-| `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
-| `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models. |
-| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
-| `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
-| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` auto-downloads. Set `true` for remote-only. |
-| `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing. |
-| `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Light-lane consolidation worker (Phase 1 backfill + Phase 2 merge + Phase 3 deductive synthesis + Phase 4 recall stats). **v0.8.2:** every tick wraps in a `worker_leases` row (`light-consolidation` key) so multiple host processes against the same vault cannot race on Phase 2 merges. Hosted by `clawmem watch` (canonical) or `clawmem mcp` (per-session fallback). |
-| `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000). |
-| `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 merge-safety score threshold when candidate and existing anchors align. |
-| `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold (fallback when anchors are ambiguous). |
-| `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration. |
-| `CLAWMEM_CONTRADICTION_POLICY` | `link` | **v0.7.1.** How the merge-time contradiction gate handles a blocked merge. `link` (default) keeps both rows + inserts `contradicts` edge. `supersede` marks the old row `status='inactive'`. |
-| `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | **v0.7.1.** Minimum combined heuristic+LLM confidence required before the contradiction gate blocks a merge. |
-| `CLAWMEM_HEAVY_LANE` | disabled | **v0.8.0.** Enable the quiet-window heavy maintenance worker — a second, longer-interval consolidation lane with DB-backed `worker_leases` exclusivity, stale-first batching, and `maintenance_runs` journaling. Runs alongside the light lane. **v0.8.2:** canonical host is `clawmem watch` (e.g. systemd `clawmem-watcher.service`); `clawmem mcp` retains the same gate as a fallback host but emits a stderr warning advising operators to move heavy-lane hosting to the watcher because per-session stdio MCPs may never be alive during the configured quiet window. |
-| `CLAWMEM_HEAVY_LANE_INTERVAL` | 1800000 | **v0.8.0.** Heavy-lane tick interval in ms (min 30000, default 30 min). |
-| `CLAWMEM_HEAVY_LANE_WINDOW_START` / `_END` | (none) | **v0.8.0.** Start/end hours (0-23) of the quiet window. Supports midnight wrap (22→6). Null on either bound = always in window. |
-| `CLAWMEM_HEAVY_LANE_MAX_USAGES` | 30 | **v0.8.0.** Max `context_usage` rows in the last 10 min before the heavy lane skips with `reason='query_rate_high'`. |
-| `CLAWMEM_HEAVY_LANE_OBS_LIMIT` / `_DED_LIMIT` | 100 / 40 | **v0.8.0.** Phase 2 / Phase 3 stale-first batch sizes. |
-| `CLAWMEM_HEAVY_LANE_SURPRISAL` | `false` | **v0.8.0.** When `true`, the heavy lane seeds Phase 2 with k-NN anomaly-ranked doc ids from `computeSurprisalScores` instead of stale-first ordering. Degrades to stale-first on vaults without embeddings. |
-
-**Note:** The `bin/clawmem` wrapper sets all endpoint defaults. Always use the wrapper — never `bun run src/clawmem.ts` directly.
+Two tiers: **hooks** = automatic context flow (surfacing, extraction, compaction survival); **MCP tools** = explicit recall / write / lifecycle. Substrate: QMD retrieval (BM25 + vector + RRF + cross-encoder rerank + query expansion), with SAME (composite scoring), MAGMA (intent + graph), and A-MEM (self-evolving notes) layered on top. Do not call standalone QMD tools.
 
 ---
 
-## Quick Setup
+## Tier 2 — Automatic retrieval (hooks)
 
-```bash
-# Install via npm
-bun add -g clawmem   # or: npm install -g clawmem
+Hooks handle ~90% of retrieval at zero agent effort.
 
-# Or from source
-git clone https://github.com/yoloshii/clawmem.git ~/clawmem
-cd ~/clawmem && bun install
-ln -sf ~/clawmem/bin/clawmem ~/.bun/bin/clawmem
+| Hook | Trigger | Does |
+|------|---------|------|
+| `context-surfacing` | UserPromptSubmit | retrieval gate → profile-driven hybrid search → FTS supplement → file-aware search → snooze/noise filters → spreading activation → memory-type diversification → tiered injection → `<vault-context>` (+ optional `<vault-facts>` / `<vault-routing>`). Budget/results/timeout/threshold driven by `CLAWMEM_PROFILE`. |
+| `postcompact-inject` | SessionStart (compact) | re-injects authoritative state after compaction → `<vault-postcompact>` |
+| `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
+| `precompact-extract` | PreCompact | extracts decisions / file paths / open questions before compaction |
+| `decision-extractor` | Stop | LLM → observations + causal links + contradiction detection + SPO triples |
+| `handoff-generator` | Stop | LLM session summary → handoffs |
+| `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
 
-# Bootstrap a vault (init + index + embed + hooks + MCP)
-clawmem bootstrap ~/notes --name notes
+**Default behavior:** read injected `<vault-context>` first; if sufficient, answer immediately.
 
-# Or step by step:
-clawmem init
-clawmem collection add ~/notes --name notes
-clawmem update --embed
-clawmem setup hooks
-clawmem setup mcp
+**Hook blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, and cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3.
 
-# Verify
-clawmem doctor    # Full health check
-clawmem status    # Quick index status
-```
-
-### Background Services (systemd user units)
-
-```bash
-mkdir -p ~/.config/systemd/user
-
-# clawmem-watcher.service — auto-indexes on .md changes
-cat > ~/.config/systemd/user/clawmem-watcher.service << 'EOF'
-[Unit]
-Description=ClawMem file watcher — auto-indexes on .md changes
-After=default.target
-
-[Service]
-Type=simple
-ExecStart=%h/clawmem/bin/clawmem watch
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-
-# clawmem-embed.service — oneshot embedding sweep
-cat > ~/.config/systemd/user/clawmem-embed.service << 'EOF'
-[Unit]
-Description=ClawMem embedding sweep
-
-[Service]
-Type=oneshot
-ExecStart=%h/clawmem/bin/clawmem embed
-EOF
-
-# clawmem-embed.timer — daily at 04:00
-cat > ~/.config/systemd/user/clawmem-embed.timer << 'EOF'
-[Unit]
-Description=ClawMem daily embedding sweep
-
-[Timer]
-OnCalendar=*-*-* 04:00:00
-Persistent=true
-RandomizedDelaySec=300
-
-[Install]
-WantedBy=timers.target
-EOF
-
-# Enable and start
-systemctl --user daemon-reload
-systemctl --user enable --now clawmem-watcher.service clawmem-embed.timer
-loginctl enable-linger $(whoami)
-```
-
-**Note:** Service files use `%h` (home dir). For remote GPU, add `Environment=CLAWMEM_EMBED_URL=http://host:8088` etc. to both service files.
+**Profiles:** `speed` / `balanced` (default) / `deep` set the kept-score ratio (65% / 55% / 45%) and an activation floor. Only `deep` adds query expansion + reranking to the hook path. Profile and the hook `timeout` are set in `~/.claude/settings.json` — see *Operational gotchas* for timeout tuning.
 
 ---
 
-## Tier 2 — Automatic Retrieval (Hooks)
+## Tier 3 — Agent-initiated retrieval (MCP tools)
 
-Hooks handle ~90% of retrieval. Zero agent effort.
-
-| Hook | Trigger | Budget | Content |
-|------|---------|--------|---------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 + factsTokens sub-budget) | retrieval gate -> **multi-turn query** (v0.8.1: current + up to 2 recent same-session priors, discovery only) -> **session focus topic resolution** (v0.9.0 §11.4: reads `~/.cache/clawmem/sessions/<id>.focus`, threaded as intent hint to expansion/rerank/snippet) -> profile-driven hybrid search -> FTS supplement -> file-aware search (E13) -> snooze/noise filters -> spreading activation (E11) -> composite scoring -> **session focus topic boost** (v0.9.0 §11.4: 1.4x match / 0.75x demote, NO-OP on zero matches) -> adaptive threshold -> memory type diversification (E10) -> tiered injection (HOT/WARM/COLD) -> `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships><vault-facts>...</vault-facts></vault-context>` (v0.7.1: instruction always prepended; relationships = memory-graph edges where BOTH endpoints are in the surfaced set, truncated first when over budget. **v0.9.0 §11.1:** `<vault-facts>` appends raw SPO triple lines when the prompt mentions known entities via three-path extraction (canonical-id regex + proper-noun validation + longer-first n-grams), dedicated `factsTokens` sub-budget per profile (speed=0, balanced=200, deep=250), cross-entity triple dedup, truncate-at-triple-boundary, fail-open on every error path) + optional `<vault-routing>` hint. Budget, max results, vector timeout, min score, facts sub-budget all driven by `CLAWMEM_PROFILE`. Raw prompt persisted to `context_usage.query_text` for future lookback — gated skip paths withhold the text for privacy. |
-| `postcompact-inject` | SessionStart (compact) | 1200 tokens | re-injects authoritative context after compaction: precompact state (600) + decisions (400) + antipatterns (150) + vault context (200) -> `<vault-postcompact>` |
-| `curator-nudge` | SessionStart | 200 tokens | surfaces curator report actions, nudges when report is stale (>7 days) |
-| `precompact-extract` | PreCompact | — | extracts decisions, file paths, open questions -> writes `precompact-state.md`. Query-aware ranking. Reindexes auto-memory. |
-| `decision-extractor` | Stop | — | LLM extracts observations -> `_clawmem/agent/observations/`, infers causal links, detects contradictions |
-| `handoff-generator` | Stop | — | LLM summarizes session -> `_clawmem/agent/handoffs/` |
-| `feedback-loop` | Stop | — | tracks referenced notes -> boosts confidence, records usage relations + co-activations, tracks utility signals (surfaced vs referenced ratio) |
-
-**Default behavior:** Read injected `<vault-context>` first. If sufficient, answer immediately.
-
-**Hook blind spots (by design):** Hooks filter out `_clawmem/` system artifacts, enforce score thresholds, and cap token budget. Absence in `<vault-context>` does NOT mean absence in memory. Escalate to Tier 3 if expected memory wasn't surfaced.
-
-**Adaptive thresholds:** Context-surfacing uses ratio-based scoring that adapts to vault characteristics. Results are kept within a percentage of the best result's composite score (speed: 65%, balanced: 55%, deep: 45%). An activation floor prevents surfacing when all results are weak. `CLAWMEM_PROFILE=deep` adds query expansion + reranking. MCP tools use fixed absolute thresholds, not adaptive.
-
----
-
-## Tier 3 — Agent-Initiated Retrieval (MCP Tools)
-
-### 3-Rule Escalation Gate
+### 3-rule escalation gate
 
 Escalate to MCP tools ONLY when one of these fires:
 
-1. **Low-specificity injection** — `<vault-context>` is empty or lacks the specific fact the task requires. Hooks surface top-k by relevance; if needed memory wasn't in top-k, escalate.
-2. **Cross-session question** — task explicitly references prior sessions or decisions: "why did we decide X", "what changed since last time".
-3. **Pre-irreversible check** — about to make a destructive or hard-to-reverse change. Check vault for prior decisions.
+1. **Low-specificity injection** — `<vault-context>` is empty or lacks the specific fact the task requires.
+2. **Cross-session question** — "why did we decide X", "what changed since last time", "when did we start Y".
+3. **Pre-irreversible check** — about to make a destructive / hard-to-reverse change; check the vault for prior decisions first.
 
-All other retrieval is handled by Tier 2 hooks. Do NOT call MCP tools speculatively.
+All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculatively.**
 
-### Tool Routing
+### Tool routing
 
-Once escalated, route by query type:
-
-**PREFERRED:** `memory_retrieve(query)` — auto-classifies and routes to the optimal backend (query, intent_search, session_log, find_similar, or query_plan). Use this instead of manually choosing a tool below.
+**PREFERRED:** `memory_retrieve(query)` — auto-classifies and routes to the optimal backend (query / intent_search / session_log / find_similar / query_plan). Use this instead of manually choosing.
 
 ```
-1a. General recall -> query(query, compact=true, limit=20)
-    Full hybrid: BM25 + vector + query expansion + deep reranking.
-    Supports compact, collection filter, intent, candidateLimit.
-    Optional: intent="domain hint" for ambiguous queries.
-    Optional: candidateLimit=N (default 30).
-    BM25 strong-signal bypass: skips expansion when top BM25 >= 0.85 with gap >= 0.15
-    (disabled when intent is provided).
-
+1a. General recall      -> query(query, compact=true, limit=20)
+    Full hybrid: BM25 + vector + expansion + deep rerank. Supports compact, collection,
+    intent, candidateLimit. BM25 strong-signal bypass skips expansion when top hit >= 0.85
+    with gap >= 0.15 (disabled when intent is provided).
 1b. Causal/why/when/entity -> intent_search(query, enable_graph_traversal=true)
     MAGMA intent classification + intent-weighted RRF + multi-hop graph traversal.
-    Use DIRECTLY when question is "why", "when", "how did X lead to Y",
-    or needs entity-relationship traversal.
-    Override auto-detection: force_intent="WHY"|"WHEN"|"ENTITY"|"WHAT"
-
-    Choose 1a or 1b based on query type. Parallel options, not sequential.
-
-1c. Multi-topic/complex -> query_plan(query, compact=true)
-    Decomposes query into 2-4 typed clauses (bm25/vector/graph), executes in parallel, merges via RRF.
-    Use when query spans multiple topics or needs both keyword and semantic recall simultaneously.
-    Falls back to single-query behavior for simple queries.
-
-2. Progressive disclosure -> multi_get("path1,path2") for full content of top hits
-
-3. Spot checks -> search(query) (BM25, 0 GPU) or vsearch(query) (vector, 1 GPU)
-
-4. Chain tracing -> find_causal_links(docid, direction="both", depth=5)
-   Traverses causal edges between _clawmem/agent/observations/ docs.
-
-5. Entity facts -> kg_query(entity, as_of?, direction?)
-   Structured SPO triples with temporal validity. Different from intent_search:
-   - kg_query: "what does ClawMem relate to?" -> returns structured facts (subject-predicate-object)
-   - intent_search: "why did we choose ClawMem?" -> returns documents with causal reasoning
-   Use kg_query for entity lookup, intent_search for causal chains.
-
-6. Memory debugging -> memory_evolution_status(docid)
-
-7. Temporal context -> timeline(docid, before=5, after=5, same_collection=false)
-   Shows what was created/modified before and after a document.
-   Use after search to understand chronological neighborhood.
+    Use DIRECTLY (not as a fallback) for "why" / "when" / "how did X lead to Y" / entity links.
+    Override: force_intent="WHY"|"WHEN"|"ENTITY"|"WHAT".
+    (1a vs 1b are parallel options, chosen by query type — not sequential.)
+1c. Multi-topic         -> query_plan(query, compact=true)
+    Decomposes into 2-4 typed clauses (bm25/vector/graph), runs them in parallel, merges via RRF.
+2.  Progressive disclosure -> multi_get("path1,path2") for full content of top hits
+3.  Spot checks         -> search(query) (BM25, 0 GPU)  or  vsearch(query) (vector, 1 GPU)
+4.  Chain tracing       -> find_causal_links(docid, direction="both", depth=5)
+5.  Entity facts        -> kg_query(entity)  (SPO triples; different from intent_search's reasoning chains)
+6.  Temporal context    -> timeline(docid, before=5, after=5)
 ```
 
-### All MCP Tools
+### All MCP tools
 
 | Tool | Purpose |
 |------|---------|
-| `memory_retrieve` | **Preferred.** Auto-classifies query and routes to optimal backend. Use instead of choosing manually. |
-| `query` | Full hybrid (BM25 + vector + rerank). General-purpose when type unclear. WRONG for "why" (use `intent_search`) or cross-session (use `session_log`). Prefer `memory_retrieve`. |
-| `intent_search` | USE THIS for "why did we decide X", "what caused Y", "who worked on Z". Classifies intent, traverses graph edges. Returns decision chains `query()` cannot find. |
-| `query_plan` | USE THIS for multi-topic queries ("X and also Y", "compare A with B"). `query()` searches as one blob — this splits and routes each optimally. |
-| `search` | BM25 keyword — for exact terms, config names, error codes. Fast, 0 GPU. Prefer `memory_retrieve`. |
-| `vsearch` | Vector semantic — for conceptual/fuzzy when keywords unknown. ~100ms, 1 GPU. Prefer `memory_retrieve`. |
-| `get` | Retrieve single doc by path or `#docid`. |
-| `multi_get` | Retrieve multiple docs by glob or comma-separated list. |
-| `find_similar` | USE THIS for "what else relates to X". k-NN vector neighbors — discovers connections beyond keyword overlap. |
-| `find_causal_links` | Trace decision chains: "what led to X". Follow up `intent_search` on a top result to walk the full causal chain. |
-| `session_log` | USE THIS for "last time", "yesterday", "what did we do". DO NOT use `query()` for cross-session questions. |
+| `memory_retrieve` | **Preferred.** Auto-classifies + routes. Use instead of choosing manually. |
+| `query` | Full hybrid (BM25 + vector + rerank). General-purpose. WRONG for "why" (→ `intent_search`) or cross-session (→ `session_log`). |
+| `intent_search` | "why did we decide X" / "what caused Y" / "who worked on Z". Classifies intent, traverses graph edges — returns decision chains `query` can't find. |
+| `query_plan` | Multi-topic queries ("X and also Y", "compare A with B"). Splits + routes each clause. |
+| `search` | BM25 keyword — exact terms, config names, error codes. Fast, 0 GPU. |
+| `vsearch` | Vector semantic — conceptual/fuzzy when vocabulary unknown. ~100ms, 1 GPU. |
+| `get` / `multi_get` | Single doc by path/`#docid` / multiple by glob or comma-list. |
+| `find_similar` | "what else relates to X" — k-NN vector neighbors beyond keyword overlap. |
+| `find_causal_links` | Trace decision chains ("what led to X") over observation docs. |
+| `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why" (use `intent_search`). |
+| `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
-| `memory_forget` | Deactivate a memory by closest match. |
-| `memory_pin` | +0.3 composite boost. USE PROACTIVELY for constraints, architecture decisions, corrections. Don't wait for curator. |
-| `memory_snooze` | USE PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days instead of ignoring. |
-| `build_graphs` | Build temporal backbone + semantic graph after bulk ingestion. |
-| `beads_sync` | Sync Beads issues from Dolt backend into memory. |
-| `index_stats` | Doc counts, embedding coverage, content type distribution. |
-| `status` | Quick index health. |
-| `reindex` | Force re-index (BM25 only, does NOT embed). Use `--enrich` after major upgrades to backfill entity extraction + links on existing docs. |
-| `memory_evolution_status` | Track how a doc's A-MEM metadata evolved over time. |
-| `timeline` | Temporal neighborhood around a document — what was modified before/after. Progressive disclosure: search → timeline → get. Supports same-collection scoping and session correlation. |
-| `list_vaults` | Show configured vault names and paths. Empty in single-vault mode. |
-| `vault_sync` | Index markdown from a directory into a named vault. Restricted-path validation rejects sensitive directories. |
-| `kg_query` | Query SPO knowledge graph for entity relationships with temporal validity. Accepts entity name or canonical ID (`vault:type:slug`). Triples are populated by decision-extractor from observer-emitted `<triples>` blocks using a canonical predicate vocabulary. |
-| `diary_write` | Write diary entry. Use proactively in non-hooked environments. Do NOT use in Claude Code. |
-| `diary_read` | Read recent diary entries. Filter by agent name. |
-| `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary. |
-| `lifecycle_sweep` | Run lifecycle policies: archive stale docs. Defaults to dry_run (preview only). |
-| `lifecycle_restore` | Restore auto-archived documents. Filter by query, collection, or all. Does NOT restore manually forgotten docs. |
+| `memory_pin` | +0.3 composite boost. Use PROACTIVELY for constraints, architecture decisions, corrections. |
+| `memory_snooze` | Use PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days. |
+| `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. |
+| `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. |
+| `timeline` | Temporal neighborhood around a doc. Progressive disclosure: search → timeline → get. |
+| `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
+| `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default) / restore auto-archived. |
+| `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / force re-index (does NOT embed). |
+| `beads_sync` / `vault_sync` / `list_vaults` | Beads issues from Dolt / index a dir into a named vault / list vaults. |
 
-**Multi-vault:** All tools accept an optional `vault` parameter. Omit for the default vault (single-vault mode). Named vaults configured in `~/.config/clawmem/config.yaml` under `vaults:` or via `CLAWMEM_VAULTS` env var. Vault paths support `~` expansion.
-
-**Progressive disclosure:** ALWAYS `compact=true` first -> review snippets/scores -> `get(docid)` or `multi_get(pattern)` for full content.
+**Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content.
 
 ---
 
-## Query Optimization
+## Query optimization (4 levers)
 
-ClawMem's pipeline autonomously generates lex/vec/hyde variants, fuses BM25 + vector via RRF, and reranks with a cross-encoder. The agent does NOT choose search types — the pipeline handles fusion internally. The agent's optimization levers are: **tool selection**, **query string quality**, **intent**, and **candidateLimit**.
+The pipeline autonomously generates lex/vec/hyde variants, fuses BM25 + vector via RRF, and reranks with a cross-encoder — you do NOT choose search types. Your levers are **tool selection, query string quality, intent, and candidateLimit.**
 
-### Lever 1: Tool Selection (highest impact)
+### Lever 1 — Tool selection (highest impact)
 
-Pick the lightest tool that satisfies the need. Heavier tools are slower and consume more GPU.
+Pick the lightest tool that satisfies the need:
 
 | Tool | Cost | When |
 |------|------|------|
-| `search(q, compact=true)` | BM25 only, 0 GPU | Know exact terms, spot-check, fast keyword lookup |
-| `vsearch(q, compact=true)` | Vector only, 1 GPU call | Conceptual/fuzzy, don't know vocabulary |
-| `query(q, compact=true)` | Full hybrid, 3+ GPU calls | General recall, unsure which signal matters, need best results |
-| `intent_search(q)` | Hybrid + graph traversal | Why/entity chains (graph traversal), when queries (BM25-biased) |
-| `query_plan(q, compact=true)` | Hybrid + decomposition | Complex multi-topic queries needing parallel typed retrieval |
+| `search(q, compact=true)` | BM25 only, 0 GPU | Know exact terms, spot-check |
+| `vsearch(q, compact=true)` | Vector only, 1 GPU | Conceptual/fuzzy, vocabulary unknown |
+| `query(q, compact=true)` | Full hybrid, 3+ GPU | General recall, need best results |
+| `intent_search(q)` | Hybrid + graph | Why/entity chains, when queries |
+| `query_plan(q, compact=true)` | Hybrid + decomposition | Complex multi-topic |
 
-Use `search` for quick keyword spot-checks. Use `query` for general recall (default Tier 3 workhorse). Use `intent_search` directly (not as fallback) when the question is causal or relational.
+### Lever 2 — Query string quality
 
-### Lever 2: Query String Quality
+The query string feeds BM25 (probes first, can short-circuit the pipeline) and anchors the 2×-weighted original signal in RRF — the single biggest determinant of result quality.
 
-The query string directly feeds BM25 (which probes first and can short-circuit the entire pipeline) and anchors the 2x-weighted original signal in RRF. A good query string is the single biggest determinant of result quality.
+- **Keyword recall (BM25):** 2–5 precise terms, no filler. Code identifiers work (`handleError async`). BM25 ANDs all terms as prefix matches (`perf` matches "performance") — no phrase search or negation. A strong hit (≥ 0.85, gap ≥ 0.15) skips expansion.
+- **Semantic recall (vector):** full natural-language question, be specific — `"in the payment service, how are refunds processed"` > `"refunds"`.
+- **Do NOT write hypothetical-answer-style queries** — the expansion LLM already generates hyde variants; a long hypothetical dilutes BM25 and duplicates the pipeline.
 
-**For keyword recall (BM25 path):**
-- 2-5 precise terms, no filler words
-- Code identifiers work: `handleError async`
-- BM25 tokenizes on whitespace and separators (`_ - . /` etc., mirroring the index), then AND's all terms as prefix matches (`perf` matches "performance"; `before_compaction` matches docs containing `before` and `compaction`)
-- No phrase search or negation syntax — all terms are positive prefix matches
-- A strong keyword hit (score >= 0.85 with gap >= 0.15) skips expansion entirely — faster results
+### Lever 3 — Intent (disambiguation)
 
-**For semantic recall (vector path):**
-- Full natural language question, be specific
-- Include context: `"in the payment service, how are refunds processed"` > `"refunds"`
-- The expansion LLM generates complementary variants — don't try to do its job
+Steers 5 autonomous stages (expansion, reranking, chunk selection, snippet extraction, strong-signal bypass). `query("performance", intent="web page load times and Core Web Vitals")`.
 
-**Do NOT write hypothetical-answer-style queries.** The expansion LLM already generates hyde variants internally. Writing a 50-word hypothetical dilutes BM25 scoring and is redundant with what the pipeline does autonomously.
+- **Provide when:** the term is polysemous in the vault, or the domain is known but the query alone is ambiguous.
+- **Skip when:** the query is already specific, single-domain vault, or using `search`/`vsearch` (intent only affects `query`).
+- Intent disables the BM25 strong-signal bypass (forces full expansion+rerank) — correct, since intent signals ambiguity.
 
-### Lever 3: Intent (Disambiguation)
+### Lever 4 — candidateLimit
 
-Steers 5 autonomous stages: expansion, reranking, chunk selection, snippet extraction, and strong-signal bypass (disabled when intent is provided, forcing full pipeline).
-
-```
-query("performance", intent="web page load times and Core Web Vitals")
-```
-
-**When to provide:**
-- Query term has multiple meanings in the vault ("performance", "pipeline", "model")
-- You know the domain but the query alone is ambiguous
-- Cross-domain search where same terms appear in different contexts
-
-**When NOT to provide:**
-- Query is already specific enough
-- Single-domain vault with no ambiguity
-- Using `search` or `vsearch` (intent only affects `query` tool)
-
-**Note:** Intent disables BM25 strong-signal bypass, forcing full expansion+reranking even on strong keyword hits. This is correct behavior — intent means the query is ambiguous, so keyword confidence alone is insufficient.
-
-### Lever 4: candidateLimit
-
-Controls how many RRF candidates reach the cross-encoder reranker (default 30).
-
-```
-query("architecture decisions", candidateLimit=15)  # Faster, more precise
-query("architecture decisions", candidateLimit=50)  # Broader recall, slower
-```
-
-Lower when: high-confidence keyword query, speed matters, vault is small.
-Higher when: broad topic, vault is large, recall matters more than speed.
+How many RRF candidates reach the cross-encoder reranker (default 30). Lower (`15`) for high-confidence/speed/small-vault; higher (`50`) for broad topics/large vault/recall-over-speed.
 
 ---
 
-## Pipeline Details
+## Pipeline behavior
 
 ### `query` (default Tier 3 workhorse)
 
 ```
-User Query + optional intent hint
-  -> BM25 Probe -> Strong Signal Check (skip expansion if top hit >= 0.85 with gap >= 0.15; disabled when intent provided)
-  -> Query Expansion (LLM generates text variants; intent steers expansion prompt)
-  -> Parallel: BM25(original) + Vector(original) + BM25(each expanded) + Vector(each expanded)
-  -> Original query lists get positional 2x weight in RRF; expanded get 1x
-  -> Reciprocal Rank Fusion (k=60, top candidateLimit)
-  -> Intent-Aware Chunk Selection (intent terms at 0.5x weight alongside query terms at 1.0x)
-  -> Cross-Encoder Reranking (4000 char context; intent prepended to rerank query; chunk dedup; batch cap=4)
-  -> Rerank/RRF Blend (blendRerank: 0.9*reranker + 0.1*normalized-RRF tiebreaker; reranker can promote over RRF #1; falls back to RRF order if reranker unavailable)
-  -> Composite Scoring
-  -> MMR Diversity Filter (Jaccard bigram similarity > 0.6 -> demoted, not removed)
+Query + optional intent
+  -> Temporal extraction (date ranges from "last week"/"March 2026")
+  -> BM25 probe -> strong-signal check (skip expansion if top >= 0.85, gap >= 0.15; off when intent given)
+  -> Query expansion (LLM text variants; intent steers the prompt)
+  -> Parallel typed legs: BM25(orig) + Vector(orig) + BM25(lex exp) + Vector(vec/hyde exp) [+ temporal/entity if signalled]
+  -> RRF (k=60; original lists get 2x positional weight, expanded 1x; top candidateLimit)
+  -> Intent-aware chunk selection -> cross-encoder rerank (4000-char ctx; chunk dedup)
+  -> rerank/RRF blend (0.9 reranker + 0.1 RRF tiebreaker; falls back to RRF if reranker down)
+  -> composite scoring -> MMR diversity (Jaccard bigram > 0.6 demoted, not removed)
 ```
 
 ### `intent_search` (specialist for causal chains)
 
 ```
-User Query -> Intent Classification (WHY/WHEN/ENTITY/WHAT)
-  -> BM25 + Vector (intent-weighted RRF: boost BM25 for WHEN, vector for WHY)
-  -> Graph Traversal (WHY/ENTITY only; multi-hop beam search over memory_relations)
-      Outbound: all edge types (semantic, supporting, contradicts, causal, temporal)
-      Inbound: semantic and entity only
-      Scores normalized to [0,1] before merge with search results
-  -> Cross-Encoder Reranking (200 char context per doc; file-keyed score join)
-  -> Composite Scoring (uses stored confidence from contradiction detection + feedback)
+Query -> intent classification (WHY/WHEN/ENTITY/WHAT)
+  -> BM25 + Vector (intent-weighted RRF: BM25 for WHEN, vector for WHY)
+  -> Graph traversal (WHY/ENTITY; multi-hop over memory_relations; outbound all edge types, inbound semantic+entity)
+  -> cross-encoder rerank (200-char ctx) -> composite scoring
 ```
 
-### Key Differences
+**MPFP fusion is max-score, NOT RRF.** The graph stage runs meta-path patterns (`[semantic,causal]`, `[entity,temporal]`, …) via Forward Push (α=0.15) and fuses by max-score ("best supporting path wins"), because propagation magnitude carries signal. This is distinct from the *outer* retrieval, which DOES fuse BM25+vector via RRF — two layers, two fusion rules, by design.
+
+### Key differences
 
 | Aspect | `query` | `intent_search` |
 |--------|---------|-----------------|
-| Query expansion | Yes (skipped on strong BM25 signal) | No |
-| Intent hint | Yes (`intent` param steers 5 stages) | Auto-detected (WHY/WHEN/ENTITY/WHAT) |
-| Rerank context | 4000 chars/doc (intent-aware chunk selection) | 200 chars/doc |
-| Chunk dedup | Yes (identical texts share single rerank call) | No |
+| Query expansion | Yes (skipped on strong BM25) | No |
+| Intent | `intent` param steers 5 stages | Auto-detected (WHY/WHEN/ENTITY/WHAT) |
+| Rerank context | 4000 chars/doc | 200 chars/doc |
 | Graph traversal | No | Yes (WHY/ENTITY, multi-hop) |
-| MMR diversity | Yes (`diverse=true` default) | No |
-| `compact` param | Yes | No |
-| `collection` filter | Yes | No |
-| `candidateLimit` | Yes (default 30) | No |
-| Best for | Most queries, progressive disclosure | Causal chains spanning multiple docs |
+| MMR diversity | Yes | No |
+| `compact` / `collection` / `candidateLimit` | Yes | No |
+| Best for | most queries, progressive disclosure | causal chains across docs |
 
-### `intent_search` force_intent Guide
-
-| Override | Triggers |
-|----------|----------|
-| `WHY` | "why", "what led to", "rationale", "tradeoff", "decision behind" |
-| `ENTITY` | Named component/person/service needing cross-doc linkage |
-| `WHEN` | Timelines, first/last occurrence, "when did this change/regress" |
-
-**WHEN note:** Start with `enable_graph_traversal=false` (BM25-biased); fall back to `query()` if recall drifts.
+**force_intent:** `WHY` ("why", "what led to", "rationale", "tradeoff") · `ENTITY` (named component/person/service needing cross-doc linkage) · `WHEN` (timelines, first/last, "when did this change") — for WHEN start with `enable_graph_traversal=false`, fall back to `query()` if recall drifts.
 
 ---
 
-## Composite Scoring
+## Composite scoring (how ranking works)
 
-Applied automatically to all search tool results.
-
-```
-compositeScore = (0.50 x searchScore + 0.25 x recencyScore + 0.25 x confidenceScore) x qualityMultiplier x coActivationBoost
-```
-
-Where `qualityMultiplier = 0.7 + 0.6 x qualityScore` (range: 0.7x penalty to 1.3x boost).
-`coActivationBoost = 1 + min(coCount/10, 0.15)` — documents frequently surfaced together get up to 15% boost.
-
-Length normalization: `1/(1 + 0.5 x log2(max(bodyLength/500, 1)))` — penalizes verbose entries, floor at 30%.
-
-Frequency boost: `freqSignal = (revisions-1)x2 + (duplicates-1)`, `freqBoost = min(0.10, log1p(freqSignal)x0.03)`. Revision count weighted 2x vs duplicate count. Capped at 10%.
-
-Pinned documents get +0.3 additive boost (capped at 1.0).
-
-### Recency Intent Detected ("latest", "recent", "last session")
+Applied automatically to all search results.
 
 ```
-compositeScore = (0.10 x searchScore + 0.70 x recencyScore + 0.20 x confidenceScore) x qualityMultiplier x coActivationBoost
+compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
-### Content Type Half-Lives
+- `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× penalty … 1.3× boost).
+- `coActivationBoost = 1 + min(coCount/10, 0.15)` (docs surfaced together get up to +15%).
+- Length normalization penalizes verbose entries (floor 30%); frequency boost capped at +10%.
+- **Pinned docs: +0.3 additive** (capped at 1.0).
+- **`query` tool (v0.13.0+):** non-recency queries use retrieval-tuned **0.70·search + 0.15·recency + 0.15·confidence**. `search`/`vsearch`/`memory_retrieve`/`context-surfacing` keep the 0.50/0.25/0.25 default.
+- **Recency intent** ("latest"/"recent"/"last session") switches all to **0.10·search + 0.70·recency + 0.20·confidence**.
 
-| Content Type | Half-Life | Effect |
-|--------------|-----------|--------|
-| decision, deductive, preference, hub | infinity | Never decay |
-| antipattern | infinity | Never decay — accumulated negative patterns persist |
-| project | 120 days | Slow decay |
-| research | 90 days | Moderate decay |
-| problem, milestone, note | 60 days | Default |
-| conversation, progress | 45 days | Faster decay |
-| handoff | 30 days | Fast — recent matters most |
+**Content-type half-lives:** decision / deductive / preference / hub / antipattern = ∞ (never decay) · project 120d · research 90d · problem / milestone / note 60d · conversation / progress 45d · handoff 30d. Half-lives extend up to 3× for frequently-accessed memories. Attention decay: non-durable types (handoff, progress, conversation, note, project) lose 5% confidence/week without access; decision / deductive / preference / hub / research / antipattern are exempt.
 
-Half-lives extend up to 3x for frequently-accessed memories (access reinforcement decays over 90 days).
-
-Attention decay: non-durable types (handoff, progress, note, project) lose 5% confidence per week without access. Decision/hub/research/antipattern are exempt.
+→ full derivation: [`docs/concepts/composite-scoring.md`](docs/concepts/composite-scoring.md).
 
 ---
 
-## Indexing & Graph Building
+## Memory lifecycle (pin / snooze / forget — manual tools)
 
-### What Gets Indexed (per collection in config.yaml)
-
-- `**/MEMORY.md` — any depth
-- `**/memory/**/*.md`, `**/memory/**/*.txt` — session logs
-- `**/docs/**/*.md`, `**/docs/**/*.txt` — documentation
-- `**/research/**/*.md`, `**/research/**/*.txt` — research dumps
-- `**/YYYY-MM-DD*.md`, `**/YYYY-MM-DD*.txt` — date-format records
-
-### Excluded (even if pattern matches)
-
-- `gits/`, `scraped/`, `.git/`, `node_modules/`, `dist/`, `build/`, `vendor/`
-
-### Indexing vs Embedding
-
-**Infrastructure (Tier 1, no agent action):**
-- **`clawmem-watcher`** — keeps index + A-MEM fresh (continuous, on `.md` change). Watches `.beads/` too. Does NOT embed.
-- **`clawmem-embed` timer** — keeps embeddings fresh (daily). Idempotent, skips already-embedded fragments.
-
-**Quality scoring:** Each document gets `quality_score` (0.0-1.0) during indexing based on length, structure (headings, lists), decision keywords, correction keywords, frontmatter richness. Applied as multiplier in composite scoring.
-
-**Impact of missing embeddings:** `vsearch`, `query` (vector component), `context-surfacing` (vector component), and `generateMemoryLinks()` all depend on embeddings. BM25 still works, but vector recall and inter-doc link quality suffer.
-
-**Agent escape hatches (rare):**
-- `clawmem embed` via CLI for immediate vector recall after writing a doc.
-- Manual `reindex` only when watcher hasn't caught up.
-
-### Adding New Collections
-
-```bash
-# 1. Edit config
-Edit ~/.config/clawmem/config.yaml
-
-# 2. Reindex (BM25 only)
-mcp__clawmem__reindex()
-
-# 3. Embed (vectors, CLI only)
-CLAWMEM_PATH=~/clawmem ~/clawmem/bin/clawmem embed
-
-# 4. Verify
-mcp__clawmem__search(query, collection="name", compact=true)    # BM25
-mcp__clawmem__vsearch(query, collection="name", compact=true)   # vector
-```
-
-**Gotcha:** `reindex` shows `added` count but does NOT embed. `needsEmbedding` in `index_stats` shows pending. Must run CLI `embed` separately.
-
-### Graph Population (memory_relations)
-
-| Source | Edge Types | Trigger | Notes |
-|--------|-----------|---------|-------|
-| A-MEM `generateMemoryLinks()` | semantic, supporting, contradicts | Indexing (new docs) | LLM-assessed confidence. Requires embeddings. |
-| A-MEM `inferCausalLinks()` | causal | Post-response (decision-extractor) | Links `_clawmem/agent/observations/` docs only. |
-| Beads `syncBeadsIssues()` | causal, supporting, semantic | `beads_sync` MCP or watcher | Queries `bd` CLI (Dolt backend). |
-| `buildTemporalBackbone()` | temporal | `build_graphs` MCP (manual) | Creation-order edges. |
-| `buildSemanticGraph()` | semantic | `build_graphs` MCP (manual) | Pure cosine similarity. A-MEM edges take precedence (first-writer wins). |
-| `consolidated_observations` | supporting, contradicts | Consolidation worker (background, light + heavy lanes) | **v0.7.1 safety gates:** Phase 2 name-aware merge gate (entity anchors + 3-gram cosine, dual-threshold `CLAWMEM_MERGE_SCORE_NORMAL`=0.93 / `_STRICT`=0.98) blocks cross-entity merges. Merge-time contradiction gate (heuristic + LLM) routes blocked merges to `link` (default, inserts `contradicts` edge) or `supersede` (old row `status='inactive'`) via `CLAWMEM_CONTRADICTION_POLICY`. **v0.8.0:** heavy lane calls `consolidateObservations(store, llm, { maxDocs, guarded: true, staleOnly: true, candidateIds? })` — `guarded: true` forces enforcement regardless of `CLAWMEM_MERGE_GUARD_DRY_RUN`, `staleOnly: true` reorders by `recall_stats.last_recalled_at ASC`, and optional `candidateIds` plumbs surprisal-selector output. |
-| Deductive synthesis | supporting, contradicts | Consolidation worker Phase 3 (every ~15 min in light lane; batched in heavy lane) | Combines 2-3 related observations (decision/preference/milestone/problem, last 7 days) into `content_type='deductive'` docs. **v0.7.1 anti-contamination:** deterministic pre-checks (empty/invalid_indices/pool-only entity contamination) + LLM validator (fail-open, `validatorFallbackAccepts` counter) + dedupe. Per-reason rejection stats via `DeductiveSynthesisStats`. Contradictory dedupe matches linked via `contradicts` edges. **v0.8.0:** heavy lane calls `generateDeductiveObservations(store, llm, { maxRecent, guarded: true, staleOnly: true })` for stale-first batching. |
-| Conversation synthesis | semantic, supporting, contradicts, causal, temporal, entity | `clawmem mine <dir> --synthesize` (opt-in, post-index) | **v0.7.2.** Two-pass LLM pipeline over freshly imported `content_type='conversation'` docs. Pass 1 extracts structured decision/preference/milestone/problem facts + aliases + cross-fact links, saves via dedup-aware `saveMemory`, populates ambiguity-aware local Set map. Pass 2 resolves links (local first, SQL fallback with `LIMIT 2` ambiguity detection), upserts relations via `ON CONFLICT DO UPDATE SET weight = MAX(weight, excluded.weight)`. Synthesized paths are a pure function of `(sourceDocId, slug(title), short sha256(normalizedTitle))` so reruns update in place. All failures non-fatal. Counters split: `llmFailures` (LLM/parse error) vs `docsWithNoFacts` (valid empty extraction). |
-| Heavy maintenance lane journal | — | `CLAWMEM_HEAVY_LANE=true` (v0.8.0) | Writes a row to `maintenance_runs` for every scheduled heavy-lane attempt (including skips). Columns: `lane` (`heavy`), `phase` (`gate`/`consolidate`/`deductive`), `status` (`started`/`completed`/`failed`/`skipped`), `reason` (`outside_window`/`query_rate_high`/`lease_unavailable`), per-phase counts, and `metrics_json` with selector type (`stale-first`/`surprisal`/`surprisal-fallback-stale`) + full `DeductiveSynthesisStats`. Exclusivity via new `worker_leases` table (atomic `INSERT ... ON CONFLICT DO UPDATE ... WHERE expires_at <= ?`, 16-byte fencing tokens, TTL reclaim). Gate reuses `context_usage` (no `query_activity` table). |
-
-**Graph traversal asymmetry:** `adaptiveTraversal()` traverses all edge types outbound (source->target) but only `semantic` and `entity` inbound.
-
-### When to Run `build_graphs`
-
-- After **bulk ingestion** — adds temporal backbone + semantic gap filling.
-- When `intent_search` for WHY/ENTITY returns weak results and you suspect graph sparsity.
-- Do NOT run after every reindex (A-MEM handles per-doc links automatically).
+- **`memory_pin`** (+0.3 boost, persistent surfacing) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist across sessions. Do NOT pin routine/session-specific items.
+- **`memory_snooze`** — PROACTIVELY when a memory keeps surfacing but isn't relevant now, user says "not now"/"later", or content is time-boxed.
+- **`memory_forget`** — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
+- **Contradiction auto-resolution:** when `decision-extractor` detects a new decision contradicting an old one, the old one's confidence is lowered automatically — no manual action needed.
 
 ---
 
-## Memory Lifecycle
+## Operational gotchas (agent-facing)
 
-Pin, snooze, and forget are **manual MCP tools**.
-
-### Pin (`memory_pin`)
-
-+0.3 composite boost, ensures persistent surfacing.
-
-**Proactive triggers:**
-- User says "remember this" / "don't forget" / "this is important"
-- Architecture or critical design decision just made
-- User-stated preference or constraint that should persist across sessions
-
-**Do NOT pin:** routine decisions, session-specific context, or observations that naturally surface via recency.
-
-### Snooze (`memory_snooze`)
-
-Temporarily hides from context surfacing until a date.
-
-**Proactive triggers:**
-- A memory keeps surfacing but isn't relevant to current work
-- User says "not now" / "later" / "ignore this for now"
-- Seasonal or time-boxed content
-
-### Forget (`memory_forget`)
-
-Permanently deactivates. Use sparingly — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
-
-### Contradiction Auto-Resolution
-
-When `decision-extractor` detects a new decision contradicting an old one, the old decision's confidence is lowered automatically. No manual intervention needed.
-
-**v0.7.1 merge-time contradiction gate:** The consolidation worker adds a second layer at merge time. Before Phase 2 merges a new pattern into an existing consolidated observation, it runs a deterministic heuristic (negation asymmetry, number/date mismatch) followed by an LLM confirmation. When confidence crosses `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default 0.5), the merge is blocked and one of two policies applies via `CLAWMEM_CONTRADICTION_POLICY`:
-
-- `link` (default) — insert a new consolidated row and create a `contradicts` edge in `memory_relations`. Both remain queryable.
-- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit.
-
-Phase 3 deductive synthesis applies the same `contradicts` link for any draft that matches a prior deductive observation with conflicting content.
+- **Empty `context-surfacing`** → prompt < 20 chars, starts with `/`, or nothing scored above threshold. Check `clawmem status` (doc counts) + embedding coverage.
+- **Vector search empty but BM25 works** → missing embeddings (the watcher indexes but does NOT embed). Run `clawmem embed` or wait for the embed timer.
+- **`intent_search` weak for WHY/ENTITY** → sparse graph. Run `build_graphs` (temporal backbone + semantic edges). Otherwise don't run it after every reindex — A-MEM links per-doc automatically.
+- **Rankings look RRF-flat / reranker suspect** → `clawmem rerank-health`. A mis-served reranker (e.g. a GGUF that drops the score head) returns HTTP 200 but inert, non-discriminating scores, silently collapsing ranking to RRF. The reranker is a served sidecar, not a bundled model — verify it discriminates, don't assume liveness = correctness.
+- **Intermittent `UserPromptSubmit hook timed out after 8s — output discarded`** → almost always the context-surfacing hook's **cold-start**, NOT inference: a fresh Bun process + opening a large `index.sqlite` + a cold OS page cache. Warm calls are sub-second. On a memory-constrained host (e.g. WSL with a low memory cap) or a large vault, the cache is evicted between turns so it **recurs on certain turns**. A timed-out hook silently drops that turn's `<vault-context>` (degraded recall, no error). **Durable fix: give the host enough RAM to keep the index + Bun modules cached**; raising the hook `timeout` in `~/.claude/settings.json` (8s default; no CLI knob) is only a secondary margin — avoid 15s+ as a standing default since the hook blocks prompt submission. Full detail: [`docs/troubleshooting.md`](docs/troubleshooting.md) → *Hooks slow or near timeout* / *Tuning the context-surfacing hook timeout*.
+- **Anything setup-shaped** (download blocked, server unreachable, watcher memory bloat, indexer bugs) → [`docs/troubleshooting.md`](docs/troubleshooting.md). This skill does not duplicate it.
 
 ---
 
-## Anti-Patterns
+## Anti-patterns
 
-- Do NOT manually pick query/intent_search/search when `memory_retrieve` can auto-route.
-- Do NOT call MCP tools every turn — 3-rule escalation gate is the only trigger.
-- Do NOT re-search what's already in `<vault-context>`.
-- Do NOT run `status` routinely. Only when retrieval feels broken or after large ingestion.
-- Do NOT pin everything — pin is for persistent high-priority items.
-- Do NOT forget memories to "clean up" — let confidence decay and contradiction detection handle it.
-- Do NOT run `build_graphs` after every reindex — A-MEM creates per-doc links automatically.
-- Do NOT run `clawmem mine` autonomously — it is a bulk ingestion command. Suggest it to the user when they mention old conversation exports, but let them run it. **v0.7.2 adds `--synthesize`** — an opt-in post-import LLM fact extraction pass. Also requires user consent because it drives one extra LLM call per conversation doc. Suggest both together when the user wants searchable structured memory from raw chat exports.
-- Do NOT use `diary_write` in Claude Code — hooks capture this automatically. Diary is for non-hooked environments only (Hermes, Gemini, plain MCP).
-- Do NOT use `kg_query` for causal "why" questions — use `intent_search` or `memory_retrieve`. `kg_query` returns structured entity facts (SPO triples), not reasoning chains.
-
----
-
-## OpenClaw Integration
-
-**Active Memory coexistence:** ClawMem is fully compatible with OpenClaw's Active Memory plugin (v2026.4.10+). They search different backends and inject into different prompt regions, both can run simultaneously. The deployment options below control native memory search (`memorySearch.extraPaths`), not Active Memory.
-
-**memory-core dreaming sidecar coexistence (v2026.4.18+, #65411):** When ClawMem owns the memory slot AND `plugins.entries.memory-core.config.dreaming.enabled = true`, OpenClaw loads `memory-core`'s dreaming engine alongside ClawMem (rest of `memory-core` stays unloaded). Default after `openclaw plugins enable clawmem` is `dreaming.enabled = false` (ClawMem-only). Set it `true` to keep the dreaming output stream (`memory/dreaming/{phase}/YYYY-MM-DD.md`) alongside ClawMem.
-
-**OpenClaw v2026.4.11+ required for ClawMem v0.10.0+.** v2026.4.11 tightened plugin discovery (requires `package.json` with `openclaw.extensions`, rejects symlinked plugin directories). ClawMem v0.10.0 ships the new discovery manifest and defaults `clawmem setup openclaw` to recursive copy (not symlink). v2026.4.10 earlier fixed the #64192 config-normalization bug that dropped the `contextEngine` slot, which is now moot on v0.10.0+ because v0.10.0 uses the `memory` slot instead.
-
-**ClawMem v0.10.0 plugin kind:** `memory` (not `context-engine`). Enable with `openclaw plugins enable clawmem`, which also disables `memory-core` / `memory-lancedb` in one step.
-
-### Option 1: ClawMem Exclusive (Recommended)
-
-ClawMem handles 100% of structured memory. Disable native memory search:
-
-```bash
-openclaw config set agents.defaults.memorySearch.extraPaths "[]"
-```
-
-**Distribution:** Hooks 90%, MCP tools 10%.
-
-### Option 2: Hybrid
-
-Run both ClawMem and OpenClaw native memory search.
-
-```bash
-openclaw config set agents.defaults.memorySearch.extraPaths '["~/documents", "~/notes"]'
-```
-
-**Tradeoffs:** Redundant recall but 10-15% context window waste from duplicate facts.
-
-### Multi-user install gotcha (v2026.4.11+)
-
-If the gateway runs as a dedicated system user (e.g. `openclaw`) different from the user who runs `clawmem setup openclaw` (e.g. `sciros`), the copied plugin dir is rejected with `suspicious ownership (uid=X, expected uid=Y or root)`. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs are not affected.
-
-Also: if the gateway user cannot traverse `~/<installer>/.openclaw/` (directory mode 700), the gateway fails to start with `Missing config. Run openclaw setup or set gateway.mode=local`. Fix: `sudo chmod 750 ~/<installer>/.openclaw` and ensure the gateway user is in the owning group.
-
-### Precompact state capture — where it runs
-
-The load-bearing surface for `precompact-extract` is `before_prompt_build`, not `before_compaction`. `before_prompt_build` awaits the extraction synchronously when token usage approaches the compaction threshold, so state capture completes before the LLM call that could trigger compaction on this turn. `before_compaction` is a defense-in-depth fallback only — fire-and-forget at OpenClaw's call site, races the compactor, exists for the rare case the proximity heuristic in `before_prompt_build` missed a sudden token jump. v0.3.0 did the pre-emptive extraction from `ContextEngine.compact()` via `delegateCompactionToRuntime()`; v0.10.0 moves it into `before_prompt_build` where it has a real pre-LLM hook to await on. ClawMem does not implement compaction itself — if you want compression in the same OpenClaw runtime, install a context-engine plugin (e.g. `lossless-claw`) into the context-engine slot, which v0.10.0 no longer occupies.
+- ❌ Manually pick `query`/`intent_search`/`search` when `memory_retrieve` can auto-route → ✅ `memory_retrieve` first.
+- ❌ Call MCP tools every turn → ✅ only when the 3-rule gate fires.
+- ❌ Re-search what's already in `<vault-context>`.
+- ❌ Run `status` routinely → ✅ only when retrieval feels broken or after large ingestion.
+- ❌ Pin everything → ✅ pin only persistent high-priority items.
+- ❌ Forget memories to "clean up" → ✅ let decay + contradiction detection handle it.
+- ❌ `build_graphs` after every reindex → ✅ only after bulk ingestion or when graph traversal is weak.
+- ❌ `diary_write` in Claude Code → ✅ hooks capture this automatically (diary is for non-hooked envs only).
+- ❌ `kg_query` for causal "why" → ✅ `intent_search` (kg_query is entity facts, not reasoning chains).
 
 ---
 
-## Hermes Agent Integration
+## Curator agent
 
-### Install
+Maintenance agent for Tier-3 work the main agent neglects. Invoke: **"curate memory" / "run curator" / "memory maintenance"**. Six phases: (1) health snapshot, (2) lifecycle triage (pin/snooze/propose-forget — never auto-confirms), (3) retrieval health probes, (4) reflect + consolidate `--dry-run`, (5) conditional graph rebuild, (6) collection hygiene. Safety rails: never auto-confirms forget, never runs embed, never edits config.
 
-Copy or symlink `src/hermes/` into `hermes-agent/plugins/memory/clawmem/`. Set `memory.provider: clawmem` in Hermes config.
-
-### How it works
-
-Plugin implements Hermes's `MemoryProvider` ABC:
-- `prefetch()` — context-surfacing hook (automatic per turn)
-- `on_session_end()` — extraction hooks in parallel (decision-extractor, handoff-generator, feedback-loop)
-- `on_pre_compress()` — precompact-extract (side effect only)
-- 5 agent tools via REST: `clawmem_retrieve`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
-
-### Key difference from OpenClaw/Claude Code
-
-Hermes passes turn pairs, not transcript files. The plugin maintains its own JSONL transcript at `$HERMES_HOME/clawmem-transcripts/<session_id>.jsonl` so ClawMem hooks can read it.
-
-### Requirements
-
-`clawmem` binary on PATH + `clawmem serve` running (external) or `CLAWMEM_SERVE_MODE=managed`. Python 3.10+.
-
----
-
-## Troubleshooting
+## Tool selection (one-liner)
 
 ```
-Symptom: "Local model download blocked" error
-  -> llama-server endpoint unreachable while CLAWMEM_NO_LOCAL_MODELS=true.
-  -> Fix: Start llama-server. Or set CLAWMEM_NO_LOCAL_MODELS=false for in-process fallback.
-
-Symptom: Query expansion always fails / returns garbage
-  -> On CPU-only systems, in-process inference is significantly slower and less reliable. Systems with GPU acceleration (Metal/Vulkan) handle these models well in-process.
-  -> Fix: Run llama-server on GPU.
-
-Symptom: Vector search returns no results but BM25 works
-  -> Missing embeddings. Watcher indexes but does NOT embed.
-  -> Fix: Run `clawmem embed` or wait for daily embed timer.
-
-Symptom: context-surfacing hook returns empty
-  -> Prompt too short (<20 chars), starts with `/`, or no docs above threshold.
-  -> Fix: Check `clawmem status` for doc counts. Check `clawmem embed` for embedding coverage.
-
-Symptom: intent_search returns weak results for WHY/ENTITY
-  -> Graph may be sparse (few A-MEM edges).
-  -> Fix: Run `build_graphs` to add temporal backbone + semantic edges.
-
-Symptom: Watcher fires but collections show 0 docs
-  -> Bun.Glob does not support brace expansion {a,b,c}.
-  -> Fixed: indexer.ts splits brace patterns into individual Glob scans.
-
-Symptom: Watcher fires but wrong collection processes events
-  -> Collection prefix matching returns first match. Parent paths match before children.
-  -> Fixed: cmdWatch() sorts by path length descending (most specific first).
-
-Symptom: reindex --force crashes with UNIQUE constraint
-  -> Force deactivates rows but UNIQUE(collection, path) doesn't discriminate by active flag.
-  -> Fixed: indexer.ts reactivates inactive rows instead of inserting.
-
-Symptom: `clawmem update` crashes with "Binding expected string, TypedArray, boolean, number, bigint or null"
-  -> YAML frontmatter values like `title: 2023-09-27` or `title: true` are coerced by gray-matter
-     into Date objects or booleans. Bun's SQLite driver rejects these as bind parameters.
-  -> Fixed v0.4.2: `parseDocument()` runtime-checks all frontmatter fields via `str()` helper.
-  -> Affects: title, domain, workstream, content_type, review_by.
-
-Symptom: CLI reindex/update falls back to node-llama-cpp
-  -> GPU env vars only in systemd drop-in, not in wrapper script.
-  -> Fixed: bin/clawmem wrapper exports CLAWMEM_EMBED_URL/LLM_URL/RERANK_URL defaults.
-
-Symptom: "UserPromptSubmit hook error" on context-surfacing hook (intermittent)
-  -> SQLite contention between watcher and hook. Watcher processes filesystem events and holds
-     brief write locks. If the hook fires during a lock, it can exceed its timeout. More likely
-     during active conversations with frequent file changes.
-  -> v0.1.6 fix: watcher no longer processes session transcript .jsonl files (only .beads/*.jsonl),
-     eliminating the most common source of contention.
-  -> Default hook timeout is 8s (since v0.1.1). If you have an older install, re-run
-     `clawmem setup hooks`. If persistent, restart the watcher: `systemctl --user restart
-     clawmem-watcher.service`. Healthy memory is under 100MB — if 400MB+, restart clears it.
-  -> v0.2.4 fix: hook's SQLite busy_timeout was 500ms — too tight. During A-MEM enrichment
-     or heavy indexing, watcher write locks exceed 500ms, causing SQLITE_BUSY. Raised to
-     5000ms (matches MCP server). Still completes within the 8s outer timeout.
-  -> Large vault + memory-constrained host (intermittent cold-start, even with llama-server):
-     the first/cold call of a session — or any later turn after the OS evicts the page cache —
-     can exceed 8s from fresh Bun start + opening a large index.sqlite (grows with vault size;
-     multi-hundred-MB to >1GB is the trigger) + re-reading dropped pages, NOT inference. On a
-     memory-pressured host (e.g. WSL2 with a low .wslconfig memory cap) the cache is evicted
-     between turns so it recurs on certain turns. Durable fix: more host RAM so the index + Bun
-     modules stay cached; raising the hook `timeout` in settings.json is a secondary margin.
-     `deep` profile also reranks (wider cold window); `balanced` (default) does not. Full detail:
-     docs/troubleshooting.md -> "Hooks slow or near timeout".
-
-Symptom: WSL hangs or becomes unresponsive during long sessions / watcher has 100K+ FDs
-  -> Pre-v0.2.3: fs.watch(recursive: true) registered inotify watches on EVERY subdirectory,
-     including excluded dirs (gits/, node_modules/, .git/). Broad collection paths like
-     ~/Projects with 67K subdirs exhausted inotify limits.
-  -> v0.2.3 fix: watcher walks dir trees at startup, skips excluded subtrees, watches
-     non-excluded dirs individually. 500-dir cap per collection path.
-  -> Diagnosis: `ls /proc/$(pgrep -f "clawmem.*watch")/fd | wc -l` — healthy < 15K.
-  -> If still high: narrow broad collection paths. See docs/troubleshooting.md.
+memory_retrieve(query) | query(compact=true) | intent_search(why/when/entity) | query_plan(multi-topic) -> multi_get -> search/vsearch (spot checks)
 ```
 
 ---
 
-## CLI Reference
+## Setup / config / internals → AGENTS.md + docs/
 
-Run `clawmem --help` for full command listing.
+This skill is **operations-only**. For installation, inference-server setup (the embedding/LLM/reranker services — the SOTA reranker is a **seq-cls sidecar, not a GGUF**), environment variables, systemd units, indexing/collection config, graph internals, and the OpenClaw (`kind: memory`) / Hermes (`MemoryProvider`) plugins, see [`AGENTS.md`](AGENTS.md) and [`docs/`](docs/):
 
-### IO6 Surface Commands (daemon/`--print` mode)
-
-```bash
-# IO6a: per-prompt context injection (pipe prompt on stdin)
-echo "user query" | clawmem surface --context --stdin
-
-# IO6b: per-session bootstrap injection (pipe session ID on stdin)
-echo "session-id" | clawmem surface --bootstrap --stdin
-```
-
-### Enrichment Commands
-
-```bash
-clawmem reindex --enrich        # Full A-MEM pipeline on ALL docs (entity extraction,
-                                # link generation, memory evolution). Use after major upgrades.
-                                # Without --enrich, reindex only refreshes metadata for changed docs.
-```
-
-### Browse and Analysis
-
-```bash
-clawmem list [-n N] [-c col]    # Browse recent documents (--json for machine output)
-clawmem reflect [N]             # Cross-session reflection (last N days, default 14)
-                                # Recurring themes, antipatterns, co-activation clusters
-clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
-                                # Jaccard similarity within same collection
-```
-
-### Session Focus Topic (v0.9.0 §11.4)
-
-Per-session topic biasing for context-surfacing. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and post-composite-score topic boost (1.4x match / 0.75x demote, NO-OP on zero matches). Session-isolated — never writes to SQLite or lifecycle columns. Session ID resolved from `--session-id <id>` > `CLAUDE_SESSION_ID` env > `CLAWMEM_SESSION_ID` env.
-
-**When to use:** user says "focus on X for this session" / "only surface Y right now" / "let's work on Z." Clear at end of subsession to return to baseline.
-
-```bash
-clawmem focus set "authentication flow"                       # uses CLAUDE_SESSION_ID env
-clawmem focus set "authentication flow" --session-id abc123   # explicit session id
-clawmem focus show --session-id abc123
-clawmem focus clear --session-id abc123
-```
-
-
----
-
-## Integration Notes
-
-- QMD retrieval (BM25, vector, RRF, rerank, query expansion) is forked into ClawMem. Do not call standalone QMD tools.
-- SAME (composite scoring), MAGMA (intent + graph), A-MEM (self-evolving notes) layer on top of QMD substrate.
-- Three inference services on local or remote GPU — `llama-server` for all three in the default stack; the SOTA stack serves the reranker as a transformers sidecar. Wrapper defaults to `localhost:8088/8089/8090`.
-- `CLAWMEM_NO_LOCAL_MODELS=false` (default) allows in-process fallback. Set `true` for remote-only to fail fast.
-- Consolidation worker (`CLAWMEM_ENABLE_CONSOLIDATION=true`) backfills unenriched docs and runs Phase 2 merge / Phase 3 deductive synthesis. **v0.8.2:** hosted by either `clawmem watch` (long-lived, canonical) or `clawmem mcp` (per-session fallback); every tick acquires a `light-consolidation` `worker_leases` row before doing work, so dual-hosting against the same vault is safe.
-- Beads integration: `syncBeadsIssues()` queries `bd` CLI (Dolt backend, v0.58.0+), creates markdown docs, maps dependency edges into `memory_relations`. Watcher auto-triggers on `.beads/` changes; `beads_sync` MCP for manual sync.
-- HTTP REST API: `clawmem serve [--port 7438]` — optional REST server on localhost. Search, retrieval, lifecycle, and graph traversal. `POST /retrieve` mirrors `memory_retrieve` with auto-routing (keyword/semantic/causal/timeline/hybrid). `POST /search` provides direct mode selection. Bearer token auth via `CLAWMEM_API_TOKEN` env var (disabled if unset).
-- OpenClaw memory plugin (v0.10.0+): `clawmem setup openclaw` — registers as native OpenClaw memory plugin (`kind: memory`). Dual-mode: shares vault with Claude Code hooks. Hook wiring on the plugin-hook bus: `before_prompt_build` is the **load-bearing** path — it runs prompt-aware retrieval AND the pre-emptive `precompact-extract` synchronously when token usage approaches the compaction threshold, so state is captured before the LLM call that could trigger compaction. `agent_end` runs decision-extractor + handoff-generator + feedback-loop in parallel (fire-and-forget at OpenClaw's call site, plus a 30s default void-hook timeout from OpenClaw v2026.4.26+ that logs slow handlers but does not cancel the underlying postrun work). `before_compaction` is **defense-in-depth fallback only** — fire-and-forget, races the compactor, exists for the rare case where the proximity heuristic in `before_prompt_build` missed a sudden token jump. `session_start` registers the session + caches first-turn bootstrap context. The §14.3 migration removed the `ClawMemContextEngine` class and moved the plugin from the `context-engine` slot to the `memory` slot. Requires OpenClaw v2026.4.11+ (earlier versions do not support the new discovery contract).
-- Hermes Agent MemoryProvider plugin: `src/hermes/` — Python plugin for Hermes's memory system. Shell-out hooks for lifecycle (prefetch, extraction, precompact), REST API for tools. Plugin-managed transcript JSONL bridges Hermes turn pairs to ClawMem file format. Shares vault with Claude Code and OpenClaw. **Preferred install path:** `$HERMES_HOME/plugins/clawmem/` (Hermes #10529 user-plugin discovery, v2026.4.13+) — survives `git pull` of hermes-agent. The bundled `hermes-agent/plugins/memory/clawmem/` path still works. **Agent-context isolation:** read-side hooks always run; write-side surfaces (`sync_turn`, `on_session_end`, `on_pre_compress`) early-return when `agent_context != "primary"` so cron/subagent state never reaches the vault.
-
-## Tool Selection (one-liner)
-
-```
-ClawMem escalation: memory_retrieve(query) | query(compact=true) | intent_search(why/when/entity) | query_plan(multi-topic) -> multi_get -> search/vsearch (spot checks)
-```
-
-## Curator Agent
-
-Maintenance agent for Tier 3 operations the main agent typically neglects. Install with `clawmem setup curator`.
-
-**Invoke:** "curate memory", "run curator", or "memory maintenance"
-
-**6 phases:**
-1. Health snapshot — status, index_stats, lifecycle_status, doctor
-2. Lifecycle triage — pin high-value unpinned memories, snooze stale content, propose forget candidates (never auto-confirms)
-3. Retrieval health check — 5 probes (BM25, vector, hybrid, intent/graph, lifecycle)
-4. Maintenance — reflect (cross-session patterns), consolidate --dry-run (dedup candidates)
-5. Graph rebuild — conditional on probe results and embedding state
-6. Collection hygiene — orphan detection, content type distribution
-
-**Safety rails:** Never auto-confirms forget. Never runs embed (timer's job). Never modifies config.yaml. All destructive proposals require user approval.
+- Inference stack choice + server setup → [`docs/guides/inference-services.md`](docs/guides/inference-services.md)
+- All environment variables → [`docs/reference/configuration.md`](docs/reference/configuration.md)
+- Cloud embedding → [`docs/guides/cloud-embedding.md`](docs/guides/cloud-embedding.md)
+- Setup (hooks / mcp / systemd) → [`docs/guides/setup-hooks.md`](docs/guides/setup-hooks.md), [`docs/guides/setup-mcp.md`](docs/guides/setup-mcp.md), [`docs/guides/systemd-services.md`](docs/guides/systemd-services.md)
+- Internals (pipelines, graph, entities) → [`docs/internals/`](docs/internals/)
+- OpenClaw / Hermes plugins → [`docs/guides/openclaw-plugin.md`](docs/guides/openclaw-plugin.md), [`docs/guides/hermes-plugin.md`](docs/guides/hermes-plugin.md)
+- Troubleshooting → [`docs/troubleshooting.md`](docs/troubleshooting.md)

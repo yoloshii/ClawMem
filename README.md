@@ -114,8 +114,8 @@ After installing, here's the full journey from zero to working memory:
 | Step | What | How | Details |
 |------|------|-----|---------|
 | **1. Bootstrap** | Create a vault, index your first collection, embed, install hooks and MCP | `clawmem bootstrap ~/notes --name notes` | One command does it all. Or run each step manually (see below). |
-| **2. Choose models** | Pick embedding + reranker models based on your hardware | 16GB+ VRAM → SOTA stack (zembed-1 + zerank-2 sidecar). Less → QMD native combo. No GPU → cloud embedding or CPU fallback. | [GPU Services](#gpu-services) |
-| **3. Download models** | Get the model files for your chosen stack (GGUFs for embedding/LLM/default-reranker; the zerank-2 SOTA reranker builds its own sidecar artifact) | `wget` from HuggingFace, let `node-llama-cpp` auto-download the QMD native models, or run the sidecar recipe | [Embedding](#embedding), [LLM Server](#llm-server), [Reranker Server](#reranker-server) |
+| **2. Choose models** | Pick embedding + reranker models based on your hardware | 16GB+ VRAM → SOTA stack (zembed-1 + zerank-2 sidecar). Less → QMD native combo. No GPU → cloud embedding or CPU fallback. | [Inference services](docs/guides/inference-services.md) |
+| **3. Download models** | Get the model files for your chosen stack (GGUFs for embedding/LLM/default-reranker; the zerank-2 SOTA reranker builds its own sidecar artifact) | `wget` from HuggingFace, let `node-llama-cpp` auto-download the QMD native models, or run the sidecar recipe | [Inference services](docs/guides/inference-services.md) |
 | **4. Start services** | Run GPU servers (if using dedicated GPU) and background services. Optionally enable the v0.8.2 background maintenance workers in the watcher unit so consolidation + deductive synthesis run automatically. | `llama-server` for each model. systemd units for watcher + embed timer. Drop-in for the watcher to enable workers + tune intervals + set the quiet window. | [systemd services](docs/guides/systemd-services.md), [background workers](docs/guides/systemd-services.md#background-maintenance-workers-v082) |
 | **5. Decide what to index** | Add collections for your projects, notes, research, and domain docs | `clawmem collection add ~/project --name project` | The more relevant markdown you index, the better retrieval works. See [building a rich context field](docs/introduction.md#building-a-rich-context-field). |
 | **6. Connect your agent** | Hook into Claude Code, OpenClaw, Hermes, or any MCP client | `clawmem setup hooks && clawmem setup mcp` for Claude Code. `clawmem setup openclaw` for OpenClaw. Copy `src/hermes/` to Hermes plugins for Hermes. | [Integration](#integration) |
@@ -303,193 +303,21 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 **Single-vault users:** No action needed. Everything works without configuration. The `vault` parameter is always optional and ignored when no vaults are configured.
 
-### GPU Services
+### Inference services (GPU, in-process, or cloud)
 
-ClawMem uses three inference services — embedding, LLM, and reranker. In the **default** stack all three run as `llama-server` (llama.cpp) instances, each with an in-process `node-llama-cpp` fallback (auto-downloads on first use), so ClawMem works without a dedicated GPU. (The **SOTA** reranker is the exception — it is a transformers sidecar, see [Reranker Server](#reranker-server).) `node-llama-cpp` auto-detects the best available backend — Metal on Apple Silicon, Vulkan where available, CPU as last resort. With GPU acceleration (Metal/Vulkan), in-process inference is fast for these small models (0.3B–1.7B); on CPU-only systems it is significantly slower. For production use, run the servers via [systemd services](docs/guides/systemd-services.md) to prevent silent fallback.
+ClawMem uses three inference services — **embedding**, **LLM** (query expansion / intent / A-MEM), and **reranker**. In the **default** stack all three run as `llama-server` instances, each with an in-process `node-llama-cpp` fallback that auto-downloads on first use, so ClawMem works without a dedicated GPU (Metal on Apple Silicon, Vulkan where available, CPU as last resort). The `bin/clawmem` wrapper points at `localhost:8088/8089/8090`. **Always run via `bin/clawmem`** — it sets the endpoints.
 
-**GPU with VRAM to spare (16GB+, recommended):** ZeroEntropy's distillation-paired stack delivers best retrieval quality — total ~16GB VRAM.
+**Choose a stack:**
 
-| Service | Port | Model | VRAM | Purpose |
+| Stack | Models | VRAM | License | When |
 |---|---|---|---|---|
-| Embedding | 8088 | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) | ~4.4GB | SOTA embedding (2560d, 32K context). Distilled from zerank-2 via zELO. |
-| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
-| Reranker | 8090 | [zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/) | ~9GB (bf16) | SOTA reranker. NDCG@10 ahead of Cohere rerank-3.5. Optimal pairing with zembed-1. |
+| **QMD native** (default) | EmbeddingGemma-300M + qmd-query-expansion-1.7B + qwen3-reranker-0.6B | ~4 GB, or in-process | **Permissive — commercial OK** | Any GPU or none; commercial use; zero-config start |
+| **z / SOTA** | zembed-1 + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** | ~16 GB | **CC-BY-NC-4.0 — non-commercial only** | 16 GB+ GPU and non-commercial; best recall |
+| **Cloud embedding** | Jina / OpenAI / Voyage / Cohere (embedding only) | none | provider ToS | No local GPU for embedding; LLM + reranker stay local |
 
-**The SOTA reranker is a sidecar, not a GGUF.** It is served by the [zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/) (transformers, bf16). The previously-listed `zerank-2-Q4_K_M` GGUF is **deprecated** — llama.cpp's converter drops zerank's score head, so under `--reranking` it produces near-zero, uninformative scores (final ordering stays RRF-dominated). See the [sidecar README](extras/rerankers/zerank-2-seq/) and [Reranker Server](#reranker-server).
+**Heads-up before you serve:** the zerank-2 **GGUF is deprecated and inert** — llama.cpp drops its score head, so the SOTA reranker must run as the [seq-cls sidecar](extras/rerankers/zerank-2-seq/), not a GGUF (verify with `clawmem rerank-health`). zembed-1 / reranking need `-ub` = `-b` (non-causal attention). Changing embedding dimensions requires `clawmem embed --force`. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of silent CPU fallback.
 
-**Important:** zembed-1 uses non-causal attention — `-ub` must equal `-b` on llama-server (e.g. `-b 2048 -ub 2048`). See [Embedding](#embedding) for details.
-
-**License:** zembed-1 and zerank-2 are released under **CC-BY-NC-4.0** — non-commercial only. The QMD native models below have no such restriction.
-
-**No dedicated GPU / GPU without VRAM to spare:** The QMD native combo — total ~4GB VRAM, also runs via `node-llama-cpp` (Metal on Apple Silicon, Vulkan where available, CPU as last resort). Fast with GPU acceleration; significantly slower on CPU-only.
-
-| Service | Port | Model | VRAM | Purpose |
-|---|---|---|---|---|
-| Embedding | 8088 | [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | ~400MB | Vector search, indexing, context-surfacing (768d, 2K context) |
-| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~2.2GB | Intent classification, query expansion, A-MEM |
-| Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~1.3GB | Cross-encoder reranking (query, intent_search) |
-
-The `bin/clawmem` wrapper defaults to `localhost:8088/8089/8090`. If a server is unreachable (transport error like ECONNREFUSED/ETIMEDOUT), ClawMem sets a 60-second cooldown and falls back to in-process inference via `node-llama-cpp` (auto-downloads the QMD native models on first use, uses Metal/Vulkan/CPU depending on hardware). HTTP errors (400/500) and user-cancelled requests do not trigger cooldown — the remote server is retried normally on the next call. With GPU acceleration the fallback is fast; on CPU-only it is significantly slower. ClawMem always works either way, but **if you're running dedicated GPU servers, use [systemd services](docs/guides/systemd-services.md) to ensure they stay up**.
-
-To prevent fallback and fail fast instead, set `CLAWMEM_NO_LOCAL_MODELS=true`.
-
-#### Remote GPU (optional)
-
-If your GPU lives on a separate machine, point the env vars at it:
-
-```bash
-export CLAWMEM_EMBED_URL=http://gpu-host:8088
-export CLAWMEM_LLM_URL=http://gpu-host:8089
-export CLAWMEM_LLM_MODEL=qwen3
-export CLAWMEM_RERANK_URL=http://gpu-host:8090
-```
-
-For remote setups, set `CLAWMEM_NO_LOCAL_MODELS=true` to prevent `node-llama-cpp` from auto-downloading multi-GB model files if a server is unreachable.
-
-#### No Dedicated GPU (in-process inference)
-
-All three QMD native models run locally without a dedicated GPU. `node-llama-cpp` auto-downloads them on first use (~300MB embedding + ~1.1GB LLM + ~600MB reranker) and auto-detects the best backend — **Metal on Apple Silicon** (fast, uses integrated GPU), **Vulkan where available** (fast, uses discrete or integrated GPU), or **CPU as last resort** (significantly slower). With Metal or Vulkan, in-process inference handles these small models well; CPU-only is functional but noticeably slower.
-
-Alternatively, use a [cloud embedding provider](#option-c-cloud-embedding-api) if you prefer not to run models locally.
-
-### Embedding
-
-ClawMem calls the OpenAI-compatible `/v1/embeddings` endpoint for all embedding operations. This works with local llama-server instances and cloud providers alike.
-
-#### Option A: GPU with VRAM to spare (recommended)
-
-Use [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) — SOTA retrieval quality, distilled from zerank-2 via [ZeroEntropy's zELO methodology](https://docs.zeroentropy.dev). **CC-BY-NC-4.0** — non-commercial only.
-
-- Size: 2.4GB, Dimensions: 2560, VRAM: ~4.4GB, Context: 32K tokens
-
-```bash
-wget https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF/resolve/main/zembed-1-Q4_K_M.gguf
-
-# -ub must match -b for non-causal attention
-llama-server -m zembed-1-Q4_K_M.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 \
-  -ngl 99 -c 8192 -b 2048 -ub 2048
-```
-
-#### Option B: No GPU / GPU without VRAM to spare
-
-Use [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) — the QMD native embedding model. Only 300MB, runs on CPU or any GPU.
-
-- Size: 314MB, Dimensions: 768, VRAM: ~400MB (or CPU), Context: 2048 tokens
-
-```bash
-wget https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
-
-# On GPU (add -ngl 99):
-llama-server -m embeddinggemma-300M-Q8_0.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 \
-  -ngl 99 -c 2048 --batch-size 2048
-
-# On CPU (omit -ngl):
-llama-server -m embeddinggemma-300M-Q8_0.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 \
-  -c 2048 --batch-size 2048
-```
-
-For multilingual corpora, the SOTA zembed-1 (Option A) supports multilingual out of the box. For a lightweight alternative: [granite-embedding-278m-multilingual-Q6_K](https://huggingface.co/bartowski/granite-embedding-278m-multilingual-GGUF) (314MB, set `CLAWMEM_EMBED_MAX_CHARS=1100` due to 512-token context).
-
-#### Option C: Cloud Embedding API
-
-Alternatively, use a cloud embedding provider instead of running a local server. Any provider with an OpenAI-compatible `/v1/embeddings` endpoint works.
-
-**Configuration:** Copy `.env.example` to `.env` and set your provider credentials:
-
-```bash
-cp .env.example .env
-# Edit .env:
-CLAWMEM_EMBED_URL=https://api.jina.ai
-CLAWMEM_EMBED_API_KEY=jina_your-key-here
-CLAWMEM_EMBED_MODEL=jina-embeddings-v5-text-small
-```
-
-Or export them in your shell. **Precedence:** shell environment > `.env` file > `bin/clawmem` wrapper defaults.
-
-| Provider | `CLAWMEM_EMBED_URL` | `CLAWMEM_EMBED_MODEL` | Dimensions | Notes |
-|---|---|---|---|---|
-| Jina AI | `https://api.jina.ai` | `jina-embeddings-v5-text-small` | 1024 | 32K context, task-specific LoRA adapters |
-| OpenAI | `https://api.openai.com` | `text-embedding-3-small` | 1536 | 8K context, Matryoshka dimensions via `CLAWMEM_EMBED_DIMENSIONS` |
-| Voyage AI | `https://api.voyageai.com` | `voyage-4-large` | 1024 | 32K context |
-| Cohere | `https://api.cohere.com` | `embed-v4.0` | 1024 | 128K context |
-
-Cloud mode auto-detects your provider from the URL and sends the right parameters (Jina `task`, Voyage/Cohere `input_type`, OpenAI `dimensions`). Batch embedding (50 fragments/request), server-side truncation, adaptive TPM-aware pacing, and retry with jitter are all handled automatically. Set `CLAWMEM_EMBED_TPM_LIMIT` to match your provider tier (default: 100000). See [docs/guides/cloud-embedding.md](docs/guides/cloud-embedding.md) for full details.
-
-**Note:** Cloud providers handle their own context window limits — ClawMem skips client-side truncation when an API key is set. Local llama-server truncates at `CLAWMEM_EMBED_MAX_CHARS` (default: 6000 chars).
-
-#### Verify and embed
-
-```bash
-# Verify endpoint is reachable
-curl $CLAWMEM_EMBED_URL/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CLAWMEM_EMBED_API_KEY" \
-  -d "{\"input\":\"test\",\"model\":\"$CLAWMEM_EMBED_MODEL\"}"
-
-# Embed your vault
-./bin/clawmem embed
-```
-
-### LLM Server
-
-Intent classification, query expansion, and A-MEM extraction use [qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) — a Qwen3-1.7B finetuned by QMD specifically for generating search expansion terms (hyde, lexical, and vector variants). ~1.1GB at q4_k_m quantization, served via `llama-server` on port 8089.
-
-**Without a server:** If `CLAWMEM_LLM_URL` is unset, `node-llama-cpp` auto-downloads the model on first use.
-
-**Performance (RTX 3090):**
-- Intent classification: **27ms**
-- Query expansion: **333 tok/s**
-- VRAM: ~2.2-2.8GB depending on quantization
-
-**Qwen3 /no_think flag:** Qwen3 uses thinking tokens by default. ClawMem appends `/no_think` to all prompts automatically to get structured output in the `content` field.
-
-**Intent classification:** Uses a dual-path approach:
-1. **Heuristic regex classifier** (instant) — handles strong signals (why/when/who keywords) with 0.8+ confidence
-2. **LLM refinement** (27ms on GPU) — only for ambiguous queries below 0.8 confidence
-
-**Server setup:**
-
-```bash
-# Download the finetuned model
-wget https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf/resolve/main/qmd-query-expansion-1.7B-q4_k_m.gguf
-
-# Start llama-server for LLM inference
-llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
-  --port 8089 --host 0.0.0.0 \
-  -ngl 99 -c 4096 --batch-size 512
-```
-
-### Reranker Server
-
-Cross-encoder reranking for `query` and `intent_search` pipelines on port 8090. ClawMem calls the `/v1/rerank` endpoint (or falls back to scoring via `/v1/completions` for compatible servers).
-
-Scores each candidate against the original query (cross-encoder architecture). `query` pipeline: 4000 char context per doc (deep reranking); `intent_search`: 200 char context per doc (fast reranking).
-
-**GPU with VRAM to spare (recommended):** the **[zerank-2 seq-cls sidecar](extras/rerankers/zerank-2-seq/)** (bf16, ~9GB VRAM). zerank-2's NDCG@10 is ahead of Cohere rerank-3.5 and Gemini 2.5 Flash. Optimal pairing with zembed-1 (same distillation architecture via zELO). **CC-BY-NC-4.0** — non-commercial only.
-
-zerank-2 is **not** servable as a llama.cpp GGUF — its CrossEncoder/LogitScore head is dropped by the GGUF converter (the model becomes a headless causal LM that produces near-zero, uninformative scores under `--reranking`, leaving final ordering RRF-dominated). The sidecar serves the real head via transformers, with a reproducible correctness gate:
-
-```bash
-cd extras/rerankers/zerank-2-seq
-docker compose build
-HF_TOKEN=hf_xxx docker compose run --rm convert   # download + convert + verify (all gates must pass)
-docker compose up -d reranker                      # serves /v1/rerank on :8090
-```
-
-**CPU / GPU without VRAM to spare:** [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600MB, ~1.3GB VRAM). The QMD native reranker — auto-downloaded by `node-llama-cpp` if no server is running.
-
-```bash
-wget https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/Qwen3-Reranker-0.6B-Q8_0.gguf
-
-llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
-  --reranking --port 8090 --host 0.0.0.0 \
-  -ngl 99 -c 2048 --batch-size 512
-```
-
-**Note:** zembed-1 (embedding) uses non-causal attention — `-ub` (ubatch) must equal `-b` (batch); omitting `-ub` or setting it lower causes assertion crashes. The qwen3-reranker-0.6B GGUF does not have this requirement, and the zerank-2 sidecar is served via transformers (no llama.cpp batch flags). See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
+→ **Full stack decision matrix, model/VRAM tables, and server-setup commands:** [docs/guides/inference-services.md](docs/guides/inference-services.md). Cloud providers, batch + TPM behavior: [docs/guides/cloud-embedding.md](docs/guides/cloud-embedding.md). All environment variables: [docs/reference/configuration.md](docs/reference/configuration.md). Keeping servers running: [docs/guides/systemd-services.md](docs/guides/systemd-services.md).
 
 ### MCP Server
 
@@ -574,22 +402,23 @@ bun test               # Run test suite
 
 ## Agent Instructions
 
-ClawMem ships three instruction files and an optional maintenance agent:
+ClawMem ships agent instruction files and an optional maintenance agent:
 
 | File | Loaded | Purpose |
 |------|--------|---------|
-| `CLAUDE.md` | Automatically (Claude Code, when working in this repo) | Complete operational reference — hooks, tools, query optimization, scoring, pipeline details, troubleshooting |
-| `AGENTS.md` | Framework-dependent | Identical to CLAUDE.md — cross-framework compatibility (Cursor, Windsurf, Codex, etc.) |
-| `SKILL.md` | On-demand (agent reads when needed) | Same reference as CLAUDE.md, shipped with the package for cross-project use |
+| `AGENTS.md` | Automatically (most agents, when working in this repo) | **Lean root SSOT** — agent-facing quick reference (inference at a glance, install, retrieval routing, MCP tools, indexing rules, integrations) + an index into `docs/` |
+| `CLAUDE.md` | Automatically (Claude Code) | `@AGENTS.md` import — Claude Code reads `CLAUDE.md` natively, so it just pulls in the SSOT |
+| `SKILL.md` | On-demand (agent reads when needed) | Portable operating reference — escalation gate, tool routing, the 4 query-optimization levers, pipeline behavior, composite scoring, lifecycle. Shipped with the package for cross-project use |
+| `docs/` | On-demand (linked throughout `AGENTS.md`) | Deep reference — inference setup, configuration, concepts, internals, guides, troubleshooting |
 | `agents/clawmem-curator.md` | On-demand via `clawmem setup curator` | Maintenance agent — lifecycle triage, retrieval health checks, dedup sweeps, graph rebuilds |
 
-**Working in the ClawMem repo:** No action needed — `CLAUDE.md` loads automatically.
+**Working in the ClawMem repo:** No action needed — `CLAUDE.md` (which imports `AGENTS.md`) loads automatically.
 
 **Using ClawMem from other projects:** Your agent needs instructions on how to use ClawMem's hooks and MCP tools. Two options:
 
 ### Option A: Copy instructions into your project
 
-Copy the contents of `CLAUDE.md` (or the relevant sections) into your project's own `CLAUDE.md` or `AGENTS.md`. Simple but requires manual updates when ClawMem changes.
+Copy the contents of `AGENTS.md` (or the relevant sections) into your project's own `AGENTS.md` or `CLAUDE.md`. Simple but requires manual updates when ClawMem changes.
 
 ### Option B: Add a trigger block (recommended)
 
@@ -645,7 +474,7 @@ ALWAYS `compact=true` first → review → `multi_get` for full content.
 - Do NOT forget memories to "clean up" — let confidence decay handle it
 - Do NOT wait for curator to pin decisions — pin immediately when critical
 
-For detailed operational guidance (query optimization, troubleshooting, collection setup, embedding workflow, graph building, curator), find and read the shipped SKILL.md:
+For detailed operating guidance (escalation gate, tool routing, query-optimization levers, pipeline behavior, composite scoring, lifecycle), find and read the shipped SKILL.md (setup, inference, and internals live in AGENTS.md + docs/):
   Bash: CLAWMEM_ROOT=$(cd "$(dirname "$(which clawmem)")/.." && pwd) && echo "$CLAWMEM_ROOT/SKILL.md"
   Then: Read the file at that path.
 ```
@@ -1153,7 +982,7 @@ clawmem serve --port 7438 &
 
 ## Deployment
 
-Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box without a dedicated GPU (all models auto-download via `node-llama-cpp`, uses Metal on Apple Silicon). For best performance, run the inference services on GPU (three `llama-server` instances in the default stack; the SOTA reranker is a transformers sidecar) — see [GPU Services](#gpu-services) for model tiers (SOTA vs QMD native) and [Cloud Embedding](#option-c-cloud-embedding-api) for cloud embedding alternatives.
+Three-tier retrieval architecture: infrastructure (watcher + embed timer) → hooks (~90%) → agent MCP (~10%). Works out of the box without a dedicated GPU (all models auto-download via `node-llama-cpp`, uses Metal on Apple Silicon). For best performance, run the inference services on GPU (three `llama-server` instances in the default stack; the SOTA reranker is a transformers sidecar) — see [Inference services](docs/guides/inference-services.md) for model tiers (SOTA vs QMD native) and [cloud embedding](docs/guides/cloud-embedding.md) for cloud embedding alternatives.
 
 Key services: `clawmem-watcher` (auto-index on file change + beads sync), `clawmem-embed` timer (daily embedding sweep), 7 Claude Code hooks installed by default (context injection, curator nudge, compaction support, decision extraction, handoffs, feedback). Optional `clawmem-curator` agent for on-demand lifecycle triage, retrieval health checks, and maintenance (`clawmem setup curator`).
 

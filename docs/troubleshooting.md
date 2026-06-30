@@ -187,7 +187,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 | Cloud embedding (`CLAWMEM_EMBED_API_KEY` set) | ~500ms | HTTP call to cloud provider, no `node-llama-cpp` needed. |
 
 - **Fix by setup type:**
-  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [GPU Services](../README.md#gpu-services) for setup. This is what most users will do in practice.
+  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [the inference services guide](guides/inference-services.md) for setup. This is what most users will do in practice.
   - **Quick:** Set `CLAWMEM_PROFILE=speed` — disables vector search in hooks entirely, pure BM25, never loads `node-llama-cpp`. Hooks complete in under 500ms.
   - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
   - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.

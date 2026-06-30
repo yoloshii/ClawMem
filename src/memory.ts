@@ -22,6 +22,7 @@ export const HALF_LIVES: Record<string, number> = {
   decision: Infinity,
   deductive: Infinity,
   hub: Infinity,
+  antipattern: Infinity,
 };
 
 // =============================================================================
@@ -33,6 +34,7 @@ export const TYPE_BASELINES: Record<string, number> = {
   deductive: 0.85,
   preference: 0.80,
   hub: 0.80,
+  antipattern: 0.75,
   problem: 0.75,
   research: 0.70,
   milestone: 0.70,
