@@ -183,14 +183,24 @@ export async function contextSurfacing(
   // When vector succeeds, also supplement with FTS for keyword-exact recall
   let results: SearchResult[] = [];
   if (profile.useVector) {
+    let vectorTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const vectorPromise = store.searchVec(retrievalQuery, DEFAULT_EMBED_MODEL, maxResults);
-      const timeoutPromise = new Promise<SearchResult[]>((_, reject) =>
-        setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout)
-      );
+      // Pass a wall-clock deadline into searchVec: the Promise.race below abandons the vector
+      // promise on timeout but cannot CANCEL it (and cannot interrupt its synchronous scan). The
+      // deadline makes searchVec self-abort before the blocking MATCH, so a slow embed cannot let
+      // an already-timed-out vector leg resume and re-block the hook after it fell back to FTS.
+      const vectorDeadline = Date.now() + profile.vectorTimeout;
+      const vectorPromise = store.searchVec(retrievalQuery, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline);
+      const timeoutPromise = new Promise<SearchResult[]>((_, reject) => {
+        vectorTimer = setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout);
+      });
       results = await Promise.race([vectorPromise, timeoutPromise]);
     } catch {
       // Vector search unavailable, timed out, or errored — fall back to BM25
+    } finally {
+      // Clear the timer when the vector promise won the race: a pending (ref'd) setTimeout keeps the
+      // Bun hook process alive for the full vectorTimeout after results are already in hand.
+      if (vectorTimer) clearTimeout(vectorTimer);
     }
   }
 
@@ -269,7 +279,21 @@ export async function contextSurfacing(
             if (eq.type === 'lex') {
               hits = store.searchFTS(eq.query, 5);
             } else if (profile.useVector) {
-              try { hits = await store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 5); } catch { /* vector leg non-fatal */ }
+              // Bound BOTH the async embed wait (Promise.race on the remaining 6s budget) AND the
+              // late synchronous MATCH (the deadline arg makes the abandoned promise self-abort
+              // before the scan) — mirroring the balanced leg above. The loop guard only breaks
+              // BETWEEN iterations, so without the race a slow embed here can still blow the budget.
+              const remainingMs = startTime + 6000 - Date.now();
+              if (remainingMs <= 0) break;
+              let deepTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const deepVec = store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, startTime + 6000);
+                const deepTimeout = new Promise<SearchResult[]>((_, reject) => {
+                  deepTimer = setTimeout(() => reject(new Error("vector timeout")), remainingMs);
+                });
+                hits = await Promise.race([deepVec, deepTimeout]);
+              } catch { /* vector leg non-fatal (timed out or errored) */ }
+              finally { if (deepTimer) clearTimeout(deepTimer); }  // don't let a pending timer keep the hook process alive
             }
             for (const r of hits) {
               if (!seen.has(r.filepath)) {

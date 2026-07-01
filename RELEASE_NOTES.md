@@ -4,6 +4,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.16.0 — Fix: `context-surfacing` UserPromptSubmit hook intermittently times out
+
+The `context-surfacing` hook could intermittently exceed its UserPromptSubmit budget ("hook timed out — output discarded"), especially on the first prompt after a fresh boot and across concurrent sessions. The dominant cause was **not** inference or host memory: the vector leg ran a *synchronous* `sqlite-vec` scan that the `Promise.race(vectorTimeout)` guard could not bound (a synchronous call blocks the event loop, so the timer never fires), and every writable hook open ran an unconditional backfill `UPDATE` that could wait out `busy_timeout` under writer contention.
+
+- **Bounded vector search on the hook path.** `searchVec` now takes a wall-clock deadline and self-aborts before the blocking `MATCH` if the budget elapsed during the async embed. Both the balanced and deep-escalation vector legs race the embed against the remaining budget and clear their timers, so a pending timer no longer keeps the hook process alive after results are in hand.
+- **No write lock on a healthy init.** The `last_accessed_at` backfill is read-guarded (skipped when nothing needs it) and `initializeDatabase`'s `busy_timeout` is capped to the caller's value, so a writable hook open no longer waits out the init `busy_timeout` under contention.
+- **Watcher-side vector prewarm.** A single embed-independent prewarm (a zero-vector `MATCH`) warms the sqlite-vec payload into the OS page cache on watcher startup so the first post-boot hook call isn't cold. It runs only in the watcher process (never per-session), reports success only when a scan actually ran, and never blocks startup.
+
+Cross-model reviewed (GPT-5.5, five rounds to zero findings). New tests: `tests/unit/hook-timeout-fix.test.ts`.
+
 ## v0.15.1 — Fix: macOS bootstrap fails to load the sqlite-vec extension (Issue #20)
 
 On macOS, `clawmem bootstrap` (and `clawmem doctor`) failed at the database step with `This build of sqlite3 does not support dynamic extension loading`. Apple's built-in SQLite — which Bun uses by default — is compiled without extension-loading support, so the `sqlite-vec` vector extension cannot load. The prior macOS handling probed only the Apple-Silicon Homebrew path and swallowed the failure silently, so a fresh macOS install with no `brew install sqlite` (and Intel Macs, whose Homebrew prefix differs) hit the bare extension-loading error with no guidance. Yoloshii/ClawMem#20.

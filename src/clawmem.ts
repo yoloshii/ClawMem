@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readFileSync } from "fs";
 import { resolve as pathResolve, basename } from "path";
 import {
   createStore,
+  prewarmVectors,
   enableProductionMode,
   getDefaultDbPath,
   canonicalDocId,
@@ -1885,6 +1886,20 @@ async function cmdWatch() {
     console.log(`${c.dim}[watch] Starting heavy maintenance lane worker${c.reset}`);
     stopHeavyLane = startHeavyMaintenanceWorker(s, llm, cfg);
   }
+
+  // Prewarm the sqlite-vec chunks into OS page cache ONCE, in the single long-lived watcher
+  // process only (never in the per-session MCP processes — N concurrent cold scans would be an
+  // I/O storm). The context-surfacing UserPromptSubmit hook runs a SYNCHRONOUS sqlite-vec MATCH
+  // that cannot be time-bounded in-thread (bun:sqlite exposes no interrupt); a cold ~1.5 GB scan
+  // can blow the hook's 8-15s budget. A single warm scan here keeps the hook-path scan sub-second.
+  // Deferred + best-effort so it never delays watcher startup and never throws.
+  setTimeout(() => {
+    try {
+      // prewarmVectors is embed-independent and returns true ONLY when a scan actually ran,
+      // so we never log a false-positive "prewarmed" (embed down at boot / no vectors yet).
+      if (prewarmVectors(s.db)) console.log(`${c.dim}[watch] vector cache prewarmed${c.reset}`);
+    } catch { /* best-effort: unexpected SQL error */ }
+  }, 0);
 
   watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,

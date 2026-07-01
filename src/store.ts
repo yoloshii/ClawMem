@@ -365,7 +365,7 @@ function loadVecExtension(db: Database): void {
   }
 }
 
-function initializeDatabase(db: Database): void {
+function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // Set busy_timeout FIRST so subsequent PRAGMAs (journal_mode in particular,
   // which acquires a write lock when switching or initializing WAL state) wait
   // instead of returning SQLITE_BUSY when concurrent Stop hooks
@@ -373,10 +373,12 @@ function initializeDatabase(db: Database): void {
   // before_reset hook fan-out in src/openclaw/engine.ts — open the DB
   // simultaneously. busy_timeout is a connection-level setting that only
   // governs *subsequent* statements (default busy handler is NULL → SQLITE_BUSY
-  // returns immediately), so it must precede the contending PRAGMAs. 15s is
-  // well within the 30s Stop hook timeout. createStore() resets to operational
+  // returns immediately), so it must precede the contending PRAGMAs. The init
+  // busy_timeout defaults to 15s (well within the 30s Stop hook timeout) but is
+  // capped to the caller's opts.busyTimeout — hook opens pass 5000 so init cannot
+  // wait out the 8-15s UserPromptSubmit budget. createStore() resets to operational
   // value (5000ms or opts.busyTimeout) after DDL completes. Issue #13.
-  db.exec("PRAGMA busy_timeout = 15000");
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   loadVecExtension(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -450,9 +452,17 @@ function initializeDatabase(db: Database): void {
     }
   }
 
-  // Backfill last_accessed_at from modified_at for existing docs
+  // Backfill last_accessed_at from modified_at for existing docs.
+  // Guarded by a read first: on an already-backfilled DB the UPDATE is skipped, so a writable
+  // open takes NO write lock here and cannot wait on busy_timeout under concurrent writers.
+  // (The unconditional UPDATE previously ran on EVERY writable open — including the
+  // context-surfacing UserPromptSubmit hook — and could block up to busy_timeout when another
+  // process held the write lock, pushing the hook past its 8-15s deadline.)
   try {
-    db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+    const needsBackfill = db.prepare(`SELECT 1 FROM documents WHERE last_accessed_at IS NULL LIMIT 1`).get();
+    if (needsBackfill) {
+      db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+    }
   } catch { /* ignore if already backfilled */ }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
@@ -1137,6 +1147,22 @@ export function getVecTableDim(db: Database): number | null {
 }
 
 /**
+ * Prewarm the sqlite-vec payload into OS page cache with a single brute-force MATCH using a ZERO
+ * query vector. Decoupled from the embedding server on purpose — it works when the embed server is
+ * down at boot or CLAWMEM_NO_LOCAL_MODELS=true, unlike a searchVec()-based prewarm (which embeds
+ * first and would silently no-op). Returns true ONLY if a scan actually ran (a vector table with a
+ * known dimension exists), so callers never log a false-positive "warmed". The k-NN MATCH is
+ * brute-force, so it touches every vector chunk — exactly the payload we want cache-resident.
+ */
+export function prewarmVectors(db: Database): boolean {
+  const dim = getVecTableDim(db);
+  if (!dim || dim <= 0) return false;
+  const zero = new Float32Array(dim);
+  db.prepare(`SELECT hash_seq FROM vectors_vec WHERE embedding MATCH ? AND k = ?`).all(zero, 1);
+  return true;
+}
+
+/**
  * The DISTINCT non-empty embedding models stored in the vault (empty array if no
  * embeddings exist). Used to detect model drift BETWEEN runs — a different model at
  * the SAME dimension produces a heterogeneous vector space that dimension checks
@@ -1204,7 +1230,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1339,7 +1365,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     ? new Database(resolvedPath, { readonly: true })
     : new Database(resolvedPath);
   if (!opts?.readonly) {
-    initializeDatabase(db);
+    initializeDatabase(db, opts?.busyTimeout ?? 15000);
   } else {
     // Readonly: set busy_timeout FIRST so the journal_mode PRAGMA below
     // doesn't race when concurrent processes open the DB. PRAGMA
@@ -1352,7 +1378,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA query_only = ON");
   }
-  // For the writable branch: initializeDatabase() set 15000 during DDL —
+  // For the writable branch: initializeDatabase() set opts.busyTimeout (default 15000) during DDL —
   // reset to operational value here. For readonly: already set inside the
   // branch above; this assignment is a no-op rewrite to the same value.
   db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
@@ -1398,7 +1424,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchFTS(db, query, limit, collectionId, collections, dateRange),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchVec(db, query, model, limit, collectionId, collections, dateRange),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
@@ -3361,12 +3387,18 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
   const embedding = await getEmbedding(query, model, true);
   if (!embedding) return [];
+
+  // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
+  // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
+  // If the wall-clock budget already elapsed during the async embed above, bail here so a
+  // timed-out vector leg cannot resume and re-block the hook after it fell back to FTS.
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
