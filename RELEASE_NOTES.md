@@ -4,6 +4,23 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.17.0 — Harden the `context-surfacing` hook budget + cancellable embeds (follow-up to v0.16.0)
+
+v0.16.0 fixed the dominant `context-surfacing` hook-timeout causes (the unbounded synchronous vector leg and the init-backfill write lock). This release closes the residual write-contention and embed-cancellation gaps on the same hook path, and keeps the warm-cache guarantee alive on long-running hosts.
+
+- **Best-effort hook writes fail fast under contention.** The hook's own writes (the dedup UPSERT, `context_usage`, recall events, co-activations) are all best-effort, but the dedup UPSERT ran early and unguarded — a contended `SQLITE_BUSY` there aborted the whole hook before it could return context. It is now fail-open, and the `context-surfacing` hook process caps its own `busy_timeout` (1500ms) so a contended best-effort write fails fast instead of stalling the budget. The cap is scoped to that process only (the Stop hooks keep the 5000ms default), and the skill-vault opens on the hook path inherit the same cap.
+- **Cancellable embeds.** `embed()` now honors an `AbortSignal` end to end: the underlying fetch is cancellable, the 429 retry backoff aborts mid-sleep instead of sleeping through every retry, and an aborted embed is classified as cancellation — not a transport failure — so it no longer trips the 60s remote-down cooldown. `searchVec`/`getEmbedding` derive the signal from their wall-clock deadline, and a deadline also suppresses the unbounded local-model fallback so a hook embed cannot start a model load past its budget. The indexing batch-embed path is unchanged.
+- **Periodic vector prewarm.** The watcher's one-shot prewarm warms the OS page cache once; on a long-running host under memory pressure the kernel can evict the vector payload between hook calls, letting a cold synchronous scan creep back onto the hook path. The watcher now re-runs the embed-independent prewarm on an interval — `CLAWMEM_PREWARM_INTERVAL_MS`, default 10 minutes, `0` disables, values below a 60s floor are clamped up — to keep the payload resident. This is a probability reduction, not a hard cap: a true bound on the uninterruptible synchronous scan needs process isolation and is tracked as deferred.
+- **Two test-methodology fixes (source proven correct, not adjusted).** A pre-existing topic-boost fail-open test conflated the focus-topic variable with sequential recall-feedback state and read the real skill vault; it now uses two identically-seeded stores plus hermetic vault isolation, and the zero-match fail-open contract is proven byte-identical. A pre-existing watcher heavy-lane test set a `0..23` quiet-window believing it meant "any hour," but the window is end-exclusive, so the test failed during the 23:00 local hour; it now omits the window (always-open) and a hermetic unit guard pins the end-exclusive boundary.
+
+### Verification
+
+`bun test` → 1390 pass / 0 fail. New and expanded bug-first tests: `tests/unit/hook-timeout-fix.test.ts` (dedup fail-open under a held write lock, the named-vault `busy_timeout` cap, periodic prewarm firing + clean teardown, and the interval resolver's strict parse + floor) and `tests/unit/llm-fallback.test.ts` (embed `AbortSignal` across the fetch, the 429 backoff, the cooldown classification, and the local-fallback suppression). Each was guard-verified — it fails on the pre-fix source and passes after. Reviewed by an independent cross-model adversarial pass (GPT-5.5 high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, and the vault format are untouched. The `busy_timeout` cap is scoped to the `context-surfacing` hook process, so the Stop hooks and every other command keep the operational default. On any host that does not run the watcher, behavior is exactly as in v0.16.0 (the periodic prewarm lives only in the watcher).
+
 ## v0.16.0 — Fix: `context-surfacing` UserPromptSubmit hook intermittently times out
 
 The `context-surfacing` hook could intermittently exceed its UserPromptSubmit budget ("hook timed out — output discarded"), especially on the first prompt after a fresh boot and across concurrent sessions. The dominant cause was **not** inference or host memory: the vector leg ran a *synchronous* `sqlite-vec` scan that the `Promise.race(vectorTimeout)` guard could not bound (a synchronous call blocks the event loop, so the timer never fires), and every writable hook open ran an unconditional backfill `UPDATE` that could wait out `busy_timeout` under writer contention.

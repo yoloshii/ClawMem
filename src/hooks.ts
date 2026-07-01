@@ -213,13 +213,25 @@ export function wasPromptSeenRecently(store: Store, hookName: string, prompt: st
   }
 
   const preview = normalized.slice(0, 120);
-  store.db.prepare(`
-    INSERT INTO hook_dedupe (hook_name, prompt_hash, prompt_preview, last_seen_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(hook_name, prompt_hash) DO UPDATE SET
-      prompt_preview = excluded.prompt_preview,
-      last_seen_at = excluded.last_seen_at
-  `).run(hookName, hash, preview, nowIso);
+  // Best-effort dedup bookkeeping. Under writer contention this UPSERT can hit
+  // SQLITE_BUSY — especially from the context-surfacing hook, which caps its
+  // busy_timeout low (B3) so its own writes cannot stall the tight
+  // UserPromptSubmit budget. A failed write only means the next identical
+  // prompt won't be suppressed; it is never a reason to throw and abort the
+  // hook. The `recent` verdict comes from the READ above (WAL-safe, does not
+  // wait on the write lock), so same-prompt dedup still works when the row
+  // already exists even if this refresh write is skipped.
+  try {
+    store.db.prepare(`
+      INSERT INTO hook_dedupe (hook_name, prompt_hash, prompt_preview, last_seen_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(hook_name, prompt_hash) DO UPDATE SET
+        prompt_preview = excluded.prompt_preview,
+        last_seen_at = excluded.last_seen_at
+    `).run(hookName, hash, preview, nowIso);
+  } catch {
+    /* best-effort: contended/failed dedup write must never abort the hook */
+  }
 
   return recent;
 }

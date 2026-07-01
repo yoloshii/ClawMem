@@ -9,6 +9,8 @@ import { resolve as pathResolve, basename } from "path";
 import {
   createStore,
   prewarmVectors,
+  startPeriodicPrewarm,
+  resolvePrewarmIntervalMs,
   enableProductionMode,
   getDefaultDbPath,
   canonicalDocId,
@@ -1071,6 +1073,15 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
 // Hook dispatch
 // =============================================================================
 
+// B3: the context-surfacing UserPromptSubmit hook runs under a tight budget
+// (8s repo default). Its OWN writes — dedup UPSERT, context_usage, recall
+// events, co-activations — are all best-effort/fail-open, but under writer
+// contention each could otherwise wait up to the store default busy_timeout
+// (5000ms) and blow the budget. Cap this process's busy_timeout so a contended
+// write fails fast (SQLITE_BUSY → skipped by the fail-open guards) instead of
+// stalling. Reads are unaffected (WAL readers never wait on the write lock).
+const CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS = 1500;
+
 async function cmdHook(args: string[]) {
   const hookName = args[0];
   if (!hookName) die("Usage: clawmem hook <name>");
@@ -1082,6 +1093,11 @@ async function cmdHook(args: string[]) {
   try {
     switch (hookName) {
       case "context-surfacing":
+        // Scope the small busy_timeout to THIS process only. Each `clawmem
+        // hook` invocation runs exactly one hook, so the Stop hooks
+        // (decision-extractor / handoff-generator / feedback-loop, 30s budget)
+        // run in separate processes and keep the store default (5000ms).
+        try { s.db.exec(`PRAGMA busy_timeout = ${CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS}`); } catch { /* non-fatal */ }
         output = await contextSurfacing(s, input);
         break;
       case "session-bootstrap":
@@ -1831,6 +1847,7 @@ async function cmdWatch() {
   let stopHeavyLane: (() => Promise<void>) | null = null;
   let watcherHandle: { close: () => void } | null = null;
   let checkpointTimerHandle: Timer | null = null;
+  let prewarmTimerHandle: ReturnType<typeof setInterval> | null = null;
 
   // Graceful shutdown — stop workers, close watchers, then exit. SIGTERM
   // handling is critical for systemd `systemctl --user stop` to shut down
@@ -1839,6 +1856,13 @@ async function cmdWatch() {
   // its own withWorkerLease finally block before we close the store.
   const shutdown = async (signal: string) => {
     console.log(`\n${c.dim}[watch] Received ${signal}, shutting down...${c.reset}`);
+    // Clear the periodic prewarm FIRST — before the awaited worker drains below. The timer is
+    // unref'd but still fires while the loop is alive; a tick landing mid-drain would run the
+    // synchronous ~1.5 GB scan and delay shutdown. Clearing it here is the only guard against that.
+    if (prewarmTimerHandle) {
+      clearInterval(prewarmTimerHandle);
+      prewarmTimerHandle = null;
+    }
     if (stopHeavyLane) {
       await stopHeavyLane();
       stopHeavyLane = null;
@@ -1900,6 +1924,21 @@ async function cmdWatch() {
       if (prewarmVectors(s.db)) console.log(`${c.dim}[watch] vector cache prewarmed${c.reset}`);
     } catch { /* best-effort: unexpected SQL error */ }
   }, 0);
+
+  // B5 Option C: keep the vector payload warm against OS page-cache eviction BETWEEN hook calls.
+  // The one-shot prewarm above warms once; on a long-running host under memory pressure the kernel
+  // can evict the payload and let a cold synchronous MATCH creep back into the context-surfacing
+  // hook path. Re-touching the pages on an interval biases the kernel LRU toward keeping them
+  // resident (a PROBABILITY reduction, not a hard cap — the hard cap is the deferred BACKLOG
+  // Source 46 daemon). Cleared FIRST in shutdown(); the handle is unref'd so it never keeps the
+  // process alive by itself. resolvePrewarmIntervalMs enforces a strict parse + 60s floor so a
+  // stray tiny value (e.g. "1", or "1e3" which parseInt would read as 1) cannot schedule a
+  // near-continuous scan loop. Set CLAWMEM_PREWARM_INTERVAL_MS=0 to disable. Default 10 min.
+  const prewarmIntervalMs = resolvePrewarmIntervalMs(Bun.env.CLAWMEM_PREWARM_INTERVAL_MS);
+  prewarmTimerHandle = startPeriodicPrewarm(s.db, prewarmIntervalMs);
+  if (prewarmTimerHandle) {
+    console.log(`${c.dim}[watch] periodic vector prewarm every ${Math.round(prewarmIntervalMs / 1000)}s${c.reset}`);
+  }
 
   watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,

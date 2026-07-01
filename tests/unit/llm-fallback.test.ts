@@ -433,4 +433,107 @@ describe("LLM Remote Fallback", () => {
       expect(result?.text).toBe("ok");
     });
   });
+
+  // ─── B4: embed() honors AbortSignal across fetch + 429 backoff ─────────
+  describe("embed() honors AbortSignal (B4)", () => {
+    it("aborts during the 429 retry backoff instead of sleeping through all retries", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+
+      let fetchCount = 0;
+      // Always 429 → embedRemote enters exponential backoff (1s, 2s, 4s, 8s, 16s).
+      // The abortable backoff must cut this off when the caller's signal fires.
+      globalThis.fetch = (() => {
+        fetchCount++;
+        return Promise.resolve(new Response("rate limited", { status: 429 }));
+      }) as any;
+
+      const t0 = Date.now();
+      const result = await llm.embed("some query text", { signal: AbortSignal.timeout(150) });
+      const elapsed = Date.now() - t0;
+
+      expect(result).toBeNull();
+      // Bug-first: the abortable backoff must bail DURING the sleep (~150ms),
+      // not after it. Without it, the non-abortable first backoff is >=750ms
+      // (jitter of 1000ms) before the top-of-loop abort check can bail on the
+      // next attempt — and a late abort would wait out a backoff up to 16s.
+      // 500ms cleanly separates the two: abortable ~150ms vs non-abortable
+      // >=750ms.
+      expect(elapsed).toBeLessThan(500);
+      expect(fetchCount).toBeGreaterThanOrEqual(1);
+    }, 10000);
+
+    it("aborts a hung fetch via the threaded signal (returns null, does not hang)", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+
+      // A fetch that ONLY settles when its abort signal fires. Bug-first: if the
+      // signal is not threaded into the fetch call, opts.signal is undefined and
+      // this never resolves — the embed hangs and the test times out.
+      globalThis.fetch = ((_url: any, opts: any) =>
+        new Promise((_resolve, reject) => {
+          const s: AbortSignal | undefined = opts?.signal;
+          if (!s) return; // no signal threaded → hang forever (the bug)
+          if (s.aborted) return reject(s.reason ?? new DOMException("aborted", "AbortError"));
+          s.addEventListener("abort", () => reject(s.reason ?? new DOMException("aborted", "AbortError")), { once: true });
+        })) as any;
+
+      const t0 = Date.now();
+      const result = await llm.embed("some query text", { signal: AbortSignal.timeout(150) });
+      const elapsed = Date.now() - t0;
+
+      expect(result).toBeNull();
+      expect(elapsed).toBeLessThan(900); // aborted at ~150ms, did not hang
+    }, 10000);
+
+    it("an aborted embed does NOT trip the remote-down cooldown", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+
+      globalThis.fetch = ((_url: any, opts: any) =>
+        new Promise((_resolve, reject) => {
+          const s: AbortSignal | undefined = opts?.signal;
+          if (!s) return;
+          if (s.aborted) return reject(s.reason ?? new DOMException("aborted", "AbortError"));
+          s.addEventListener("abort", () => reject(s.reason ?? new DOMException("aborted", "AbortError")), { once: true });
+        })) as any;
+
+      await llm.embed("q", { signal: AbortSignal.timeout(100) });
+
+      // If the abort had been misclassified as a transport failure, the 60s
+      // cooldown would skip remote on the next call. It must still try remote.
+      let fetchCalled = false;
+      globalThis.fetch = (() => {
+        fetchCalled = true;
+        return Promise.resolve(new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }), { status: 200 }));
+      }) as any;
+      const next = await llm.embed("q2");
+      expect(fetchCalled).toBe(true);
+      expect(next?.embedding).toEqual([0.1, 0.2]);
+    }, 10000);
+
+    it("skips the LOCAL embed fallback when a deadline signal is set (remote in cooldown) — Medium fix", async () => {
+      const llm = createLlm();
+      // NB: NO CLAWMEM_NO_LOCAL_MODELS — local fallback WOULD normally run.
+      const embedLocalSpy = spyOn(llm as any, "embedLocal").mockResolvedValue({ embedding: [9, 9], model: "local" });
+
+      // Drive the remote embed into cooldown via a transport error (no signal).
+      globalThis.fetch = (() => {
+        const e = new Error("connect ECONNREFUSED 127.0.0.1:8088");
+        (e as any).code = "ECONNREFUSED";
+        throw e;
+      }) as any;
+      await llm.embed("warm"); // remote now marked down; this call DID fall to local
+      expect(embedLocalSpy).toHaveBeenCalled();
+      embedLocalSpy.mockClear();
+
+      // Now embed WITH a deadline signal while remote is in cooldown. Bug-first:
+      // without the fix, embed() falls through to embedLocal (which ignores the
+      // signal and can load/download a model past the deadline). With the fix,
+      // a signal suppresses the local fallback → returns null → caller degrades.
+      const result = await llm.embed("q", { signal: AbortSignal.timeout(1000) });
+      expect(result).toBeNull();
+      expect(embedLocalSpy).not.toHaveBeenCalled();
+    }, 10000);
+  });
 });

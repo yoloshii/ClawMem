@@ -1163,6 +1163,67 @@ export function prewarmVectors(db: Database): boolean {
 }
 
 /**
+ * Keep the sqlite-vec payload resident in the OS page cache by re-running the brute-force
+ * prewarm on an interval. The one-shot prewarm at watcher startup warms the cache ONCE; on a
+ * long-running host under memory pressure the kernel can evict the (potentially ~1.5 GB) vector
+ * payload between hook calls, and the next cold SYNCHRONOUS MATCH in the context-surfacing hook
+ * path can then blow the 8-15s hook budget (bun:sqlite exposes no interrupt, so an in-flight
+ * scan cannot be abandoned). Re-touching the pages biases the kernel LRU toward keeping them
+ * resident — a PROBABILITY reduction, NOT a hard cap. The hard cap (moving the blocking scan off
+ * the hook's event loop so its deadline can fire) is the deferred BACKLOG Source 46 daemon.
+ *
+ * Best-effort: never throws; a per-tick failure is swallowed so the timer keeps running. Returns
+ * the interval handle (the caller MUST clear it on shutdown) or null when disabled (intervalMs
+ * <= 0 or non-finite). The handle is unref'd so it never by itself keeps the process alive.
+ * `onPrewarm(ran)` is an optional observability hook fired after each attempt — `ran` is whether
+ * a scan actually executed (i.e. a dimensioned vector table exists).
+ */
+export function startPeriodicPrewarm(
+  db: Database,
+  intervalMs: number,
+  onPrewarm?: (ran: boolean) => void,
+): ReturnType<typeof setInterval> | null {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  const timer = setInterval(() => {
+    let ran = false;
+    try { ran = prewarmVectors(db); } catch { /* best-effort: unexpected SQL error */ }
+    if (onPrewarm) { try { onPrewarm(ran); } catch { /* observer must never break the timer */ } }
+  }, intervalMs);
+  (timer as { unref?: () => void }).unref?.();
+  return timer;
+}
+
+/** Floor for the periodic re-prewarm interval. Below this, a large-vault (~1.5 GB) brute-force scan
+ *  runs near-continuously and can saturate the watcher event loop + I/O, so any smaller positive
+ *  request is clamped UP to this value. */
+export const PREWARM_MIN_INTERVAL_MS = 60_000;
+/** Default periodic re-prewarm interval when CLAWMEM_PREWARM_INTERVAL_MS is unset or unparseable. */
+export const PREWARM_DEFAULT_INTERVAL_MS = 600_000;
+
+/**
+ * Resolve the raw CLAWMEM_PREWARM_INTERVAL_MS env value into a SAFE interval for the watcher. This
+ * policy is kept OUT of the permissive `startPeriodicPrewarm` mechanism (so unit tests can still use
+ * tiny intervals) and applied only on the production env path.
+ *   - unset / empty / unparseable → default (600000). Garbage must NOT silently disable the
+ *     mitigation, nor be read as a tiny interval.
+ *   - exactly 0 → 0 (the documented off switch; `startPeriodicPrewarm` then returns null).
+ *   - negative → default (nonsensical; neither an intentional disable nor a fast loop).
+ *   - 0 < n < floor → clamped UP to the 60s floor. Prevents the near-continuous scan loop that e.g.
+ *     "1" or "1e3" would otherwise schedule. NOTE: `Number("1e3") === 1000` whereas
+ *     `parseInt("1e3", 10) === 1`, so `Number()` is used deliberately (parseInt silently truncates
+ *     at the "e").
+ *   - n >= floor → floored to an integer and used as-is.
+ */
+export function resolvePrewarmIntervalMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return PREWARM_DEFAULT_INTERVAL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PREWARM_DEFAULT_INTERVAL_MS;
+  if (n === 0) return 0;
+  if (n < 0) return PREWARM_DEFAULT_INTERVAL_MS;
+  return Math.max(PREWARM_MIN_INTERVAL_MS, Math.floor(n));
+}
+
+/**
  * The DISTINCT non-empty embedding models stored in the vault (empty array if no
  * embeddings exist). Used to detect model drift BETWEEN runs — a different model at
  * the SAME dimension produces a heterogeneous vector space that dimension checks
@@ -3391,7 +3452,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true);
+  const embedding = await getEmbedding(query, model, true, deadlineMs);
   if (!embedding) return [];
 
   // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
@@ -3499,11 +3560,22 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: number): Promise<number[] | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = await llm.embed(formattedText, { model, isQuery });
+  // B4: bound the remote embed fetch + its 429 backoff to the caller's wall-clock
+  // deadline. Under the context-surfacing hook's Promise.race the abandoned embed
+  // promise otherwise keeps its fetch + retry sleeps running; AbortSignal.timeout
+  // actually cancels them, so a slow/rate-limited embed can no longer outlive the
+  // hook budget.
+  let signal: AbortSignal | undefined;
+  if (deadlineMs !== undefined) {
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) return null; // deadline already elapsed — skip the embed entirely
+    signal = AbortSignal.timeout(remaining);
+  }
+  const result = await llm.embed(formattedText, { model, isQuery, signal });
   return result?.embedding || null;
 }
 

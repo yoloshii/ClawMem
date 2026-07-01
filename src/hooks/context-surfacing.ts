@@ -149,6 +149,21 @@ export async function contextSurfacing(
   const tokenBudget = profile.tokenBudget;
   const startTime = Date.now();
 
+  // High-fix (B3): the hook's writes to the MAIN store are bounded by the
+  // busy_timeout cmdHook set for this process (1500ms for context-surfacing).
+  // But skill-vault stores are opened separately via resolveStore(), which
+  // would otherwise use the 5000ms operational default — so a contended
+  // skill-vault write (the recall mirror below) could still stall the hook up
+  // to 5s. Inherit the main store's current cap and pass it to EVERY
+  // skill-vault open so those opens/writes are bounded identically. (Reads are
+  // WAL-safe regardless; this primarily bounds the mirror write.)
+  let hookBusyTimeout = 5000;
+  try {
+    const bt = (store.db.prepare("PRAGMA busy_timeout").get() as { timeout?: number } | undefined)?.timeout;
+    if (typeof bt === "number" && bt > 0) hookBusyTimeout = bt;
+  } catch { /* keep default */ }
+  const skillStoreOpts = { busyTimeout: hookBusyTimeout };
+
   // §11.4: Resolve session-scoped focus topic. Primary signal is the
   // per-session focus file at ~/.cache/clawmem/sessions/<id>.focus
   // (file > env var precedence via resolveSessionTopic). Env var
@@ -221,7 +236,7 @@ export async function contextSurfacing(
   // Dual-query: also search skill vault if configured (secondary source)
   if (getVaultPath("skill")) {
     try {
-      const skillStore = resolveStore("skill");
+      const skillStore = resolveStore("skill", skillStoreOpts);
       const skillResults = skillStore.searchFTS(retrievalQuery, 5);
       // Tag skill vault results for identification in output
       for (const r of skillResults) {
@@ -346,7 +361,7 @@ export async function contextSurfacing(
     // expects the collection-relative path, not the full virtual path
     const parsed = r.filepath.startsWith('clawmem://') ? r.filepath.replace(/^clawmem:\/\/[^/]+\/?/, '') : r.filepath;
     // Use the correct store for skill-vault results
-    const targetStore = (r as any)._fromVault === "skill" ? (() => { try { return resolveStore("skill"); } catch { return store; } })() : store;
+    const targetStore = (r as any)._fromVault === "skill" ? (() => { try { return resolveStore("skill", skillStoreOpts); } catch { return store; } })() : store;
     const doc = targetStore.findActiveDocument(r.collectionName, parsed);
     if (!doc) return true;
     if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
@@ -374,7 +389,7 @@ export async function contextSurfacing(
   let enriched = enrichResults(store, generalResults, prompt);
   if (skillResults.length > 0) {
     try {
-      const skillStore = resolveStore("skill");
+      const skillStore = resolveStore("skill", skillStoreOpts);
       enriched = [...enriched, ...enrichResults(skillStore, skillResults, prompt)];
     } catch {
       // Skill store unavailable — enrich with general store as fallback
@@ -500,7 +515,7 @@ export async function contextSurfacing(
           writeRecallEvents(store, input.sessionId, qHash, mappedDocs, validUsageId, turnIndex);
         } else {
           try {
-            const vaultStore = resolveStore(vault);
+            const vaultStore = resolveStore(vault, skillStoreOpts);
             // Mirror context_usage row into named vault for correct FK + attribution
             const vaultPaths = docs.map(r => r.displayPath);
             const vaultUsageId = vaultStore.insertUsage({
