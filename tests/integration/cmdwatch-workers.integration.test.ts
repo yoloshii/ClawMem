@@ -229,8 +229,12 @@ describe("cmdWatch worker hosting (v0.8.2 Ext 2)", () => {
         CLAWMEM_CONSOLIDATION_INTERVAL: "15000",
         CLAWMEM_HEAVY_LANE: "true",
         CLAWMEM_HEAVY_LANE_INTERVAL: "30000",
-        // Wide quiet window so the heavy lane gate would pass at any hour
-        // (even though we don't wait for an actual tick — banner is enough).
+        // A window is set here only to mirror a realistic config; this test
+        // asserts the startup BANNER (printed before any gate check) and
+        // SIGTERMs well before the first tick, so the window value is
+        // irrelevant to it. NOTE the window is END-EXCLUSIVE — "0".."23"
+        // covers hours 0-22, NOT 23. A test that waits for a real tick must
+        // omit the window (null = always open); see the slow-path test.
         CLAWMEM_HEAVY_LANE_WINDOW_START: "0",
         CLAWMEM_HEAVY_LANE_WINDOW_END: "23",
       },
@@ -364,6 +368,16 @@ describe("cmdWatch worker hosting (v0.8.2 Ext 2)", () => {
 //   2. >= 1 row in maintenance_runs for lane='heavy' (real tick happened)
 //   3. NO live leases in worker_leases (acquired+released cleanly)
 //
+// HOUR-INDEPENDENCE (root cause of a prior spurious ~31s failure): this test
+// must NOT set a bounded quiet window. `isInQuietWindow` is END-EXCLUSIVE
+// (`hour >= start && hour < end`), so a literal "0".."23" covers hours 0-22
+// and EXCLUDES hour 23 — during 23:00-23:59 local the gate would skip, the
+// only journaled row would be a gate-skip, and `nonGateSkip` below would be
+// undefined → failure at ~t+31s. It looked load-flaky only because the run
+// that failed happened to land in the 23:00 hour. Omitting the window env
+// vars defaults it to null, which `isInQuietWindow` treats as "always open"
+// at every hour — the only hour-independent way to force the gate open.
+//
 // Test budget ~35s. Worth the wall time because it is the ONLY automated
 // check that the lifecycle wiring (start → tick → SIGTERM → drain → release
 // → store close) holds end-to-end against a real subprocess.
@@ -396,8 +410,14 @@ describe("cmdWatch worker hosting (v0.8.2 slow path)", () => {
             CLAWMEM_CONFIG_DIR: localFixture.configDir,
             CLAWMEM_HEAVY_LANE: "true",
             CLAWMEM_HEAVY_LANE_INTERVAL: "30000",
-            CLAWMEM_HEAVY_LANE_WINDOW_START: "0",
-            CLAWMEM_HEAVY_LANE_WINDOW_END: "23",
+            // NO quiet-window env vars → window defaults to null → the gate is
+            // open at EVERY hour. This is load-bearing: a bounded window is
+            // END-EXCLUSIVE (isInQuietWindow returns `hour >= start && hour <
+            // end`), so a literal "0".."23" EXCLUDES hour 23 and this test
+            // would gate-skip (only a gate-skip row → nonGateSkip undefined →
+            // failure at ~t+31s) during 23:00-23:59 local. null (the default
+            // when the env vars are unset) is the ONLY truly hour-independent
+            // "always run" setting — see the diagnosis in the file header.
             // Force remote-only mode so workers tick but never spend on real LLM.
             CLAWMEM_NO_LOCAL_MODELS: "true",
             CLAWMEM_EMBED_URL: "http://127.0.0.1:1",

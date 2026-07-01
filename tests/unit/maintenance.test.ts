@@ -129,6 +129,20 @@ describe("isInQuietWindow", () => {
     expect(isInQuietWindow(withHour(12), 2, 6)).toBe(false);
   });
 
+  it("EXCLUDES hour 23 for a '0 to 23' window (end-exclusive) — the cmdWatch slow-path trap", () => {
+    // A literal 0..23 window reads like "all day" but is END-EXCLUSIVE, so it
+    // covers hours 0-22 and EXCLUDES 23. The cmdwatch-workers slow-path
+    // integration test hit exactly this: during 23:00-23:59 local the
+    // heavy-lane gate skipped and the test failed at ~t+31s (nonGateSkip
+    // undefined). The fix there is to use a null window (always open). This
+    // case locks in the semantic so nobody "corrects" isInQuietWindow to be
+    // inclusive (which would break legitimate quiet-window configs) or
+    // reintroduces a bounded window that excludes the run hour in that test.
+    expect(isInQuietWindow(withHour(22), 0, 23)).toBe(true);
+    expect(isInQuietWindow(withHour(23), 0, 23)).toBe(false); // the trap
+    expect(isInQuietWindow(withHour(23), null, null)).toBe(true); // null = always open, hour-independent
+  });
+
   it("handles midnight wraparound (22→6)", () => {
     expect(isInQuietWindow(withHour(23), 22, 6)).toBe(true);
     expect(isInQuietWindow(withHour(2), 22, 6)).toBe(true);
