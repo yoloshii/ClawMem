@@ -114,6 +114,9 @@ const clawmemPlugin = {
         ...(pluginCfg.gpuLlmNoThink !== undefined
           ? { CLAWMEM_LLM_NO_THINK: String(pluginCfg.gpuLlmNoThink) }
           : {}),
+        ...(pluginCfg.gpuLlmApiKey
+          ? { CLAWMEM_LLM_API_KEY: pluginCfg.gpuLlmApiKey as string }
+          : {}),
         ...(pluginCfg.gpuRerank ? { CLAWMEM_RERANK_URL: pluginCfg.gpuRerank as string } : {}),
         CLAWMEM_PROFILE: profile,
       },
