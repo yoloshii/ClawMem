@@ -20,6 +20,7 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  rethrowIfFatalVectorError,
   type Store,
   type SearchResult,
   type CausalLink,
@@ -283,7 +284,7 @@ This is the recommended entry point for ALL memory queries.`,
         const intent = await classifyIntent(query, llm, store.db);
         const bm25Results = store.searchFTS(query, 30);
         let vecResults: SearchResult[] = [];
-        try { vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch { /* no vectors */ }
+        try { vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
         const rrfWeights = intent.intent === 'WHY' ? [1.0, 1.5] : intent.intent === 'WHEN' ? [1.5, 1.0] : [1.0, 1.0];
         const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
         const allSearch = [...bm25Results, ...vecResults];
@@ -354,7 +355,7 @@ This is the recommended entry point for ALL memory queries.`,
         for (const clause of clauses.sort((a, b) => a.priority - b.priority)) {
           let results: SearchResult[] = [];
           if (clause.type === 'bm25') results = store.searchFTS(clause.query, 20, undefined, clause.collections);
-          else if (clause.type === 'vector') { try { results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections); } catch { /* */ } }
+          else if (clause.type === 'vector') { try { results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections); } catch (e) { rethrowIfFatalVectorError(e); /* */ } }
           else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections); }
           allResults.push(...results);
         }
@@ -378,12 +379,12 @@ This is the recommended entry point for ALL memory queries.`,
       if (effectiveMode === "keyword") {
         results = store.searchFTS(query, lim);
       } else if (effectiveMode === "semantic" || effectiveMode === "discovery") {
-        try { results = await store.searchVec(query, DEFAULT_EMBED_MODEL, lim); } catch { results = store.searchFTS(query, lim); }
+        try { results = await store.searchVec(query, DEFAULT_EMBED_MODEL, lim); } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim); }
       } else {
         // Hybrid: BM25 + vector + RRF
         const bm25 = store.searchFTS(query, 30);
         let vec: SearchResult[] = [];
-        try { vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch { /* */ }
+        try { vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch (e) { rethrowIfFatalVectorError(e); /* */ }
         if (vec.length > 0) {
           const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
           const allSearch = [...bm25, ...vec];
@@ -961,7 +962,8 @@ This is the recommended entry point for ALL memory queries.`,
           }));
         }
       }
-    } catch {
+    } catch (e) {
+      rethrowIfFatalVectorError(e);
       // Vector search unavailable — degrade gracefully
     }
 

@@ -374,3 +374,62 @@ describe("Phase 3 no-op when fewer than 2 recent observations", () => {
     expect(llm.generate).toHaveBeenCalledTimes(0);
   });
 });
+
+describe("Phase 3 anti-parrot — draft echoing the schema skeleton is rejected pre-validation", () => {
+  it("rejects a {{...}} placeholder conclusion and never calls the validator", async () => {
+    const store = createTestStore();
+    const llm = createMockLLM();
+
+    seedDeductiveSource(store, { path: "src-a.md", title: "Decision A", facts: "team migrated auth to OAuth2" });
+    seedDeductiveSource(store, { path: "src-b.md", title: "Decision B", facts: "team completed the OAuth2 migration" });
+
+    // Draft-gen echoes the {{...}} skeleton verbatim. Only the draft-gen call is staged — the guard
+    // must reject BEFORE any validation call, so no validation responses are provided.
+    stageLLM(
+      llm,
+      JSON.stringify([
+        {
+          conclusion: "{{new conclusion combining 2+ observations, 1-2 sentences}}",
+          premises: ["{{fact from one source observation}}", "{{fact from another}}"],
+          source_indices: [1, 2],
+        },
+      ]),
+      [],
+    );
+
+    const stats = await runDeductiveSynthesis(store, llm);
+
+    expect(stats.drafted).toBe(1);
+    expect(stats.placeholderRejects).toBe(1);
+    expect(stats.rejected).toBe(1);
+    expect(stats.accepted).toBe(0);
+    expect(stats.created).toBe(0);
+    // Exactly one LLM call (draft-gen). validateDeductiveDraft was never invoked because the guard
+    // short-circuits before it.
+    expect(llm.generate).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects the literal 'Clear deductive statement' example residue too", async () => {
+    const store = createTestStore();
+    const llm = createMockLLM();
+    seedDeductiveSource(store, { path: "src-a.md", title: "A", facts: "fact A about migration" });
+    seedDeductiveSource(store, { path: "src-b.md", title: "B", facts: "fact B about completion" });
+
+    stageLLM(
+      llm,
+      JSON.stringify([
+        {
+          conclusion: "Clear deductive statement",
+          premises: ["Premise from obs 1", "Premise from obs 3"],
+          source_indices: [1, 2],
+        },
+      ]),
+      [],
+    );
+
+    const stats = await runDeductiveSynthesis(store, llm);
+    expect(stats.placeholderRejects).toBe(1);
+    expect(stats.created).toBe(0);
+    expect(llm.generate).toHaveBeenCalledTimes(1);
+  });
+});

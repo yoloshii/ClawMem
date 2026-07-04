@@ -19,6 +19,7 @@ Three services — **embedding**, **LLM** (query expansion / intent / A-MEM), **
 - The zerank-2 **GGUF is inert** — llama.cpp drops the score head → ranking silently collapses to RRF. Use the **seq-cls sidecar**; verify with `clawmem rerank-health` (liveness ≠ correctness).
 - `-ub` must equal `-b` for embedding/reranking (non-causal attention) or `llama-server` asserts.
 - Changing embedding dimensions → `clawmem embed --force` (full re-embed).
+- Changing the embedding **model** (even at the same dimension) → `clawmem embed --force`; querying otherwise now throws `VecReadModelMismatchError` instead of serving cosine-meaningless results (v0.18.0).
 - `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of silent CPU fallback.
 
 → Stack decision matrix + server setup: [docs/guides/inference-services.md](docs/guides/inference-services.md) · cloud: [docs/guides/cloud-embedding.md](docs/guides/cloud-embedding.md) · all env vars: [docs/reference/configuration.md](docs/reference/configuration.md).

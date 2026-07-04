@@ -92,6 +92,7 @@ describe("store.rerank probe seam", () => {
   const originalFetch = globalThis.fetch;
   const originalUrl = process.env.CLAWMEM_RERANK_URL;
   const originalNoLocal = process.env.CLAWMEM_NO_LOCAL_MODELS;
+  const originalApiKey = process.env.CLAWMEM_RERANK_API_KEY;
 
   beforeEach(() => {
     process.env.CLAWMEM_RERANK_URL = "http://rerank.test:8090";
@@ -103,6 +104,8 @@ describe("store.rerank probe seam", () => {
     else process.env.CLAWMEM_RERANK_URL = originalUrl;
     if (originalNoLocal === undefined) delete process.env.CLAWMEM_NO_LOCAL_MODELS;
     else process.env.CLAWMEM_NO_LOCAL_MODELS = originalNoLocal;
+    if (originalApiKey === undefined) delete process.env.CLAWMEM_RERANK_API_KEY;
+    else process.env.CLAWMEM_RERANK_API_KEY = originalApiKey;
   });
 
   function mockRerank(results: { index: number; relevance_score: number }[]): () => number {
@@ -261,6 +264,39 @@ describe("store.rerank probe seam", () => {
     const out = await store.rerank("q", docs, "m", undefined, { noCache: true }); // no requireLiveCoverage
     expect(out.find((r) => r.file === "a")!.score).toBe(0.9);
     expect(out.find((r) => r.file === "b")!.score).toBe(0); // b skipped → zero-filled, no crash
+  });
+
+  // W3 remote-reranker auth — the remote GPU reranker may sit behind an authenticated gateway.
+  test("sends Authorization: Bearer to the remote reranker when CLAWMEM_RERANK_API_KEY is set", async () => {
+    process.env.CLAWMEM_RERANK_API_KEY = "test-rerank-key";
+    let seenHeaders: Record<string, string> | undefined;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      seenHeaders = init?.headers as Record<string, string>;
+      return new Response(
+        JSON.stringify({ results: [{ index: 0, relevance_score: 0.7 }, { index: 1, relevance_score: 0.2 }] }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const store = createStore(":memory:");
+    await store.rerank("q", docs, "m", undefined, { noCache: true });
+    expect(seenHeaders?.["Authorization"]).toBe("Bearer test-rerank-key");
+    expect(seenHeaders?.["Content-Type"]).toBe("application/json");
+  });
+
+  test("omits Authorization to the remote reranker when CLAWMEM_RERANK_API_KEY is unset (backward compatible)", async () => {
+    delete process.env.CLAWMEM_RERANK_API_KEY;
+    let seenHeaders: Record<string, string> | undefined;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      seenHeaders = init?.headers as Record<string, string>;
+      return new Response(
+        JSON.stringify({ results: [{ index: 0, relevance_score: 0.7 }, { index: 1, relevance_score: 0.2 }] }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const store = createStore(":memory:");
+    await store.rerank("q", docs, "m", undefined, { noCache: true });
+    expect(seenHeaders?.["Authorization"]).toBeUndefined();
+    expect(seenHeaders?.["Content-Type"]).toBe("application/json");
   });
 });
 

@@ -144,6 +144,15 @@ describe("buildExtractionPrompt", () => {
     const prompt = buildExtractionPrompt("sample");
     expect(prompt).toMatch(/do not fabricate/i);
   });
+
+  it("uses a structure-only skeleton, not a copyable real-content example (anti-parrot)", () => {
+    // The former "Example output" carried a concrete OAuth fact a weak model parroted verbatim.
+    // It is replaced by {{...}} skeleton tokens the residue guard catches if echoed.
+    const prompt = buildExtractionPrompt("sample");
+    expect(prompt).not.toContain("Use OAuth 2.0 with PKCE");
+    expect(prompt).not.toContain("Example output:");
+    expect(prompt).toContain("{{"); // skeleton tokens present
+  });
 });
 
 // =============================================================================
@@ -254,6 +263,40 @@ describe("extractFactsFromConversation", () => {
     );
     const facts = await extractFactsFromConversation(llm as any, "x", 1);
     expect(facts).toEqual([]);
+  });
+
+  it("rejects a fact that echoes the prompt's {{...}} skeleton placeholders (anti-parrot)", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockImplementation(
+      mockGenerateReturning([
+        {
+          title: "{{concise 3-8 word title}}",
+          contentType: "decision",
+          narrative: "{{1-3 sentence description of the fact in context}}",
+        },
+      ]),
+    );
+    const facts = await extractFactsFromConversation(llm as any, "x", 1);
+    expect(facts).toEqual([]); // skeleton residue must never become a persisted fact
+  });
+
+  it("filters placeholder residue out of a real fact's facts/aliases arrays", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockImplementation(
+      mockGenerateReturning([
+        {
+          title: "Adopt Bun test runner",
+          contentType: "decision",
+          narrative: "Switched the suite to bun test for speed.",
+          facts: ["{{supporting evidence string}}", "3x faster CI"],
+          aliases: ["{{optional alternative title}}", "bun migration"],
+        },
+      ]),
+    );
+    const facts = await extractFactsFromConversation(llm as any, "x", 1);
+    expect(facts).toHaveLength(1);
+    expect(facts[0]!.facts).toEqual(["3x faster CI"]);
+    expect(facts[0]!.aliases).toEqual(["bun migration"]);
   });
 
   it("extracts a well-formed fact with all fields", async () => {

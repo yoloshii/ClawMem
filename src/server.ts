@@ -23,6 +23,7 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   extractSnippet,
+  rethrowIfFatalVectorError,
 } from "./store.ts";
 
 // =============================================================================
@@ -149,7 +150,8 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
   } else if (mode === "semantic") {
     try {
       results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch {
+    } catch (e) {
+      rethrowIfFatalVectorError(e);
       results = store.searchFTS(query, limit * 2, undefined, collections);
     }
   } else {
@@ -158,7 +160,7 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
     let vecResults: SearchResult[] = [];
     try {
       vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch { /* vector unavailable */ }
+    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
     // Simple merge — dedupe by filepath, take max score
     const merged = new Map<string, SearchResult>();
     for (const r of [...ftsResults, ...vecResults]) {
@@ -612,7 +614,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
     let vec: SearchResult[] = [];
     try {
       vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch { /* vector unavailable */ }
+    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
     const weights = intent.intent === "WHEN" ? [1.5, 1.0] : [1.0, 1.5];
     const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], weights);
     const allResults = [...bm25, ...vec];
@@ -625,7 +627,8 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
   } else if (mode === "semantic") {
     try {
       results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch {
+    } catch (e) {
+      rethrowIfFatalVectorError(e);
       results = store.searchFTS(query, limit * 2, undefined, collections);
     }
   } else {
@@ -634,7 +637,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
     let vec: SearchResult[] = [];
     try {
       vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch { /* vector unavailable */ }
+    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
     const merged = new Map<string, SearchResult>();
     for (const r of [...fts, ...vec]) {
       const existing = merged.get(r.filepath);

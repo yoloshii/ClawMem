@@ -7,7 +7,7 @@
  */
 
 import type { Store, SearchResult } from "../store.ts";
-import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, extractSnippet, resolveStore } from "../store.ts";
+import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore } from "../store.ts";
 import { getVaultPath, getActiveProfile } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
@@ -210,8 +210,11 @@ export async function contextSurfacing(
         vectorTimer = setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout);
       });
       results = await Promise.race([vectorPromise, timeoutPromise]);
-    } catch {
-      // Vector search unavailable, timed out, or errored — fall back to BM25
+    } catch (e) {
+      // Vector search unavailable, timed out, or errored — fall back to BM25. A vault-wide
+      // embedding-model mismatch is a persistent config error, not a transient miss: surface it
+      // loudly once, then degrade (the hook stays fail-open).
+      warnOnceOnVectorModelMismatch(e);
     } finally {
       // Clear the timer when the vector promise won the race: a pending (ref'd) setTimeout keeps the
       // Bun hook process alive for the full vectorTimeout after results are already in hand.
@@ -307,7 +310,7 @@ export async function contextSurfacing(
                   deepTimer = setTimeout(() => reject(new Error("vector timeout")), remainingMs);
                 });
                 hits = await Promise.race([deepVec, deepTimeout]);
-              } catch { /* vector leg non-fatal (timed out or errored) */ }
+              } catch (e) { warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
               finally { if (deepTimer) clearTimeout(deepTimer); }  // don't let a pending timer keep the hook process alive
             }
             for (const r of hits) {

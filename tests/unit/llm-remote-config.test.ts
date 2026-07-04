@@ -319,3 +319,78 @@ describe("remote LLM model selection", () => {
     expect(seenBody?.reasoning_effort).toBeUndefined();
   });
 });
+
+describe("remote LLM auth header", () => {
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    delete process.env.CLAWMEM_LLM_URL;
+    delete process.env.CLAWMEM_LLM_API_KEY;
+    await disposeDefaultLlamaCpp();
+    setDefaultLlamaCpp(null);
+  });
+
+  it("sends Authorization: Bearer when remoteLlmApiKey is configured on the instance", async () => {
+    let seenHeaders: Record<string, string> | undefined;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      seenHeaders = init?.headers as Record<string, string>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as typeof fetch;
+
+    const llm = new LlamaCpp({
+      remoteLlmUrl: "https://api.example.com/v1",
+      remoteLlmApiKey: "test-llm-key",
+    });
+    await llm.generate("test prompt");
+
+    expect(seenHeaders?.["Authorization"]).toBe("Bearer test-llm-key");
+    expect(seenHeaders?.["Content-Type"]).toBe("application/json");
+  });
+
+  it("omits Authorization when no remoteLlmApiKey is set (backward compatible)", async () => {
+    let seenHeaders: Record<string, string> | undefined;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      seenHeaders = init?.headers as Record<string, string>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as typeof fetch;
+
+    const llm = new LlamaCpp({ remoteLlmUrl: "http://localhost:8089" });
+    await llm.generate("test prompt");
+
+    expect(seenHeaders?.["Authorization"]).toBeUndefined();
+    expect(seenHeaders?.["Content-Type"]).toBe("application/json");
+  });
+
+  it("reads CLAWMEM_LLM_API_KEY when bootstrapping the default LLM instance from env", async () => {
+    let seenHeaders: Record<string, string> | undefined;
+    process.env.CLAWMEM_LLM_URL = "https://api.example.com/v1";
+    process.env.CLAWMEM_LLM_API_KEY = "env-llm-key";
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      seenHeaders = init?.headers as Record<string, string>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as typeof fetch;
+
+    const llm = getDefaultLlamaCpp();
+    await llm.generate("test prompt");
+
+    expect(seenHeaders?.["Authorization"]).toBe("Bearer env-llm-key");
+  });
+
+  it("carries the LLM key on generate, never the embed key (keys are independent)", async () => {
+    let seenHeaders: Record<string, string> | undefined;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      seenHeaders = init?.headers as Record<string, string>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as typeof fetch;
+
+    const llm = new LlamaCpp({
+      remoteLlmUrl: "https://llm.example.com/v1",
+      remoteLlmApiKey: "llm-only-key",
+      remoteEmbedUrl: "https://embed.example.com",
+      remoteEmbedApiKey: "embed-only-key",
+    });
+    await llm.generate("test prompt");
+
+    expect(seenHeaders?.["Authorization"]).toBe("Bearer llm-only-key");
+  });
+});

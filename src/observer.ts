@@ -9,6 +9,7 @@
 import type { TranscriptMessage } from "./hooks.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
+import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 
 // =============================================================================
 // Types
@@ -179,31 +180,9 @@ export const VALID_PREDICATES = new Set([
 // Predicates whose <object> should be stored as a literal (not resolved to an entity).
 export const LITERAL_PREDICATES = new Set(["prefers", "avoids"]);
 
-// Exact placeholder strings that must never be persisted as facts or triple components.
-// Defense-in-depth: even though the prompt no longer places example text inside
-// <fact>/<subject>/<object> tags, a weak model could still echo these phrases.
-const SCHEMA_PLACEHOLDER_STRINGS = new Set([
-  "individual atomic fact",
-  "atomic fact",
-  "one atomic claim per fact element",
-  "brief descriptive title",
-  "canonical entity name",
-]);
-
-// Regex for template placeholder markers: {{...}}, <!--...-->, ${...}.
-// Intentionally narrow — earlier drafts rejected any line starting with
-// "example:" / "placeholder:", which false-positived legitimate facts like
-// "Example: QMD switched to Bun in v0.2". Shape-only matching avoids that
-// drift; the exact-string blocklist above handles known echoed placeholders.
-const PLACEHOLDER_REGEX = /^(\{\{.*\}\}|<!--.*-->|\$\{.*\})/;
-
-function isSchemaPlaceholder(text: string): boolean {
-  if (!text) return true;
-  const normalized = text.trim().toLowerCase();
-  if (SCHEMA_PLACEHOLDER_STRINGS.has(normalized)) return true;
-  if (PLACEHOLDER_REGEX.test(normalized)) return true;
-  return false;
-}
+// Anti-parrot residue guard (SCHEMA_PLACEHOLDER_STRINGS / PLACEHOLDER_REGEX / isSchemaPlaceholder)
+// now lives in ./schema-placeholder.ts, shared with the consolidation + conversation-synthesis
+// extraction paths. Imported at the top of this file.
 
 export function parseObservationXml(xml: string): Observation | null {
   const typeMatch = xml.match(/<type>\s*(.*?)\s*<\/type>/s);

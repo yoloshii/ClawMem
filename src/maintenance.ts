@@ -479,6 +479,7 @@ export async function runHeavyMaintenanceTick(
             invalidIndexRejects: stats.invalidIndexRejects,
             unsupportedRejects: stats.unsupportedRejects,
             emptyRejects: stats.emptyRejects,
+            placeholderRejects: stats.placeholderRejects,
             dedupSkipped: stats.dedupSkipped,
             validatorFallbackAccepts: stats.validatorFallbackAccepts,
           },

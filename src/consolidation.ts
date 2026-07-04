@@ -15,6 +15,7 @@
 import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
+import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 import { hashContent } from "./indexer.ts";
 import { passesMergeSafety } from "./text-similarity.ts";
 import { withWorkerLease } from "./worker-lease.ts";
@@ -68,6 +69,8 @@ export interface DeductiveSynthesisStats {
   unsupportedRejects: number;
   /** Drafts rejected because the conclusion was empty/trivial */
   emptyRejects: number;
+  /** Drafts rejected because the conclusion echoed the schema skeleton residue (anti-parrot) */
+  placeholderRejects: number;
   /** Accepted drafts that were then skipped as deductive dedupe duplicates */
   dedupSkipped: number;
   /**
@@ -93,6 +96,7 @@ function emptyDeductiveStats(considered: number = 0): DeductiveSynthesisStats {
     invalidIndexRejects: 0,
     unsupportedRejects: 0,
     emptyRejects: 0,
+    placeholderRejects: 0,
     dedupSkipped: 0,
     validatorFallbackAccepts: 0,
   };
@@ -1030,11 +1034,12 @@ For each valid deduction:
 2. List the premises (which observations support it)
 3. List the source indices (1-indexed)
 
-Return ONLY valid JSON array:
+Return ONLY a JSON array in this shape (structure only — replace every {{...}} with real content
+drawn from the observations above; never emit the {{...}} tokens or any schema text literally):
 [
   {
-    "conclusion": "Clear deductive statement",
-    "premises": ["Premise from obs 1", "Premise from obs 3"],
+    "conclusion": "{{new conclusion combining 2+ observations, 1-2 sentences}}",
+    "premises": ["{{fact from one source observation}}", "{{fact from another}}"],
     "source_indices": [1, 3]
   }
 ]
@@ -1071,6 +1076,18 @@ Return ONLY the JSON array. /no_think`;
       stats.rejected++;
       stats.invalidIndexRejects++;
       continue;
+    }
+
+    // Anti-parrot: reject a draft whose conclusion echoes the JSON skeleton's placeholder residue
+    // ({{...}} tokens / "clear deductive statement") before the expensive validator runs. Premises
+    // that are placeholder residue are filtered (non-fatal — the conclusion carries the deduction).
+    if (isSchemaPlaceholder(deduction.conclusion)) {
+      stats.rejected++;
+      stats.placeholderRejects++;
+      continue;
+    }
+    if (Array.isArray(deduction.premises)) {
+      deduction.premises = deduction.premises.filter(p => typeof p === "string" && !isSchemaPlaceholder(p));
     }
 
     const sourceDocIds = [...new Set(

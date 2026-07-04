@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, afterEach } from "bun:test";
 
 /**
  * Dimension-safety + consistency tests for the 2026-06-22 vector-retrieval
@@ -16,18 +16,25 @@ import { describe, it, expect } from "bun:test";
 
 import {
   createStore,
+  searchVec,
   updateDocument,
   VecDimensionMismatchError,
+  VecReadModelMismatchError,
   VecSchemaError,
   EmbedLeaseLostError,
+  rethrowIfFatalVectorError,
+  DEFAULT_EMBED_MODEL,
   type Store,
 } from "../../src/store.ts";
+import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import {
   acquireWorkerLease,
   releaseWorkerLease,
   renewWorkerLease,
 } from "../../src/worker-lease.ts";
 import { hashContent } from "../../src/indexer.ts";
+import { tmpdir } from "node:os";
+import { unlinkSync } from "node:fs";
 
 function seed(store: Store, col: string, path: string, body: string): string {
   const hash = hashContent(body + path);
@@ -301,5 +308,151 @@ describe("renewWorkerLease — token-fenced heartbeat", () => {
     expect(a.acquired).toBe(true);
     const b = acquireWorkerLease(store, "embedding", 60_000);
     expect(b.acquired).toBe(false); // second embed must skip
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W1 — read-path embedding-model consistency guard
+//
+// The vault's stored vectors carry the model that produced them (cv.model). If the active endpoint
+// later returns a DIFFERENT model at the SAME dimension (so VecDimensionMismatchError cannot catch
+// it), matching the new model's query vector against the old model's stored vectors is
+// cosine-meaningless. searchVec must throw VecReadModelMismatchError on the query path rather than
+// serve corrupted results. Bug-first: these assert CORRECT behavior.
+// ---------------------------------------------------------------------------
+
+// Minimal LLM stub: getEmbedding() calls getDefaultLlamaCpp().embed(); only .embed is exercised.
+// It returns a fixed unit vector plus the `model` we want the "endpoint" to report.
+function mockEmbedLlm(model: string, dim = 4): unknown {
+  return {
+    embed: async () => ({ embedding: Array.from({ length: dim }, (_, i) => (i === 0 ? 1 : 0)), model }),
+  };
+}
+
+describe("searchVec — read-path embedding-model consistency (W1)", () => {
+  afterEach(() => setDefaultLlamaCpp(null));
+
+  function seedOneVector(store: Store, storedModel: string) {
+    store.ensureVecTable(4);
+    const hash = seed(store, "c", "a.md", "doc a body");
+    store.insertEmbedding(hash, 0, 1, vec(4), storedModel, new Date().toISOString(), "full", null, "c/a.md");
+  }
+
+  it("throws VecReadModelMismatchError when the endpoint model differs from the stored model (same dim)", async () => {
+    const store = createStore(":memory:");
+    seedOneVector(store, "model-A");
+    expect(store.getVecModels()).toEqual(["model-A"]);
+
+    setDefaultLlamaCpp(mockEmbedLlm("model-B") as any); // endpoint now serves a different model, same dim
+    await expect(searchVec(store.db, "some query", DEFAULT_EMBED_MODEL, 10)).rejects.toBeInstanceOf(
+      VecReadModelMismatchError,
+    );
+  });
+
+  it("does not throw and returns results when the endpoint model matches the stored model", async () => {
+    const store = createStore(":memory:");
+    seedOneVector(store, "model-A");
+    setDefaultLlamaCpp(mockEmbedLlm("model-A") as any);
+    const results = await searchVec(store.db, "some query", DEFAULT_EMBED_MODEL, 10);
+    expect(results.length).toBeGreaterThanOrEqual(1); // consistent → the seeded vector is served
+  });
+
+  it("compares the ENDPOINT model, not the caller's DEFAULT_EMBED_MODEL arg", async () => {
+    // The vault stored "model-A"; the caller passes DEFAULT_EMBED_MODEL ("granite"), which is a local
+    // alias unrelated to what the endpoint serves. The endpoint returns "model-A", so the check must
+    // pass. A wrong implementation comparing the caller arg ("granite") to stored ("model-A") would
+    // false-throw here.
+    const store = createStore(":memory:");
+    seedOneVector(store, "model-A");
+    expect(DEFAULT_EMBED_MODEL).not.toBe("model-A"); // the caller arg is genuinely different
+    setDefaultLlamaCpp(mockEmbedLlm("model-A") as any);
+    const results = await searchVec(store.db, "q", DEFAULT_EMBED_MODEL, 10);
+    expect(results.length).toBeGreaterThanOrEqual(1); // matched on endpoint model, no throw
+  });
+
+  it("does not throw on an empty vault (no stored vectors to be inconsistent with)", async () => {
+    const store = createStore(":memory:");
+    store.ensureVecTable(4); // table exists but holds no vectors
+    setDefaultLlamaCpp(mockEmbedLlm("model-B") as any);
+    const results = await searchVec(store.db, "some query", DEFAULT_EMBED_MODEL, 10);
+    expect(results).toEqual([]); // MATCH finds nothing → empty, and no spurious throw
+  });
+
+  it("re-checks when the endpoint model drifts, even after a consistent verdict was cached", async () => {
+    // Cache correctness: the memoization stores only the specific OK model, so a later drift to a
+    // different model is NOT masked by the cached happy-path verdict.
+    const store = createStore(":memory:");
+    seedOneVector(store, "model-A");
+    setDefaultLlamaCpp(mockEmbedLlm("model-A") as any);
+    await searchVec(store.db, "q", DEFAULT_EMBED_MODEL, 10); // consistent → caches model-A as OK
+    setDefaultLlamaCpp(mockEmbedLlm("model-B") as any); // endpoint drifts
+    await expect(searchVec(store.db, "q", DEFAULT_EMBED_MODEL, 10)).rejects.toBeInstanceOf(
+      VecReadModelMismatchError,
+    );
+  });
+
+  it("throws on a HETEROGENEOUS vault even when the endpoint matches ONE of the stored models", async () => {
+    // A vault holding >1 model is cosine-corrupt: matching the endpoint against one model still scans
+    // the other model's polluting vectors. Consistency requires EXACTLY one stored model == endpoint.
+    const store = createStore(":memory:");
+    store.ensureVecTable(4);
+    const hA = seed(store, "c", "a.md", "doc a body");
+    store.insertEmbedding(hA, 0, 1, vec(4), "model-A", new Date().toISOString(), "full", null, "c/a.md");
+    const hB = seed(store, "c", "b.md", "doc b body");
+    store.insertEmbedding(hB, 0, 1, vec(4), "model-B", new Date().toISOString(), "full", null, "c/b.md");
+    expect(store.getVecModels().length).toBe(2);
+
+    setDefaultLlamaCpp(mockEmbedLlm("model-A") as any); // endpoint matches ONE of the two
+    await expect(searchVec(store.db, "q", DEFAULT_EMBED_MODEL, 10)).rejects.toBeInstanceOf(
+      VecReadModelMismatchError,
+    );
+  });
+
+  it("invalidates a cached OK verdict when ANOTHER connection rebuilds the vault (data_version)", async () => {
+    // Finding 1 (multi-process staleness): a long-running process caches model-A as OK, then a
+    // separate `clawmem embed --force` process re-embeds with model-B. SQLite's data_version (which
+    // changes on the first connection when ANOTHER connection commits) must invalidate the stale
+    // verdict so the next query re-reads content_vectors and throws.
+    const path = `${tmpdir()}/clawmem-w1-datav-${process.pid}-${Date.now()}.sqlite`;
+    const s1 = createStore(path);
+    const s2 = createStore(path); // a second, independent connection to the same DB file
+    try {
+      s1.ensureVecTable(4);
+      const hA = seed(s1, "c", "a.md", "doc a body");
+      s1.insertEmbedding(hA, 0, 1, vec(4), "model-A", new Date().toISOString(), "full", null, "c/a.md");
+
+      setDefaultLlamaCpp(mockEmbedLlm("model-A") as any);
+      const first = await searchVec(s1.db, "q", DEFAULT_EMBED_MODEL, 10); // caches {dataVersion, model-A}
+      expect(first.length).toBeGreaterThanOrEqual(1);
+
+      // Another connection rebuilds the vault with model-B (its commits bump s1's data_version).
+      s2.clearAllEmbeddings();
+      s2.ensureVecTable(4);
+      const hB = seed(s2, "c", "b.md", "doc b body");
+      s2.insertEmbedding(hB, 0, 1, vec(4), "model-B", new Date().toISOString(), "full", null, "c/b.md");
+
+      // s1's endpoint is still model-A; the vault now holds model-B. The stale cache must NOT mask it.
+      await expect(searchVec(s1.db, "q", DEFAULT_EMBED_MODEL, 10)).rejects.toBeInstanceOf(
+        VecReadModelMismatchError,
+      );
+    } finally {
+      s1.close();
+      s2.close();
+      try { unlinkSync(path); } catch { /* best-effort cleanup */ }
+    }
+  });
+});
+
+describe("rethrowIfFatalVectorError", () => {
+  it("rethrows FatalVectorError subclasses so a searchVec fallback catch surfaces them", () => {
+    const err = new VecReadModelMismatchError(["A"], "B");
+    expect(() => rethrowIfFatalVectorError(err)).toThrow(VecReadModelMismatchError);
+    expect(() => rethrowIfFatalVectorError(new VecDimensionMismatchError(4, 8))).toThrow(VecDimensionMismatchError);
+  });
+
+  it("swallows non-fatal errors (transient vector timeout / absent vectors) without throwing", () => {
+    expect(rethrowIfFatalVectorError(new Error("vector timeout"))).toBeUndefined();
+    expect(rethrowIfFatalVectorError("string error")).toBeUndefined();
+    expect(rethrowIfFatalVectorError(undefined)).toBeUndefined();
   });
 });

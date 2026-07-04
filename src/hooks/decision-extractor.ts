@@ -23,7 +23,7 @@ import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
 import { extractJsonFromLLM } from "../amem.ts";
-import { DEFAULT_EMBED_MODEL, extractSnippet, type SearchResult } from "../store.ts";
+import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
 
 // Observation types that are allowed to contribute SPO triples. Widened from the
@@ -92,7 +92,8 @@ export async function checkMergePolicy(
       if (sameType.length > 0) {
         return { action: 'skip' };
       }
-    } catch {
+    } catch (e) {
+      warnOnceOnVectorModelMismatch(e);
       // Vector search unavailable — fall through to insert
     }
     return { action: 'insert' };
@@ -211,7 +212,8 @@ async function detectContradictions(
   let existingDocs: SearchResult[];
   try {
     existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5);
-  } catch {
+  } catch (e) {
+    warnOnceOnVectorModelMismatch(e);
     existingDocs = store.searchFTS(queryText, 5);
   }
 

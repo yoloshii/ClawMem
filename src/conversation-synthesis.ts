@@ -28,6 +28,7 @@
 import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
+import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 import type { ContentType } from "./memory.ts";
 
 // =============================================================================
@@ -179,7 +180,7 @@ For each fact provide:
 - contentType: one of [decision, preference, milestone, problem]
 - narrative: 1-3 sentence description of the fact in context
 - facts: optional array of supporting fact strings (evidence)
-- aliases: optional alternative titles for linking (e.g., ["OAuth choice"] for "Use OAuth 2.0")
+- aliases: optional alternative titles for linking (help match this fact to related ones)
 - links: optional array of cross-fact references. Each link is
   {targetTitle, relationType, weight}
   - targetTitle may refer to another fact extracted from this conversation OR from
@@ -189,18 +190,20 @@ For each fact provide:
   - weight is 0.0-1.0 (default 0.6)
 
 Only extract facts the conversation clearly supports. Do NOT fabricate.
+Never copy the {{...}} tokens or any schema text below into your output — replace every {{...}}
+with real content drawn from the conversation. Emit only real extracted facts.
 Return ONLY valid JSON array. Return empty array [] if no structured facts found.
 
-Example output:
+Shape (structure only — not example content):
 [
   {
-    "title": "Use OAuth 2.0 with PKCE",
-    "contentType": "decision",
-    "narrative": "Team decided to use OAuth 2.0 with PKCE for user authentication, replacing session cookies.",
-    "facts": ["PKCE chosen for mobile support", "Legacy session auth to be deprecated Q2"],
-    "aliases": ["OAuth decision", "switch to OAuth"],
+    "title": "{{concise 3-8 word title}}",
+    "contentType": "{{one of: decision, preference, milestone, problem}}",
+    "narrative": "{{1-3 sentence description of the fact in context}}",
+    "facts": ["{{supporting evidence string}}"],
+    "aliases": ["{{optional alternative title}}"],
     "links": [
-      { "targetTitle": "Deprecate session auth", "relationType": "causal", "weight": 0.8 }
+      { "targetTitle": "{{another fact's title}}", "relationType": "{{one of: semantic, supporting, contradicts, causal, temporal, entity}}", "weight": 0.6 }
     ]
   }
 ]`;
@@ -219,6 +222,8 @@ function normalizeExtractedFact(
 
   const title = typeof obj.title === "string" ? obj.title.trim() : "";
   if (!title) return null;
+  // Anti-parrot: reject a fact whose title is echoed schema/skeleton residue.
+  if (isSchemaPlaceholder(title)) return null;
 
   const contentType = obj.contentType;
   if (typeof contentType !== "string") return null;
@@ -226,13 +231,14 @@ function normalizeExtractedFact(
 
   const narrative = typeof obj.narrative === "string" ? obj.narrative.trim() : "";
   if (!narrative) return null;
+  if (isSchemaPlaceholder(narrative)) return null;
 
   const facts: string[] = Array.isArray(obj.facts)
-    ? obj.facts.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
+    ? obj.facts.filter((f): f is string => typeof f === "string" && f.trim().length > 0 && !isSchemaPlaceholder(f))
     : [];
 
   const aliases: string[] = Array.isArray(obj.aliases)
-    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim().length > 0 && !isSchemaPlaceholder(a))
     : [];
 
   const links: ExtractedFactLink[] = Array.isArray(obj.links)

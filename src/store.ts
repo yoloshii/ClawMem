@@ -1035,6 +1035,16 @@ const contextUsageHasQueryTextCache = new WeakMap<Database, boolean>();
  */
 export class FatalVectorError extends Error {}
 
+/**
+ * Rethrow a fatal vector error (dimension / model / schema mismatch) so a searchVec() fallback
+ * catch surfaces it instead of silently degrading to BM25. Transient conditions (timeout, absent
+ * vectors) are NOT FatalVectorError and remain swallowed by the caller, as before. Apply this at the
+ * FTS-fallback catch sites that wrap searchVec.
+ */
+export function rethrowIfFatalVectorError(e: unknown): void {
+  if (e instanceof FatalVectorError) throw e;
+}
+
 export class VecDimensionMismatchError extends FatalVectorError {
   constructor(public readonly existingDim: number, public readonly requestedDim: number) {
     super(`Embedding dimension changed: vectors_vec is float[${existingDim}] but the model now returns float[${requestedDim}]. Run 'clawmem embed --force' to clear and rebuild the full vault.`);
@@ -1053,6 +1063,33 @@ export class VecModelMismatchError extends FatalVectorError {
   constructor(public readonly expectedModel: string, public readonly actualModel: string) {
     super(`Embedding model changed mid-run: the vault is being built with "${expectedModel}" but the endpoint now returns "${actualModel}". Mixing different models in one vector space (even at the same dimension) makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild with the current model.`);
     this.name = "VecModelMismatchError";
+  }
+}
+
+/**
+ * Read-path sibling of VecModelMismatchError. VecModelMismatchError fires only mid-embed-run; this
+ * one fires on the QUERY path when the vault's stored vectors were embedded with one model but the
+ * active embedding endpoint now returns a different model at the SAME dimension (so the dimension
+ * guard cannot catch it). Matching the new model's query vector against the old model's stored
+ * vectors is cosine-meaningless, so searchVec throws this rather than serving corrupted results.
+ */
+export class VecReadModelMismatchError extends FatalVectorError {
+  constructor(public readonly storedModels: string[], public readonly activeModel: string) {
+    super(`Embedding model mismatch on the query path: the vault's vectors were embedded with ${storedModels.map(m => `"${m}"`).join(", ")} but the active embedding endpoint now returns "${activeModel}". At the same dimension the dimension guard cannot catch this, and matching the new model's query vector against the old model's stored vectors makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild the vault with the current model.`);
+    this.name = "VecReadModelMismatchError";
+  }
+}
+
+// Fail-open surfacing for a read-path model mismatch: warn LOUDLY once per process, then let the
+// caller degrade to BM25. For hooks that MUST NOT throw — context-surfacing (UserPromptSubmit) and
+// the Stop hooks (decision-extractor) — a throwing hook breaks that turn. Explicit query paths use
+// rethrowIfFatalVectorError instead. The once-flag is process-global so the warning fires exactly
+// once no matter which hook trips it first.
+let _warnedVectorModelMismatch = false;
+export function warnOnceOnVectorModelMismatch(e: unknown): void {
+  if (e instanceof VecReadModelMismatchError && !_warnedVectorModelMismatch) {
+    _warnedVectorModelMismatch = true;
+    console.warn(`[clawmem] ${e.message}`);
   }
 }
 
@@ -3448,12 +3485,54 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
+// W1 read-path model-consistency cache, keyed on SQLite's `data_version` so a CROSS-PROCESS vault
+// rebuild invalidates a stale OK verdict. `data_version` changes whenever ANOTHER connection commits
+// (e.g. a separate `clawmem embed --force` process re-embeds with a different model) — exactly the
+// multi-process staleness case — and is a cheap header read (no scan), unlike the getVecModels()
+// DISTINCT+JOIN it guards. Same-connection writes don't bump it, but in-process model swaps are
+// already blocked by the embed-time VecModelMismatchError / clearAllEmbeddings drop.
+const verifiedQueryEmbedModels = new WeakMap<Database, { dataVersion: number; model: string }>();
+
+/**
+ * Guard the query path against a same-dimension embedding-model swap. Compares the ENDPOINT-returned
+ * model (NOT the caller's DEFAULT_EMBED_MODEL arg, which is a local alias unrelated to what the
+ * endpoint actually serves) against the models the vault's active vectors were embedded with. The
+ * vault is consistent ONLY when it holds EXACTLY ONE model equal to the endpoint's — a heterogeneous
+ * vault (length > 1) is cosine-corrupt even if the endpoint matches one of the models, because the
+ * other model's vectors still pollute the space. Throws VecReadModelMismatchError otherwise; no-ops
+ * when the vault has no vectors yet.
+ */
+function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): void {
+  const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
+  const cached = verifiedQueryEmbedModels.get(db);
+  if (cached && cached.dataVersion === dataVersion && cached.model === endpointModel) return;
+
+  const storedModels = getVecModels(db);
+  if (storedModels.length === 0) return; // nothing embedded yet — nothing to be inconsistent with
+
+  if (!(storedModels.length === 1 && storedModels[0] === endpointModel)) {
+    throw new VecReadModelMismatchError(storedModels, endpointModel);
+  }
+
+  // Consistent — memoize under the current data_version. A cross-process rebuild bumps data_version,
+  // invalidating this entry so the next query re-reads content_vectors.
+  verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true, deadlineMs);
-  if (!embedding) return [];
+  const embedResult = await getEmbedding(query, model, true, deadlineMs);
+  if (!embedResult) return [];
+
+  // W1: read-path embedding-model consistency gate. On a same-dimension model swap (which
+  // VecDimensionMismatchError cannot catch) this throws VecReadModelMismatchError rather than
+  // serving cosine-meaningless results. Cached per (db, model) — the DISTINCT runs at most once
+  // per model per process.
+  assertQueryEmbedModelConsistent(db, embedResult.model);
+
+  const embedding = embedResult.embedding;
 
   // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
   // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
@@ -3560,7 +3639,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: number): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: number): Promise<{ embedding: number[]; model: string } | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
@@ -3576,7 +3655,8 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, deadl
     signal = AbortSignal.timeout(remaining);
   }
   const result = await llm.embed(formattedText, { model, isQuery, signal });
-  return result?.embedding || null;
+  if (!result?.embedding) return null;
+  return { embedding: result.embedding, model: result.model };
 }
 
 /**
@@ -3879,19 +3959,24 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Cap parallelism at 4 to prevent VRAM exhaustion
   if (uncachedDocs.length > 0) {
     const rerankUrl = Bun.env.CLAWMEM_RERANK_URL;
+    const rerankApiKey = Bun.env.CLAWMEM_RERANK_API_KEY;
     let scored = false;
 
     // Try remote GPU reranker first
     // Truncate to ~400 chars per doc to fit within server's 512-token context
     // (query + document must fit in one pair; ~2 chars/token for mixed content)
     if (rerankUrl) {
+      // Independent of the embed/LLM keys — the rerank endpoint may be a different
+      // authenticated host. Sent as Authorization: Bearer when CLAWMEM_RERANK_API_KEY is set.
+      const rerankHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (rerankApiKey) rerankHeaders["Authorization"] = `Bearer ${rerankApiKey}`;
       try {
         // Process in batches of 4 to prevent VRAM exhaustion
         for (let i = 0; i < uncachedDocs.length; i += 4) {
           const batch = uncachedDocs.slice(i, i + 4);
           const resp = await fetch(`${rerankUrl}/v1/rerank`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: rerankHeaders,
             body: JSON.stringify({
               query: rerankQuery,
               documents: batch.map(d => d.text.slice(0, 400)),

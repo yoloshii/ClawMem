@@ -328,6 +328,13 @@ export type LlamaCppConfig = {
    */
   remoteLlmUrl?: string;
   /**
+   * API key for the remote LLM service (independent of the embed/rerank keys —
+   * the LLM endpoint may point at a different authenticated host than embedding).
+   * When set, sent as Authorization: Bearer header with chat completion requests.
+   * Env: CLAWMEM_LLM_API_KEY
+   */
+  remoteLlmApiKey?: string;
+  /**
    * Remote LLM model name to send with chat completion requests.
    * Env: CLAWMEM_LLM_MODEL
    */
@@ -401,6 +408,7 @@ export class LlamaCpp implements LLM {
   private remoteEmbedApiKey: string | null;
   private remoteEmbedModel: string;
   private remoteLlmUrl: string | null;
+  private remoteLlmApiKey: string | null;
   private remoteLlmModel: string;
   private remoteLlmReasoningEffort: string | null;
   private remoteLlmNoThink: boolean;
@@ -436,6 +444,7 @@ export class LlamaCpp implements LLM {
     this.remoteEmbedApiKey = config.remoteEmbedApiKey || null;
     this.remoteEmbedModel = config.remoteEmbedModel || "embedding";
     this.remoteLlmUrl = config.remoteLlmUrl || null;
+    this.remoteLlmApiKey = config.remoteLlmApiKey || null;
     const normalizedRemoteLlmModel = config.remoteLlmModel?.trim();
     this.remoteLlmModel = normalizedRemoteLlmModel || "qwen3";
     this.remoteLlmReasoningEffort = normalizeRemoteLlmReasoningEffort(config.remoteLlmReasoningEffort);
@@ -944,6 +953,14 @@ export class LlamaCpp implements LLM {
     return headers;
   }
 
+  private getLlmHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.remoteLlmApiKey) {
+      headers["Authorization"] = `Bearer ${this.remoteLlmApiKey}`;
+    }
+    return headers;
+  }
+
   private truncateForEmbed(text: string): string {
     // Cloud providers handle their own context window limits
     if (this.isCloudEmbedding()) return text;
@@ -1167,7 +1184,7 @@ export class LlamaCpp implements LLM {
       }
       const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: this.getLlmHeaders(),
         body: JSON.stringify(body),
         signal,
       });
@@ -1485,6 +1502,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
       remoteEmbedApiKey: embedApiKey,
       remoteEmbedModel: process.env.CLAWMEM_EMBED_MODEL || undefined,
       remoteLlmUrl: process.env.CLAWMEM_LLM_URL || undefined,
+      remoteLlmApiKey: process.env.CLAWMEM_LLM_API_KEY || undefined,
       remoteLlmModel: process.env.CLAWMEM_LLM_MODEL?.trim() || undefined,
       remoteLlmReasoningEffort: process.env.CLAWMEM_LLM_REASONING_EFFORT || undefined,
       remoteLlmNoThink: (() => {

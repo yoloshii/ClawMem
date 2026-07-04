@@ -27,3 +27,5 @@ Brain.
 test-beads/
 config.yaml
 dist/
+.codex-review-session.txt
+.no-test-on-stop
