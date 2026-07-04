@@ -4,6 +4,20 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.19.0 — Priority-based transcript formatting for session extraction
+
+The `decision-extractor` and session-summary Stop hooks prepared their LLM input by walking the last N messages and truncating each to a per-role character cap until a flat budget ran out. Under that scheme a long run of mid-conversation tool output could exhaust the budget before the final assistant message (the actual outcome) was reached, and the original user request — the single most important anchor for extraction — carried the same weight as any other message. Extraction quality degraded on exactly the long, tool-heavy sessions where good observations matter most.
+
+- **Priority-based transcript assembly.** `prepareTranscript` now classifies each message before budgeting: P0 the first user message (the original request), P1 the last real assistant message (the final response, skipping trailing tool calls), P2 tool activity, P3 the remaining conversation, P4 system messages. The critical P0/P1 pair is always included (at a doubled per-role cap); tool activity and then conversation fill the remaining budget and are *truncated to fit* rather than dropped wholesale; the result is reassembled in chronological order so the LLM still sees a coherent sequence. Tool detection keys off the generic `[tool_use` / `[tool_result` markers, so a transcript that ends on a tool call correctly keeps the preceding assistant text as the final response instead of mislabeling the tool call as the outcome.
+
+### Verification
+
+`bun test` → 1431 pass / 0 fail — the project's release gate. New bug-first tests in `tests/unit/observer.test.ts` cover `classifyMessages` (P0–P4 assignment, plus the end-on-tool and all-tool edge cases where no P1 exists) and `prepareTranscript` (P0/P1 always present, chronological order preserved, tight-budget prioritization, and tool messages truncated-to-fit rather than dropped). A bare `tsc --noEmit` remains a non-gate for the reasons noted under v0.18.0; the changed `src/observer.ts` adds no new type errors over that baseline. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, the vault format, and every public API are untouched. The formatter keeps the same `TranscriptMessage[] → string` contract; only the selection and ordering of what survives truncation changed. A session short enough to fit the budget is formatted with the same content as before, now in guaranteed-chronological order.
+
 ## v0.18.0 — Read-path embedding-model guard, extraction parrot-hardening, remote LLM/rerank auth
 
 Three independent hardenings gathered from a QMD-upstream survey. The first is a behavior change on the query path (a new fatal that replaces silently-wrong results) and drives the minor bump; the other two are additive.
