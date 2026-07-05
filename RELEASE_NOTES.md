@@ -4,6 +4,22 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.20.0 — Vector-query daemon: a hard cap on the cold synchronous MATCH
+
+v0.16.0 and v0.17.0 bounded the `context-surfacing` hook's vector leg with wall-clock deadlines and kept the sqlite-vec payload warm with a watcher prewarm, but those are probability reductions: a synchronous `bun:sqlite` MATCH exposes no interrupt, so once a cold scan on a large vault is in flight it blocks the hook's event loop past the 8-15s budget and the in-thread `Promise.race` timer cannot fire. v0.17.0 tracked the true hard cap — moving the scan off the hook's event loop — as deferred. This release ships it.
+
+- **Vector-query daemon, hosted by the watcher (opt-in, a pure optimization layer).** `clawmem watch` now runs a per-vault unix-domain socket daemon. The `context-surfacing` hook sends only the query string; the daemon runs Step 1 — the embed plus the blocking sqlite-vec MATCH — in its own process and returns the raw `{hash_seq, distance}` matches, which the hook hydrates locally (Step 2). With the blocking scan off the hook's event loop, the hook's real `setTimeout` finally fires: a cold scan that would have blocked the turn now times out fast and falls back to FTS with bounded latency. `searchVec` is split into `searchVecMatch` (Step 1) and `hydrateVecResults` (Step 2); the in-process `searchVec` composes them, so its contract is unchanged, and both hook vector legs — primary and deep-escalation — are bounded, not just the first.
+- **Strict graceful degradation — never a dependency.** When the watcher isn't running the socket is absent and the hook uses the in-process path exactly as before. When the daemon is busy or misbehaving the hook drops to FTS rather than re-running the scan in-process (which would reintroduce the block). A read-path model mismatch still surfaces as `VecReadModelMismatchError` (warned once) across the socket, preserving the v0.18.0 contract.
+- **Single-flight, deadline-on-receipt, and a private socket.** At most one scan runs per vault; a request arriving mid-scan gets an immediate `busy` (→ FTS) rather than queuing, and a request whose deadline already elapsed is dropped without scanning — so cold-scan pileups cannot starve the watcher. The socket lives under `$XDG_RUNTIME_DIR/clawmem/` (0700 dir, 0600 socket), is keyed per vault DB path, refuses to clobber a live daemon from another watcher, and is unlinked on shutdown. `CLAWMEM_VEC_TIMING=1` logs per-leg outcome and elapsed for attribution.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail — the project's release gate. New bug-first tests in `tests/unit/vector-daemon.test.ts` (16, deterministic under `--rerun-each 3`) cover the socket protocol (serve, malformed, oversized, teardown), single-flight and deadline-on-receipt, the per-vault socket derivation, and the client's full fail-open matrix (absent → in-process, busy/error → FTS, model-mismatch → typed rethrow); the Step-1 scan is dependency-injected so they run without an embedding server. A bare `tsc --noEmit` remains a non-gate for the reasons noted under v0.18.0; the new `src/vector-daemon.ts` and the split `src/store.ts` add no new type errors over that baseline. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high): a fresh DESIGN gate on the spec at build time, then code review to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, ranking, and the vault format are untouched — the daemon returns the same Step-1 matches the in-process path would, hydrated by the same Step-2 query. A deployment that does not run `clawmem watch` gets byte-identical behavior to v0.19.0. The daemon hosts the general vault only; skill-vault vector queries stay in-process (a far smaller surface, not the ~2 GB risk).
+
 ## v0.19.0 — Priority-based transcript formatting for session extraction
 
 The `decision-extractor` and session-summary Stop hooks prepared their LLM input by walking the last N messages and truncating each to a per-role character cap until a flat budget ran out. Under that scheme a long run of mid-conversation tool output could exhaust the budget before the final assistant message (the actual outcome) was reached, and the original user request — the single most important anchor for extraction — carried the same weight as any other message. Extraction quality degraded on exactly the long, tool-heavy sessions where good observations matter most.

@@ -27,6 +27,7 @@ import {
   VecModelMismatchError,
   EmbedLeaseLostError,
 } from "./store.ts";
+import { startVectorDaemon, type VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
@@ -96,9 +97,9 @@ enableProductionMode();
 
 let store: Store | null = null;
 
-function getStore(): Store {
+function getStore(busyTimeout: number = 5000): Store {
   if (!store) {
-    store = createStore(undefined, { busyTimeout: 5000 });
+    store = createStore(undefined, { busyTimeout });
   }
   return store;
 }
@@ -1087,7 +1088,10 @@ async function cmdHook(args: string[]) {
   if (!hookName) die("Usage: clawmem hook <name>");
 
   const input = await readHookInput();
-  const s = getStore();
+  // Open the store capped from the START for the context-surfacing hook (not just after open via the
+  // PRAGMA below) so a contended init cannot wait the full 5000ms default before it is narrowed. Other
+  // hooks (Stop-lane, 30s budget) keep the 5000ms default.
+  const s = getStore(hookName === "context-surfacing" ? CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS : 5000);
   let output: HookOutput;
 
   try {
@@ -1848,6 +1852,7 @@ async function cmdWatch() {
   let watcherHandle: { close: () => void } | null = null;
   let checkpointTimerHandle: Timer | null = null;
   let prewarmTimerHandle: ReturnType<typeof setInterval> | null = null;
+  let vectorDaemonHandle: VectorDaemonHandle | null = null;
 
   // Graceful shutdown — stop workers, close watchers, then exit. SIGTERM
   // handling is critical for systemd `systemctl --user stop` to shut down
@@ -1862,6 +1867,12 @@ async function cmdWatch() {
     if (prewarmTimerHandle) {
       clearInterval(prewarmTimerHandle);
       prewarmTimerHandle = null;
+    }
+    // Stop the vector daemon early — before the awaited worker drain below — so no new socket-driven
+    // scan starts mid-shutdown. close() stops the listener and unlinks the socket file.
+    if (vectorDaemonHandle) {
+      vectorDaemonHandle.close();
+      vectorDaemonHandle = null;
     }
     if (stopHeavyLane) {
       await stopHeavyLane();
@@ -1939,6 +1950,11 @@ async function cmdWatch() {
   if (prewarmTimerHandle) {
     console.log(`${c.dim}[watch] periodic vector prewarm every ${Math.round(prewarmIntervalMs / 1000)}s${c.reset}`);
   }
+
+  // BACKLOG Source 46: vector-query daemon — HARD cap on the cold synchronous MATCH. Runs Step 1 off
+  // the hook's event loop on this long-lived watcher; the hook connects only when the socket exists,
+  // so it is a pure optimization layer (null on bind failure → the hook keeps its in-process fallback).
+  vectorDaemonHandle = await startVectorDaemon(s, (msg) => console.log(`${c.dim}${msg}${c.reset}`));
 
   watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,

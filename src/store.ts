@@ -3519,7 +3519,13 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
   verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
+// Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the wall-clock
+// deadline, then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
+// collection/date filtering is a Step-2 concern. Split out (BACKLOG Source 46) so the vector-query
+// daemon can run JUST this half on the long-lived watcher — keeping the blocking MATCH off the hook's
+// event loop — while the hook hydrates locally via hydrateVecResults(). In-process searchVec() below
+// composes the two, so its public contract is unchanged.
+export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: number): Promise<{ hash_seq: string; distance: number }[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -3546,12 +3552,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
+  return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
   `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+}
 
+// Step 2 of vector search — the cheap, local half: hydrate raw {hash_seq, distance} hits into
+// SearchResult[] via indexed JOINs, collection/date filtering, and per-doc dedup. Pure primary-key
+// SQLite lookups — safe to run in the short-lived hook process even when Step 1 ran in the daemon.
+export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; distance: number }[], limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
   if (vecResults.length === 0) return [];
 
   // Step 2: Get chunk info and document data
@@ -3633,6 +3644,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
         fragmentLabel: row.fragment_label ?? undefined,
       };
     });
+}
+
+// In-process vector search — Step 1 (MATCH) + Step 2 (hydrate) composed. Public contract unchanged;
+// the daemon-backed hook path (context-surfacing) instead calls searchVecMatch (in the daemon) +
+// hydrateVecResults (locally), so the blocking MATCH never runs on the hook's event loop.
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
+  const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
+  return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
 }
 
 // =============================================================================

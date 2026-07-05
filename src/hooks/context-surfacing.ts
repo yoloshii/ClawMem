@@ -8,6 +8,7 @@
 
 import type { Store, SearchResult } from "../store.ts";
 import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore } from "../store.ts";
+import { searchVecBounded } from "../vector-daemon.ts";
 import { getVaultPath, getActiveProfile } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
@@ -205,7 +206,11 @@ export async function contextSurfacing(
       // deadline makes searchVec self-abort before the blocking MATCH, so a slow embed cannot let
       // an already-timed-out vector leg resume and re-block the hook after it fell back to FTS.
       const vectorDeadline = Date.now() + profile.vectorTimeout;
-      const vectorPromise = store.searchVec(retrievalQuery, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline);
+      // searchVecBounded runs Step 1 (the blocking MATCH) in the vector daemon when it is live, so the
+      // Promise.race timer below can ACTUALLY fire (this event loop stays free during the scan). When the
+      // daemon is absent it falls back to the in-process searchVec unchanged; when the daemon is
+      // busy/errors it returns [] and we drop to FTS below.
+      const vectorPromise = searchVecBounded(store, retrievalQuery, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline);
       const timeoutPromise = new Promise<SearchResult[]>((_, reject) => {
         vectorTimer = setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout);
       });
@@ -305,7 +310,7 @@ export async function contextSurfacing(
               if (remainingMs <= 0) break;
               let deepTimer: ReturnType<typeof setTimeout> | undefined;
               try {
-                const deepVec = store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, startTime + 6000);
+                const deepVec = searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, startTime + 6000);
                 const deepTimeout = new Promise<SearchResult[]>((_, reject) => {
                   deepTimer = setTimeout(() => reject(new Error("vector timeout")), remainingMs);
                 });
