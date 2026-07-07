@@ -4,6 +4,37 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.20.2 — Beads sync hardening: argument-safe exec, telemetry-off spawns
+
+`runBd` assembled a shell string and ran it through `execSync`, leaving argument interpolation to the shell, and bd v1.1.0 upstream turned on anonymous usage metrics by default with a remote reporting endpoint and a spawned flush sender — so every bd invocation ClawMem makes during a sync would have phoned home on upgraded installs.
+
+- **`execFileSync` replaces the shell string** (`src/beads.ts`): arguments pass as an array with no shell interpolation; same timeout, cwd, and error handling.
+- **Telemetry is disabled for ClawMem-spawned bd calls only.** The spawn env forces `BD_DISABLE_METRICS=1` and `BD_DISABLE_EVENT_FLUSH=1`. Older bd releases ignore the unknown variables (verified on v0.58.0); a user's own interactive bd keeps whatever metrics preference they chose — automated sync calls would only have skewed it.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail. Empirical matrix on both ends of the supported bd range: v0.58.0 and v1.1.0 return identical rows with and without the env pair. The exec seam was flagged in an independent cross-model adversarial review (codex / GPT-5.5).
+
+### What didn't change
+
+The parse schema, sync semantics, dep-type bridging, and document shape are untouched. v0.20.2 is byte-identical in behavior to v0.20.1 except for the exec mechanism and the spawned-call env.
+
+## v0.20.1 — Beads sync against bd v1.1.0: full-backlog list, dead field dropped, claim leases surfaced
+
+An upstream delta survey of beads v1.0.5 → v1.1.0 (`gastownhall/beads`, formerly `steveyegge/beads`) found three drift points in the sync:
+
+- **The 50-issue silent truncation is gone.** `queryBeadsList` inherited `bd list`'s default cap, so backlogs past 50 issues silently synced a prefix. The query now passes `--limit 0` (unlimited) — verified live against bd v0.58.0 and v1.1.0, so the fix does not raise the version floor.
+- **`quality_score` dropped from the parse** (`src/beads.ts` interface, normalizer, and formatter). Upstream removed the field at v0.62.0; it was `omitempty` even before, so real `bd list --json` output stopped carrying it long ago. This is bd's per-issue field — ClawMem's own indexing-time quality scoring is a different mechanism and is untouched.
+- **Claim leases surfaced.** bd v1.1.0 issues can carry `lease_expires_at` / `heartbeat_at`; the sync now parses both and renders a `**Claim Lease**: expires …` line when present, so agent-claimed work is visible in indexed memory. Absent on older bd → the line is skipped.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail. No ClawMem consumer references the dropped field (`store.ts` / `mcp.ts` / CLI checked). `--limit 0` and field behavior exercised against live databases on bd v0.58.0 and v1.1.0.
+
+### What didn't change
+
+Dependency-type bridging is untouched — the new upstream dep types (`tracks`, `until`, `authored-by`, `assigned-to`, `approved-by`, `attests`) fall to the existing `semantic` default exactly as unmapped types always have. Watcher behavior, `.beads/` discovery, and document format are unchanged apart from the two field-level items above.
+
 ## v0.20.0 — Vector-query daemon: a hard cap on the cold synchronous MATCH
 
 v0.16.0 and v0.17.0 bounded the `context-surfacing` hook's vector leg with wall-clock deadlines and kept the sqlite-vec payload warm with a watcher prewarm, but those are probability reductions: a synchronous `bun:sqlite` MATCH exposes no interrupt, so once a cold scan on a large vault is in flight it blocks the hook's event loop past the 8-15s budget and the in-thread `Promise.race` timer cannot fire. v0.17.0 tracked the true hard cap — moving the scan off the hook's event loop — as deferred. This release ships it.

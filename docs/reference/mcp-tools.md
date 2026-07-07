@@ -280,6 +280,8 @@ Sync Beads issues from Dolt backend into the search index.
 |-------|------|---------|-------------|
 | `project_path` | string | cwd | Path to project with `.beads/` directory |
 
+Runs `bd list --json --limit 0` — the full backlog, not bd's default 50-issue page (v0.20.1). The spawned call disables bd usage metrics (`BD_DISABLE_METRICS=1`, ignored by pre-1.1.0 binaries). Issues carrying bd ≥1.1.0 claim-lease fields render a `**Claim Lease**` line in the indexed document (v0.20.1); upstream's removed `quality_score` field is no longer parsed.
+
 ## Vault management
 
 ### list_vaults

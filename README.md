@@ -85,7 +85,7 @@ Full version history is in [RELEASE_NOTES.md](RELEASE_NOTES.md). Upgrade instruc
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — for hooks + MCP integration
 - [OpenClaw](https://github.com/openclaw/openclaw) — for native plugin integration
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) — for `MemoryProvider` plugin integration
-- [bd CLI](https://github.com/dolthub/dolt) v0.58.0+ — for Beads issue tracker sync (only if using Beads)
+- [bd CLI](https://github.com/gastownhall/beads) v0.58.0+ (verified through v1.1.0) — for Beads issue tracker sync (only if using Beads)
 
 ### Install from npm (recommended)
 
@@ -572,7 +572,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 | Tool | Description |
 |---|---|
-| `beads_sync` | Sync Beads issues from Dolt backend (`bd` CLI) into memory: creates docs, bridges all dep types to `memory_relations`, runs A-MEM enrichment |
+| `beads_sync` | Sync Beads issues from Dolt backend (`bd` CLI) into memory: syncs the full backlog (no 50-issue cap), creates docs, bridges all dep types to `memory_relations`, surfaces bd ≥1.1.0 claim leases, runs A-MEM enrichment |
 
 ### Vault Management
 
