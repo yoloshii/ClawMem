@@ -9,7 +9,7 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 
 // =============================================================================
 // Types (matches bd list --json output: IssueWithCounts)
@@ -93,11 +93,13 @@ function runBd(projectDir: string, args: string[], timeoutMs = 10000): string | 
   }
 
   try {
-    return execSync(`${bd} ${args.join(" ")}`, {
+    return execFileSync(bd, args, {
       cwd: projectDir,
       encoding: "utf-8",
       timeout: timeoutMs,
-      env: { ...process.env },
+      // No shell interpolation of args; bd usage metrics + event flush stay off
+      // (default-on with a remote endpoint as of bd 1.1.0).
+      env: { ...process.env, BD_DISABLE_METRICS: "1", BD_DISABLE_EVENT_FLUSH: "1" },
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err: any) {
