@@ -43,7 +43,8 @@ export interface BeadsIssue {
   metadata?: Record<string, unknown>;
   labels?: string[];
   dependencies?: BeadsDependency[];
-  quality_score?: number;
+  lease_expires_at?: string;
+  heartbeat_at?: string;
   // Computed counts from bd list --json
   dependency_count?: number;
   dependent_count?: number;
@@ -114,7 +115,7 @@ function runBd(projectDir: string, args: string[], timeoutMs = 10000): string | 
  * Returns parsed issues with labels and dependencies populated.
  */
 export function queryBeadsList(projectDir: string): BeadsIssue[] {
-  const output = runBd(projectDir, ["list", "--json"]);
+  const output = runBd(projectDir, ["list", "--json", "--limit", "0"]);
   if (!output) return [];
 
   try {
@@ -158,7 +159,8 @@ function normalizeBeadsIssue(raw: any): BeadsIssue {
     metadata: raw.metadata,
     labels: raw.labels || [],
     dependencies: deps,
-    quality_score: raw.quality_score,
+    lease_expires_at: raw.lease_expires_at,
+    heartbeat_at: raw.heartbeat_at,
     dependency_count: raw.dependency_count,
     dependent_count: raw.dependent_count,
     comment_count: raw.comment_count,
@@ -213,7 +215,7 @@ export function formatBeadsIssueAsMarkdown(issue: BeadsIssue): string {
   }
   if (issue.blocks && issue.blocks.length > 0) lines.push(`**Blocks**: ${issue.blocks.join(", ")}`);
   if (issue.external_ref) lines.push(`**External Ref**: ${issue.external_ref}`);
-  if (issue.quality_score != null) lines.push(`**Quality Score**: ${issue.quality_score}`);
+  if (issue.lease_expires_at) lines.push(`**Claim Lease**: expires ${issue.lease_expires_at}`);
 
   if (issue.description) {
     lines.push("", "## Description", "", issue.description);
