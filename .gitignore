@@ -21,6 +21,7 @@ node_modules/
 .env
 
 # Internal dev artifacts
+eval-queries*.json
 .ralph/
 ralph.yml
 Brain.
