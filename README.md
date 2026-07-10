@@ -542,7 +542,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | Tool | Description |
 |---|---|
 | `memory_retrieve` | **Preferred entry point.** Auto-classifies query and routes to optimal backend (query, intent_search, session_log, find_similar, or query_plan). Use instead of manually choosing a search tool. |
-| `search` | BM25 keyword search — for exact terms, config names, error codes, filenames. Composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
+| `search` | BM25 keyword search — for exact terms, config names, error codes, filenames. Composite scoring + co-activation boost + compact mode. **v0.23.0: the keyword relevance signal is real** — the exposed FTS score is a monotonic BM25 transform (a clamp bug flattened it to a constant 1.0 through v0.22.0, making ranking metadata-only). Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
 | `vsearch` | Vector semantic search — for conceptual/fuzzy matching when exact keywords are unknown. **v0.22.0: non-recency queries rank by RAW cosine (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default)**; recency-intent queries keep composite. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
 | `query` | Full hybrid pipeline (BM25 + vector + rerank) — general-purpose when query type is unclear. WRONG for "why" questions (use `intent_search`) or cross-session queries (use `session_log`). Prefer `memory_retrieve` for auto-routing. Intent hint, strong-signal bypass, chunk dedup, candidateLimit, MMR diversity, compact mode. |
 | `get` | Retrieve single document by path or docid |
@@ -594,7 +594,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
 | Tool | Description |
 |---|---|
-| `memory_forget` | Search → deactivate closest match (with audit trail) |
+| `memory_forget` | Search → deactivate closest match (with audit trail). Weak matches return a disambiguation list instead of acting (v0.23.0) |
 | `memory_pin` | Pin a memory: lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on hook/`query`/`search` surfaces; exact-tie precedence on the raw vector routes). USE PROACTIVELY when: user states a persistent constraint, makes an architecture decision, or corrects a misconception. Don't wait for curator — pin critical decisions immediately. |
 | `memory_snooze` | Temporarily hide a memory from context surfacing until a date. USE PROACTIVELY when `<vault-context>` repeatedly surfaces irrelevant content — snooze for 30 days instead of ignoring it. |
 | `status` | Index health with content type distribution |

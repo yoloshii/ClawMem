@@ -107,7 +107,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `profile` | User profile (static facts + dynamic context). |
 | `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw vector routes). PROACTIVELY for constraints, architecture decisions, corrections. |
 | `memory_snooze` | PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days. |
-| `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. |
+| `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. Weak matches return a disambiguation list instead of acting (v0.23.0). |
 | `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. |
 | `timeline` | Temporal neighborhood around a doc. Progressive disclosure: search → timeline → get. |
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
@@ -135,7 +135,7 @@ The pipeline autonomously generates lex/vec/hyde variants, fuses BM25 + vector v
 
 ## Composite scoring
 
-Applied on the composite surfaces: hooks, `query`, `search`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. **v0.22.0: MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine instead** (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default); recency-intent queries keep composite everywhere.
+Applied on the composite surfaces: hooks, `query`, `search`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. **v0.22.0: MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine instead** (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default); recency-intent queries keep composite everywhere. **v0.23.0:** `searchScore` on FTS surfaces is the monotonic `|bm25|/(1+|bm25|)` transform (it was a constant 1.0 through v0.22.0 due to a clamp bug — keyword relevance contributed zero ordering); FTS-transform scores and cosines are independent monotonic signals, not one calibrated scale.
 
 ```
 compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost

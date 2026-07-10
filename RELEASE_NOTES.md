@@ -4,6 +4,24 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.23.0 — monotonic BM25 exposed score (the FTS relevance signal was a constant)
+
+The v0.22.0 design gate discovered that `searchFTS`'s exposed score was computed as `1 / (1 + Math.max(0, bm25))` — but FTS5's `bm25()` is negative-is-better and ≤ 0 for every match (0/4,962 positive rows measured on a production vault), so **every FTS result carried the identical score 1.0**. SQL ordering was correct; everything downstream of the exposed score was not: composite ranking on FTS surfaces (`search`, REST keyword, CLI, `memory_retrieve` keyword and its semantic-mode FTS fallback, hook FTS lanes) was effectively metadata-only, the `query` pipeline's strong-signal bypass could never fire on multi-hit queries yet always fired on single-hit ones, hook injection systematically preferred FTS-sourced docs over vector-sourced ones (1.0 vs cosine), and every score-threshold gate was vacuous.
+
+### Behavior changes
+
+- **Exposed FTS score is now `|bm25|/(1+|bm25|)`** (`ftsScoreFromBm25`, exported): monotonic in match strength, bounded [0,1), per-row stable, clamps a hypothetical positive input to 0.
+- **`search` keeps the composite regime** (a regime change is gated on the 49.2 judged keyword eval) — but its searchScore input is now real, so keyword relevance finally contributes ordering. Observed `score`/`compositeScore` values shift accordingly; `minScore` semantics are unchanged. Compact results report the composite; non-compact carry both `score` (raw transform) and `compositeScore`.
+- **Strong-signal bypass is functional**: fires only on a strong (≥ 0.85 ⇔ |bm25| ≥ 5.67), clearly separated (gap ≥ 0.15) top hit; a lone weak match no longer triggers it. One shared helper (`hasStrongFtsSignal`) now backs both the MCP `query` pipeline and the CLI `query` command (previously a drifted duplicate).
+- **`memory_forget` targeting is stricter and safer**: the confidence gate (`score ≥ 0.7`, or a ≥ 0.2 gap when 2+ candidates exist) is live — previously every FTS candidate scored 1.0 and was auto-selected, including a lone garbage match. Weak matches now return the candidate list for disambiguation. Non-destructive pin/snooze behavior is unchanged.
+- **`query_plan`'s graph clause now carries RRF-fused scores into graph traversal** (parity with the causal and `intent_search` paths, via a shared `attachRrfScores` helper) — traversal seed mass was previously anchored on raw single-channel scores.
+- **Consolidation dup-gate and curator BM25 probe are live**: the `score ≥ 0.7` duplicate filter and the `> 0.3` retrieval probe actually discriminate now. A near-empty vault may honestly report a degraded BM25 probe where it previously passed vacuously.
+- **Scale honesty**: FTS-transform scores and vector cosines are independent monotonic signals, not a calibrated common scale. Mixed-channel merge points (REST hybrid max-merge, hook dedup) are no longer degenerate, but cross-channel calibration remains future, eval-gated work.
+
+Follow-on work: BACKLOG 49.2 (judged keyword eval → `search` regime recommendation; reports bypass firings) and 49.3 (query-pipeline A/B before any bypass-threshold tuning).
+
+---
+
 ## v0.22.0 — raw-similarity-primary ranking for the direct vector routes
 
 v0.21.0 removed the system-internal junk from the direct tools' results; the direct-pipeline eval it mandated then showed the composite scoring layer itself was the remaining defect on those routes: on a judged set against the live vault, pure raw cosine ranked 16/19 targets #1 (MRR 0.912) while the shipping composite ranked 1/19 (MRR 0.307), filtered 14/19 correct answers below the old `minScore` floor, and got WORSE with deeper candidate pools. Attribution was measured per stage: length normalization caused the floor kills; the pin +0.3 additive made one pinned, heavily-accessed hub document top-1 for nearly every query including nonsense controls; re-mixing the weights could not help because every multiplier is larger than the 0.03–0.10 raw margins that separate right answers from wrong ones in the compressed-high band of modern embedding models.

@@ -79,6 +79,8 @@ When the top BM25 hit scores >= 0.85 and the gap to the second hit is >= 0.15, t
 
 The bypass is disabled when `intent` is provided — intent implies the query is ambiguous, so keyword confidence alone is insufficient.
 
+Functional as of v0.23.0: through v0.22.0 a clamp bug flattened every FTS score to a constant 1.0, so with two or more hits the gap was always 0 (the bypass never fired) and with exactly one hit the gap was always 1.0 (it fired even on a garbage match). The scores are now the monotonic `|bm25|/(1+|bm25|)` transform — 0.85 corresponds to |bm25| ≥ 5.67 — and the check itself lives in one shared helper (`hasStrongFtsSignal`) used by both this pipeline and the CLI `query` command. Threshold tuning is deliberately deferred to a judged query-pipeline A/B (BACKLOG 49.3).
+
 ## Query expansion
 
 The LLM generates lex (keyword), vec (semantic), and hyde (hypothetical answer) variants of the query, each carried as a typed `ExpandedQuery`. Variants are **routed by type**: `lex` expansions are searched on BM25 only, `vec` and `hyde` on vector only. The original query is the only leg that fans out to *both* backends. All legs are searched in parallel and fused; the original query's two lists receive 2x weight in RRF, ensuring it anchors the ranking.

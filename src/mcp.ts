@@ -33,7 +33,7 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, attachRrfScores, type RankedResult } from "./search-utils.ts";
 import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
@@ -330,11 +330,7 @@ This is the recommended entry point for ALL memory queries.`,
         } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
         const rrfWeights = intent.intent === 'WHY' ? [1.0, 1.5] : intent.intent === 'WHEN' ? [1.5, 1.0] : [1.0, 1.0];
         const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
-        const allSearch = [...bm25Results, ...vecResults];
-        let fused: SearchResult[] = fusedRanked.map(fr => {
-          const orig = allSearch.find(r => r.filepath === fr.file);
-          return orig ? { ...orig, score: fr.score } : null;
-        }).filter((r): r is SearchResult => r !== null);
+        let fused: SearchResult[] = attachRrfScores(fusedRanked, [...bm25Results, ...vecResults]);
 
         if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
           try {
@@ -460,11 +456,7 @@ This is the recommended entry point for ALL memory queries.`,
         } catch (e) { rethrowIfFatalVectorError(e); /* */ }
         if (vec.length > 0) {
           const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          const allSearch = [...bm25, ...vec];
-          results = fusedRanked.map(fr => {
-            const orig = allSearch.find(r => r.filepath === fr.file);
-            return orig ? { ...orig, score: fr.score } : null;
-          }).filter((r): r is SearchResult => r !== null);
+          results = attachRrfScores(fusedRanked, [...bm25, ...vec]);
         } else {
           results = bm25;
         }
@@ -747,12 +739,9 @@ This is the recommended entry point for ALL memory queries.`,
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
       const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl);
-      const topScore = initialFts.length > 0 ? Math.abs(initialFts[0]!.score) : 0;
-      const secondScore = initialFts.length > 1 ? Math.abs(initialFts[1]!.score) : 0;
       // When intent is provided, disable strong-signal bypass — the obvious BM25
       // match may not be what the caller wants (e.g. "performance" with intent "web page load times")
-      const hasStrongSignal = !intent && initialFts.length > 0
-        && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+      const hasStrongSignal = !intent && hasStrongFtsSignal(initialFts);
 
       // Step 2: Query expansion (skipped if strong signal). Typed routing —
       // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.
@@ -1101,9 +1090,11 @@ This is the recommended entry point for ALL memory queries.`,
 
     const top = candidates[0]!;
 
-    // Clear winner: high score OR significant gap to #2
+    // Clear winner: high score OR significant gap to #2. The gap clause requires an
+    // actual #2 to gap against — a lone weak candidate must not qualify (destructive
+    // ops would otherwise auto-select a garbage single match).
     const gap = candidates.length > 1 ? top.score - candidates[1]!.score : 1.0;
-    const confident = top.score >= 0.7 || gap >= 0.2;
+    const confident = top.score >= 0.7 || (candidates.length > 1 && gap >= 0.2);
 
     // For destructive ops (forget), require higher confidence
     if (destructive && !confident) {
@@ -1724,11 +1715,7 @@ This is the recommended entry point for ALL memory queries.`,
       const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
 
       // Map RRF results back to SearchResult with updated scores
-      const allSearchResults = [...bm25Results, ...vecResults];
-      const fused: SearchResult[] = fusedRanked.map(fr => {
-        const original = allSearchResults.find(r => r.filepath === fr.file);
-        return original ? { ...original, score: fr.score } : null;
-      }).filter((r): r is SearchResult => r !== null);
+      const fused: SearchResult[] = attachRrfScores(fusedRanked, [...bm25Results, ...vecResults]);
 
       // Step 4: Graph expansion (if enabled and intent allows)
       let expanded = fused;
@@ -1922,10 +1909,11 @@ This is the recommended entry point for ALL memory queries.`,
           const vec = detGraph.results;
           if (detGraph.degraded && detGraph.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:graph:vector`, reason: detGraph.degradedReason });
           const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          const searchMap = new Map([...bm25, ...vec].map(r => [r.filepath, r]));
-          results = fused
-            .map(fr => searchMap.get(fr.file))
-            .filter((r): r is SearchResult => r !== null);
+          // Carry the RRF-fused score (parity with causal + intent_search): the graph
+          // traversal below anchors on `score`, which must be RRF-scale, not raw single-channel.
+          // vec-first: this site historically preferred the vector variant on duplicate
+          // paths (its pre-helper Map construction let later entries overwrite) — preserved.
+          results = attachRrfScores(fused, [...vec, ...bm25]);
 
           // Graph expansion for WHY/ENTITY
           if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {

@@ -58,7 +58,7 @@ import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { indexCollection, parseDocument } from "./indexer.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, hasStrongFtsSignal, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
 import { getProfile, updateProfile, isProfileStale } from "./profile.ts";
 import { regenerateAllDirectoryContexts } from "./directory-context.ts";
@@ -1095,9 +1095,7 @@ async function cmdQuery(args: string[]) {
 
   // Step 1: BM25 for strong signal check
   const ftsResults = s.searchFTS(query, 20);
-  const topScore = ftsResults[0]?.score ?? 0;
-  const secondScore = ftsResults[1]?.score ?? 0;
-  const strongSignal = topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+  const strongSignal = hasStrongFtsSignal(ftsResults);
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
   // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and

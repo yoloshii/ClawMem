@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.22.0**.
+Guide for upgrading between released versions. Current: **v0.23.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,19 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.23.0: monotonic BM25 exposed score
+
+No migration command, no schema change, no re-embed. Restart long-lived processes per the quick path.
+
+**Behavior change — the exposed FTS score is a real relevance signal.** Through v0.22.0 a clamp bug flattened every FTS result's `score` to the constant 1.0, so ranking on the BM25 surfaces (`search`, REST keyword mode, CLI search, `memory_retrieve` keyword and its semantic-mode FTS fallback, hook FTS lanes) was effectively metadata-only. The score is now `|bm25|/(1+|bm25|)` — bounded [0,1), higher is better. What to expect after upgrading:
+
+- `search` results reorder toward keyword relevance; reported scores drop from the old flat values and vary per hit. If a workflow compared `search` scores against a hardcoded cutoff tuned to the constant-1.0 era, re-tune it (the composite floor semantics of `minScore` are unchanged; the observed values shifted).
+- The `query` pipeline's strong-signal bypass actually fires now on unambiguous keyword queries (skipping LLM expansion, which makes those calls faster) — and no longer fires on a lone weak match.
+- `memory_forget` targeting is stricter: weak keyword matches return a disambiguation list instead of auto-selecting. If a script relied on forget acting on any single match, it must now pass a more specific query or a path.
+- `clawmem doctor`/curator's BM25 probe reports honestly — a near-empty vault may now show a degraded BM25 probe where it previously passed vacuously.
 
 ---
 

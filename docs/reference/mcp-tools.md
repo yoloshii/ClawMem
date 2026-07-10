@@ -8,6 +8,8 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 
 **Scoring regimes (v0.22.0):** the direct vector routes — `vsearch` and `memory_retrieve`'s semantic/discovery modes — rank non-recency queries by RAW vector cosine. Their `structuredContent` carries `scoreBasis: "vector-cosine"`; raw cosine values are specific to the embedding model that produced them and are NOT comparable across models or to composite scores. Document metadata — including pin — participates only inside groups of exactly-equal raw scores. On these routes `minScore` filters the raw score and has NO default (omitted = no filter; an explicit `0` is honored). Recency-intent queries ("latest…", "recently…", "yesterday…") keep the composite regime with its 0.3 default floor and report `scoreBasis: "composite"`, as do `search`, `query`, `query_plan`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. `find_similar` has always ranked by raw cosine. Rationale: on the measured vault, raw cosine ranked 16/19 judged targets #1 (MRR 0.912) while the composite stack ranked 1/19 and filtered 14/19 out entirely.
 
+**FTS score provenance (v0.23.0):** the raw `score` on BM25/FTS results is the monotonic transform `|bm25|/(1+|bm25|)` of FTS5's negative-is-better `bm25()` value — bounded [0,1), higher is better, stable across queries. (Through v0.22.0 a clamp bug flattened it to a constant 1.0, so composite ranking on FTS surfaces was effectively metadata-only and score-threshold gates never filtered.) FTS-transform scores and vector cosines are **independent monotonic signals, not a calibrated common scale** — compare within a channel, not across channels.
+
 **Degraded vector results (v0.21.0):** under default exclusion the vector scan escalates its depth to fill `limit` with allowed documents, up to a hard cap. When the cap prevents an exhaustive scan and the result is under-filled, `structuredContent` carries `degraded: true` with `degradedReason`: `"excluded-dominant"` (distinct excluded docs account for the shortfall — the guidance line suggests `includeInternal: true` or a refined query) or `"cap-truncation"` (shortfall driven by fragment dedup, neutral guidance). Multi-leg routes (`query`, `query_plan`, `memory_retrieve` complex mode) aggregate `degraded = any(leg)` and list per-leg reasons in `structuredContent.degradedLegs`; single-vector routes (`vsearch`, `find_similar`, `memory_retrieve`'s other modes) report the flat `degraded` + `degradedReason` pair. A small vault whose whole index is scanned without hitting the cap returns a plain short list with NO marker.
 
 ### memory_retrieve
@@ -49,16 +51,19 @@ BM25 strong-signal bypass: skips expansion when top BM25 hit >= 0.85 with gap >=
 
 ### search
 
-BM25 only. Zero GPU cost.
+BM25 only. Zero GPU cost. Ranking is composite (see the score-provenance note above); the underlying keyword relevance signal is the monotonic BM25 transform introduced in v0.23.0.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `query` | string | required | Search query |
 | `limit` | number | 10 | Max results |
+| `minScore` | number | 0 | Composite-score floor (values shifted in v0.23.0 — the searchScore input is now a real relevance signal, not a constant) |
 | `compact` | boolean | true | Compact output |
 | `collection` | string | — | Filter by collection |
 | `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
+
+Score fields: compact results report the rounded **composite** score; non-compact results carry both `score` (raw BM25 transform) and `compositeScore`.
 
 ### vsearch
 
@@ -210,6 +215,8 @@ Permanently deactivate a memory.
 | `vault` | string | — | Named vault |
 
 **Search behavior (v0.2.6+, all three tools):** Query matching cascades through four strategies: exact path match → BM25 full-text → title-token overlap → vector similarity. This prevents "No matching memory found" errors when the document exists but BM25 fails to match (e.g., too many AND'd terms). Path-like queries (containing `/` or ending in `.md`) try direct path matching first. `memory_forget` requires higher confidence to act — ambiguous matches return candidates instead of mutating.
+
+**Targeting confidence (v0.23.0):** the confidence gate (`score ≥ 0.7`, or a ≥ 0.2 gap to the runner-up when more than one candidate exists) is now live for BM25 candidates — through v0.22.0 every FTS candidate carried a constant score of 1.0, so `memory_forget` treated ANY keyword match as high-confidence and auto-selected it. Weak matches — including a lone weak match — now return the candidate list for disambiguation instead of acting. Stricter, safer targeting for a destructive operation.
 
 ## Lifecycle
 

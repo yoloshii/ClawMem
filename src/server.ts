@@ -12,7 +12,7 @@
 
 import type { Server } from "bun";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
-import { enrichResults, reciprocalRankFusion, toRanked } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, attachRrfScores } from "./search-utils.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { listCollections } from "./collections.ts";
@@ -617,11 +617,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
     } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
     const weights = intent.intent === "WHEN" ? [1.5, 1.0] : [1.0, 1.5];
     const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], weights);
-    const allResults = [...bm25, ...vec];
-    results = fused.map(fr => {
-      const orig = allResults.find(r => r.filepath === fr.file);
-      return orig ? { ...orig, score: fr.score } : null;
-    }).filter((r): r is SearchResult => r !== null);
+    results = attachRrfScores(fused, [...bm25, ...vec]);
   } else if (mode === "keyword") {
     results = store.searchFTS(query, limit * 2, undefined, collections);
   } else if (mode === "semantic") {

@@ -98,6 +98,16 @@ beforeAll(async () => {
   seedVector(seedStore, staleHash, "user", "stale-low.md", "deduction junk");
   // FTS-only doc (no vector) for the semantic FTS-fallback carve-out.
   seedDoc(seedStore, "user", "fallback-doc.md", "fallbackprobe cooking guide for bread ovens");
+  // S49.1 lifecycle-gate fixtures (orthogonal vocabulary; long bodies keep the FTS
+  // match weak so the candidates land under the 0.7 confidence gate):
+  const longFiller = (marker: string) =>
+    `Assorted planning notes collected over several weeks covering schedules, reminders, follow-ups, errands, and observations. ${"More filler prose about routine tasks, meetings, and small chores accumulating over time. ".repeat(6)}Somewhere in the middle there is a single passing mention of ${marker} and nothing else about it. ${"Additional trailing notes about unrelated topics such as reading lists, travel plans, and archived correspondence. ".repeat(6)}`;
+  seedDoc(seedStore, "user", "lone-weak.md", longFiller("grimblewort"));
+  seedDoc(seedStore, "user", "multi-weak-1.md", longFiller("quibblefog"));
+  seedDoc(seedStore, "user", "multi-weak-2.md", longFiller("quibblefog"));
+  seedDoc(seedStore, "user", "zanzibar.md", "zanzibar protocol reference. The zanzibar protocol governs handshake ordering.");
+  seedDoc(seedStore, "user", "brontal-guide.md", "brontal sequence guide. The brontal sequence steps are enumerated here in order.");
+  seedDoc(seedStore, "user", "brontal-mention.md", longFiller("brontal sequence"));
   // Causal-mode graph edge: user doc → internal deduction (traversal + hydration guard).
   seedStore.db.exec(`CREATE TABLE IF NOT EXISTS memory_relations (source_id INTEGER, target_id INTEGER, relation_type TEXT, weight REAL)`);
   const idOf = (h: string) => (seedStore.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1`).get(h) as { id: number }).id;
@@ -297,5 +307,45 @@ describe("raw-primary regime at the handler level (v0.22.0)", () => {
     const res = await call("memory_retrieve", { query: "fallbackprobe cooking", mode: "semantic", compact: true });
     expect(res.structuredContent?.scoreBasis).toBe("composite");
     expect(paths(res)).toContain("user/fallback-doc.md");
+  });
+});
+
+describe("S49.1 — FTS exposed score consumers", () => {
+  it("search exposes varying raw scores (non-compact) — no longer a constant 1.0", async () => {
+    const res = await call("search", { query: "deduction junk", includeInternal: true });
+    const results = res.structuredContent?.results ?? [];
+    expect(results.length).toBeGreaterThanOrEqual(2);
+    for (const r of results) {
+      expect(r.score).toBeGreaterThan(0);
+      expect(r.score).toBeLessThan(1);
+    }
+    const distinct = new Set(results.map((r: any) => r.score.toFixed(4)));
+    expect(distinct.size).toBeGreaterThan(1);
+  });
+
+  it("memory_forget: a lone weak candidate is ambiguous, not auto-selected (T20 gate)", async () => {
+    const res = await call("memory_forget", { query: "grimblewort", confirm: false });
+    const text = res.content?.[0]?.text ?? "";
+    expect(text).toContain("Multiple possible matches");
+    expect(text).not.toContain("Would forget");
+  });
+
+  it("memory_forget: multiple weak, close candidates are ambiguous", async () => {
+    const res = await call("memory_forget", { query: "quibblefog", confirm: false });
+    const text = res.content?.[0]?.text ?? "";
+    expect(text).toContain("Multiple possible matches");
+    expect(text).not.toContain("Would forget");
+  });
+
+  it("memory_forget: a lone strong candidate is confidently targeted", async () => {
+    const res = await call("memory_forget", { query: "zanzibar protocol", confirm: false });
+    const text = res.content?.[0]?.text ?? "";
+    expect(text).toContain("Would forget: user/zanzibar.md");
+  });
+
+  it("memory_forget: a strong candidate clearly separated from a weak one is targeted", async () => {
+    const res = await call("memory_forget", { query: "brontal sequence", confirm: false });
+    const text = res.content?.[0]?.text ?? "";
+    expect(text).toContain("Would forget: user/brontal-guide.md");
   });
 });

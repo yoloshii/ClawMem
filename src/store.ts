@@ -3506,6 +3506,20 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
+/**
+ * Convert an FTS5 bm25() value into a stable [0,1) relevance score where higher is better.
+ *
+ * FTS5's bm25() is negative-is-better: it returns -1 × the BM25 score, so it is ≤ 0 for
+ * every match. The transform is per-row and monotonic in match strength (|bm25|/(1+|bm25|))
+ * with no per-query normalization, so cross-query comparisons, minScore filters, and the
+ * strong-signal bypass all stay meaningful. A hypothetical positive input clamps to 0
+ * rather than inverting the ordering.
+ */
+export function ftsScoreFromBm25(bm25Score: number): number {
+  const m = Math.max(0, -bm25Score);
+  return m / (1 + m);
+}
+
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
@@ -3558,9 +3572,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; modified_at: string; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (lower is better) into a stable (0..1] score where higher is better.
-    // Avoid per-query normalization so "strong signal" heuristics can work.
-    const score = 1 / (1 + Math.max(0, row.bm25_score));
+    const score = ftsScoreFromBm25(row.bm25_score);
     return {
       filepath: row.filepath,
       displayPath: row.display_path,

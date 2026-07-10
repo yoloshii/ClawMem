@@ -23,6 +23,8 @@ The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a h
 
 Threshold note: EOS-anchored last-token embedding models (e.g. zembed-1 served correctly) produce a **compressed-high similarity band** — unrelated pairs sit near ~0.4 rather than ~0.2. Relative ordering is what matters; treat absolute `minScore` cutoffs as model-dependent rather than universal.
 
+`searchScore` provenance (v0.23.0): on FTS/BM25 surfaces the input is the monotonic transform `|bm25|/(1+|bm25|)` of FTS5's negative-is-better `bm25()` (through v0.22.0 a clamp bug flattened it to a constant 1.0, which made composite ranking on those surfaces metadata-only); on vector surfaces it is the raw cosine. The two are independent monotonic signals on an uncalibrated common range — composite blends them where pools mix (hooks, REST hybrid), which removes the old unconditional FTS-over-vector dominance but does not make the channels numerically comparable.
+
 ## Signal breakdown
 
 ### Search score (0.0 - 1.0)
