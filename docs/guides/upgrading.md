@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.23.0**.
+Guide for upgrading between released versions. Current: **v0.24.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,16 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.24.0: raw-BM25-primary ranking on `search`
+
+No migration steps — drop-in. Behavior notes:
+
+- **MCP `search` ordering changes for non-recency queries**: results now rank by the raw BM25 transform instead of the composite blend (judged keyword eval: raw MRR 0.848 vs composite 0.415 over 43 targets; the composite lost even the fresh-doc-favorable slice). If you depended on recency/quality multipliers reordering keyword results, phrase the query with recency intent ("recent …", "latest …") — that branch keeps composite — or use `query`.
+- **`minScore` on `search` is now raw-basis with NO default** for non-recency queries: omitted = no filter, explicit `0` honored. Previous composite-scale floors (e.g. `0.3`) do not translate — the raw transform maps `0.70 ⇔ |bm25| ≈ 2.3` and `0.85 ⇔ |bm25| ≈ 5.7`.
+- **`structuredContent.scoreBasis`** on `search` reports `"fts-bm25"` (non-recency) or `"composite"` (recency-intent). Consumers that parsed the compact `score` as a composite value should read the basis field.
+- **CLI `search`, REST, hooks, `query`, and `memory_retrieve` are unchanged** — the ranking-contract change is scoped to the MCP `search` tool, exactly as evaluated.
+- New ops knob: `CLAWMEM_DISABLE_FTS_BYPASS=true` disables the query-pipeline strong-signal bypass at both consumers (MCP + CLI) — harness/incident use.
 
 ## v0.23.0: monotonic BM25 exposed score
 

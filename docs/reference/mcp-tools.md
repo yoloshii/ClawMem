@@ -6,7 +6,7 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 
 **Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` exclude the system-internal `_clawmem` collection (observations/deductions/handoffs) by default. Opt-ins: pass `includeInternal: true` (all six tools), or — on the tools that expose a `collection` parameter (`search`, `vsearch`, `query`) — name `_clawmem` explicitly in the filter. `find_similar` auto-includes internal results when the REFERENCE document is itself internal. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design.
 
-**Scoring regimes (v0.22.0):** the direct vector routes — `vsearch` and `memory_retrieve`'s semantic/discovery modes — rank non-recency queries by RAW vector cosine. Their `structuredContent` carries `scoreBasis: "vector-cosine"`; raw cosine values are specific to the embedding model that produced them and are NOT comparable across models or to composite scores. Document metadata — including pin — participates only inside groups of exactly-equal raw scores. On these routes `minScore` filters the raw score and has NO default (omitted = no filter; an explicit `0` is honored). Recency-intent queries ("latest…", "recently…", "yesterday…") keep the composite regime with its 0.3 default floor and report `scoreBasis: "composite"`, as do `search`, `query`, `query_plan`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. `find_similar` has always ranked by raw cosine. Rationale: on the measured vault, raw cosine ranked 16/19 judged targets #1 (MRR 0.912) while the composite stack ranked 1/19 and filtered 14/19 out entirely.
+**Scoring regimes (v0.22.0 vector · v0.24.0 FTS):** the direct retrieval routes — `vsearch` and `memory_retrieve`'s semantic/discovery modes (v0.22.0), and `search` (v0.24.0) — rank non-recency queries by their RAW channel score: vector cosine (`scoreBasis: "vector-cosine"`) on the vector routes, the monotonic BM25 transform (`scoreBasis: "fts-bm25"`) on `search`. Raw values are channel-specific and NOT comparable across channels, across embedding models, or to composite scores. Document metadata — including pin — participates only inside groups of exactly-equal raw scores. On these routes `minScore` filters the raw score and has NO default (omitted = no filter; an explicit `0` is honored). Recency-intent queries ("latest…", "recently…", "yesterday…") keep the composite regime and report `scoreBasis: "composite"` — `vsearch`'s recency branch keeps its 0.3 composite default floor, `search`'s keeps 0 — as do `query`, `query_plan`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. `find_similar` has always ranked by raw cosine. Rationale — both splits are measured, not aesthetic: on judged sets against the live vault, raw cosine ranked 16/19 targets #1 (MRR 0.912) vs composite 1/19 (0.307); raw-FTS ranked 33/43 keyword targets #1 (MRR 0.848) vs composite 6/43 (0.415), with composite losing even on the fresh-doc-favorable slice (0.348 vs 0.801).
 
 **FTS score provenance (v0.23.0):** the raw `score` on BM25/FTS results is the monotonic transform `|bm25|/(1+|bm25|)` of FTS5's negative-is-better `bm25()` value — bounded [0,1), higher is better, stable across queries. (Through v0.22.0 a clamp bug flattened it to a constant 1.0, so composite ranking on FTS surfaces was effectively metadata-only and score-threshold gates never filtered.) FTS-transform scores and vector cosines are **independent monotonic signals, not a calibrated common scale** — compare within a channel, not across channels.
 
@@ -40,7 +40,7 @@ Full hybrid pipeline: BM25 + vector + query expansion + cross-encoder reranking.
 |-------|------|---------|-------------|
 | `query` | string | required | Search query |
 | `limit` | number | 10 | Max results |
-| `compact` | boolean | true | Compact output |
+| `compact` | boolean | false | Compact output |
 | `collection` | string | — | Filter by collection (comma-separated for multi) |
 | `intent` | string | — | Domain hint for ambiguous queries (steers expansion, reranking, chunk selection) |
 | `candidateLimit` | number | 30 | Candidates for reranking (tune precision vs speed) |
@@ -51,19 +51,19 @@ BM25 strong-signal bypass: skips expansion when top BM25 hit >= 0.85 with gap >=
 
 ### search
 
-BM25 only. Zero GPU cost. Ranking is composite (see the score-provenance note above); the underlying keyword relevance signal is the monotonic BM25 transform introduced in v0.23.0.
+BM25 only. Zero GPU cost. Non-recency queries rank by the RAW BM25 transform (`scoreBasis: "fts-bm25"`, v0.24.0 — see the regimes note above); recency-intent queries use the composite regime.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `query` | string | required | Search query |
 | `limit` | number | 10 | Max results |
-| `minScore` | number | 0 | Composite-score floor (values shifted in v0.23.0 — the searchScore input is now a real relevance signal, not a constant) |
-| `compact` | boolean | true | Compact output |
+| `minScore` | number | — | Score floor. Non-recency: filters the RAW BM25 transform, NO default (omitted = no filter; explicit `0` honored). Recency-intent: composite floor, default 0 |
+| `compact` | boolean | false | Compact output |
 | `collection` | string | — | Filter by collection |
 | `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
 
-Score fields: compact results report the rounded **composite** score; non-compact results carry both `score` (raw BM25 transform) and `compositeScore`.
+Score fields: on non-recency queries the reported ranking score IS the raw BM25 transform (compact `score` and non-compact `compositeScore` both carry it; non-compact `score` is the same raw value). On recency-intent queries compact `score` / non-compact `compositeScore` are composite while non-compact `score` stays the raw transform.
 
 ### vsearch
 
@@ -74,7 +74,7 @@ Vector only. Semantic similarity. Non-recency queries rank by RAW cosine (`score
 | `query` | string | required | Search query |
 | `limit` | number | 10 | Max results |
 | `minScore` | number | — | Raw-cosine floor on non-recency queries (no default — omitted means no filter; explicit `0` honored). Recency-intent queries keep the composite-scale 0.3 default. |
-| `compact` | boolean | true | Compact output |
+| `compact` | boolean | false | Compact output |
 | `collection` | string | — | Filter by collection |
 | `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
@@ -186,7 +186,7 @@ Recent session history with handoffs and file changes.
 
 ### memory_pin
 
-Pin a memory: lifecycle retention plus prioritization among relevance-equivalent results. On composite surfaces (hooks, `query`, `search`) pinned docs get the +0.3 composite boost; on the raw vector routes (v0.22.0) pin wins exact raw-score ties but never overrides a relevance difference.
+Pin a memory: lifecycle retention plus prioritization among relevance-equivalent results. On composite surfaces (hooks, `query`) pinned docs get the +0.3 composite boost; on the raw routes (`vsearch`/`memory_retrieve` semantic-discovery v0.22.0, `search` non-recency v0.24.0) pin wins exact raw-score ties but never overrides a relevance difference.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|

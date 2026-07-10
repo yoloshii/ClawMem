@@ -4184,14 +4184,24 @@ export type ExpandedQuery = {
 const EXPAND_CACHE_VERSION = "v3-qmd-terse-typed";
 const EXPAND_PROVIDER_FINGERPRINT = "qmd-terse";
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
-  // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
-  const cacheKey = getCacheKey(`expandQuery:${EXPAND_CACHE_VERSION}`, {
+/**
+ * The EXACT llm_cache key expandQuery(query, model, intent) reads and writes.
+ * Exported for eval harnesses (S49.3 freeze protocol): delete/verify expansion
+ * cache rows without replicating the private key construction — the version and
+ * provider fingerprint stay in one place.
+ */
+export function expandQueryCacheKey(query: string, model: string = DEFAULT_QUERY_MODEL, intent?: string): string {
+  return getCacheKey(`expandQuery:${EXPAND_CACHE_VERSION}`, {
     query,
     model,
     provider: EXPAND_PROVIDER_FINGERPRINT,
     ...(intent && { intent }),
   });
+}
+
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+  // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
+  const cacheKey = expandQueryCacheKey(query, model, intent);
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {

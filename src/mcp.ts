@@ -33,8 +33,8 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, attachRrfScores, type RankedResult } from "./search-utils.ts";
-import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, attachRrfScores, type RankedResult } from "./search-utils.ts";
+import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
@@ -558,7 +558,7 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: search (BM25 + composite)
+  // Tool: search (BM25 — raw-transform ranking; composite on recency intent)
   // ---------------------------------------------------------------------------
 
   server.registerTool(
@@ -569,7 +569,7 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Search query"),
         limit: z.number().optional().default(10),
-        minScore: z.number().optional().default(0),
+        minScore: z.number().optional().describe("Score floor. Non-recency queries filter the RAW FTS score, the monotonic |bm25|/(1+|bm25|) transform (default: no filter; explicit 0 honored). Recency-intent queries keep the composite-scale default 0."),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
         includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
@@ -586,8 +586,16 @@ This is the recommended entry point for ALL memory queries.`,
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn)
-        .filter(r => r.compositeScore >= (minScore || 0));
+      // v0.24.0 two-regime scoring (S49-JUDGED-EVAL-DESIGN.md, SWITCH verdict): non-recency
+      // queries rank by the raw FTS transform — metadata (incl. pin) breaks exact score
+      // ties only, and minScore (if given) filters the raw score with NO default floor.
+      // Recency-intent queries keep the pre-v0.24.0 composite behavior including its
+      // default-0 floor.
+      const regime = selectScoringRegime(query);
+      const sScoreBasis = regime === "raw" ? FTS_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = regime === "raw"
+        ? rankRawPrimary(enriched, query, coFn).filter(r => minScore === undefined || r.compositeScore >= minScore)
+        : applyCompositeScoring(enriched, query, coFn).filter(r => r.compositeScore >= (minScore || 0));
 
       if (compact) {
         const items = scored.map(r => ({
@@ -596,7 +604,7 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items, scoreBasis: sScoreBasis } };
       }
 
       const filtered: SearchResultItem[] = scored.map(r => {
@@ -615,7 +623,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
+        structuredContent: { results: filtered, scoreBasis: sScoreBasis },
       };
     }
   );
@@ -741,7 +749,7 @@ This is the recommended entry point for ALL memory queries.`,
       const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl);
       // When intent is provided, disable strong-signal bypass — the obvious BM25
       // match may not be what the caller wants (e.g. "performance" with intent "web page load times")
-      const hasStrongSignal = !intent && hasStrongFtsSignal(initialFts);
+      const hasStrongSignal = !intent && ftsBypassEnabled() && hasStrongFtsSignal(initialFts);
 
       // Step 2: Query expansion (skipped if strong signal). Typed routing —
       // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.

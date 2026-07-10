@@ -1,15 +1,17 @@
 /**
- * Centralized scoring-regime selection for the MCP direct vector routes (v0.22.0).
+ * Centralized scoring-regime selection for the MCP direct retrieval routes
+ * (vector routes v0.22.0; FTS `search` route v0.24.0).
  *
  * Two regimes:
  *
  *   "raw"               — non-recency queries on the evidenced raw routes (`vsearch`,
- *                         `memory_retrieve` semantic/discovery): results rank by RAW
- *                         vector cosine DESC. Document metadata — including pin —
- *                         participates ONLY inside groups of exactly-equal raw scores.
- *                         The reported score IS the raw cosine (scoreBasis
- *                         "vector-cosine"): specific to the embedding model that
- *                         produced it, and not comparable to composite scores.
+ *                         `memory_retrieve` semantic/discovery, `search`): results rank
+ *                         by the RAW channel score DESC — vector cosine on the vector
+ *                         routes (scoreBasis "vector-cosine"), the monotonic BM25
+ *                         transform on the FTS route (scoreBasis "fts-bm25"). Document
+ *                         metadata — including pin — participates ONLY inside groups of
+ *                         exactly-equal raw scores. Raw scores are channel-specific and
+ *                         not comparable to composite scores or across channels.
  *
  *   "recency-composite" — hasRecencyIntent(query): the pre-v0.22.0 composite behavior,
  *                         unchanged (RECENCY_WEIGHTS blend, multipliers, pin boost,
@@ -20,6 +22,10 @@
  * below the old composite minScore — every metadata signal large enough to matter is
  * larger than the 0.03–0.10 raw margins that separate right answers from wrong ones,
  * so metadata may only ever break exact raw-score ties on these routes.
+ * FTS basis (BACKLOG Source 49.2, judged keyword eval 2026-07-11): raw-FTS-primary
+ * MRR 0.848 vs shipped composite 0.415 over 43 judged targets (held-out 0.875 vs
+ * 0.335, composite hit@1 0/20) — composite lost even on the composite-favorable
+ * fresh-among-many shape (0.348 vs 0.801).
  */
 import {
   applyCompositeScoring,
@@ -30,8 +36,11 @@ import {
   type CompositeScoringOptions,
 } from "./memory.ts";
 
-/** Reported score basis for raw-regime results: raw vector cosine. */
+/** Reported score basis for raw-regime results on the vector routes: raw cosine. */
 export const VECTOR_SCORE_BASIS = "vector-cosine" as const;
+/** Reported score basis for raw-regime results on the FTS route (v0.24.0): the
+ *  monotonic |bm25|/(1+|bm25|) transform. */
+export const FTS_SCORE_BASIS = "fts-bm25" as const;
 /** Reported score basis for composite-scored results. */
 export const COMPOSITE_SCORE_BASIS = "composite" as const;
 
@@ -43,15 +52,17 @@ export function selectScoringRegime(query: string): ScoringRegime {
 }
 
 /**
- * Raw-primary ranking (design R1/R2): raw score DESC; within a group of exactly-equal
- * raw scores the deterministic tie order is pinned DESC, then legacy composite DESC,
- * then displayPath ASC. `compositeScore` on the returned rows carries the RAW score —
- * the reported score is the raw cosine.
+ * Raw-primary ranking (design R1/R2): raw channel score DESC; within a group of
+ * exactly-equal raw scores the deterministic tie order is pinned DESC, then legacy
+ * composite DESC, then displayPath ASC. `compositeScore` on the returned rows carries
+ * the RAW score — vector cosine on the vector routes, the monotonic BM25 transform on
+ * the FTS route. Exact transformed-score ties are legitimate relevance-equivalent
+ * groups on both channels.
  *
  * Callers gate on selectScoringRegime() first — this ranker is only meaningful for
  * non-recency queries (the legacy composite computed here for tie keys therefore never
  * takes the RECENCY_WEIGHTS branch). Inputs are document-unique on these routes
- * (searchVecDetailed hydrates one row per document).
+ * (searchVecDetailed and searchFTS both hydrate one row per document).
  *
  * `options.now` flows to the tie-key composite so frozen-clock evaluation (the v0.22.0
  * acceptance bundle) is bit-reproducible.

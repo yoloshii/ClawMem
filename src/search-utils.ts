@@ -233,3 +233,13 @@ export function hasStrongFtsSignal(results: SearchResult[]): boolean {
   const second = results.length > 1 ? results[1]!.score : 0;
   return top >= 0.85 && (top - second) >= 0.15;
 }
+
+/**
+ * Ops escape hatch for the BM25 strong-signal bypass: CLAWMEM_DISABLE_FTS_BYPASS=true
+ * forces the full expansion path on every query (both the MCP `query` pipeline and the
+ * CLI `query` consume this). Read at call time so A/B harnesses and tests can toggle
+ * per invocation; `hasStrongFtsSignal` itself stays pure.
+ */
+export function ftsBypassEnabled(): boolean {
+  return process.env.CLAWMEM_DISABLE_FTS_BYPASS !== "true";
+}

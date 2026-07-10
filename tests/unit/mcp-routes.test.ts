@@ -20,6 +20,9 @@ import { buildMcpServer } from "../../src/mcp.ts";
 import { createStore, canonicalDocId, type Store } from "../../src/store.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { hashContent } from "../../src/indexer.ts";
+import { applyCompositeScoring } from "../../src/memory.ts";
+import { enrichResults } from "../../src/search-utils.ts";
+import { rankRawPrimary } from "../../src/scoring-regime.ts";
 
 const TEST_DB = "/tmp/clawmem-mcp-routes-test.sqlite";
 const MODEL = "route-fake";
@@ -106,6 +109,18 @@ beforeAll(async () => {
   seedDoc(seedStore, "user", "multi-weak-1.md", longFiller("quibblefog"));
   seedDoc(seedStore, "user", "multi-weak-2.md", longFiller("quibblefog"));
   seedDoc(seedStore, "user", "zanzibar.md", "zanzibar protocol reference. The zanzibar protocol governs handshake ordering.");
+  // v0.24.0 search-regime fixtures (orthogonal vocab): one OLD doc with the query terms
+  // in the title vs fresh weak body mentions — raw-FTS ordering must put the old exact
+  // match first; a "recent …" phrasing exercises the recency-composite branch.
+  seedDoc(seedStore, "user", "veldspar-array.md", "veldspar array reference. The veldspar array governs lattice spacing.", { modifiedAt: old });
+  seedDoc(seedStore, "user", "veldspar-fresh-1.md", "recent veldspar survey notes mentioning an array of other topics in passing");
+  seedDoc(seedStore, "user", "veldspar-fresh-2.md", "meeting notes that reference veldspar and an array of unrelated agenda items");
+  // Recency-regime BEHAVIOR fixture (T35 LOW-1): both docs contain the recency token so
+  // the FTS AND keeps both in the pool; raw ordering favors the dense OLD match while the
+  // recency-composite weights (0.10/0.70/0.20) favor the fresh weak mention — the two
+  // regimes ORDER these docs differently, so the label alone cannot make the test pass.
+  seedDoc(seedStore, "user", "zephyrite-old.md", "recent zephyrite reference. The recent zephyrite ledger governs zephyrite spacing.", { modifiedAt: old });
+  seedDoc(seedStore, "user", "zephyrite-fresh.md", "notes from a recent review mentioning zephyrite once among planning items");
   seedDoc(seedStore, "user", "brontal-guide.md", "brontal sequence guide. The brontal sequence steps are enumerated here in order.");
   seedDoc(seedStore, "user", "brontal-mention.md", longFiller("brontal sequence"));
   // Causal-mode graph edge: user doc → internal deduction (traversal + hydration guard).
@@ -135,6 +150,58 @@ const call = async (name: string, args: Record<string, unknown>): Promise<ToolRe
 
 const paths = (r: ToolResult): string[] =>
   (r.structuredContent?.results ?? []).map((x: any) => x.path ?? x.file ?? x.displayPath ?? "");
+
+describe("search two-regime scoring (v0.24.0 — S49.2 SWITCH verdict)", () => {
+  it("non-recency search ranks by the raw FTS transform (scoreBasis fts-bm25, raw-desc order, old exact match first)", async () => {
+    const res = await call("search", { query: "veldspar array", compact: false });
+    expect((res.structuredContent as any)?.scoreBasis).toBe("fts-bm25");
+    const rows = (res.structuredContent?.results ?? []) as { file: string; score: number }[];
+    expect(rows.length).toBeGreaterThanOrEqual(3);
+    for (let i = 1; i < rows.length; i++) expect(rows[i - 1]!.score).toBeGreaterThanOrEqual(rows[i]!.score);
+    expect(rows[0]!.file).toBe("user/veldspar-array.md"); // old strong-title match wins under raw ordering
+  });
+
+  it("minScore filters the RAW score with no default floor; explicit 0 and negative preserve the omitted set", async () => {
+    const all = await call("search", { query: "veldspar array", compact: false });
+    const rows = (all.structuredContent?.results ?? []) as { file: string; score: number }[];
+    const zero = await call("search", { query: "veldspar array", compact: false, minScore: 0 });
+    expect(((zero.structuredContent?.results ?? []) as unknown[]).length).toBe(rows.length);
+    const neg = await call("search", { query: "veldspar array", compact: false, minScore: -1 });
+    expect(((neg.structuredContent?.results ?? []) as { file: string }[]).map(r => r.file)).toEqual(rows.map(r => r.file));
+    const cut = (rows[0]!.score + rows[1]!.score) / 2; // between top and second raw score
+    const filtered = await call("search", { query: "veldspar array", compact: false, minScore: cut });
+    const kept = (filtered.structuredContent?.results ?? []) as { file: string; score: number }[];
+    expect(kept.length).toBeGreaterThanOrEqual(1);
+    expect(kept.length).toBeLessThan(rows.length);
+    expect(kept.every(r => r.score >= cut)).toBe(true);
+  });
+
+  it("recency-intent search keeps the composite regime (scoreBasis composite)", async () => {
+    const res = await call("search", { query: "recent veldspar", compact: true });
+    expect((res.structuredContent as any)?.scoreBasis).toBe("composite");
+    expect(paths(res).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("recency-intent search applies composite BEHAVIOR, not just the label (order differs from raw)", async () => {
+    const q = "recent zephyrite";
+    const res = await call("search", { query: q, compact: false, limit: 10 });
+    expect((res.structuredContent as any)?.scoreBasis).toBe("composite");
+    const got = ((res.structuredContent?.results ?? []) as { file: string }[]).map(r => r.file);
+    expect(got.length).toBeGreaterThanOrEqual(2);
+    // Direct composite computation over the handler's exact pool reproduces the order…
+    const pool = seedStore.searchFTS(q, 10, undefined, undefined, undefined, ["_clawmem"]);
+    const coFn = (p: string) => seedStore.getCoActivated(p);
+    const composite = applyCompositeScoring(enrichResults(seedStore, pool, q), q, coFn)
+      .filter(r => r.compositeScore >= 0).map(r => r.displayPath);
+    expect(got).toEqual(composite.slice(0, got.length));
+    // …and DIFFERS from raw ordering on this fixture: the recency weights promote the
+    // fresh weak mention over the old dense match, raw ranking does the opposite.
+    const raw = rankRawPrimary(enrichResults(seedStore, pool, q), q, coFn).map(r => r.displayPath);
+    expect(got[0]).toBe("user/zephyrite-fresh.md");
+    expect(raw[0]).toBe("user/zephyrite-old.md");
+    expect(got).not.toEqual(raw.slice(0, got.length));
+  });
+});
 
 describe("visibility exclusion — all six retrieval routes", () => {
   it("search excludes _clawmem by default, includes on includeInternal, and on explicit collection", async () => {

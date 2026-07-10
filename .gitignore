@@ -22,6 +22,8 @@ node_modules/
 
 # Internal dev artifacts
 eval-queries*.json
+eval-bypass-cases*.json
+eval-bundles/
 .ralph/
 ralph.yml
 Brain.

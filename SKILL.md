@@ -92,7 +92,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why" (use `intent_search`). |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
-| `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw vector routes). Use PROACTIVELY for constraints, architecture decisions, corrections. |
+| `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw routes — vector + `search` non-recency). Use PROACTIVELY for constraints, architecture decisions, corrections. |
 | `memory_snooze` | Use PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days. |
 | `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. Weak matches return a disambiguation list instead of acting (v0.23.0). |
 | `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. |
@@ -189,7 +189,7 @@ Query -> intent classification (WHY/WHEN/ENTITY/WHAT)
 
 ## Composite scoring (how ranking works)
 
-Applied on the composite surfaces: hooks, `query`, `search`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. **v0.22.0: MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine instead** (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default); recency-intent queries keep composite everywhere. **v0.23.0:** `searchScore` on FTS surfaces is the monotonic `|bm25|/(1+|bm25|)` transform (it was a constant 1.0 through v0.22.0 due to a clamp bug — keyword relevance contributed zero ordering); FTS-transform scores and cosines are independent monotonic signals, not one calibrated scale.
+Applied on the composite surfaces: hooks, `query`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. **v0.22.0: MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine instead** (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default); recency-intent queries keep composite everywhere. **v0.23.0:** `searchScore` on FTS surfaces is the monotonic `|bm25|/(1+|bm25|)` transform (it was a constant 1.0 through v0.22.0 due to a clamp bug — keyword relevance contributed zero ordering); FTS-transform scores and cosines are independent monotonic signals, not one calibrated scale. **v0.24.0: MCP `search` ranks non-recency queries by the RAW BM25 transform** (`scoreBasis: "fts-bm25"`; metadata breaks exact ties only; `minScore` filters raw with no default) — judged keyword eval: raw MRR 0.848 vs composite 0.415 over 43 targets, composite losing even on the fresh-doc-favorable slice; recency-intent queries keep composite.
 
 ```
 compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost
@@ -198,8 +198,8 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 - `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× penalty … 1.3× boost).
 - `coActivationBoost = 1 + min(coCount/10, 0.15)` (docs surfaced together get up to +15%).
 - Length normalization penalizes verbose entries (floor 30%); frequency boost capped at +10%.
-- **Pinned docs: +0.3 additive on composite surfaces** (capped at 1.0); on the raw vector routes pin = exact-tie precedence only.
-- **`query` tool (v0.13.0+):** non-recency queries use retrieval-tuned **0.70·search + 0.15·recency + 0.15·confidence**. `search`, `memory_retrieve`'s composite modes, and `context-surfacing` keep the 0.50/0.25/0.25 default. (`vsearch` + `memory_retrieve` semantic/discovery use RAW cosine for non-recency queries as of v0.22.0 — no composite weights at all.)
+- **Pinned docs: +0.3 additive on composite surfaces** (capped at 1.0); on the raw routes (vector + `search` non-recency) pin = exact-tie precedence only.
+- **`query` tool (v0.13.0+):** non-recency queries use retrieval-tuned **0.70·search + 0.15·recency + 0.15·confidence**. `memory_retrieve`'s composite modes, `context-surfacing`, and `search`'s recency branch keep the 0.50/0.25/0.25 default. (`vsearch` + `memory_retrieve` semantic/discovery use RAW cosine, and `search` uses the RAW BM25 transform, for non-recency queries — v0.22.0/v0.24.0: no composite weights at all.)
 - **Recency intent** ("latest"/"recent"/"last session") switches all to **0.10·search + 0.70·recency + 0.20·confidence**.
 
 **Content-type half-lives:** decision / deductive / preference / hub / antipattern = ∞ (never decay) · project 120d · research 90d · problem / milestone / note 60d · conversation / progress 45d · handoff 30d. Half-lives extend up to 3× for frequently-accessed memories. Attention decay: non-durable types (handoff, progress, conversation, note, project) lose 5% confidence/week without access; decision / deductive / preference / hub / research / antipattern are exempt.
@@ -210,7 +210,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 
 ## Memory lifecycle (pin / snooze / forget — manual tools)
 
-- **`memory_pin`** (lifecycle retention + priority among relevance-equivalent results; +0.3 boost on composite surfaces, exact-tie precedence on raw vector routes) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist across sessions. Do NOT pin routine/session-specific items.
+- **`memory_pin`** (lifecycle retention + priority among relevance-equivalent results; +0.3 boost on composite surfaces, exact-tie precedence on raw routes) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist across sessions. Do NOT pin routine/session-specific items.
 - **`memory_snooze`** — PROACTIVELY when a memory keeps surfacing but isn't relevant now, user says "not now"/"later", or content is time-boxed.
 - **`memory_forget`** — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
 - **Contradiction auto-resolution:** when `decision-extractor` detects a new decision contradicting an old one, the old one's confidence is lowered automatically — no manual action needed.
