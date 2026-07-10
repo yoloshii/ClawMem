@@ -512,6 +512,31 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     )
   `);
 
+  // Geometry-canary baseline (VSEARCH-TRUST-HARDENING (d)): per-profile probe vectors +
+  // measured pair-margins from the last healthy embed run. NOT content_vectors — canary
+  // probes must never pollute retrieval.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embed_canary (
+      probe_id TEXT NOT NULL,
+      profile_key TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      pair_margins TEXT NOT NULL,
+      embedded_at TEXT NOT NULL,
+      PRIMARY KEY (probe_id, profile_key)
+    )
+  `);
+
+  // Durable vault health flags (T8-M1): e.g. embed_geometry_taint — a detected mid-run
+  // geometry change must survive the process so doctor stays nonzero until a verified
+  // full rebuild clears it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vault_flags (
+      flag TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+
   // FTS - index filepath (collection/path), title, and content
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -641,6 +666,10 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     ["fragment_type", "ALTER TABLE content_vectors ADD COLUMN fragment_type TEXT"],
     ["fragment_label", "ALTER TABLE content_vectors ADD COLUMN fragment_label TEXT"],
     ["canonical_id", "ALTER TABLE content_vectors ADD COLUMN canonical_id TEXT"],
+    // Embed-input fingerprint (VSEARCH-TRUST-HARDENING (d).4 / T4-M2): SHA-256 over the
+    // UTF-8 bytes of the exact final formatDocForEmbedding(...) string. Rows without it
+    // (legacy) are title-unverifiable at doctor time until their next re-embed.
+    ["embed_input_fp", "ALTER TABLE content_vectors ADD COLUMN embed_input_fp TEXT"],
   ];
   for (const [col, sql] of cvMigrations) {
     if (!cvColNames.has(col)) {
@@ -1327,8 +1356,9 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
+  searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1360,8 +1390,13 @@ export type Store = {
   getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string }[];
   clearAllEmbeddings: (leaseGuard?: LeaseGuard) => void;
   getVectorConsistency: () => { cvCount: number; vvCount: number; cvMissingVv: number; vvOrphan: number; pending: number };
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string) => void;
   cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => number;
+  saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => void;
+  getCanaryBaseline: (profileKey: string) => { probes: Map<string, Float32Array>; pairMargins: Record<string, number>; embeddedAt: string } | null;
+  setVaultFlag: (flag: string, value: string, leaseGuard?: LeaseGuard) => void;
+  getVaultFlag: (flag: string) => string | null;
+  clearVaultFlag: (flag: string, leaseGuard?: LeaseGuard) => void;
 
   // SAME: Observation metadata
   updateObservationFields: (docPath: string, collectionName: string, fields: { observation_type?: string; facts?: string; narrative?: string; concepts?: string; files_read?: string; files_modified?: string }) => void;
@@ -1386,9 +1421,9 @@ export type Store = {
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
   // Embed state tracking
-  markEmbedStart: (hash: string) => void;
-  markEmbedSynced: (hash: string) => void;
-  markEmbedFailed: (hash: string, error: string) => void;
+  markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => void;
+  markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => void;
+  markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => void;
   getEmbedStats: () => { pending: number; synced: number; failed: number };
 
   // Beads integration
@@ -1521,8 +1556,9 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchFTS(db, query, limit, collectionId, collections, dateRange),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections),
     searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
+    searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
@@ -1554,8 +1590,50 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getHashesNeedingFragments: () => getHashesNeedingFragments(db),
     clearAllEmbeddings: (leaseGuard?: LeaseGuard) => clearAllEmbeddings(db, leaseGuard),
     getVectorConsistency: () => getVectorConsistency(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard, embedInputFp),
     cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => cleanStaleEmbeddings(db, leaseGuard),
+    saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => {
+      const marginsJson = JSON.stringify(pairMargins);
+      const now = new Date().toISOString();
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`DELETE FROM embed_canary WHERE profile_key = ?`).run(profileKey);
+        const ins = db.prepare(`INSERT INTO embed_canary (probe_id, profile_key, embedding, pair_margins, embedded_at) VALUES (?, ?, ?, ?, ?)`);
+        for (const p of probes) {
+          ins.run(p.probeId, profileKey, new Uint8Array(p.embedding.buffer.slice(p.embedding.byteOffset, p.embedding.byteOffset + p.embedding.byteLength)), marginsJson, now);
+        }
+      }).immediate();
+    },
+    getCanaryBaseline: (profileKey: string) => {
+      const rows = db.prepare(`SELECT probe_id, embedding, pair_margins, embedded_at FROM embed_canary WHERE profile_key = ?`).all(profileKey) as { probe_id: string; embedding: Uint8Array; pair_margins: string; embedded_at: string }[];
+      if (rows.length === 0) return null;
+      const probes = new Map<string, Float32Array>();
+      for (const r of rows) {
+        const buf = new Uint8Array(r.embedding);
+        probes.set(r.probe_id, new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4));
+      }
+      let pairMargins: Record<string, number> = {};
+      try { pairMargins = JSON.parse(rows[0]!.pair_margins); } catch { /* malformed → empty */ }
+      return { probes, pairMargins, embeddedAt: rows[0]!.embedded_at };
+    },
+    // Lease-fenced (T9-M4): a holder reclaimed during an async end probe must not set or
+    // clear taint written by its successor — ownership check and mutation share one txn.
+    setVaultFlag: (flag: string, value: string, leaseGuard?: LeaseGuard) => {
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`).run(flag, value, new Date().toISOString());
+      }).immediate();
+    },
+    getVaultFlag: (flag: string) => {
+      const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(flag) as { value: string } | undefined;
+      return row?.value ?? null;
+    },
+    clearVaultFlag: (flag: string, leaseGuard?: LeaseGuard) => {
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(flag);
+      }).immediate();
+    },
 
     // SAME: Observation metadata
     updateObservationFields: (docPath: string, collectionName: string, fields) => updateObservationFieldsFn(db, docPath, collectionName, fields),
@@ -1579,24 +1657,35 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     pinDocument: (collection: string, path: string, pinned: boolean) => pinDocumentFn(db, collection, path, pinned),
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
 
-    // Embed state tracking
-    markEmbedStart: (hash: string) => {
+    // Embed state tracking — lease-fenced (VSEARCH-TRUST-HARDENING (f).5): the ownership
+    // check and the state write share one transaction, so a reclaimed old holder cannot
+    // overwrite a successor's document state after its last fragment.
+    markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => {
       // Increment embed_attempts exactly ONCE per attempt, at the start, and set
       // 'pending' so a crash mid-document leaves the doc retryable (and selected by
       // getHashesNeedingFragments). The completion setters below are state-only — no
       // further increment — so a start + a failure for the same attempt cannot
       // double-count the retry budget.
-      db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(hash);
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(hash);
+      }).immediate();
     },
-    markEmbedSynced: (hash: string) => {
+    markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => {
       // Success resets the retry budget: embed_attempts counts CONSECUTIVE failures
       // of the current content, so a successful (re-)embed must clear it — otherwise
       // a doc re-embedded many times (repeated content edits) accumulates attempts
       // and is wrongly excluded by the worklist's `embed_attempts < 3` guard.
-      db.prepare(`UPDATE documents SET embed_state = 'synced', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`).run(hash);
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`UPDATE documents SET embed_state = 'synced', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`).run(hash);
+      }).immediate();
     },
-    markEmbedFailed: (hash: string, error: string) => {
-      db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ? WHERE hash = ? AND active = 1`).run(error, hash);
+    markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => {
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ? WHERE hash = ? AND active = 1`).run(error, hash);
+      }).immediate();
     },
     getEmbedStats: () => {
       const stats = db.prepare(`
@@ -3417,7 +3506,7 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3452,6 +3541,14 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   if (dateRange) {
     sql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
     params.push(dateRange.start, dateRange.end);
+  }
+
+  // Visibility exclusion (VSEARCH-TRUST-HARDENING (b).1): excluded collections never enter
+  // the candidate pool, so `limit` is satisfied with allowed content by construction.
+  if (excludeCollections && excludeCollections.length > 0) {
+    const exPlaceholders = excludeCollections.map(() => '?').join(',');
+    sql += ` AND d.collection NOT IN (${exPlaceholders})`;
+    params.push(...excludeCollections);
   }
 
   // bm25 lower is better; sort ascending.
@@ -3532,11 +3629,12 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   const embedResult = await getEmbedding(query, model, true, deadlineMs);
   if (!embedResult) return [];
 
-  // W1: read-path embedding-model consistency gate. On a same-dimension model swap (which
-  // VecDimensionMismatchError cannot catch) this throws VecReadModelMismatchError rather than
-  // serving cosine-meaningless results. Cached per (db, model) — the DISTINCT runs at most once
-  // per model per process.
-  assertQueryEmbedModelConsistent(db, embedResult.model);
+  // W1: read-path embedding-model consistency gate + dimension check via the SHARED guard
+  // (same guard the eval-only precomputed-vector entry runs — the two paths cannot diverge).
+  // On a same-dimension model swap this throws VecReadModelMismatchError rather than serving
+  // cosine-meaningless results. Cached per (db, model) — the DISTINCT runs at most once per
+  // model per process.
+  assertQueryVectorCompatible(db, embedResult.model, embedResult.embedding.length);
 
   const embedding = embedResult.embedding;
 
@@ -3655,6 +3753,233 @@ export async function searchVec(db: Database, query: string, model: string, limi
 }
 
 // =============================================================================
+// Detailed vector search — visibility exclusion + escalation (VSEARCH-TRUST-HARDENING (b).1)
+// =============================================================================
+
+/**
+ * Shared query-vector compatibility guard — model consistency (W1) + dimension-vs-table
+ * validation, called by BOTH the production embed path and the eval-only precomputed-vector
+ * entry so the two can never diverge (design (e), T4-M4).
+ */
+function assertQueryVectorCompatible(db: Database, endpointModel: string, dim: number): void {
+  assertQueryEmbedModelConsistent(db, endpointModel);
+  const tableDim = getVecTableDim(db);
+  if (tableDim !== null && tableDim !== dim) throw new VecDimensionMismatchError(tableDim, dim);
+}
+
+export interface VecSearchDetailedOpts {
+  collectionId?: number;
+  collections?: string[];
+  excludeCollections?: string[];
+  dateRange?: { start: string; end: string };
+  deadlineMs?: number;
+  /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
+  escalationCap?: number;
+}
+
+export interface VecSearchDetailedResult {
+  results: SearchResult[];
+  degraded: boolean;
+  degradedReason?: "excluded-dominant" | "cap-truncation";
+  scannedFragments: number;
+  excludedDocsSeen: number;
+}
+
+// Hard MATCH-depth cap for exclusion escalation. Exhausting a 60k+ table per query is a
+// hot-path perf cliff; past this the result carries an explicit degraded marker instead.
+const VEC_ESCALATION_HARD_CAP = 4096;
+
+// Hydration + visibility classification for one escalation round. Include-collections and
+// dateRange are SQL predicates (a row failing them was never a candidate); EXCLUSION is
+// classified in JS because the excluded-doc count is part of the degraded contract (T5-M2).
+function hydrateVecResultsClassified(
+  db: Database,
+  vecResults: { hash_seq: string; distance: number }[],
+  limit: number,
+  opts: VecSearchDetailedOpts,
+  exclude: Set<string>
+): { results: SearchResult[]; allowedDocs: number; excludedDocsSeen: number } {
+  if (vecResults.length === 0) return { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
+
+  const hashSeqs = vecResults.map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+  const placeholders = hashSeqs.map(() => '?').join(',');
+  let docSql = `
+    SELECT
+      cv.hash || '_' || cv.seq as hash_seq,
+      cv.hash,
+      cv.pos,
+      cv.fragment_type,
+      cv.fragment_label,
+      d.collection,
+      'clawmem://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      d.modified_at,
+      content.doc as body
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
+    JOIN content ON content.hash = d.hash
+    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+  `;
+  const params: string[] = [...hashSeqs];
+
+  if (opts.collections && opts.collections.length > 0) {
+    const colPlaceholders = opts.collections.map(() => '?').join(',');
+    docSql += ` AND d.collection IN (${colPlaceholders})`;
+    params.push(...opts.collections);
+  } else if (opts.collectionId) {
+    docSql += ` AND d.collection = ?`;
+    params.push(String(opts.collectionId));
+  }
+  if (opts.dateRange) {
+    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    params.push(opts.dateRange.start, opts.dateRange.end);
+  }
+
+  const docRows = db.prepare(docSql).all(...params) as {
+    hash_seq: string; hash: string; pos: number; collection: string; filepath: string;
+    display_path: string; title: string; body: string; modified_at: string;
+    fragment_type: string | null; fragment_label: string | null;
+  }[];
+
+  const excludedDocs = new Set<string>();
+  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  for (const row of docRows) {
+    if (exclude.has(row.collection)) {
+      excludedDocs.add(row.filepath);
+      continue;
+    }
+    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const existing = seen.get(row.filepath);
+    if (!existing || distance < existing.bestDist) {
+      seen.set(row.filepath, { row, bestDist: distance });
+    }
+  }
+
+  const results = Array.from(seen.values())
+    .sort((a, b) => a.bestDist - b.bestDist)
+    .slice(0, limit)
+    .map(({ row, bestDist }) => ({
+      filepath: row.filepath,
+      displayPath: row.display_path,
+      title: row.title,
+      hash: row.hash,
+      docid: getDocid(row.hash),
+      collectionName: row.collection,
+      modifiedAt: row.modified_at || "",
+      bodyLength: row.body.length,
+      body: row.body,
+      context: getContextForFile(db, row.filepath),
+      score: 1 - bestDist,
+      source: "vec" as const,
+      chunkPos: row.pos,
+      fragmentType: row.fragment_type ?? undefined,
+      fragmentLabel: row.fragment_label ?? undefined,
+    }));
+
+  return { results, allowedDocs: seen.size, excludedDocsSeen: excludedDocs.size };
+}
+
+/**
+ * Eval-only + internal core: detailed vector search from a PRECOMPUTED query vector.
+ * Runs the SAME shared compatibility guard as the production path (T3-M2/T4-M4) — the
+ * endpointModel MUST come from the actual embed response that produced the vector.
+ * Synchronous (MATCH + hydration only); writes nothing.
+ */
+export function searchVecDetailedWithVector(
+  db: Database,
+  queryVec: { embedding: Float32Array; endpointModel: string },
+  limit: number = 20,
+  opts: VecSearchDetailedOpts = {}
+): VecSearchDetailedResult {
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0 };
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return empty;
+
+  assertQueryVectorCompatible(db, queryVec.endpointModel, queryVec.embedding.length);
+
+  const exclude = new Set(opts.excludeCollections ?? []);
+  const tableRows = (db.prepare(`SELECT count(*) as c FROM vectors_vec`).get() as { c: number }).c;
+  if (tableRows === 0) return empty;
+  const hardCap = opts.escalationCap ?? VEC_ESCALATION_HARD_CAP;
+  const effectiveCap = Math.min(hardCap, tableRows);
+
+  const matchStmt = db.prepare(`SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ? AND k = ?`);
+
+  let k = Math.min(limit * 3, effectiveCap);
+  let raw: { hash_seq: string; distance: number }[] = [];
+  let classified: ReturnType<typeof hydrateVecResultsClassified> = { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
+
+  // Escalation loop (exclusion-enabled callers only): grow MATCH depth x3 until `limit`
+  // allowed DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
+  // Without exclusion this runs exactly once at limit*3 — today's semantics.
+  for (;;) {
+    raw = matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: number }[];
+    classified = hydrateVecResultsClassified(db, raw, limit, opts, exclude);
+    const done =
+      exclude.size === 0 ||
+      classified.allowedDocs >= limit ||
+      k >= effectiveCap ||
+      raw.length < k || // MATCH returned fewer than requested: table exhausted below k
+      (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs);
+    if (done) break;
+    k = Math.min(k * 3, effectiveCap);
+  }
+
+  // Degraded contract (T4-M1 + T5-M2): only the HARD cap preventing an exhaustive scan
+  // counts — scanning the whole (sub-cap) table is ordinary corpus exhaustion, no marker.
+  const scannedFragments = raw.length;
+  let degraded = false;
+  let degradedReason: VecSearchDetailedResult["degradedReason"];
+  const underfilled = classified.allowedDocs < limit;
+  const hardCapPreventedExhaustion = tableRows > hardCap && k >= hardCap;
+  if (exclude.size > 0 && underfilled && hardCapPreventedExhaustion) {
+    degraded = true;
+    degradedReason = classified.excludedDocsSeen >= (limit - classified.allowedDocs)
+      ? "excluded-dominant"
+      : "cap-truncation";
+  }
+
+  return {
+    results: classified.results,
+    degraded,
+    degradedReason,
+    scannedFragments,
+    excludedDocsSeen: classified.excludedDocsSeen,
+  };
+}
+
+/**
+ * Detailed vector search — embeds the query, then delegates to the precomputed-vector core.
+ * The entry for every exclusion-enabled caller; carries the FULL searchVec parameter surface
+ * (collections / collectionId / dateRange / deadlineMs) so temporal RRF is never contaminated
+ * by dropped filters (T6-H2).
+ */
+export async function searchVecDetailed(
+  db: Database,
+  query: string,
+  model: string,
+  limit: number = 20,
+  opts: VecSearchDetailedOpts = {}
+): Promise<VecSearchDetailedResult> {
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0 };
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return empty;
+
+  const embedResult = await getEmbedding(query, model, true, opts.deadlineMs);
+  if (!embedResult) return empty;
+  if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
+
+  return searchVecDetailedWithVector(
+    db,
+    { embedding: new Float32Array(embedResult.embedding), endpointModel: embedResult.model },
+    limit,
+    opts
+  );
+}
+
+// =============================================================================
 // Embeddings
 // =============================================================================
 
@@ -3703,16 +4028,24 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
   // Also retry docs left 'pending' (crash mid-doc) or 'failed' (partial fragment failure) so partial
   // embeds are not permanently silent — bounded by embed_attempts < 3. The OR-branch is parenthesized
   // so embed_attempts < 3 and d.active = 1 always apply to every selected row (SQL precedence).
+  // The (collection, path, title) tuple must be ONE REAL document row (T9-M1): independent
+  // MIN() per column can synthesize a tuple belonging to no document, which then produces a
+  // canonicalDocId that matches nothing at doctor time. min(collection||'/'||path) picks a
+  // deterministic real alias; the correlated join recovers that row's actual columns.
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.fragment_type IS NOT NULL
-    LEFT JOIN content_vectors v0 ON d.hash = v0.hash AND v0.seq = 0
-    WHERE d.active = 1
-      AND COALESCE(d.embed_attempts, 0) < 3
-      AND ((v.hash IS NULL OR v0.hash IS NULL) OR d.embed_state IN ('pending', 'failed'))
-    GROUP BY d.hash
+    SELECT g.hash, c.doc as body, d.path as path, d.title as title, d.collection as collection
+    FROM (
+      SELECT dd.hash, MIN(dd.collection || '/' || dd.path) as canon_key
+      FROM documents dd
+      LEFT JOIN content_vectors v ON dd.hash = v.hash AND v.fragment_type IS NOT NULL
+      LEFT JOIN content_vectors v0 ON dd.hash = v0.hash AND v0.seq = 0
+      WHERE dd.active = 1
+        AND COALESCE(dd.embed_attempts, 0) < 3
+        AND ((v.hash IS NULL OR v0.hash IS NULL) OR dd.embed_state IN ('pending', 'failed'))
+      GROUP BY dd.hash
+    ) g
+    JOIN documents d ON d.hash = g.hash AND d.active = 1 AND (d.collection || '/' || d.path) = g.canon_key
+    JOIN content c ON g.hash = c.hash
   `).all() as { hash: string; body: string; path: string; title: string; collection: string }[];
 }
 
@@ -3784,7 +4117,8 @@ export function insertEmbedding(
   fragmentType?: string,
   fragmentLabel?: string,
   canonicalId?: string,
-  leaseGuard?: LeaseGuard
+  leaseGuard?: LeaseGuard,
+  embedInputFp?: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
   // Atomic vec0 + metadata write: the DELETE (vec0's "upsert" — no INSERT OR
@@ -3805,8 +4139,8 @@ export function insertEmbedding(
     db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
     db.prepare(
-      `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
+      `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id, embed_input_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null, embedInputFp ?? null);
   }).immediate(); // immediate write lock: the lease assert reads under the lock, so a lost-lease write can't slip through
 }
 

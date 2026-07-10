@@ -52,11 +52,24 @@ export interface LifecyclePolicy {
   dry_run: boolean;
 }
 
+export interface RetrievalConfig {
+  /**
+   * Option-B knob (VSEARCH-TRUST-HARDENING (a)): when true, the MCP direct tools
+   * (search / vsearch / memory_retrieve) score non-recency queries with the
+   * retrieval-tuned QUERY_WEIGHTS instead of DEFAULT_WEIGHTS. Default FALSE —
+   * the flip is gated on a direct-pipeline eval (the n=199 evidence covered only
+   * the hybrid `query` pipeline).
+   */
+  mcp_direct_tuned_weights: boolean;
+}
+
 export interface ClawMemConfig {
   /** Named vault paths (empty = single-vault mode) */
   vaults: VaultConfig;
   /** Lifecycle management policy */
   lifecycle?: LifecyclePolicy;
+  /** Retrieval behavior knobs */
+  retrieval?: RetrievalConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +186,15 @@ export function loadVaultConfig(): ClawMemConfig {
     };
   }
 
-  _cachedConfig = { vaults, lifecycle };
+  // 4. Retrieval knobs (optional). Env override for tests / staged rollout.
+  let retrieval: RetrievalConfig | undefined;
+  const envTuned = process.env.CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS;
+  const yamlTuned = parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
+    ? parsedYaml.retrieval.mcp_direct_tuned_weights === true
+    : false;
+  retrieval = { mcp_direct_tuned_weights: envTuned !== undefined ? envTuned === "true" : yamlTuned };
+
+  _cachedConfig = { vaults, lifecycle, retrieval };
   return _cachedConfig;
 }
 

@@ -19,6 +19,12 @@ export interface TraversalOptions {
   budget: number;             // Max total nodes (20-50)
   intent: IntentType;
   queryEmbedding: number[];
+  // Visibility exclusion (VSEARCH-TRUST-HARDENING (b).3): excluded-collection neighbors are
+  // pruned in the neighbor-selection query itself — BEFORE beam selection and BEFORE merged-
+  // score normalization — so internal nodes can neither crowd out nor demote user nodes.
+  // Callers with retrieval visibility policy (memory_retrieve causal mode, query_plan graph
+  // clause) pass this; substrate-by-design callers (intent_search) do not.
+  excludeCollections?: string[];
 }
 
 export interface TraversalNode {
@@ -120,10 +126,30 @@ export function adaptiveTraversal(
       anchorNodes.push({ docId, score: anchor.score });
     }
   }
-  const { maxDepth, beamWidth, budget, intent, queryEmbedding } = options;
+  const { maxDepth, beamWidth, budget, intent, queryEmbedding, excludeCollections } = options;
 
   // Intent-specific weights for structural alignment
   const weights = getIntentWeights(intent);
+
+  // Neighbor-selection query — with the visibility guard IN the SQL when exclusion is active,
+  // so excluded nodes never enter `candidates` (no beam consumption, no normalization skew).
+  const hasExclusion = !!(excludeCollections && excludeCollections.length > 0);
+  const exPlaceholders = hasExclusion ? excludeCollections!.map(() => '?').join(',') : '';
+  const neighborStmt = hasExclusion
+    ? db.prepare(`
+        SELECT r.target_id as docId, r.relation_type, r.weight
+        FROM memory_relations r
+        JOIN documents d ON d.id = r.target_id
+        WHERE r.source_id = ? AND d.collection NOT IN (${exPlaceholders})
+
+        UNION
+
+        SELECT r.source_id as docId, r.relation_type, r.weight
+        FROM memory_relations r
+        JOIN documents d ON d.id = r.source_id
+        WHERE r.target_id = ? AND r.relation_type IN ('semantic', 'entity') AND d.collection NOT IN (${exPlaceholders})
+      `)
+    : null;
 
   const visited = new Map<number, TraversalNode>();
   let currentFrontier: TraversalNode[] = anchorNodes.map(a => ({
@@ -143,8 +169,10 @@ export function adaptiveTraversal(
     const candidates: TraversalNode[] = [];
 
     for (const u of currentFrontier) {
-      // Get all neighbors via any relation type
-      const neighbors = db.prepare(`
+      // Get all neighbors via any relation type (visibility-guarded variant when exclusion is active)
+      const neighbors = (hasExclusion
+        ? neighborStmt!.all(u.docId, ...excludeCollections!, u.docId, ...excludeCollections!)
+        : db.prepare(`
         SELECT target_id as docId, relation_type, weight
         FROM memory_relations
         WHERE source_id = ?
@@ -154,7 +182,7 @@ export function adaptiveTraversal(
         SELECT source_id as docId, relation_type, weight
         FROM memory_relations
         WHERE target_id = ? AND relation_type IN ('semantic', 'entity')
-      `).all(u.docId, u.docId) as { docId: number; relation_type: string; weight: number }[];
+      `).all(u.docId, u.docId)) as { docId: number; relation_type: string; weight: number }[];
 
       for (const neighbor of neighbors) {
         if (visited.has(neighbor.docId)) continue;

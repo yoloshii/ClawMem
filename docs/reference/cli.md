@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation)
 ```
 
 ## Collection management
@@ -30,8 +30,10 @@ clawmem mine <dir> --dry-run                   # Preview without importing
 clawmem mine <dir> --synthesize                # v0.7.2: import + post-import LLM fact extraction
 clawmem mine <dir> --synthesize --synthesis-max-docs 50   # Cap synthesis to first 50 conversations (default 20)
 clawmem reindex                                # Force re-scan all collections
-clawmem embed                   # Embed all un-embedded fragments
-clawmem embed --force           # Re-embed everything (clears existing vectors)
+clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
+clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
+clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild
+clawmem embed --force --recalibrate-canary    # v0.21.0: replace the stored canary baseline after a deliberate model/server change (requires --force)
 ```
 
 ### Conversation Import

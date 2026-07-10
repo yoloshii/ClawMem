@@ -6,6 +6,9 @@
 import { parseArgs } from "util";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { resolve as pathResolve, basename } from "path";
+import { createHash } from "crypto";
+import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
+import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
 import {
   createStore,
   prewarmVectors,
@@ -390,14 +393,37 @@ async function cmdMine(args: string[]) {
   }
 }
 
+// SQLITE_BUSY retry helper lives in busy-retry.ts (testable — importing THIS module runs
+// the CLI). Console reporting is injected here so the helper stays I/O-free.
+const retryOnBusy = <T,>(fn: () => T, label: string, isLeaseLost: () => boolean): Promise<T> =>
+  retryOnBusyAsync(fn, label, isLeaseLost, {
+    onRetry: (l, attempt, delayMs) =>
+      console.error(`${c.yellow}    ${l}: database busy — retrying in ${delayMs / 1000}s (${attempt}/3)${c.reset}`),
+  });
+
 async function cmdEmbed(args: string[]) {
   const { values } = parseArgs({
     args,
-    options: { force: { type: "boolean", short: "f", default: false } },
+    options: {
+      force: { type: "boolean", short: "f", default: false },
+      // Escape hatch for the geometry-canary preflight ((d).1): a failing battery
+      // aborts the run BEFORE any destructive step unless this is passed.
+      "force-geometry": { type: "boolean", default: false },
+      // Explicit baseline replacement (T8-M3): baselines are first-healthy calibrations
+      // and never roll on their own — this is the intentional recalibration operation.
+      "recalibrate-canary": { type: "boolean", default: false },
+    },
     allowPositionals: false,
   });
 
   const s = getStore();
+  // Embed runs race live hook/watcher writers. Set the operational busy timeout on the
+  // ACTIVE connection — `update --embed` constructs and caches the store before invoking
+  // this command, so a getStore()-time option could not cover it ((f).3 / T2-M1). Kept at
+  // 10s: a synchronous busy wait blocks the event loop, and the lease heartbeat below
+  // fires every 30s against a 60s TTL — waits must stay well under the renewal margin
+  // ((f).1 / T2-H4). Recovery beyond 10s is the ASYNC bounded retry, not a longer block.
+  s.db.exec(`PRAGMA busy_timeout = 10000`);
 
   // Embedding lease: serialize embed commands (manual / embed timer / update --embed)
   // so two embeds cannot run at once. It is RENEWABLE (token-fenced heartbeat), not a
@@ -422,6 +448,17 @@ async function cmdEmbed(args: string[]) {
     if (!renewWorkerLease(s, LEASE_NAME, leaseToken, LEASE_TTL_MS)) leaseLost = true;
   }, Math.floor(LEASE_TTL_MS / 2));
 
+  // Run-level state-marker wrapper ((f).4 / T9-M4): busy-retried, lease-loss aborts, and
+  // a marker that STILL fails logs-and-continues — bookkeeping must never kill the run.
+  const markSafeGlobal = async (label: string, fn: () => void) => {
+    try { await retryOnBusy(fn, label, () => leaseLost); }
+    catch (err) {
+      if (err instanceof FatalVectorError) throw err; // incl. EmbedLeaseLostError
+      if (!isSqliteBusyError(err)) throw err;
+      console.error(`${c.yellow}Warning: ${label} still busy after retries — continuing${c.reset}`);
+    }
+  };
+
   try {
     const embedUrl = process.env.CLAWMEM_EMBED_URL;
     if (embedUrl) {
@@ -431,6 +468,85 @@ async function cmdEmbed(args: string[]) {
       setDefaultLlamaCpp(new LlamaCpp({ inactivityTimeoutMs: 0 }));
     }
     const llm = getDefaultLlamaCpp();
+
+    // Geometry-canary PREFLIGHT ((d).1 / T3-H1): gate BEFORE any destructive step — a
+    // broken-geometry server must fail the run before clearAllEmbeddings, not after 60k
+    // writes. Runs on EVERY embed entry, including runs that turn out to be no-work
+    // (a healthy-looking idle run still validates the server). FAIL-CLOSED for --force
+    // (T8-H1): a destructive clear must never proceed on an UNVALIDATED endpoint — the
+    // dimension probe alone can pass a flaky server far enough to destroy the old index.
+    // Recalibration (T9-M3) evaluates INTRINSIC sanity only — the old baseline is exactly
+    // what a recalibration replaces — and requires --force: the baseline must describe the
+    // geometry the WHOLE vault was embedded with, which only a full rebuild guarantees.
+    const recalibrate = !!values["recalibrate-canary"];
+    if (recalibrate && !values.force) {
+      console.error(`${c.red}--recalibrate-canary requires --force: the new baseline must correspond to a full rebuild under the new geometry.${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    let canaryState: CanaryCheckResult | null = null;
+    {
+      const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key), { ignoreBaseline: recalibrate });
+      if (!("unavailable" in outcome)) canaryState = outcome;
+      const gate = canaryGate(outcome, { force: !!values.force, forceGeometry: !!values["force-geometry"] });
+      if (gate.action === "abort") {
+        console.error(`${c.red}Embed aborted: ${gate.reason}${c.reset}`);
+        if (canaryState) {
+          for (const f of canaryState.failures) console.error(`  ${c.red}${f}${c.reset}`);
+          console.error(`${c.red}The server is producing non-discriminating or drifted vectors (pooling / EOS-anchor / quant misconfiguration?). Nothing was cleared or written. Fix the serving stack (see docs/troubleshooting.md → "Vector search returns weak or irrelevant results"), or override with --force-geometry.${c.reset}`);
+        }
+        process.exitCode = 1;
+        return;
+      }
+      if (gate.action === "warn") {
+        console.error(`${c.yellow}Geometry canary: ${gate.reason}${c.reset}`);
+        if (canaryState) for (const f of canaryState.failures) console.error(`  ${c.yellow}${f}${c.reset}`);
+      }
+    }
+
+    // Shared end-of-run finalization (T9-H1 + T10-M1): EVERY exit path that reaches a
+    // completed run — including the no-work early return — verifies the end state.
+    // Absent preflight vectors (canary unavailable, run proceeded) → persistent
+    // unverified taint + nonzero; baseline persist/recalibration happens ONLY after a
+    // successful same-dimension end probe. "Not verified" is never success (T8-M2).
+    const finalizeCanary = async (failedFragmentsCount: number) => {
+      const setTaint = (reason: string) =>
+        markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
+      if (!canaryState) {
+        console.error(`${c.red}WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.${c.reset}`);
+        await setTaint(`no preflight validation at ${new Date().toISOString()}`);
+        process.exitCode = 1;
+        return;
+      }
+      let endDrift: number | null = null;
+      try {
+        const fresh = await llm.embed(canaryProbeInputs().get("rel_a")!);
+        const pre = canaryState.vectors.get("rel_a")!;
+        if (fresh && fresh.embedding.length === pre.length) {
+          endDrift = cosineSim(pre, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
+        }
+      } catch { /* endpoint gone at the very end — endDrift stays null → unverified */ }
+      if (endDrift === null) {
+        console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
+        await setTaint(`unverified end-of-run at ${new Date().toISOString()}`);
+        process.exitCode = 1;
+      } else if (endDrift < CANARY_DRIFT_FLOOR) {
+        console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
+        await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${new Date().toISOString()}`);
+        process.exitCode = 1;
+      } else {
+        // Verified end. A FULL verified rebuild (--force) clears any standing taint —
+        // the mixed-geometry state the flag records has been rebuilt away (T8-M1).
+        // leaseLost is re-checked first: a reclaimed holder must not clear a
+        // successor's taint (T9-M4).
+        if (values.force && failedFragmentsCount === 0 && !leaseLost) {
+          await markSafeGlobal("clearVaultFlag(taint)", () => s.clearVaultFlag("embed_geometry_taint", leaseGuard));
+        }
+        if (canaryState.pass) {
+          persistCanaryBaselineIfFirst(s, canaryState, { recalibrate, leaseGuard });
+        }
+      }
+    };
 
     // Probe the live model's output dimension (+ model name). Returns null on ANY
     // failure so a down/flaky endpoint can NEVER trigger a destructive clear.
@@ -488,16 +604,33 @@ async function cmdEmbed(args: string[]) {
       }
     }
 
-    // Clean stale embeddings (orphaned hashes from updated/deleted documents)
-    const cleaned = s.cleanStaleEmbeddings(leaseGuard);
-    if (cleaned > 0) {
-      console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
+    // Clean stale embeddings (orphaned hashes from updated/deleted documents).
+    // SKIPPED under --force ((f).7 / T2-H3): clearAllEmbeddings just emptied
+    // content_vectors, so no orphaned hashes can exist — running it only risks a
+    // SQLITE_BUSY dying AFTER the clear with the index freshly emptied.
+    if (!values.force) {
+      try {
+        const cleaned = await retryOnBusy(() => s.cleanStaleEmbeddings(leaseGuard), "cleanStaleEmbeddings", () => leaseLost);
+        if (cleaned > 0) {
+          console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
+        }
+      } catch (err) {
+        if (err instanceof FatalVectorError) throw err; // incl. EmbedLeaseLostError
+        if (!isSqliteBusyError(err)) throw err;
+        // Busy after all retries: stale rows are inert (hydration JOINs active docs only) —
+        // log and continue; the next sweep retries.
+        console.error(`${c.yellow}Warning: stale-embedding cleanup still busy after retries — continuing${c.reset}`);
+      }
     }
 
     // Use fragment-based pipeline: split documents into semantic fragments and embed each
     const hashes = s.getHashesNeedingFragments();
     if (hashes.length === 0) {
+      // No-work run: routes through the SAME finalization as a working run (T10-M1) —
+      // it must not skip end verification, silently exit zero on an unvalidated
+      // endpoint, or persist/recalibrate a baseline without a verified end.
       console.log(`${c.green}All documents already embedded${c.reset}`);
+      await finalizeCanary(0);
       return;
     }
 
@@ -573,7 +706,9 @@ async function cmdEmbed(args: string[]) {
       // Mark the doc 'pending' and increment embed_attempts ONCE before its first
       // fragment, so a crash mid-document leaves it retryable (re-selected by
       // getHashesNeedingFragments). Completion setters below are state-only.
-      s.markEmbedStart(hash);
+      // A state MARKER must never kill the run ((f).4) — markSafeGlobal above.
+      const markSafe = markSafeGlobal;
+      await markSafe("markEmbedStart", () => s.markEmbedStart(hash, leaseGuard));
       console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
 
       if (isCloudEmbed) {
@@ -625,12 +760,19 @@ async function cmdEmbed(args: string[]) {
               const result = results[i];
               if (result) {
                 bindAndValidate(result);
-                s.ensureVecTable(result.embedding.length, leaseGuard);
-                s.insertEmbedding(
-                  hash, seq, frag.startLine, new Float32Array(result.embedding),
-                  result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
-                  leaseGuard
-                );
+                // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
+                // the exact formatted embed input, written in the same atomic transaction.
+                const embedInputFp = createHash("sha256").update(allTexts[seq]!, "utf8").digest("hex");
+                // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws to the
+                // batch catch (fragment failure); FatalVectorError passes through untouched.
+                await retryOnBusy(() => {
+                  s.ensureVecTable(result.embedding.length, leaseGuard);
+                  s.insertEmbedding(
+                    hash, seq, frag.startLine, new Float32Array(result.embedding),
+                    result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                    leaseGuard, embedInputFp
+                  );
+                }, "insertEmbedding", () => leaseLost);
                 totalFragments++;
                 if (seq === 0) seq0Succeeded = true;
               } else {
@@ -660,12 +802,19 @@ async function cmdEmbed(args: string[]) {
             const fragMs = Date.now() - fragStart;
             if (result) {
               bindAndValidate(result);
-              s.ensureVecTable(result.embedding.length, leaseGuard);
-              s.insertEmbedding(
-                hash, seq, frag.startLine, new Float32Array(result.embedding),
-                result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
-                leaseGuard
-              );
+              // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
+              // the exact formatted embed input, written in the same atomic transaction.
+              const embedInputFp = createHash("sha256").update(text, "utf8").digest("hex");
+              // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws to the
+              // per-fragment catch (fragment failure); FatalVectorError passes through.
+              await retryOnBusy(() => {
+                s.ensureVecTable(result.embedding.length, leaseGuard);
+                s.insertEmbedding(
+                  hash, seq, frag.startLine, new Float32Array(result.embedding),
+                  result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                  leaseGuard, embedInputFp
+                );
+              }, "insertEmbedding", () => leaseLost);
               totalFragments++;
               if (seq === 0) seq0Succeeded = true;
               if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
@@ -686,14 +835,17 @@ async function cmdEmbed(args: string[]) {
       // Embed-state completion: mark synced ONLY when the WHOLE document succeeded (no
       // failed fragments) — a partial embed must not be silently permanent. Any failure
       // → 'failed' (state-only; attempts already incremented at markEmbedStart) so the
-      // worklist retries it, bounded by embed_attempts < 3.
+      // worklist retries it, bounded by embed_attempts < 3. Markers are lease-fenced and
+      // busy-retried; a marker that STILL fails logs-and-continues — it must never kill
+      // the run (the 2026-07-10 incident: markEmbedFailed's own SQLITE_BUSY crashed a
+      // force rebuild at doc 344/4,995 with the index already cleared).
       const docFragsFail = failedFragments - prevFailedFragments;
       if (seq0Succeeded && docFragsFail === 0) {
-        s.markEmbedSynced(hash);
+        await markSafe("markEmbedSynced", () => s.markEmbedSynced(hash, leaseGuard));
       } else if (!seq0Succeeded) {
-        s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
+        await markSafe("markEmbedFailed", () => s.markEmbedFailed(hash, "primary fragment (seq=0) failed", leaseGuard));
       } else {
-        s.markEmbedFailed(hash, `${docFragsFail} fragment(s) failed`);
+        await markSafe("markEmbedFailed", () => s.markEmbedFailed(hash, `${docFragsFail} fragment(s) failed`, leaseGuard));
       }
 
       embedded++;
@@ -705,6 +857,9 @@ async function cmdEmbed(args: string[]) {
     const totalSec = ((Date.now() - batchStart) / 1000).toFixed(1);
     console.log();
     console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
+
+    // End-of-run verification — shared finalization (T9-H1 + T10-M1); see finalizeCanary.
+    await finalizeCanary(failedFragments);
   } catch (err) {
     // Fatal aborts must NOT exit 0 — otherwise the embed timer / `update --embed`
     // cannot tell the run was incomplete. Set a nonzero exit code (cleanup still
@@ -2248,6 +2403,96 @@ async function cmdDoctor() {
     console.log(`${c.yellow}!${c.reset} Reranker: could not probe (${(err as Error).message})`);
   }
 
+  // 10. Embedding-geometry canary (VSEARCH-TRUST-HARDENING (d)): pair-separation sanity
+  //     (catches WRONG-but-stable geometry — the 2026-07-10 class, invisible to
+  //     self-similarity) + drift vs the stored baseline (catches a changed serving stack —
+  //     the 2026-06-22 class — behind an unchanged model name). For a vault WITH vectors
+  //     this is a REQUIRED check: unavailability is incomplete/nonzero, not green (T8-M6).
+  //     A persisted taint flag from a bad rebuild stays red until a verified full rebuild
+  //     clears it (T8-M1).
+  {
+    const s = getStore();
+    const vaultHasVectors = !!s.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get()
+      && ((s.db.prepare(`SELECT count(*) as cnt FROM vectors_vec`).get() as { cnt: number })?.cnt ?? 0) > 0;
+    const taint = s.getVaultFlag("embed_geometry_taint");
+    if (taint) {
+      console.log(`${c.red}✗${c.reset} Geometry taint: a prior embed run was tainted/unverified (${taint}) — the vault may mix two geometries. Run 'clawmem embed --force' against a stable server to clear.`);
+      issues++;
+      process.exitCode = 1;
+    }
+    try {
+      const llm = getDefaultLlamaCpp();
+      const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key));
+      if ("unavailable" in outcome) {
+        if (vaultHasVectors) {
+          console.log(`${c.red}✗${c.reset} Geometry canary: INCOMPLETE — required check could not run (${outcome.reason}). A vector vault without a validated server is unverified, not healthy.`);
+          issues++;
+          process.exitCode = 1;
+        } else {
+          console.log(`${c.yellow}!${c.reset} Geometry canary: skipped (${outcome.reason}; vault has no vectors)`);
+        }
+      } else if (outcome.pass) {
+        const m = outcome.margins;
+        console.log(`${c.green}✓${c.reset} Geometry canary: separation healthy (rel ${m.m_rel!.toFixed(2)}, echo ${m.m_echo!.toFixed(2)}, term ${m.m_term!.toFixed(2)}, trunc ${m.m_trunc!.toFixed(2)})${outcome.driftChecked ? " · drift vs baseline OK" : " · no baseline yet (absolute floors)"}`);
+      } else {
+        console.log(`${c.red}✗${c.reset} Geometry canary: FAILED — embedding server produces non-discriminating or drifted vectors`);
+        for (const f of outcome.failures.slice(0, 6)) console.log(`   ${c.dim}${f}${c.reset}`);
+        console.log(`   ${c.dim}Pooling / EOS-anchor / quant misconfiguration, or the server changed since the last embed. See docs/troubleshooting.md → "Vector search returns weak or irrelevant results". A geometry change requires 'clawmem embed --force'.${c.reset}`);
+        issues++;
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      if (vaultHasVectors) {
+        console.log(`${c.red}✗${c.reset} Geometry canary: INCOMPLETE — required check errored (${(err as Error).message})`);
+        issues++;
+        process.exitCode = 1;
+      } else {
+        console.log(`${c.yellow}!${c.reset} Geometry canary: could not run (${(err as Error).message})`);
+      }
+    }
+  }
+
+  // 11. Sampled vector validation ((d).4): persisted-vs-fresh on REAL vectors_vec rows,
+  //     reconstructed through the production pipeline from the CANONICAL document
+  //     (T8-H3). Definitive fingerprint failures return immediately and are nonzero
+  //     regardless of coverage (T6-M2/T8-H2); attempts are hard-capped. Required check
+  //     for a vector vault — exceptions are incomplete/nonzero, not green (T8-M6).
+  try {
+    const s = getStore();
+    const llm = getDefaultLlamaCpp();
+    const summary = await runSampledVectorValidation(s, (t: string) => llm.embed(t));
+    if (summary.eligible === 0) {
+      console.log(`${c.yellow}!${c.reset} Sampled vectors: no eligible rows (no synced embedded documents)`);
+    } else if (summary.definitiveFailures.length > 0) {
+      console.log(`${c.red}✗${c.reset} Sampled vectors: DEFINITIVE failure after ${summary.attempts} attempt(s) (${summary.validated}/${summary.target} validated before stopping, ${summary.eligible} eligible)`);
+      for (const f of summary.definitiveFailures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
+      console.log(`   ${c.dim}Stale-input rows need a re-embed; corruption/drift at matching fingerprints means the stored vector no longer matches its exact input.${c.reset}`);
+      issues++;
+      process.exitCode = 1;
+    } else if (summary.validated < summary.nMin || summary.validatedSeq0 < summary.seq0Target) {
+      const seq0Part = summary.validatedSeq0 < summary.seq0Target ? `; seq-0 quota UNMET (${summary.validatedSeq0}/${summary.seq0Target} validated — primary fragments are the surprisal/graph/health anchors)` : "";
+      console.log(`${c.red}✗${c.reset} Sampled vectors: DEGRADED — validation could not complete (${summary.validated}/${summary.target} validated, min ${summary.nMin}${seq0Part}; ${summary.unreconstructable} unreconstructable, ${summary.inconclusiveLegacy} legacy-inconclusive; ${summary.attempts} attempts over ${summary.eligible} eligible)`);
+      console.log(`   ${c.dim}Splitter/metadata drift or legacy rows below threshold — re-embed or investigate.${c.reset}`);
+      issues++;
+      process.exitCode = 1;
+    } else {
+      const legacyNote = summary.legacyTier > 0 ? ` (${summary.legacyTier} legacy-tier: structural only — title provenance unavailable until re-embed)` : "";
+      const seq0Note = summary.validatedSeq0 > 0 ? `, ${summary.validatedSeq0} seq-0` : "";
+      console.log(`${c.green}✓${c.reset} Sampled vectors: ${summary.validated}/${summary.target} validated (cos ≥ 0.98${seq0Note})${legacyNote}`);
+    }
+  } catch (err) {
+    const s = getStore();
+    const vaultHasVectors = !!s.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get()
+      && ((s.db.prepare(`SELECT count(*) as cnt FROM vectors_vec`).get() as { cnt: number })?.cnt ?? 0) > 0;
+    if (vaultHasVectors) {
+      console.log(`${c.red}✗${c.reset} Sampled vectors: INCOMPLETE — required check errored (${(err as Error).message})`);
+      issues++;
+      process.exitCode = 1;
+    } else {
+      console.log(`${c.yellow}!${c.reset} Sampled vectors: could not run (${(err as Error).message})`);
+    }
+  }
+
   console.log();
   if (issues > 0) {
     console.log(`${c.yellow}${issues} issue(s) found.${c.reset}`);
@@ -2255,6 +2500,7 @@ async function cmdDoctor() {
     console.log(`${c.green}All checks passed.${c.reset}`);
   }
 }
+
 
 // =============================================================================
 // Reranker health (scheduled-check CLI)
@@ -2290,6 +2536,7 @@ async function cmdRerankHealth(args: string[]) {
   // (not process.exit) so main()'s finally { closeStore() } still runs.
   process.exitCode = health.ok ? 0 : 1;
 }
+
 
 // =============================================================================
 // Bootstrap
@@ -3326,6 +3573,8 @@ ${c.bold}Options:${c.reset}
   --json               JSON output
   --min-score <N>      Minimum score threshold
   -f, --force          Force re-embed/reindex all
+  --force-geometry     Override a failing embed geometry-canary preflight
+  --recalibrate-canary Replace the stored canary baseline (first-healthy otherwise)
   --pull               Run update commands before indexing
 `);
 }

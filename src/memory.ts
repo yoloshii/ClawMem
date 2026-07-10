@@ -199,6 +199,7 @@ export const QUERY_WEIGHTS: CompositeWeights = { search: 0.7, recency: 0.15, con
 
 const RECENCY_PATTERNS = [
   /\brecent(ly)?\b/i,
+  /\blatest\b/i,
   /\blast\s+(session|time|week|month|few\s+days)\b/i,
   /\bleft\s+off\b/i,
   /\bwhere\s+(was|were)\s+(we|i)\b/i,

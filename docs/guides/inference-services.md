@@ -60,9 +60,18 @@ ZeroEntropy's distillation-paired stack — best retrieval quality, total ~16 GB
 | Reranker | 8090 | [zerank-2 seq-cls sidecar](../../extras/rerankers/zerank-2-seq/) (transformers, bf16) | ~9 GB | SOTA reranker — **not** a GGUF |
 
 ```bash
-# Embedding (zembed-1) — -ub MUST equal -b for non-causal attention
+# Embedding (zembed-1) — -ub MUST equal -b for non-causal attention.
+# --pooling last: zembed-1 is a last-token model; declare it explicitly.
+# --override-kv ...add_eos_token: last-token models read the embedding at their EOS
+# anchor. If the GGUF conversion lost add_eos_token, the server never appends the
+# terminator and similarity collapses to last-token identity (see troubleshooting →
+# "Vector search returns weak or irrelevant results"). The override restores it and
+# is a no-op when the metadata is already correct. Do NOT add these two flags to
+# mean-pooling models like the default EmbeddingGemma.
 llama-server -m zembed-1-Q4_K_M.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
+  --embeddings --pooling last \
+  --override-kv tokenizer.ggml.add_eos_token=bool:true \
+  --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 
 # Reranker (zerank-2) — seq-cls SIDECAR (transformers, bf16), NOT a llama-server GGUF:
 cd extras/rerankers/zerank-2-seq

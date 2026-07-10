@@ -4,6 +4,38 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.21.0 — vsearch trust hardening: internal-collection exclusion, geometry canary, embed survivability
+
+A live incident exposed a stacked failure: an embedding server silently producing non-discriminating vectors for the vault's dominant register (a last-token model whose GGUF conversion lost its EOS-append flag), amplified by composite scoring floating system-internal docs over true matches — while every existing health check passed. The server-side cause is an operator fix; this release closes the client-side amplification and the detection gaps, and hardens the embed run that the remediation itself crashed.
+
+### Behavior change: `_clawmem` excluded from MCP retrieval by default
+
+`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` no longer return the system-internal `_clawmem` collection (observations/deductions/handoffs) unless asked: pass `includeInternal: true`, or name `_clawmem` in an explicit `collection` filter. `find_similar` auto-includes internal neighbors when the reference document is itself internal. `intent_search` / `find_causal_links` / `kg_query` / `session_log` / `timeline` are unfiltered by design — system memory is their substrate. Exclusion happens at the store layer (SQL predicate for BM25; escalating MATCH depth for vectors) and inside graph traversal (excluded nodes are pruned before beam selection and score normalization), so internal docs neither appear NOR consume candidate/beam budget.
+
+Vector-side contract: under exclusion the scan escalates depth until `limit` allowed documents hydrate, capped at 4,096 fragments. Cap-limited under-fills carry an explicit `degraded: true` + `degradedReason` (`excluded-dominant` when distinct excluded docs account for the shortfall, `cap-truncation` when fragment dedup drives it); multi-leg routes aggregate `any(leg)` with per-leg reasons in `structuredContent.degradedLegs`. Plain small-vault exhaustion returns a normal short list with no marker.
+
+### Embedding-geometry canary (preflight + doctor)
+
+- `clawmem embed` now runs a pair-separation probe battery BEFORE any destructive step — a broken-geometry server aborts the run before `--force` clears anything (override: `--force-geometry`). The battery uses the production embed templates and includes terminus + truncation controls that catch unanchored last-token readouts; self-similarity alone cannot (stored-vs-fresh stayed 0.999 through the entire incident).
+- Baselines are stored per (probe-version, model, dimension) profile in a new `embed_canary` table as **first-healthy calibrations** — healthy runs never roll the reference; `clawmem embed --force --recalibrate-canary` is the explicit replacement operation (intrinsic sanity floors govern its gate, since the old baseline is exactly what it replaces). Margins alert relative to the calibrated baseline (< 50%) with an absolute backstop, and drift (stored-vs-fresh probe cos < 0.98) flags a changed serving stack behind an unchanged model name. Mixed dimensions/models across one battery (a flapping endpoint) are a hard failure, and a `--force` clear never proceeds on an UNVALIDATED endpoint. Mid-run drift, an unverifiable run end, or a no-preflight override persists a durable `embed_geometry_taint` flag (lease-fenced) that keeps `doctor` nonzero until a verified full rebuild clears it.
+- `clawmem doctor` gains the canary (section 10) and a sampled persisted-vs-fresh check on real index rows (section 11): fragments are reconstructed through the production parse/split/format pipeline and compared to their stored vectors. New vectors persist an `embed_input_fp` (SHA-256 of the exact embed input) enabling full validation; pre-0.21.0 rows validate structurally with title provenance flagged unavailable until their next re-embed. Definitive failures (fingerprint mismatch = stale input; fingerprint match + low cosine = corruption) exit nonzero immediately — sampling coverage can never mask them.
+
+### Embed-run survivability
+
+The incident's remediation run died on a transient `SQLITE_BUSY`: the failure-marker write itself crashed a `--force` rebuild at doc 344/4,995 with the index already cleared. Now: the embed connection runs a 10s busy timeout (set on the ACTIVE connection, covering `update --embed`'s cached store; kept short so synchronous waits cannot starve the 30s lease heartbeat), retries are asynchronous and bounded with a lease-loss abort between attempts, `markEmbedStart/Synced/Failed` are lease-fenced in-transaction, a marker that still fails logs-and-continues instead of killing the run, and `--force` skips the post-clear stale-embedding cleanup (a no-op that could only add a die-after-clear window).
+
+### Also
+
+- `latest` now routes to recency intent (`RECENCY_PATTERNS`) — "latest decisions" was scoring under non-recency weights.
+- Config knob `retrieval.mcp_direct_tuned_weights` (default **false**; env `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS`): opt-in to score the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. The default flip is gated on a direct-pipeline eval — the existing n=199 evidence covered only the hybrid `query` pipeline.
+- Read-only template A/B evaluator (`scripts/eval-query-template.ts`): ranks known-target queries under query-template / doc-template / raw formatting against the live index through the same model+dimension guards as production, writing nothing. Measured post-incident: a doc-templated query ranked the true target #1 where the query template ranked it #383 — a query-side-only template change needs no re-embed.
+- Production vector search now runs an explicit pre-MATCH dimension check via a shared query-vector compatibility guard (previously model-consistency only).
+- Docs: the zembed-1 launch line ships with `--pooling last --override-kv tokenizer.ggml.add_eos_token=bool:true` (the missing flags seeded the incident); troubleshooting's claim that a re-embed is "not required" after a pooling fix is corrected (it IS required — same-dimension geometries are incompatible); the missing-EOS-anchor signature, shared-suffix diagnostic confound, compressed-high similarity bands, and watcher/`tee` operational notes are documented.
+
+### Verification
+
+`bun test` → 1492 pass / 0 fail (45 new regressions: escalation fill / cap-exhaustion markers / dedup-collapse / mixed-cause truthfulness / small-vault no-marker; traversal beam parity; shared-guard model+dimension; canary healthy/collapsed/drift/unavailable/mixed-endpoint; fail-closed preflight gate matrix; first-healthy baseline calibration; sampled-validation tiers incl. definitive-failure non-maskability, canonical-alias dedup, and hard attempt caps; busy-retry semantics; lease-fenced markers; `latest` routing; route-level MCP tests over an in-memory transport for all six retrieval tools incl. the incident composite-ranking fixture). Design adversarially reviewed to explicit clearance in a 7-turn cross-model DESIGN gate (34 findings folded); implementation review findings (fail-open canary gate, unbounded sampling, canonical-identity blindness, rolling baselines, taint persistence, and route coverage) folded before ship.
+
 ## v0.20.2 — Beads sync hardening: argument-safe exec, telemetry-off spawns
 
 `runBd` assembled a shell string and ran it through `execSync`, leaving argument interpolation to the shell, and bd v1.1.0 upstream turned on anonymous usage metrics by default with a remote reporting endpoint and a spawned flush sender — so every bd invocation ClawMem makes during a sync would have phoned home on upgraded installs.

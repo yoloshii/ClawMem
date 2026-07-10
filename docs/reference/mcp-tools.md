@@ -4,6 +4,10 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 
 ## Retrieval
 
+**Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` exclude the system-internal `_clawmem` collection (observations/deductions/handoffs) by default. Opt-ins: pass `includeInternal: true` (all six tools), or — on the tools that expose a `collection` parameter (`search`, `vsearch`, `query`) — name `_clawmem` explicitly in the filter. `find_similar` auto-includes internal results when the REFERENCE document is itself internal. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design.
+
+**Degraded vector results (v0.21.0):** under default exclusion the vector scan escalates its depth to fill `limit` with allowed documents, up to a hard cap. When the cap prevents an exhaustive scan and the result is under-filled, `structuredContent` carries `degraded: true` with `degradedReason`: `"excluded-dominant"` (distinct excluded docs account for the shortfall — the guidance line suggests `includeInternal: true` or a refined query) or `"cap-truncation"` (shortfall driven by fragment dedup, neutral guidance). Multi-leg routes (`query`, `query_plan`, `memory_retrieve` complex mode) aggregate `degraded = any(leg)` and list per-leg reasons in `structuredContent.degradedLegs`; single-vector routes (`vsearch`, `find_similar`, `memory_retrieve`'s other modes) report the flat `degraded` + `degradedReason` pair. A small vault whose whole index is scanned without hitting the cap returns a plain short list with NO marker.
+
 ### memory_retrieve
 
 **Recommended entry point.** Auto-classifies query and routes to the optimal backend.
@@ -14,6 +18,7 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 | `mode` | enum | `auto` | Override: `keyword`, `semantic`, `causal`, `timeline`, `discovery`, `complex`, `hybrid` |
 | `limit` | number | 10 | Max results |
 | `compact` | boolean | true | Compact output (snippets vs full content) |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
 
 Auto-routing:
@@ -35,6 +40,7 @@ Full hybrid pipeline: BM25 + vector + query expansion + cross-encoder reranking.
 | `collection` | string | — | Filter by collection (comma-separated for multi) |
 | `intent` | string | — | Domain hint for ambiguous queries (steers expansion, reranking, chunk selection) |
 | `candidateLimit` | number | 30 | Candidates for reranking (tune precision vs speed) |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
 
 BM25 strong-signal bypass: skips expansion when top BM25 hit >= 0.85 with gap >= 0.15 (disabled when `intent` is provided).
@@ -49,6 +55,7 @@ BM25 only. Zero GPU cost.
 | `limit` | number | 10 | Max results |
 | `compact` | boolean | true | Compact output |
 | `collection` | string | — | Filter by collection |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
 
 ### vsearch
@@ -61,6 +68,7 @@ Vector only. Semantic similarity.
 | `limit` | number | 10 | Max results |
 | `compact` | boolean | true | Compact output |
 | `collection` | string | — | Filter by collection |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
 
 ### intent_search
@@ -84,6 +92,7 @@ Multi-topic decomposition. Use for complex queries spanning multiple subjects.
 | `query` | string | required | Complex or multi-topic query |
 | `limit` | number | 10 | Max results |
 | `compact` | boolean | true | Compact output |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
 
 ## Document access
@@ -120,6 +129,7 @@ k-NN vector neighbors of a reference document.
 |-------|------|---------|-------------|
 | `file` | string | required | Path of reference document |
 | `limit` | number | 5 | Max results |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs (auto-included when the reference doc is itself internal) |
 | `vault` | string | — | Named vault |
 
 ### find_causal_links

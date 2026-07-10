@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.10.4**.
+Guide for upgrading between released versions. Current: **v0.21.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,24 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.21.0: MCP internal-collection exclusion + embedding-geometry canary
+
+No migration command required. Two things to know:
+
+**Behavior change — `_clawmem` excluded from MCP retrieval by default.** `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` no longer return the system-internal `_clawmem` collection (observations/deductions/handoffs) unless asked. If a workflow depended on those appearing in MCP results, pass `includeInternal: true` or name `_clawmem` in an explicit `collection` filter. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are unfiltered by design, and hooks already filtered internal docs — `<vault-context>` behavior is unchanged. Details: [docs/reference/mcp-tools.md](../reference/mcp-tools.md).
+
+**What auto-applies on first open** (additive, idempotent — same contract as prior releases): the `embed_canary` and `vault_flags` tables, and an `embed_input_fp` column on `content_vectors`.
+
+**No re-embed required.** Existing vectors stay valid. Pre-0.21.0 rows carry no input fingerprint, so `clawmem doctor`'s new sampled vector validation checks them structurally and flags title provenance as unavailable ("legacy") until each document's next natural re-embed — informational, not an error.
+
+**The canary baseline seeds itself.** The first `clawmem embed` run after upgrade (including a timer-fired one) probes the embedding server with a pair-separation battery and persists a first-healthy baseline; subsequent runs alert relative to it, and a broken-geometry server now aborts `embed --force` BEFORE anything is cleared. `--force-geometry` (proceed despite a failed probe; the vault is flagged tainted until a verified rebuild) and `--force --recalibrate-canary` (replace the baseline after a deliberate model/server change) are operator overrides, not upgrade steps.
+
+**Opt-in knob:** `retrieval.mcp_direct_tuned_weights` (config) / `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` (env), default `false` — scores the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. Leave it off unless you have direct-pipeline eval evidence for your vault.
+
+Upgrades from v0.13 → v0.20 shipped no steps beyond the [quick path](#quick-path) — schema changes auto-apply; see [RELEASE_NOTES.md](../../RELEASE_NOTES.md) for what each version changed.
 
 ---
 
@@ -145,7 +163,7 @@ Hooks and the stdio MCP server pick up the new binary automatically on their nex
 - **`plugins.slots.memory: "clawmem"` replaces `plugins.slots.contextEngine: "clawmem"`.** On the new pure-memory plugin, the exclusive slot is `memory`. The `setup openclaw` next-steps output tells you to run `openclaw plugins enable clawmem`, which sets the slot and disables competing memory plugins (`memory-core`, `memory-lancedb`) in a single command. You do NOT need to run the older `openclaw config set plugins.slots.contextEngine clawmem` pattern on v0.10.0.
 - **`src/openclaw/package.json` is now the plugin's discovery manifest.** OpenClaw v2026.4.11's `discoverInDirectory` reads `package.json` for the `openclaw.extensions` field and uses that to decide whether a directory under `~/.openclaw/extensions/` is a valid plugin. The older `openclaw.plugin.json` manifest is still shipped and parsed at runtime, but it is not sufficient to pass discovery on v2026.4.11+ without the `package.json` companion file. v0.10.0 adds the `package.json` to the plugin source tree, and `clawmem setup openclaw` verifies it is present before copying.
 - **`clawmem setup openclaw` defaults to recursive copy instead of symlink.** OpenClaw v2026.4.11 walks `~/.openclaw/extensions/` with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()` to descend into candidate plugin directories. Symlinks to directories report `isDirectory() === false` on that API shape, so a symlinked plugin is silently skipped during discovery. v0.10.0's `cmdSetupOpenClaw` therefore copies the plugin source into `~/.openclaw/extensions/clawmem/` with `cpSync(..., { recursive: true, dereference: true })`. A `--link` opt-in flag preserves the old symlink behavior for local development and for older OpenClaw versions, with a warning that v2026.4.11+ discovery will skip the symlink. Setup is idempotent: any existing plugin directory or stale symlink is removed before the new copy is written.
-- **Multi-user ownership check (OpenClaw v2026.4.11+).** If the gateway runs as a dedicated system user (e.g. `openclaw`) and you run `clawmem setup openclaw` as a different user (e.g. `sciros`), the copied plugin directory is owned by the installer user, but OpenClaw's ownership check rejects it with `suspicious ownership (uid=1001, expected uid=997 or root)`. This is a security feature that prevents a privileged gateway process from loading code a less-privileged user dropped into its extensions directory. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs where you ARE the gateway user are not affected — your own user owns the copy, and the ownership check passes.
+- **Multi-user ownership check (OpenClaw v2026.4.11+).** If the gateway runs as a dedicated system user (e.g. `openclaw`) and you run `clawmem setup openclaw` as a different user (e.g. `alice`), the copied plugin directory is owned by the installer user, but OpenClaw's ownership check rejects it with `suspicious ownership (uid=1001, expected uid=997 or root)`. This is a security feature that prevents a privileged gateway process from loading code a less-privileged user dropped into its extensions directory. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs where you ARE the gateway user are not affected — your own user owns the copy, and the ownership check passes.
 
 ### Rollback
 
@@ -191,7 +209,7 @@ Hooks + MCP stdio pick up new code automatically on next invocation — no resta
 
 When the user's prompt mentions entities already known to the vault (via `entity_nodes`), `context-surfacing` now appends a token-bounded `<vault-facts>` block of raw SPO triple lines to `<vault-context>`, alongside the existing `<facts>` / `<relationships>` blocks. This feeds the model current-state knowledge about entities the user is talking about, without requiring the agent to call `kg_query` explicitly.
 
-- **Three-path entity seeding** — canonical-ID regex (e.g. `default:project:clawmem`) → proper-noun extraction via `resolveEntityTypeExact` → longer-first n-gram scan (3-gram > 2-gram > 1-gram) for lowercase/hyphenated vocabulary like `forge-stack`, `oauth2`, `vm 202`. All three paths run prompt-only — entity seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block.
+- **Three-path entity seeding** — canonical-ID regex (e.g. `default:project:clawmem`) → proper-noun extraction via `resolveEntityTypeExact` → longer-first n-gram scan (3-gram > 2-gram > 1-gram) for lowercase/hyphenated vocabulary like `side-project`, `oauth2`, `vm 12`. All three paths run prompt-only — entity seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block.
 - **Profile-gated token sub-budget** — `factsTokens=0` on `speed` disables the stage entirely. `balanced` uses 200 tokens, `deep` uses 250. The sub-budget is dedicated — `<vault-facts>` cannot steal budget from `<facts>` or `<relationships>`.
 - **Truncation** — at the triple boundary, never mid-triple, never emits an empty block.
 - **Fail-open** — empty entity set → skip. Budget too small → drop block. Per-entity DB error → skip that entity. Any exception in the stage → return baseline `vault-context` unchanged.

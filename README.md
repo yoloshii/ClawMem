@@ -531,6 +531,8 @@ clawmem status                                  Quick index status
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
+**Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` exclude the system-internal `_clawmem` collection by default — pass `includeInternal: true` (or name `_clawmem` in an explicit `collection` filter where the tool has one) to include it. `find_similar` auto-includes internal neighbors when the reference document is itself internal; `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are unfiltered by design. Full contract (including the `degraded` under-fill markers): [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
+
 | Tool | Description |
 |---|---|
 | `__IMPORTANT` | Workflow guide: prefer `memory_retrieve` → match query type to tool → `multi_get` for full content |
@@ -789,6 +791,7 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_RERANK_API_KEY` | (none) | Bearer token for an authenticated remote reranker endpoint. Independent of the embed and LLM keys. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
+| `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` | `false` | **v0.21.0.** When `true`, the MCP direct tools (`search`, `vsearch`, `memory_retrieve`) score non-recency queries with the retrieval-tuned `query`-tool weights. Ships off — the eval evidence covered only the hybrid `query` pipeline. YAML equivalent: `retrieval.mcp_direct_tuned_weights` (env wins). |
 | `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 consolidation merge-safety threshold when candidate and existing anchors align. Merges above this normalized 3-gram cosine score are allowed. |
 | `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold — fallback when anchor sets are ambiguous. |
 | `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration before enabling the gate. |

@@ -35,7 +35,7 @@ Hooks handle ~90% of retrieval at zero agent effort.
 
 **Default behavior:** read injected `<vault-context>` first; if sufficient, answer immediately.
 
-**Hook blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, and cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3.
+**Hook blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, and cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3. Note the MCP retrieval tools themselves exclude `_clawmem` by default since v0.21.0 — pass `includeInternal: true` when system-internal memory (observations/handoffs/deductions) is the target.
 
 **Profiles:** `speed` / `balanced` (default) / `deep` set the kept-score ratio (65% / 55% / 45%) and an activation floor. Only `deep` adds query expansion + reranking to the hook path. Profile and the hook `timeout` are set in `~/.claude/settings.json` — see *Operational gotchas* for timeout tuning.
 

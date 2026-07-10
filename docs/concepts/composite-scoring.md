@@ -19,7 +19,9 @@ compositeScore = (w_search * searchScore + w_recency * recencyScore + w_confiden
 
 Recency intent is detected automatically when queries contain "latest", "recent", "last session", etc. — and **takes precedence over the `query`-tool weights**: a recency-phrased `query` call still uses the Recency-intent column.
 
-The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a held-out judged-relevance eval (v0.13.0) — more weight on topical relevance measurably improves graded NDCG@10 without demoting the newest-correct version of evolving docs. All other tools (`search`, `vsearch`, `memory_retrieve`, and the context-surfacing hook) use the **Normal** column.
+The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a held-out judged-relevance eval (v0.13.0) — more weight on topical relevance measurably improves graded NDCG@10 without demoting the newest-correct version of evolving docs. `search`, `vsearch`, `memory_retrieve`, and the context-surfacing hook **keep the Normal column by default**. Since v0.21.0 a config knob — `retrieval.mcp_direct_tuned_weights: true` (or env `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS=true`) — switches the three MCP direct tools' non-recency scoring to the `query`-tool column; it ships **off** because the eval evidence covered only the hybrid `query` pipeline, and the flip is gated on a direct-pipeline eval (see [configuration](../reference/configuration.md)).
+
+Threshold note: EOS-anchored last-token embedding models (e.g. zembed-1 served correctly) produce a **compressed-high similarity band** — unrelated pairs sit near ~0.4 rather than ~0.2. Relative ordering is what matters; treat absolute `minScore` cutoffs as model-dependent rather than universal.
 
 ## Signal breakdown
 
