@@ -6,6 +6,8 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 
 **Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` exclude the system-internal `_clawmem` collection (observations/deductions/handoffs) by default. Opt-ins: pass `includeInternal: true` (all six tools), or — on the tools that expose a `collection` parameter (`search`, `vsearch`, `query`) — name `_clawmem` explicitly in the filter. `find_similar` auto-includes internal results when the REFERENCE document is itself internal. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design.
 
+**Scoring regimes (v0.22.0):** the direct vector routes — `vsearch` and `memory_retrieve`'s semantic/discovery modes — rank non-recency queries by RAW vector cosine. Their `structuredContent` carries `scoreBasis: "vector-cosine"`; raw cosine values are specific to the embedding model that produced them and are NOT comparable across models or to composite scores. Document metadata — including pin — participates only inside groups of exactly-equal raw scores. On these routes `minScore` filters the raw score and has NO default (omitted = no filter; an explicit `0` is honored). Recency-intent queries ("latest…", "recently…", "yesterday…") keep the composite regime with its 0.3 default floor and report `scoreBasis: "composite"`, as do `search`, `query`, `query_plan`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. `find_similar` has always ranked by raw cosine. Rationale: on the measured vault, raw cosine ranked 16/19 judged targets #1 (MRR 0.912) while the composite stack ranked 1/19 and filtered 14/19 out entirely.
+
 **Degraded vector results (v0.21.0):** under default exclusion the vector scan escalates its depth to fill `limit` with allowed documents, up to a hard cap. When the cap prevents an exhaustive scan and the result is under-filled, `structuredContent` carries `degraded: true` with `degradedReason`: `"excluded-dominant"` (distinct excluded docs account for the shortfall — the guidance line suggests `includeInternal: true` or a refined query) or `"cap-truncation"` (shortfall driven by fragment dedup, neutral guidance). Multi-leg routes (`query`, `query_plan`, `memory_retrieve` complex mode) aggregate `degraded = any(leg)` and list per-leg reasons in `structuredContent.degradedLegs`; single-vector routes (`vsearch`, `find_similar`, `memory_retrieve`'s other modes) report the flat `degraded` + `degradedReason` pair. A small vault whose whole index is scanned without hitting the cap returns a plain short list with NO marker.
 
 ### memory_retrieve
@@ -60,12 +62,13 @@ BM25 only. Zero GPU cost.
 
 ### vsearch
 
-Vector only. Semantic similarity.
+Vector only. Semantic similarity. Non-recency queries rank by RAW cosine (`scoreBasis: "vector-cosine"`, v0.22.0); recency-intent queries use the composite regime.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `query` | string | required | Search query |
 | `limit` | number | 10 | Max results |
+| `minScore` | number | — | Raw-cosine floor on non-recency queries (no default — omitted means no filter; explicit `0` honored). Recency-intent queries keep the composite-scale 0.3 default. |
 | `compact` | boolean | true | Compact output |
 | `collection` | string | — | Filter by collection |
 | `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
@@ -178,7 +181,7 @@ Recent session history with handoffs and file changes.
 
 ### memory_pin
 
-Pin a memory for permanent prioritization (+0.3 composite boost).
+Pin a memory: lifecycle retention plus prioritization among relevance-equivalent results. On composite surfaces (hooks, `query`, `search`) pinned docs get the +0.3 composite boost; on the raw vector routes (v0.22.0) pin wins exact raw-score ties but never overrides a relevance difference.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|

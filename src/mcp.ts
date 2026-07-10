@@ -34,6 +34,7 @@ import {
   type CoActivationFn,
 } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, type RankedResult } from "./search-utils.ts";
+import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
@@ -138,12 +139,6 @@ function degradedGuidanceText(legs: DegradedLeg[]): string {
   return anyExcludedDominant
     ? "Note: nearest-neighbor region dominated by excluded internal docs — pass includeInternal:true or refine the query."
     : "Note: vector results truncated at the scan cap.";
-}
-
-// Option-B weights knob (design (a)): default-off; flips search/vsearch/memory_retrieve
-// non-recency scoring to the retrieval-tuned weights only when explicitly enabled.
-function mcpDirectWeightsOption(): { weights: typeof QUERY_WEIGHTS } | undefined {
-  return loadVaultConfig().retrieval?.mcp_direct_tuned_weights ? { weights: QUERY_WEIGHTS } : undefined;
 }
 
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "discovery" | "complex" | "hybrid" {
@@ -388,7 +383,7 @@ This is the recommended entry point for ALL memory queries.`,
         }
 
         const enriched = enrichResults(store, fused, query);
-        const scored = applyCompositeScoring(enriched, query, undefined, mcpDirectWeightsOption()).slice(0, lim);
+        const scored = applyCompositeScoring(enriched, query).slice(0, lim);
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round(r.compositeScore * 100) / 100,
@@ -426,7 +421,7 @@ This is the recommended entry point for ALL memory queries.`,
         const seen = new Set<string>();
         const deduped = allResults.filter(r => { if (seen.has(r.filepath)) return false; seen.add(r.filepath); return true; });
         const enriched = enrichResults(store, deduped, query);
-        const scored = applyCompositeScoring(enriched, query, undefined, mcpDirectWeightsOption()).slice(0, lim);
+        const scored = applyCompositeScoring(enriched, query).slice(0, lim);
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round(r.compositeScore * 100) / 100,
@@ -442,12 +437,16 @@ This is the recommended entry point for ALL memory queries.`,
       // --- Keyword / Semantic / Discovery / Hybrid modes ---
       let results: SearchResult[] = [];
       let singleLegDegraded: DegradedLeg | undefined;
+      // semantic/discovery: the raw regime applies ONLY to results the vector leg actually
+      // served — the FTS fallback's scores are not cosine, so it keeps composite scoring.
+      let vectorLegServed = false;
       if (effectiveMode === "keyword") {
         results = store.searchFTS(query, lim, undefined, undefined, undefined, excl);
       } else if (effectiveMode === "semantic" || effectiveMode === "discovery") {
         try {
           const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, lim, { excludeCollections: excl });
           results = det.results;
+          vectorLegServed = true;
           if (det.degraded && det.degradedReason) singleLegDegraded = { leg: `${effectiveMode}:vector`, reason: det.degradedReason };
         } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim, undefined, undefined, undefined, excl); }
       } else {
@@ -472,7 +471,17 @@ This is the recommended entry point for ALL memory queries.`,
       }
 
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, undefined, mcpDirectWeightsOption()).slice(0, lim);
+      // v0.22.0 two-regime scoring (VSEARCH-RAW-PRIMARY-DESIGN.md R1/R4): vector-served
+      // semantic/discovery results on non-recency queries rank by raw cosine (metadata
+      // breaks exact ties only). Keyword/hybrid modes and the FTS fallback keep composite —
+      // their scores are not cosine, so the raw contract cannot hold there.
+      const rawRegime = vectorLegServed
+        && (effectiveMode === "semantic" || effectiveMode === "discovery")
+        && selectScoringRegime(query) === "raw";
+      const retrieveScoreBasis = rawRegime ? VECTOR_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = rawRegime
+        ? rankRawPrimary(enriched, query).slice(0, lim)
+        : applyCompositeScoring(enriched, query).slice(0, lim);
       const modeDegraded = singleLegDegraded ? { degraded: true as const, degradedReason: singleLegDegraded.reason } : {};
       const modeDegradedNote = singleLegDegraded ? `\n${degradedGuidanceText([singleLegDegraded])}` : "";
       if (compact) {
@@ -483,7 +492,7 @@ This is the recommended entry point for ALL memory queries.`,
         }));
         return {
           content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${modeDegradedNote}` }],
-          structuredContent: { mode: effectiveMode, results: items, ...modeDegraded },
+          structuredContent: { mode: effectiveMode, results: items, scoreBasis: retrieveScoreBasis, ...modeDegraded },
         };
       }
       const items: SearchResultItem[] = scored.map(r => {
@@ -497,7 +506,7 @@ This is the recommended entry point for ALL memory queries.`,
       });
       return {
         content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items, query)}${modeDegradedNote}` }],
-        structuredContent: { mode: effectiveMode, results: items, ...modeDegraded },
+        structuredContent: { mode: effectiveMode, results: items, scoreBasis: retrieveScoreBasis, ...modeDegraded },
       };
     }
   );
@@ -585,7 +594,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn, mcpDirectWeightsOption())
+      const scored = applyCompositeScoring(enriched, query, coFn)
         .filter(r => r.compositeScore >= (minScore || 0));
 
       if (compact) {
@@ -631,7 +640,7 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Natural language query"),
         limit: z.number().optional().default(10),
-        minScore: z.number().optional().default(0.3),
+        minScore: z.number().optional().describe("Score floor. Non-recency queries filter the RAW cosine score (default: no filter; explicit 0 honored; cosine values are embedding-model-specific). Recency-intent queries keep the composite-scale default 0.3."),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
         includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
@@ -656,8 +665,17 @@ This is the recommended entry point for ALL memory queries.`,
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn, mcpDirectWeightsOption())
-        .filter(r => r.compositeScore >= (minScore || 0.3));
+      // v0.22.0 two-regime scoring (VSEARCH-RAW-PRIMARY-DESIGN.md R1–R4): non-recency
+      // queries rank by raw cosine — metadata (incl. pin) breaks exact score ties only,
+      // and minScore (if given) filters the raw score with NO default floor. Recency-intent
+      // queries keep the pre-v0.22.0 composite behavior including its 0.3 default.
+      const regime = selectScoringRegime(query);
+      const vsScoreBasis = regime === "raw" ? VECTOR_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = regime === "raw"
+        ? rankRawPrimary(enriched, query, coFn).filter(r => minScore === undefined || r.compositeScore >= minScore)
+        // Recency branch preserves v0.21 semantics EXACTLY, including `||`: an explicit
+        // minScore of 0 still applies the 0.3 composite floor (R4 unchanged-recency contract).
+        : applyCompositeScoring(enriched, query, coFn).filter(r => r.compositeScore >= (minScore || 0.3));
 
       if (compact) {
         const items = scored.map(r => ({
@@ -666,7 +684,7 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${vsDegradedNote}` }], structuredContent: { results: items, ...vsDegraded } };
+        return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${vsDegradedNote}` }], structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded } };
       }
 
       const items: SearchResultItem[] = scored.map(r => {
@@ -685,7 +703,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       return {
         content: [{ type: "text", text: `${formatSearchSummary(items, query)}${vsDegradedNote}` }],
-        structuredContent: { results: items, ...vsDegraded },
+        structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded },
       };
     }
   );

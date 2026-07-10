@@ -6,7 +6,7 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
 
 - **Indexes** markdown documents into a local SQLite vault with full-text search (BM25) and vector embeddings
 - **Retrieves** relevant context automatically via hooks or on-demand via MCP tools / REST API
-- **Scores** results using composite scoring (relevance, recency, confidence, quality, co-activation)
+- **Scores** results per route: raw vector cosine on the direct vector tools (v0.22.0), composite scoring (relevance, recency, confidence, quality, co-activation) on the hook and hybrid pipelines
 - **Tracks** decisions, handoffs, and session history across conversations
 - **Traverses** causal and semantic graphs to answer "why" and "what led to" questions
 

@@ -105,7 +105,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why". |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
-| `memory_pin` | +0.3 composite boost. PROACTIVELY for constraints, architecture decisions, corrections. |
+| `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw vector routes). PROACTIVELY for constraints, architecture decisions, corrections. |
 | `memory_snooze` | PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days. |
 | `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. |
 | `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. |
@@ -135,14 +135,14 @@ The pipeline autonomously generates lex/vec/hyde variants, fuses BM25 + vector v
 
 ## Composite scoring
 
-Applied automatically to all search results.
+Applied on the composite surfaces: hooks, `query`, `search`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. **v0.22.0: MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine instead** (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default); recency-intent queries keep composite everywhere.
 
 ```
 compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
-- `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× … 1.3×); `coActivationBoost` up to +15%; length-normalized (floor 30%); frequency boost capped +10%; **pinned docs +0.3 additive**.
-- **`query` tool (v0.13.0+):** non-recency queries use **0.70·search + 0.15·recency + 0.15·confidence**. `search`/`vsearch`/`memory_retrieve`/context-surfacing keep the 0.50/0.25/0.25 default.
+- `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× … 1.3×); `coActivationBoost` up to +15%; length-normalized (floor 30%); frequency boost capped +10%; **pinned docs +0.3 additive on composite surfaces** (raw vector routes: pin = exact-tie precedence only).
+- **`query` tool (v0.13.0+):** non-recency queries use **0.70·search + 0.15·recency + 0.15·confidence**. `search`, `memory_retrieve`'s composite modes, and context-surfacing keep the 0.50/0.25/0.25 default. (`vsearch` + `memory_retrieve` semantic/discovery use RAW cosine for non-recency queries as of v0.22.0 — no composite weights at all.)
 - **Recency intent** ("latest"/"recent"/"last session") switches all to **0.10·search + 0.70·recency + 0.20·confidence**.
 - **Half-lives:** decision/deductive/preference/hub/antipattern = ∞ · project 120d · research 90d · problem/milestone/note 60d · conversation/progress 45d · handoff 30d (extend up to 3× for frequently-accessed).
 
@@ -162,7 +162,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 
 ## Memory lifecycle (pin / snooze / forget — manual tools)
 
-- **`memory_pin`** (+0.3 boost, persistent surfacing) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist. Do NOT pin routine/session-specific items.
+- **`memory_pin`** (lifecycle retention + priority among relevance-equivalent results; +0.3 boost on composite surfaces, exact-tie precedence on raw vector routes) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist. Do NOT pin routine/session-specific items.
 - **`memory_snooze`** — PROACTIVELY when a memory keeps surfacing but isn't relevant now, user says "not now"/"later", or content is time-boxed.
 - **`memory_forget`** — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
 - **Contradiction auto-resolution:** when `decision-extractor` detects a new decision contradicting an old one, the old one's confidence is lowered automatically — no manual action needed.

@@ -543,7 +543,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `memory_retrieve` | **Preferred entry point.** Auto-classifies query and routes to optimal backend (query, intent_search, session_log, find_similar, or query_plan). Use instead of manually choosing a search tool. |
 | `search` | BM25 keyword search — for exact terms, config names, error codes, filenames. Composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
-| `vsearch` | Vector semantic search — for conceptual/fuzzy matching when exact keywords are unknown. Composite scoring + co-activation boost + compact mode. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
+| `vsearch` | Vector semantic search — for conceptual/fuzzy matching when exact keywords are unknown. **v0.22.0: non-recency queries rank by RAW cosine (`scoreBasis: "vector-cosine"`; metadata breaks exact ties only; `minScore` filters raw with no default)**; recency-intent queries keep composite. Collection filter supports comma-separated values. Prefer `memory_retrieve` for auto-routing. |
 | `query` | Full hybrid pipeline (BM25 + vector + rerank) — general-purpose when query type is unclear. WRONG for "why" questions (use `intent_search`) or cross-session queries (use `session_log`). Prefer `memory_retrieve` for auto-routing. Intent hint, strong-signal bypass, chunk dedup, candidateLimit, MMR diversity, compact mode. |
 | `get` | Retrieve single document by path or docid |
 | `multi_get` | Retrieve multiple docs by glob or comma-separated list |
@@ -595,7 +595,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | Tool | Description |
 |---|---|
 | `memory_forget` | Search → deactivate closest match (with audit trail) |
-| `memory_pin` | Pin a memory for +0.3 composite boost. USE PROACTIVELY when: user states a persistent constraint, makes an architecture decision, or corrects a misconception. Don't wait for curator — pin critical decisions immediately. |
+| `memory_pin` | Pin a memory: lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on hook/`query`/`search` surfaces; exact-tie precedence on the raw vector routes). USE PROACTIVELY when: user states a persistent constraint, makes an architecture decision, or corrects a misconception. Don't wait for curator — pin critical decisions immediately. |
 | `memory_snooze` | Temporarily hide a memory from context surfacing until a date. USE PROACTIVELY when `<vault-context>` repeatedly surfaces irrelevant content — snooze for 30 days instead of ignoring it. |
 | `status` | Index health with content type distribution |
 | `reindex` | Trigger vault re-scan |
@@ -695,7 +695,7 @@ Content types are inferred from frontmatter or file path patterns. Half-lives ex
 
 **Frequency boost:** Documents with higher revision counts or duplicate counts get a durability signal: `freqSignal = (revisions - 1) × 2 + (duplicates - 1)`, `freqBoost = min(0.10, log1p(freqSignal) × 0.03)`. Revision count (content evolution) is weighted 2× vs duplicate count (ingest repetition). Capped at 10%.
 
-**Pin boost:** Pinned documents get +0.3 additive boost (capped at 1.0). Use `memory_pin` to pin critical memories.
+**Pin boost:** Pin = lifecycle retention + priority among relevance-equivalent results. On composite surfaces pinned documents get a +0.3 additive boost (capped at 1.0); on the raw vector routes (v0.22.0) pin breaks exact raw-score ties only. Use `memory_pin` to pin critical memories.
 
 **Snooze:** Snoozed documents are filtered out of context surfacing until their snooze date. Use `memory_snooze` for temporary suppression.
 
@@ -791,7 +791,7 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_RERANK_API_KEY` | (none) | Bearer token for an authenticated remote reranker endpoint. Independent of the embed and LLM keys. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
-| `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` | `false` | **v0.21.0.** When `true`, the MCP direct tools (`search`, `vsearch`, `memory_retrieve`) score non-recency queries with the retrieval-tuned `query`-tool weights. Ships off — the eval evidence covered only the hybrid `query` pipeline. YAML equivalent: `retrieval.mcp_direct_tuned_weights` (env wins). |
+| `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` | (superseded) | **No effect since v0.22.0** — the direct-pipeline eval this knob was gated on measured tuned weights at 1/19 hit@1; the direct vector routes rank by raw cosine instead. Still parsed for backward compatibility; setting it logs a once-per-process warning. |
 | `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 consolidation merge-safety threshold when candidate and existing anchors align. Merges above this normalized 3-gram cosine score are allowed. |
 | `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold — fallback when anchor sets are ambiguous. |
 | `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration before enabling the gate. |

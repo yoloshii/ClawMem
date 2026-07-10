@@ -35,7 +35,12 @@ function fakeVec(text: string): Float32Array {
   return new Float32Array([j, 0.1, 1, 0]);
 }
 const fakeLlm = {
-  embed: async (text: string) => ({ embedding: fakeVec(text), model: MODEL }),
+  embed: async (text: string) => {
+    // "fallbackprobe" simulates an unavailable embed endpoint (non-fatal error class) —
+    // exercises memory_retrieve semantic's FTS fallback, which must stay composite.
+    if (text.includes("fallbackprobe")) throw new Error("embed endpoint down (fallback probe)");
+    return { embedding: fakeVec(text), model: MODEL };
+  },
   // Production LlamaCpp degrades gracefully on endpoint failure (null / typed fallbacks,
   // never throws to callers) — the fake mirrors that so expansion/intent behave as live.
   query: async () => null,
@@ -84,6 +89,15 @@ beforeAll(async () => {
   // A second user doc for list-shape assertions.
   const otherHash = seedDoc(seedStore, "user", "other.md", "unrelated cooking notes about bread", { modifiedAt: old });
   seedVector(seedStore, otherHash, "user", "other.md", "unrelated cooking bread");
+  // Engineered low-composite doc for the recency-floor contract: very old, zero quality,
+  // long body — its recency composite lands far below the 0.3 floor while its vector
+  // similarity keeps it inside the candidate pool.
+  const veryOld = new Date(Date.now() - 600 * 86400_000).toISOString();
+  const staleHash = seedDoc(seedStore, "user", "stale-low.md", "filler ".repeat(600), { modifiedAt: veryOld });
+  seedStore.db.prepare(`UPDATE documents SET quality_score = 0.0 WHERE hash = ?`).run(staleHash);
+  seedVector(seedStore, staleHash, "user", "stale-low.md", "deduction junk");
+  // FTS-only doc (no vector) for the semantic FTS-fallback carve-out.
+  seedDoc(seedStore, "user", "fallback-doc.md", "fallbackprobe cooking guide for bread ovens");
   // Causal-mode graph edge: user doc → internal deduction (traversal + hydration guard).
   seedStore.db.exec(`CREATE TABLE IF NOT EXISTS memory_relations (source_id INTEGER, target_id INTEGER, relation_type TEXT, weight REAL)`);
   const idOf = (h: string) => (seedStore.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1`).get(h) as { id: number }).id;
@@ -132,16 +146,20 @@ describe("visibility exclusion — all six retrieval routes", () => {
     expect(paths(inc).some(p => p.startsWith("_clawmem/"))).toBe(true);
   });
 
-  it("incident composite inversion exists WITH internals and is fixed by the default exclusion", async () => {
-    // The incident rows (T8-M7): with internals included, the RECENT decay-exempt
-    // deduction composite-OUTRANKS the older true match — the measured 2026-07-10
-    // inversion. The default (excluded) route restores the true match on top.
+  it("incident inversion cannot recur on vsearch: raw ordering ships even WITH internals (v0.22.0)", async () => {
+    // The incident rows (T8-M7) under the v0.21.0 composite ranked the RECENT decay-exempt
+    // deduction ABOVE the older true match when internals were included. v0.22.0 ranks the
+    // raw route by raw cosine (VSEARCH-RAW-PRIMARY-DESIGN.md R1), so even the opted-in
+    // internal view cannot invert: the true match leads on raw similarity, the junk
+    // deduction is VISIBLE but below it.
     const inc = await call("vsearch", { query: "sealed acceptance script sandbox", compact: true, minScore: 0, includeInternal: true });
     const incPaths = paths(inc);
-    expect(incPaths[0]!.startsWith("_clawmem/")).toBe(true); // junk composite-outranks the true match
-    expect(incPaths).toContain("user/r8-note.md");            // which IS in the pool below it
+    expect(incPaths[0]).toBe("user/r8-note.md");                         // raw winner on top
+    expect(incPaths.some(p => p.startsWith("_clawmem/"))).toBe(true);    // junk visible when asked
+    expect(inc.structuredContent?.scoreBasis).toBe("vector-cosine");
     const def = await call("vsearch", { query: "sealed acceptance script sandbox", compact: true, minScore: 0 });
     expect(paths(def)[0]).toBe("user/r8-note.md");
+    expect(paths(def).some(p => p.startsWith("_clawmem/"))).toBe(false); // default exclusion intact
   });
 
   it("query (hybrid) excludes _clawmem by default and exposes no degraded marker on the healthy path", async () => {
@@ -226,4 +244,58 @@ describe("degraded-marker propagation at the handler level (T9-M5)", () => {
     const note = (res.content ?? []).map(cnt => cnt.text ?? "").join("\n");
     expect(note).toContain("includeInternal");
   }, 30_000);
+});
+
+describe("raw-primary regime at the handler level (v0.22.0)", () => {
+  it("vsearch non-recency: scoreBasis vector-cosine, NO default floor, explicit minScore filters raw", async () => {
+    // Omitted minScore = no filter: the low-cosine cooking doc stays in the list.
+    const open = await call("vsearch", { query: "sealed acceptance script sandbox", compact: true });
+    expect(open.structuredContent?.scoreBasis).toBe("vector-cosine");
+    expect(paths(open)[0]).toBe("user/r8-note.md");
+    expect(paths(open)).toContain("user/other.md");
+    // Explicit 0 is honored (nullish handling — not treated as "unset").
+    const zero = await call("vsearch", { query: "sealed acceptance script sandbox", compact: true, minScore: 0 });
+    expect(paths(zero)).toEqual(paths(open));
+    // A raw-cosine floor filters on the raw scale.
+    const tight = await call("vsearch", { query: "sealed acceptance script sandbox", compact: true, minScore: 0.9 });
+    expect(paths(tight)).toEqual(["user/r8-note.md"]);
+  });
+
+  it("vsearch recency-intent keeps the composite regime and its default floor", async () => {
+    const res = await call("vsearch", { query: "latest sealed acceptance changes", compact: true, minScore: 0 });
+    expect(res.structuredContent?.scoreBasis).toBe("composite");
+  });
+
+  it("memory_retrieve semantic ships raw; keyword stays composite", async () => {
+    const sem = await call("memory_retrieve", { query: "sealed acceptance script sandbox", mode: "semantic", compact: true });
+    expect(sem.structuredContent?.scoreBasis).toBe("vector-cosine");
+    expect(paths(sem)[0]).toBe("user/r8-note.md");
+    const kw = await call("memory_retrieve", { query: "sealed acceptance", mode: "keyword", compact: true });
+    expect(kw.structuredContent?.scoreBasis).toBe("composite");
+  });
+
+  it("vsearch recency regime preserves the v0.21 floor: explicit 0 still applies 0.3 (|| semantics)", async () => {
+    const omitted = await call("vsearch", { query: "latest sealed acceptance changes", compact: true });
+    const zero = await call("vsearch", { query: "latest sealed acceptance changes", compact: true, minScore: 0 });
+    expect(omitted.structuredContent?.scoreBasis).toBe("composite");
+    expect(paths(zero)).toEqual(paths(omitted));                 // explicit 0 == omitted — the v0.21 `||` contract
+    expect(paths(omitted).length).toBeGreaterThan(0);
+    expect(paths(omitted)).not.toContain("user/stale-low.md");   // below the preserved 0.3 floor
+    const floored = await call("vsearch", { query: "latest sealed acceptance changes", compact: true, minScore: 0.01 });
+    expect(paths(floored)).toContain("user/stale-low.md");       // truthy floor moves — it was floor-filtered, not pool-missing
+  });
+
+  it("memory_retrieve: recency query stays composite; discovery mode ships raw", async () => {
+    const rec = await call("memory_retrieve", { query: "latest sealed acceptance changes", mode: "semantic", compact: true });
+    expect(rec.structuredContent?.scoreBasis).toBe("composite");
+    const disc = await call("memory_retrieve", { query: "sealed acceptance script sandbox", mode: "discovery", compact: true });
+    expect(disc.structuredContent?.scoreBasis).toBe("vector-cosine");
+    expect(paths(disc)[0]).toBe("user/r8-note.md");
+  });
+
+  it("semantic FTS fallback keeps composite (vector leg unavailable — scores are not cosine)", async () => {
+    const res = await call("memory_retrieve", { query: "fallbackprobe cooking", mode: "semantic", compact: true });
+    expect(res.structuredContent?.scoreBasis).toBe("composite");
+    expect(paths(res)).toContain("user/fallback-doc.md");
+  });
 });

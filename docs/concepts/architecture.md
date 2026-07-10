@@ -56,7 +56,7 @@ Each indexed file becomes a document with:
 | `content_type` | Auto-detected: decision, deductive, preference, note, handoff, conversation, progress, research, hub, antipattern, project, milestone, problem |
 | `quality_score` | 0.0-1.0 based on length, structure, headings, lists, decision keywords, frontmatter |
 | `confidence` | Starts at 0.5, adjusted by contradiction detection and feedback |
-| `pinned` | Manual boost flag (+0.3 composite score) |
+| `pinned` | Lifecycle retention + priority among relevance-equivalent results (+0.3 on composite surfaces; exact-tie precedence on the raw vector routes) |
 | `snoozed_until` | Temporarily hidden from context surfacing |
 
 ## Fragments

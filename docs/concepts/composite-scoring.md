@@ -1,6 +1,6 @@
 # Composite Scoring
 
-Every search result in ClawMem is scored using a composite formula that blends multiple signals beyond raw search relevance.
+Composite scoring blends multiple signals beyond raw search relevance. **It applies to the hook pipeline (context surfacing), the `query` hybrid pipeline, `search`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes.** Since v0.22.0 the direct vector routes — MCP `vsearch` and `memory_retrieve` semantic/discovery — do NOT use it for non-recency queries: they rank by raw vector cosine, with metadata (including pin) breaking exact score ties only, and report `scoreBasis: "vector-cosine"`. That split is measured, not aesthetic: on a judged set against the live vault, raw cosine ranked 16/19 targets #1 (MRR 0.912) while this composite ranked 1/19 (MRR 0.307) and pushed 14/19 correct answers below the old minScore floor — in the compressed-high similarity band of modern embedding models, every multiplier below is larger than the raw margins separating right answers from wrong ones. Recency-intent queries keep composite (the Recency column) on every route that had it.
 
 ## Formula
 
@@ -19,7 +19,7 @@ compositeScore = (w_search * searchScore + w_recency * recencyScore + w_confiden
 
 Recency intent is detected automatically when queries contain "latest", "recent", "last session", etc. — and **takes precedence over the `query`-tool weights**: a recency-phrased `query` call still uses the Recency-intent column.
 
-The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a held-out judged-relevance eval (v0.13.0) — more weight on topical relevance measurably improves graded NDCG@10 without demoting the newest-correct version of evolving docs. `search`, `vsearch`, `memory_retrieve`, and the context-surfacing hook **keep the Normal column by default**. Since v0.21.0 a config knob — `retrieval.mcp_direct_tuned_weights: true` (or env `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS=true`) — switches the three MCP direct tools' non-recency scoring to the `query`-tool column; it ships **off** because the eval evidence covered only the hybrid `query` pipeline, and the flip is gated on a direct-pipeline eval (see [configuration](../reference/configuration.md)).
+The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a held-out judged-relevance eval (v0.13.0) — more weight on topical relevance measurably improves graded NDCG@10 without demoting the newest-correct version of evolving docs. `search`, the composite `memory_retrieve` modes, and the context-surfacing hook **keep the Normal column**. The v0.21.0 `retrieval.mcp_direct_tuned_weights` knob is **superseded as of v0.22.0 and has no effect** — the direct-pipeline eval it was gated on measured tuned weights at 1/19 hit@1, and the direct vector routes moved to raw ordering instead. The key is still parsed (a once-per-process warning is logged if set) so existing configs don't break.
 
 Threshold note: EOS-anchored last-token embedding models (e.g. zembed-1 served correctly) produce a **compressed-high similarity band** — unrelated pairs sit near ~0.4 rather than ~0.2. Relative ordering is what matters; treat absolute `minScore` cutoffs as model-dependent rather than universal.
 
@@ -92,13 +92,13 @@ coActivationBoost = 1 + min(coCount / 10, 0.15)
 
 Documents frequently surfaced together in the same session get up to 15% boost.
 
-**Where co-activation is applied depends on the caller.** MCP tools (`query`, `search`, `vsearch`) pass a co-activation function into `applyCompositeScoring()`, so the boost is part of the composite score used for ranking and `minScore` filtering. The context-surfacing hook does NOT pass co-activation into composite scoring — instead it applies a separate spreading-activation step *after* adaptive threshold filtering. This means the hook's threshold decisions are based on scores without co-activation, and co-activation only boosts results that already passed the threshold. This is intentional: it prevents relationship boosts from rescuing otherwise-weak results into the surfaced set.
+**Where co-activation is applied depends on the caller.** The composite MCP surfaces (`query`, `search`, and `vsearch` on recency-intent queries only) pass a co-activation function into `applyCompositeScoring()`, so the boost is part of the composite score used for ranking and — on `vsearch` and `search`, the tools that expose `minScore` — for `minScore` filtering. On `vsearch`'s non-recency (raw) regime, co-activation contributes only to the exact-tie key, never to ranking or filtering. The context-surfacing hook does NOT pass co-activation into composite scoring — instead it applies a separate spreading-activation step *after* adaptive threshold filtering. This means the hook's threshold decisions are based on scores without co-activation, and co-activation only boosts results that already passed the threshold. This is intentional: it prevents relationship boosts from rescuing otherwise-weak results into the surfaced set.
 
 ## Additional modifiers
 
 ### Pin boost
 
-Pinned documents receive +0.3 additive boost (capped at 1.0 total).
+On composite surfaces, pinned documents receive a +0.3 additive boost (capped at 1.0 total). Pin's contract is **lifecycle retention + prioritization among relevance-equivalent results** — on the raw vector routes (v0.22.0) it therefore breaks exact raw-score ties only and never lifts a document over a more relevant one.
 
 ### Length normalization
 

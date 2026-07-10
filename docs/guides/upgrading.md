@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.21.0**.
+Guide for upgrading between released versions. Current: **v0.22.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,6 +59,18 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.22.0: raw-cosine ranking on the direct vector routes
+
+No migration command, no schema change, no re-embed. Restart long-lived processes per the quick path.
+
+**Behavior change — MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine.** Reported scores on those routes are raw cosine (`scoreBasis: "vector-cosine"`), not composite values — expect a different numeric scale (unrelated results sit near ~0.4–0.55 on compressed-band embedding models, not near 0). `vsearch`'s `minScore` filters that raw scale and no longer defaults to 0.3 — omitted means no filter. If a workflow passed `minScore` tuned to composite values, re-tune it to your embedding model's band or omit it. Recency-phrased queries ("latest…", "recently…") behave exactly as before on every route.
+
+**Pinned documents** no longer float above more relevant results on those two routes — pin now means lifecycle retention plus winning exact-score ties. Hooks, `query`, and `search` keep the +0.3 composite pin boost.
+
+**`retrieval.mcp_direct_tuned_weights` / `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` no longer has any effect** (superseded by its own gating eval). Configs that set it keep working; a once-per-process warning is logged — remove the key at your convenience.
+
+---
+
 ## v0.21.0: MCP internal-collection exclusion + embedding-geometry canary
 
 No migration command required. Two things to know:
@@ -71,7 +83,7 @@ No migration command required. Two things to know:
 
 **The canary baseline seeds itself.** The first `clawmem embed` run after upgrade (including a timer-fired one) probes the embedding server with a pair-separation battery and persists a first-healthy baseline; subsequent runs alert relative to it, and a broken-geometry server now aborts `embed --force` BEFORE anything is cleared. `--force-geometry` (proceed despite a failed probe; the vault is flagged tainted until a verified rebuild) and `--force --recalibrate-canary` (replace the baseline after a deliberate model/server change) are operator overrides, not upgrade steps.
 
-**Opt-in knob:** `retrieval.mcp_direct_tuned_weights` (config) / `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` (env), default `false` — scores the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. Leave it off unless you have direct-pipeline eval evidence for your vault.
+**Opt-in knob:** `retrieval.mcp_direct_tuned_weights` (config) / `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` (env), default `false` — scored the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. *(Superseded in v0.22.0 — the knob no longer has any effect; see the v0.22.0 section above.)*
 
 Upgrades from v0.13 → v0.20 shipped no steps beyond the [quick path](#quick-path) — schema changes auto-apply; see [RELEASE_NOTES.md](../../RELEASE_NOTES.md) for what each version changed.
 
