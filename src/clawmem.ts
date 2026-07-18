@@ -4,7 +4,7 @@
  */
 
 import { parseArgs } from "util";
-import { existsSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
 import { resolve as pathResolve, basename } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
@@ -55,6 +55,8 @@ import {
   getConfigPath,
 } from "./collections.ts";
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
+import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
+import { GoldFileError } from "./eval/gold.ts";
 import { indexCollection, parseDocument } from "./indexer.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
@@ -1221,6 +1223,97 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
     }
     console.log();
   }
+}
+
+// =============================================================================
+// Offline eval harness (HORMA-1)
+// =============================================================================
+
+async function cmdEval(args: string[]) {
+  const usage = "Usage: clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <path>] [--json]";
+  const sub = args[0];
+  if (sub !== "run") die(usage);
+
+  const { values } = parseArgs({
+    args: args.slice(1),
+    options: {
+      gold: { type: "string" },
+      profile: { type: "string", default: "query" },
+      limit: { type: "string", default: "10" },
+      "min-examples": { type: "string", default: "30" },
+      audited: { type: "boolean", default: false },
+      out: { type: "string" },
+      db: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+
+  if (!values.gold) die(usage);
+  const profile = values.profile!;
+  if (!(IMPLEMENTED_PROFILES as readonly string[]).includes(profile)) {
+    die(`Profile "${profile}" is not implemented yet — the first build replays "query" only (intent/context/raw/structured are follow-on phases).`);
+  }
+  // Number() rejects trailing garbage ("10x" → NaN) and Number.isInteger
+  // rejects fractions ("1.5") — parseInt would silently accept both.
+  const limit = Number(values.limit);
+  const minExamples = Number(values["min-examples"]);
+  if (!Number.isInteger(limit) || limit < 1) die("--limit must be a positive integer");
+  if (!Number.isInteger(minExamples) || minExamples < 1) die("--min-examples must be a positive integer");
+
+  // Point BOTH the resolution store and the replay server at a snapshot DB
+  // (e.g. a VACUUM INTO copy) for frozen runs. Must land before any store
+  // opens — and must already exist as a file, or createStore would silently
+  // create an EMPTY vault at the typo'd path and score everything 0.
+  if (values.db) {
+    const dbPath = pathResolve(values.db);
+    if (!existsSync(dbPath) || !statSync(dbPath).isFile()) die(`--db snapshot not found (or not a file): ${dbPath}`);
+    process.env.INDEX_PATH = dbPath;
+  }
+
+  const goldPath = pathResolve(values.gold);
+  if (!existsSync(goldPath)) die(`Gold file not found: ${goldPath}`);
+
+  const s = getStore();
+  let result: RunEvalResult;
+  try {
+    result = await runEval({
+      goldPath,
+      profile: profile as EvalProfile,
+      limit,
+      minExamples,
+      audited: values.audited,
+      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${new Date().toISOString().replace(/[:.]/g, "-")}-${profile}`),
+      store: s,
+    });
+  } catch (e) {
+    if (e instanceof GoldFileError || e instanceof EvalIntegrityError) die(e.message);
+    throw e;
+  } finally {
+    await disposeDefaultLlamaCpp();
+  }
+
+  const { report, artifacts } = result;
+  if (values.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const a = report.aggregate;
+    const n = (v: number | null, d = 3) => (v === null ? "—" : v.toFixed(d));
+    console.log(`${c.bold}eval run ${report.run_id}${c.reset} (profile ${report.profile}, k=${report.limit})`);
+    console.log(`  examples: ${report.examples_scored} scored / ${report.examples_total} total` +
+      (report.skipped.length ? ` · ${report.skipped.length} skipped` : "") +
+      (report.unresolved_gold.length ? ` · ${c.red}${report.unresolved_gold.length} unresolved${c.reset}` : ""));
+    console.log(`  J_doc ${c.cyan}${n(a.jaccard_mean)}${c.reset} · recall@k ${c.cyan}${n(a.recall_mean)}${c.reset} · precision@k ${n(a.precision_mean)} · hit@k ${n(a.hit_at_k)} · MRR ${c.cyan}${n(a.mrr)}${c.reset} · p95 ${n(a.elapsed_ms_p95, 0)}ms`);
+    console.log(`  gates: ${report.gates.pass ? `${c.green}PASS${c.reset}` : `${c.red}FAIL${c.reset} — ${report.gates.reasons.join("; ")}`}`);
+    if (artifacts) {
+      console.log(`  ${c.dim}wrote ${artifacts.runJsonPath}${c.reset}`);
+      console.log(`  ${c.dim}wrote ${artifacts.reportMdPath}${c.reset}`);
+    }
+  }
+
+  // A failed trust gate must be machine-visible, not just printed — automation
+  // treating exit 0 as "trustworthy number" is exactly what the gate prevents.
+  // exitCode (not exit()) so the dispatcher's finally/cleanup still runs.
+  if (!report.gates.pass) process.exitCode = 1;
 }
 
 // =============================================================================
@@ -2839,6 +2932,9 @@ async function main() {
       case "query":
         await cmdQuery(subArgs);
         break;
+      case "eval":
+        await cmdEval(subArgs);
+        break;
       case "hook":
         await cmdHook(subArgs);
         break;
@@ -3527,6 +3623,9 @@ ${c.bold}Search:${c.reset}
   clawmem search <query> [-n N]        BM25 keyword search
   clawmem vsearch <query> [-n N]       Vector similarity
   clawmem query <query> [-n N]         Hybrid + rerank (best)
+
+${c.bold}Eval:${c.reset}
+  clawmem eval run --gold <file.jsonl> [--limit N] [--audited] [--out DIR] [--db <snapshot>]  Replay gold-labeled queries through the live pipeline (J_doc/recall/MRR); exits 1 when the trust gate fails
 
 ${c.bold}Memory:${c.reset}
   clawmem list [-n/--limit N] [-c col]  Browse recent documents (--json for machine output)

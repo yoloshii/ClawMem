@@ -4,6 +4,36 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.26.0 — offline eval harness (evidence-overlap replay) + short memory-query gate fix
+
+Retrieval quality becomes measurable: a gold-labeled replay harness scores the real `query` pipeline against hand-labeled evidence, ending the era of ranking/extraction changes shipping un-measured. Plus a gate-ordering bug fix that was dropping short explicit memory questions.
+
+### Offline eval harness (`src/eval/`, `clawmem eval run`)
+
+An offline, CLI-only evaluation subsystem (pattern extracted from the HORMA paper's evidence-grounded reward, re-authored for ClawMem's deterministic on-device substrate):
+
+- **Replays the real pipeline, never a mirror.** `clawmem eval run --gold <file.jsonl>` drives the actual registered `query` MCP tool handler over an in-memory transport — expansion, RRF fusion, rerank blending, composite scoring, and MMR diversity at their tool defaults — so the number measures the product, not a copy that drifts.
+- **Doc-level evidence-overlap metrics**: Jaccard `|C∩E|/|C∪E|` between retrieved and gold document sets, plus precision@k, recall@k, hit@k, and MRR; per-tag slices; p95 latency. Artifacts: `run.json` (machine) + `report.md` (hand-audit companion).
+- **Gold sets are strict, hand-labeled JSONL** (any path via `--gold`, so private labels can live outside the repo): unknown fields, malformed lines, and duplicate ids are hard errors; an example with any evidence ref that doesn't resolve to an active document is excluded from scoring — regardless of its replay mode — and fails the run's trust gate, so partial or stale gold can never inflate recall.
+- **Trust gate, machine-visible**: enough scored examples (`--min-examples`, default 30), zero unresolved refs, and an explicit `--audited` attestation that a 10–20% hand-audit of the labels passed. A completed run with a failing gate exits `1` (artifacts still written) so automation can't mistake an untrusted number for a trusted one.
+- **Identity integrity**: retrieved results map back to document ids by inverting the `collection/path` display path; zero or multiple matches (a collection name containing `/` colliding with a sibling) hard-fail the run instead of guessing or silently dropping — either would corrupt the metric.
+- **State-safe**: the replay writes no retrieval, lifecycle, or telemetry state (`context_usage` / `recall_events` / `memory_relations` untouched, regression-pinned); normal inference caches may populate as in any live query. `--db <snapshot>` points the whole run at a `VACUUM INTO` copy for corpus-frozen A/B comparisons between checkouts.
+- First build ships the `query` replay profile; `intent`/`context` replay, benchmark adapters, and provenance are follow-on phases. Guide: [docs/guides/eval-harness.md](docs/guides/eval-harness.md).
+
+### Short memory-intent queries now reach retrieval (`src/hooks/context-surfacing.ts`, `src/retrieval-gate.ts`)
+
+The retrieval gate's `FORCE_RETRIEVE_PATTERNS` (memory verbs, temporal refs, personal-data queries) carry the explicit contract "(checked before skip)" — but the context-surfacing hook returned on `prompt.length < 20` before the gate ever ran, so short explicit memory questions ("what did I say?", 15 chars) got an empty `<vault-context>` in violation of the gate's own contract. The force check is now consulted before the length early-return (new `hasForceRetrieveIntent` export, shared with `shouldSkipRetrieval` so there is one source of truth). Empty prompts, short non-memory prompts, slash commands, heartbeat suppression, duplicate dedupe, and the query-text privacy split (pre-retrieval skips never persist prompt text) are all unchanged.
+
+### Quality gates
+
+Full suite 1,619/0 (42 new tests). Each item independently reviewed by a cross-model adversarial pass (codex / GPT-5.6) to verbatim "Zero remaining findings — ship as is.": the eval harness in 3 turns, the gate-ordering fix in 1.
+
+### What didn't change
+
+No schema changes, no migrations, no re-embed. All runtime retrieval surfaces (hooks beyond the gate ordering, `query`, `intent_search`, `search`, `vsearch`, `memory_retrieve`, REST) score and rank exactly as in v0.25.0. No MCP tool was added — the eval harness is CLI-only.
+
+---
+
 ## v0.25.0 — extraction retry-with-error-feedback + decision half-life + entity-neighbor hub-bias fix
 
 Three independently reviewed items from the strategic queue (§13.1, §36.11, BL-001) — the first queue burndown since the ranking was locked. Three files, three pipelines, no shared invariants.

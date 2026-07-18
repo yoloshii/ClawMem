@@ -76,7 +76,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 ## Search & retrieval
 
 **context-surfacing hook returns empty**
-- Prompt too short (< 20 chars), starts with `/`, or no docs score above threshold.
+- Prompt too short (< 20 chars — short memory-intent queries like "what did I say?" are exempt and force retrieval), starts with `/`, or no docs score above threshold.
 - Fix: Check `clawmem status` for doc counts. Check `clawmem embed` for embedding coverage.
 
 **intent_search returns weak results for WHY/ENTITY**
@@ -250,7 +250,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively. Common causes:
-  - Prompt too short (< 20 chars), starts with `/`, or matches the heartbeat/greeting filter
+  - Prompt too short (< 20 chars; short memory-intent queries are exempt and force retrieval), starts with `/`, or matches the heartbeat/greeting filter
   - Duplicate prompt within the 600-second dedup window (SHA-256 hash match)
   - Vector search silently failed (dimension mismatch, server down) and BM25-only results scored too low after composite scoring
   - All results fell below the profile's minimum composite score threshold after recency decay, confidence weighting, and quality multiplier were applied

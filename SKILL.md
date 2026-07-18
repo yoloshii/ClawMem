@@ -219,7 +219,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 
 ## Operational gotchas (agent-facing)
 
-- **Empty `context-surfacing`** → prompt < 20 chars, starts with `/`, or nothing scored above threshold. Check `clawmem status` (doc counts) + embedding coverage.
+- **Empty `context-surfacing`** → prompt < 20 chars (short memory-intent queries like "what did I say?" are exempt — they force retrieval), starts with `/`, or nothing scored above threshold. Check `clawmem status` (doc counts) + embedding coverage.
 - **Vector search empty but BM25 works** → missing embeddings (the watcher indexes but does NOT embed). Run `clawmem embed` or wait for the embed timer.
 - **`intent_search` weak for WHY/ENTITY** → sparse graph. Run `build_graphs` (temporal backbone + semantic edges). Otherwise don't run it after every reindex — A-MEM links per-doc automatically.
 - **Rankings look RRF-flat / reranker suspect** → `clawmem rerank-health`. A mis-served reranker (e.g. a GGUF that drops the score head) returns HTTP 200 but inert, non-discriminating scores, silently collapsing ranking to RRF. The reranker is a served sidecar, not a bundled model — verify it discriminates, don't assume liveness = correctness.

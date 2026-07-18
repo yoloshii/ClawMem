@@ -171,7 +171,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 
 ## Operational gotchas
 
-- **Empty `context-surfacing`** → prompt < 20 chars, starts with `/`, or nothing scored above threshold. Check `clawmem status` + embedding coverage.
+- **Empty `context-surfacing`** → prompt < 20 chars (short memory-intent queries like "what did I say?" are exempt — they force retrieval), starts with `/`, or nothing scored above threshold. Check `clawmem status` + embedding coverage.
 - **Vector search empty but BM25 works** → missing embeddings (the watcher indexes but does NOT embed). Run `clawmem embed`.
 - **`intent_search` weak for WHY/ENTITY** → sparse graph. Run `build_graphs`. Don't run it after every reindex (A-MEM links per-doc automatically).
 - **Rankings look RRF-flat / reranker suspect** → `clawmem rerank-health`. A mis-served reranker (e.g. a GGUF that drops the score head) returns HTTP 200 but inert scores, silently collapsing ranking to RRF.
@@ -233,6 +233,7 @@ memory_retrieve(query) | query(compact=true) | intent_search(why/when/entity) | 
 | Pipelines / graph / entities | `docs/internals/{query-pipeline,intent-search-pipeline,graph-traversal,entity-resolution}.md` |
 | MCP tools / CLI / REST | `docs/reference/{mcp-tools,cli,rest-api}.md` |
 | Setup (hooks / mcp / systemd) | `docs/guides/{setup-hooks,setup-mcp,systemd-services}.md` |
+| Offline eval harness (gold sets, replay metrics) | `docs/guides/eval-harness.md` |
 | OpenClaw / Hermes plugins | `docs/guides/openclaw-plugin.md`, `docs/guides/hermes-plugin.md` |
 | Troubleshooting | `docs/troubleshooting.md` |
 | Upgrading | `docs/guides/upgrading.md` |

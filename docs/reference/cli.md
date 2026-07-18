@@ -145,6 +145,14 @@ clawmem reflect [N]             # Cross-session reflection (last N days, default
 clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
 ```
 
+## Offline eval harness
+
+```bash
+clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <snapshot>] [--json]
+```
+
+Replays gold-labeled queries through the real `query` tool handler and scores retrieved documents against hand-labeled evidence (doc-level Jaccard, precision/recall@k, hit@k, MRR). Writes `run.json` + `report.md`; touches no retrieval, lifecycle, or telemetry state (normal inference caches may populate, as in any live query). Exits `1` when the trust gate fails (too few scored examples, unresolved gold refs, or no `--audited` label-audit attestation). Gold schema, trust gates, and A/B workflow: [docs/guides/eval-harness.md](../guides/eval-harness.md).
+
 ## Session focus topic (v0.9.0)
 
 Per-session topic biasing for the context-surfacing hook. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and applies a post-composite-score topic boost (1.4× match, 0.75× demote, NO-OP on zero matches). Session-scoped — never writes to SQLite or mutates any lifecycle column.

@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.25.0**.
+Guide for upgrading between released versions. Current: **v0.26.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,13 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.26.0: offline eval harness + short memory-query fix
+
+No migration steps, no schema change, no re-embed — drop-in. Restart long-lived processes per the quick path. Behavior notes:
+
+- **New offline eval subsystem** (`clawmem eval run --gold <file.jsonl>`): replays gold-labeled queries through the real `query` tool handler and scores them (doc-level Jaccard, precision/recall@k, hit@k, MRR). Purely additive — no runtime surface changes; nothing to run unless you build a gold set. See [docs/guides/eval-harness.md](eval-harness.md).
+- **Short explicit memory queries now reach retrieval.** Prompts under 20 characters that match the memory-intent force patterns ("what did I say?", "recall …", "what's my email?") previously returned an empty `<vault-context>` from the length gate; they now run retrieval. Expect context injection on short memory questions that used to come back empty. Greetings, slash commands, and other short non-memory prompts are unchanged.
 
 ## v0.25.0: extraction retries + decision half-life + entity-neighbor ranking
 

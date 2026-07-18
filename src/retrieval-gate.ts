@@ -50,20 +50,32 @@ function normalizePrompt(prompt: string): string {
 }
 
 /**
+ * Memory-intent force check on the normalized prompt. Exported so
+ * context-surfacing can honor the "(checked before skip)" contract at its OWN
+ * skip gates too — §51.5: its MIN_PROMPT_LENGTH early-return used to fire
+ * before this check ever ran, dropping short explicit memory queries like
+ * "what did I say?".
+ */
+export function hasForceRetrieveIntent(prompt: string): boolean {
+  const trimmed = normalizePrompt(prompt);
+  return FORCE_RETRIEVE_PATTERNS.some(p => p.test(trimmed));
+}
+
+/**
  * Check if a prompt should skip memory retrieval.
  * Returns true if retrieval should be skipped.
  *
  * This complements (does NOT replace) existing gates in context-surfacing:
- * - MIN_PROMPT_LENGTH (<20 chars)
+ * - MIN_PROMPT_LENGTH (<20 chars — force-intent prompts exempt, §51.5)
  * - Slash commands (starts with /)
  * - Heartbeat suppression
  * - Duplicate prompt dedupe
  */
 export function shouldSkipRetrieval(prompt: string): boolean {
-  const trimmed = normalizePrompt(prompt);
-
   // Force retrieve if query has memory-related intent (before length/pattern checks)
-  if (FORCE_RETRIEVE_PATTERNS.some(p => p.test(trimmed))) return false;
+  if (hasForceRetrieveIntent(prompt)) return false;
+
+  const trimmed = normalizePrompt(prompt);
 
   // Too short to be meaningful (below context-surfacing's MIN_PROMPT_LENGTH)
   if (trimmed.length < 5) return true;

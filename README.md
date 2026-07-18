@@ -515,6 +515,7 @@ clawmem surface --bootstrap --stdin             IO6: per-session bootstrap injec
 
 clawmem reflect [N]                             Cross-session reflection (last N days, default 14)
 clawmem consolidate [--dry-run] [N]             Find and archive duplicate low-confidence docs
+clawmem eval run --gold <file.jsonl>            Offline eval: replay gold-labeled queries, score J_doc/recall/MRR
 
 clawmem install-service [--enable] [--remove]   Systemd watcher service
 clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
@@ -770,6 +771,10 @@ Automatically generates context sections in per-folder CLAUDE.md files from rece
 ### Feedback Loop
 
 Notes referenced by the agent during a session get boosted (`access_count++`). Unreferenced notes decay via recency. Over time, useful notes rise and noise fades.
+
+### Offline Eval Harness
+
+`clawmem eval run --gold <file.jsonl>` replays hand-labeled queries through the real `query` tool handler and scores the retrieved documents against gold evidence: doc-level Jaccard (`|C∩E|/|C∪E|`), precision/recall@k, hit@k, MRR. Touches no retrieval, lifecycle, or telemetry state (normal inference caches may populate, as in any live query); writes `run.json` + `report.md` for A/B comparison between checkouts or DB snapshots. Gold schema, trust gates, and labeling discipline: [docs/guides/eval-harness.md](docs/guides/eval-harness.md).
 
 ## Feature Flags
 

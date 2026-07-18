@@ -310,4 +310,43 @@ describe("contextSurfacing handler — query_text persistence", () => {
     } as any);
     expect(getLastContextUsageQueryText("s-empty-results")).toBe(prompt);
   });
+
+  describe("short memory-intent force retrieval (§51.5 gate ordering)", () => {
+    // FORCE_RETRIEVE_PATTERNS carry the contract "(checked before skip)". The
+    // MIN_PROMPT_LENGTH early-return used to fire first, so short explicit
+    // memory queries never reached retrieval. query_text persistence is the
+    // discriminator: pre-retrieval skips log WITHOUT it, turns that entered
+    // retrieval log WITH it.
+
+    it("a short explicit memory query reaches retrieval instead of dying at the length gate", async () => {
+      const prompt = "what did I say?"; // 15 chars < MIN_PROMPT_LENGTH, force pattern
+      await contextSurfacing(store, { prompt, sessionId: "s-force-short" } as any);
+      expect(getLastContextUsageQueryText("s-force-short")).toBe(prompt);
+    });
+
+    it("covers the other force families too (memory verb, personal-data)", async () => {
+      await contextSurfacing(store, { prompt: "recall my plan", sessionId: "s-force-verb" } as any);
+      expect(getLastContextUsageQueryText("s-force-verb")).toBe("recall my plan");
+      await contextSurfacing(store, { prompt: "what's my email?", sessionId: "s-force-pd" } as any);
+      expect(getLastContextUsageQueryText("s-force-pd")).toBe("what's my email?");
+    });
+
+    it("a short prompt WITHOUT memory intent still takes the length early-return", async () => {
+      const out = await contextSurfacing(store, { prompt: "hello there", sessionId: "s-short-plain" } as any);
+      expect(getLastContextUsageQueryText("s-short-plain")).toBeNull();
+      expect(out.hookSpecificOutput?.additionalContext ?? "").toBe("");
+    });
+
+    it("slash-command discipline still wins over a force term", async () => {
+      const out = await contextSurfacing(store, { prompt: "/remember", sessionId: "s-slash-force" } as any);
+      expect(getLastContextUsageQueryText("s-slash-force")).toBeNull();
+      expect(out.hookSpecificOutput?.additionalContext ?? "").toBe("");
+    });
+
+    it("empty prompt behavior is unchanged (unconditional early-return, no query_text)", async () => {
+      const out = await contextSurfacing(store, { prompt: "", sessionId: "s-empty-prompt" } as any);
+      expect(getLastContextUsageQueryText("s-empty-prompt")).toBeNull();
+      expect(out.hookSpecificOutput?.additionalContext ?? "").toBe("");
+    });
+  });
 });

@@ -24,6 +24,7 @@ node_modules/
 eval-queries*.json
 eval-bypass-cases*.json
 eval-bundles/
+eval-runs/
 .ralph/
 ralph.yml
 Brain.

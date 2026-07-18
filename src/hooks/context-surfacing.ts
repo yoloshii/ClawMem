@@ -29,7 +29,7 @@ import {
 } from "../memory.ts";
 import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
-import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
+import { shouldSkipRetrieval, hasForceRetrieveIntent, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
 import { writeRecallEvents, hashQuery } from "../recall-buffer.ts";
 import { resolveSessionTopic, applyTopicBoost } from "../session-focus.ts";
@@ -118,7 +118,11 @@ export async function contextSurfacing(
     } catch { /* non-fatal */ }
   }
 
-  if (!prompt || prompt.length < MIN_PROMPT_LENGTH) {
+  // §51.5: FORCE_RETRIEVE_PATTERNS carry the contract "(checked before skip)"
+  // — that includes THIS skip. A short explicit memory query ("what did I
+  // say?") must reach retrieval; only short prompts WITHOUT memory intent
+  // take the length early-return. Empty prompts still return unconditionally.
+  if (!prompt || (prompt.length < MIN_PROMPT_LENGTH && !hasForceRetrieveIntent(prompt))) {
     logEmptyTurn(store, input);
     return makeEmptyOutput("context-surfacing");
   }
