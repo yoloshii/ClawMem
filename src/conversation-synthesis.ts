@@ -469,12 +469,12 @@ export async function runConversationSynthesis(
     return result;
   }
 
-  let docs: Array<{ id: number; title: string; body: string }>;
+  let docs: Array<{ id: number; title: string; body: string; authoredAt: string | null }>;
   try {
     const placeholders = contentTypeFilter.map(() => "?").join(",");
     docs = store.db
       .prepare(
-        `SELECT d.id, d.title, c.doc as body
+        `SELECT d.id, d.title, c.doc as body, d.authored_at as authoredAt
          FROM documents d
          JOIN content c ON c.hash = d.hash
          WHERE d.collection = ?
@@ -487,6 +487,7 @@ export async function runConversationSynthesis(
       id: number;
       title: string;
       body: string;
+      authoredAt: string | null;
     }>;
   } catch (err) {
     console.log(`[synthesis] Query failed for collection '${collection}':`, err);
@@ -544,6 +545,8 @@ export async function runConversationSynthesis(
           confidence: DEFAULT_CONFIDENCE,
           qualityScore: DEFAULT_QUALITY_SCORE,
           semanticPayload: `${fact.title}\n${fact.narrative}`,
+          // §51.1 D7: a synthesized fact inherits its source doc's authorship
+          authoredAt: doc.authoredAt ?? undefined,
         });
 
         if (!saveResult.docId || saveResult.docId < 0) continue;

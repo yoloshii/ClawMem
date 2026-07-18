@@ -260,34 +260,35 @@ function getCurrentFocus(
   cutoff.setDate(cutoff.getDate() - DECISION_LOOKBACK_DAYS);
   const cutoffStr = cutoff.toISOString();
 
-  // Gather recent decisions, preferences, active problems, and deductive insights
-  const decisions = store.getDocumentsByType("decision", 10);
-  const preferences = store.getDocumentsByType("preference", 5);
-  const problems = store.getDocumentsByType("problem", 5);
-  const deductions = store.getDocumentsByType("deductive", 5);
+  // Gather recent decisions, preferences, active problems, and deductive insights.
+  // §51.1 D13: content-currency caller — order, cutoffs, rank, and display on effectiveAt.
+  const decisions = store.getDocumentsByType("decision", 10, { orderBy: "effective" });
+  const preferences = store.getDocumentsByType("preference", 5, { orderBy: "effective" });
+  const problems = store.getDocumentsByType("problem", 5, { orderBy: "effective" });
+  const deductions = store.getDocumentsByType("deductive", 5, { orderBy: "effective" });
 
   // Rank by: pinned first, then recency, then access_count
   const now = Date.now();
   const rankDoc = (d: any) => {
     const pinBoost = d.pinned ? 1000 : 0;
-    const daysSince = (now - new Date(d.modifiedAt).getTime()) / 86400000;
+    const daysSince = (now - new Date(d.effectiveAt).getTime()) / 86400000;
     const recencyScore = Math.max(0, 100 - daysSince * 5); // 0-100, loses 5 per day
     const accessScore = (d.accessCount ?? 0) * 2;
     return pinBoost + recencyScore + accessScore;
   };
 
   const recentDecisions = decisions
-    .filter(d => d.modifiedAt >= cutoffStr)
+    .filter(d => d.effectiveAt >= cutoffStr)
     .sort((a, b) => rankDoc(b) - rankDoc(a));
 
   const activeProblems = problems
-    .filter(d => d.modifiedAt >= cutoffStr && (d.confidence ?? 0.5) > 0.2);
+    .filter(d => d.effectiveAt >= cutoffStr && (d.confidence ?? 0.5) > 0.2);
 
   // Preferences are durable — no date filter, just rank
   const rankedPrefs = [...preferences].sort((a, b) => rankDoc(b) - rankDoc(a));
 
   const recentDeductions = deductions
-    .filter(d => d.modifiedAt >= cutoffStr)
+    .filter(d => d.effectiveAt >= cutoffStr)
     .sort((a, b) => rankDoc(b) - rankDoc(a));
 
   if (recentDecisions.length === 0 && rankedPrefs.length === 0 && activeProblems.length === 0 && recentDeductions.length === 0) {
@@ -305,7 +306,7 @@ function getCurrentFocus(
     charCount += 22;
     for (const d of activeProblems) {
       if (charCount >= maxChars) break;
-      const entry = `- ${d.title} (${d.modifiedAt.slice(0, 10)})`;
+      const entry = `- ${d.title} (${d.effectiveAt.slice(0, 10)})`;
       lines.push(entry);
       paths.push(`${d.collection}/${d.path}`);
       charCount += entry.length + 2;
@@ -322,7 +323,7 @@ function getCurrentFocus(
       if (body) body = sanitizeSnippet(body);
       if (body === "[content filtered for security]") continue;
       const snippet = body ? smartTruncate(body, 200) : d.title;
-      const entry = `- **${d.title}** (${d.modifiedAt.slice(0, 10)})\n  ${snippet}`;
+      const entry = `- **${d.title}** (${d.effectiveAt.slice(0, 10)})\n  ${snippet}`;
       if (charCount + entry.length > maxChars && lines.length > 2) break;
       lines.push(entry);
       paths.push(`${d.collection}/${d.path}`);
@@ -349,7 +350,7 @@ function getCurrentFocus(
     charCount += 24;
     for (const d of recentDeductions) {
       if (charCount >= maxChars) break;
-      const entry = `- ${d.title} (${d.modifiedAt.slice(0, 10)})`;
+      const entry = `- ${d.title} (${d.effectiveAt.slice(0, 10)})`;
       lines.push(entry);
       paths.push(`${d.collection}/${d.path}`);
       charCount += entry.length + 2;

@@ -75,6 +75,11 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## Search & retrieval
 
+**Historical/mined conversations rank as if they were written today**
+- Fixed in v0.27.0: ranking recency, temporal filters, and the recent-decision windows run on **effective time** (`authored_at` when known, `modified_at` otherwise). New mines capture authorship automatically.
+- For vaults mined before v0.27.0: re-run `clawmem mine` over the same export directory (metadata-only "dated" transition — no re-enrichment/re-embed), or `clawmem mine <dir> -c <collection> --backfill-dates` (dry-run) then `--apply`.
+- Documents that still lack `authored_at` (source transcripts without timestamps, plain-text imports) keep filing-time behavior by design.
+
 **context-surfacing hook returns empty**
 - Prompt too short (< 20 chars — short memory-intent queries like "what did I say?" are exempt and force retrieval), starts with `/`, or no docs score above threshold.
 - Fix: Check `clawmem status` for doc counts. Check `clawmem embed` for embedding coverage.

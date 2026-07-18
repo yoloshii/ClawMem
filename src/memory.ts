@@ -145,13 +145,23 @@ export function recencyScore(
 
 export function confidenceScore(
   contentType: string,
-  modifiedAt: Date | string,
+  decayAt: Date | string,
   accessCount: number,
   now: Date = new Date(),
-  lastAccessedAt?: Date | string | null
+  lastAccessedAt?: Date | string | null,
+  modifiedAtForBackfill?: Date | string
 ): number {
+  // §51.1 D8 — three time inputs with distinct roles:
+  //   decayAt              — content/effective time (authoredAt ?? modifiedAt); drives ONLY the
+  //                          internal recency term. Index-time callers pass mtime (stored
+  //                          confidence stays operational in every lane).
+  //   lastAccessedAt       — operational; attention-decay elapsed time (unchanged).
+  //   modifiedAtForBackfill — operational filing time; used ONLY by the backfilled-sentinel
+  //                          comparison below (last_accessed_at is backfilled FROM modified_at,
+  //                          so the sentinel must compare against filing time, never decayAt).
+  //                          Defaults to decayAt for callers with no separate axis.
   const baseline = TYPE_BASELINES[contentType] ?? 0.5;
-  const recency = recencyScore(modifiedAt, contentType, now);
+  const recency = recencyScore(decayAt, contentType, now);
   const safeAccess = Number.isFinite(accessCount) && accessCount >= 0 ? accessCount : 0;
   const accessBoost = Math.min(1.5, 1 + Math.log2(1 + safeAccess) * 0.1);
 
@@ -162,7 +172,8 @@ export function confidenceScore(
   let attentionDecay = 1.0;
   if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
     const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;
-    const modified = typeof modifiedAt === "string" ? new Date(modifiedAt) : modifiedAt;
+    const backfillRef = modifiedAtForBackfill ?? decayAt;
+    const modified = typeof backfillRef === "string" ? new Date(backfillRef) : backfillRef;
     if (!isNaN(lastAccess.getTime())) {
       // Skip decay if last_accessed_at == modified_at (backfilled, no real access)
       const isBackfilled = Math.abs(lastAccess.getTime() - modified.getTime()) < 1000;
@@ -244,6 +255,7 @@ export type EnrichedResult = {
   body?: string;
   contentType: string;
   modifiedAt: string;
+  authoredAt?: string | null;  // §51.1: authorship time; null/absent = unknown → modifiedAt
   accessCount: number;
   confidence: number;
   qualityScore: number;
@@ -314,8 +326,11 @@ export function applyCompositeScoring(
   const now = options?.now ?? new Date();
 
   const scored = results.map(r => {
-    const recency = recencyScore(r.modifiedAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
-    const computed = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now, r.lastAccessedAt);
+    // §51.1: rank recency by content time — authorship when known, filing time
+    // otherwise. modifiedAt still rides along for the backfill sentinel.
+    const effectiveAt = r.authoredAt ?? r.modifiedAt;
+    const recency = recencyScore(effectiveAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
+    const computed = confidenceScore(r.contentType, effectiveAt, r.accessCount, now, r.lastAccessedAt, r.modifiedAt);
     // Blend stored confidence (from contradiction lowering, feedback boosts) with computed.
     // Default stored=0.5 → 100% computed. Stored deviations shift the result proportionally.
     const storedConf = r.confidence ?? 0.5;

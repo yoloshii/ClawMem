@@ -26,6 +26,7 @@ import {
   isFallbackExpansion,
   type RerankDocument,
 } from "./llm.ts";
+import { normalizeIsoTimestamp } from "./normalize.ts";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -445,6 +446,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     ["last_seen_at", "ALTER TABLE documents ADD COLUMN last_seen_at TEXT"],
     ["topic_key", "ALTER TABLE documents ADD COLUMN topic_key TEXT"],
     ["revision_count", "ALTER TABLE documents ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 1"],
+    ["authored_at", "ALTER TABLE documents ADD COLUMN authored_at TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -483,6 +485,8 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // Timeline indexes use existing columns (modified_at, id) — always safe
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline ON documents(modified_at, id) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline_coll ON documents(collection, modified_at, id) WHERE active = 1`);
+  // §51.1: temporal predicates filter on effective time (authorship when known, filing time otherwise)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_effective_time ON documents(COALESCE(authored_at, modified_at)) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
   // Cache table for LLM API calls
@@ -1413,9 +1417,9 @@ export type Store = {
   markUsageReferenced: (id: number) => void;
 
   // SAME: Document metadata operations
-  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }) => void;
+  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }) => void;
   incrementAccessCount: (paths: string[]) => void;
-  getDocumentsByType: (contentType: string, limit?: number) => DocumentRow[];
+  getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => DocumentRow[];
   getStaleDocuments: (beforeDate: string) => DocumentRow[];
   pinDocument: (collection: string, path: string, pinned: boolean) => void;
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
@@ -1652,7 +1656,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // SAME: Document metadata operations
     updateDocumentMeta: (docId: number, meta) => updateDocumentMetaFn(db, docId, meta),
     incrementAccessCount: (paths: string[]) => incrementAccessCountFn(db, paths),
-    getDocumentsByType: (contentType: string, limit?: number) => getDocumentsByTypeFn(db, contentType, limit),
+    getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => getDocumentsByTypeFn(db, contentType, limit, opts),
     getStaleDocuments: (beforeDate: string) => getStaleDocumentsFn(db, beforeDate),
     pinDocument: (collection: string, path: string, pinned: boolean) => pinDocumentFn(db, collection, path, pinned),
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
@@ -2254,6 +2258,8 @@ export type DocumentRow = {
   title: string;
   hash: string;
   modifiedAt: string;
+  authoredAt: string | null;  // §51.1: authorship time; null = unknown
+  effectiveAt: string;        // §51.1: COALESCE(authored_at, modified_at) — content time
   domain: string | null;
   workstream: string | null;
   tags: string | null;
@@ -2517,6 +2523,14 @@ export type SaveMemoryParams = {
   semanticPayload?: string;
   /** Topic key for future upsert support (Phase 2). */
   topicKey?: string;
+  /**
+   * §51.1: when the content was originally written (UTC ISO), as opposed to
+   * created_at/modified_at which stay filing/update time. Validated strictly;
+   * invalid values are treated as absent. Advances monotonically on dedup and
+   * path-conflict updates (a newer repeated assertion moves it forward;
+   * reprocessing older evidence never regresses it).
+   */
+  authoredAt?: string;
 };
 
 export type SaveMemoryResult = {
@@ -2543,6 +2557,7 @@ const DEDUP_WINDOW_MINUTES = 30;
 
 export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryResult {
   const now = new Date().toISOString();
+  const authoredAt = normalizeIsoTimestamp(params.authoredAt);
   const payload = params.semanticPayload || params.body;
   const normHash = hashNormalized(payload);
   const bodyHasher = new Bun.CryptoHasher("sha256");
@@ -2568,13 +2583,26 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   ) as { id: number; duplicate_count: number } | null;
 
   if (dedupRow) {
-    // Increment duplicate_count and update last_seen_at
-    db.prepare(`
-      UPDATE documents
-      SET duplicate_count = duplicate_count + 1,
-          last_seen_at = ?
-      WHERE id = ?
-    `).run(now, dedupRow.id);
+    // Increment duplicate_count and update last_seen_at. §51.1: a validated
+    // incoming authorship advances authored_at monotonically (CASE, not scalar
+    // MAX — MAX(NULL, x) is NULL in SQLite and could never populate an
+    // initially unknown row); absent incoming leaves the column untouched.
+    if (authoredAt) {
+      db.prepare(`
+        UPDATE documents
+        SET duplicate_count = duplicate_count + 1,
+            last_seen_at = ?,
+            authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END
+        WHERE id = ?
+      `).run(now, authoredAt, authoredAt, dedupRow.id);
+    } else {
+      db.prepare(`
+        UPDATE documents
+        SET duplicate_count = duplicate_count + 1,
+            last_seen_at = ?
+        WHERE id = ?
+      `).run(now, dedupRow.id);
+    }
 
     return {
       action: 'deduplicated',
@@ -2593,8 +2621,8 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     db.prepare(`
       INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
                              content_type, confidence, quality_score, normalized_hash,
-                             duplicate_count, revision_count, last_seen_at, topic_key)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?)
+                             duplicate_count, revision_count, last_seen_at, topic_key, authored_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?)
     `).run(
       params.collection,
       params.path,
@@ -2608,6 +2636,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       normHash,
       now,
       params.topicKey ?? null,
+      authoredAt,
     );
   } catch (err: any) {
     // UNIQUE(collection, path) conflict — update existing row
@@ -2617,17 +2646,24 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       ).get(params.collection, params.path) as { id: number } | null;
 
       if (existing) {
+        // §51.1: same monotonic authored_at advancement as the dedup branch.
+        const authoredSet = authoredAt
+          ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
+          : "";
+        const updateVals: (string | number | null)[] = [
+          bodyHash, params.title, now, params.contentType,
+          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
+          now,
+        ];
+        if (authoredAt) updateVals.push(authoredAt, authoredAt);
+        updateVals.push(existing.id);
         db.prepare(`
           UPDATE documents
           SET hash = ?, title = ?, modified_at = ?, content_type = ?,
               confidence = ?, quality_score = ?, normalized_hash = ?,
-              revision_count = revision_count + 1, last_seen_at = ?
+              revision_count = revision_count + 1, last_seen_at = ?${authoredSet}
           WHERE id = ?
-        `).run(
-          bodyHash, params.title, now, params.contentType,
-          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
-          now, existing.id
-        );
+        `).run(...updateVals);
 
         const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
           .get(existing.id) as { revision_count: number } | null;
@@ -3551,9 +3587,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     params.push(String(collectionId));
   }
 
-  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint).
+  // §51.1: content-time predicate — authorship when known, filing time otherwise.
   if (dateRange) {
-    sql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    sql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(dateRange.start, dateRange.end);
   }
 
@@ -3709,9 +3746,10 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     params.push(String(collectionId));
   }
 
-  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint).
+  // §51.1: content-time predicate — authorship when known, filing time otherwise.
   if (dateRange) {
-    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(dateRange.start, dateRange.end);
   }
 
@@ -3845,7 +3883,8 @@ function hydrateVecResultsClassified(
     params.push(String(opts.collectionId));
   }
   if (opts.dateRange) {
-    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    // §51.1: content-time predicate — authorship when known, filing time otherwise.
+    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(opts.dateRange.start, opts.dateRange.end);
   }
 
@@ -5013,7 +5052,7 @@ function markUsageReferencedFn(db: Database, id: number): void {
 // SAME: Document Metadata Operations
 // =============================================================================
 
-function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }): void {
+function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }): void {
   const sets: string[] = [];
   const vals: (string | number | null)[] = [];
   if (meta.domain !== undefined) { sets.push("domain = ?"); vals.push(meta.domain); }
@@ -5023,6 +5062,9 @@ function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: stri
   if (meta.review_by !== undefined) { sets.push("review_by = ?"); vals.push(meta.review_by); }
   if (meta.confidence !== undefined) { sets.push("confidence = ?"); vals.push(meta.confidence); }
   if (meta.quality_score !== undefined) { sets.push("quality_score = ?"); vals.push(meta.quality_score); }
+  // §51.1: undefined = leave untouched; explicit null = CLEAR (file-backed
+  // frontmatter is authoritative — a removed/invalid authored_at clears the row).
+  if (meta.authored_at !== undefined) { sets.push("authored_at = ?"); vals.push(meta.authored_at); }
   if (sets.length === 0) return;
   vals.push(docId);
   db.prepare(`UPDATE documents SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
@@ -5050,16 +5092,24 @@ function incrementAccessCountFn(db: Database, paths: string[]): void {
   `).run(now, ...paths);
 }
 
-function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10): DocumentRow[] {
+function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10, opts?: { orderBy?: "operational" | "effective" }): DocumentRow[] {
+  // §51.1 D13: "effective" orders/limits by content time (authorship when known).
+  // Content-currency callers must use the returned effectiveAt — not modifiedAt —
+  // for ordering, cutoff filtering, and displayed dates. Default stays operational.
+  const orderExpr = opts?.orderBy === "effective"
+    ? "COALESCE(d.authored_at, d.modified_at)"
+    : "d.modified_at";
   return db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
+           d.authored_at as authoredAt,
+           COALESCE(d.authored_at, d.modified_at) as effectiveAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
            LENGTH(c.doc) as bodyLength, d.pinned
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.content_type = ?
-    ORDER BY d.modified_at DESC
+    ORDER BY ${orderExpr} DESC
     LIMIT ?
   `).all(contentType, limit) as DocumentRow[];
 }
@@ -5087,8 +5137,12 @@ function updateObservationFieldsFn(
 }
 
 function getStaleDocumentsFn(db: Database, beforeDate: string): DocumentRow[] {
+  // Staleness review stays on operational time (§51.1) — authoredAt/effectiveAt
+  // are hydrated only so the returned rows satisfy the DocumentRow contract.
   return db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
+           d.authored_at as authoredAt,
+           COALESCE(d.authored_at, d.modified_at) as effectiveAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
            LENGTH(c.doc) as bodyLength

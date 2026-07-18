@@ -195,6 +195,8 @@ Applied on the composite surfaces: hooks, `query`, and `memory_retrieve`'s keywo
 compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
+**Effective time (v0.27.0):** `recencyScore` ages documents by `authored_at ?? modified_at` — mined/synthesized historical content ranks by when it was written, not when it was filed. Result metadata carries `authored_at` (null = unknown); temporal filters and recency-intent queries use the same axis.
+
 - `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× penalty … 1.3× boost).
 - `coActivationBoost = 1 + min(coCount/10, 0.15)` (docs surfaced together get up to +15%).
 - Length normalization penalizes verbose entries (floor 30%); frequency boost capped at +10%.

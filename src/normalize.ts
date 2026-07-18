@@ -20,7 +20,7 @@ import { basename, extname, join, relative } from "path";
 // Types
 // =============================================================================
 
-export type Message = { role: "user" | "assistant"; content: string };
+export type Message = { role: "user" | "assistant"; content: string; timestamp?: string };
 
 export type NormalizedConversation = {
   source: string;           // original filename
@@ -33,7 +33,84 @@ export type ConversationChunk = {
   body: string;             // markdown body
   sourcePath: string;       // relative path of source file
   chunkIndex: number;
+  authoredAt: string | null; // max message timestamp in this exchange (§51.1 D4); null = unknown
 };
+
+// =============================================================================
+// Timestamp Adapters (§51.1 D3 — strict per-format; never host-timezone)
+// =============================================================================
+
+// RFC3339 with explicit Z or numeric colon offset. Timezone-less values are
+// rejected — interpreting them in the host timezone would make mined dates
+// machine-dependent.
+const RFC3339_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+
+// Pure Gregorian arithmetic — Date.UTC maps numeric years 0-99 to 1900-1999,
+// which would both corrupt century leap rules here and shift constructed dates.
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+}
+
+/**
+ * Strict RFC3339 timestamp (explicit Z or numeric offset) → UTC ISO, else null.
+ *
+ * The literal wall-clock components are validated as written (Feb 30 is
+ * rejected, not normalized) BEFORE the offset is applied — comparing input
+ * components against the UTC output would wrongly reject valid offset inputs
+ * ("2025-01-01T12:00:00+10:00" legitimately normalizes to 02:00Z).
+ */
+export function normalizeIsoTimestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const m = RFC3339_RE.exec(value.trim());
+  if (!m) return null;
+  const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]);
+  const hour = Number(m[4]), minute = Number(m[5]), second = Number(m[6]);
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > daysInMonth(year, month)) return null;
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  let offsetMs = 0;
+  const offset = m[8]!;
+  if (offset !== "Z" && offset !== "z") {
+    const offHour = Number(offset.slice(1, 3));
+    const offMin = Number(offset.slice(4, 6));
+    if (offHour > 23 || offMin > 59) return null;
+    offsetMs = (offset[0] === "-" ? -1 : 1) * (offHour * 3600_000 + offMin * 60_000);
+  }
+  const fracMs = m[7] ? Math.round(parseFloat(`0${m[7]}`) * 1000) : 0;
+  // setUTCFullYear takes years 0-99 literally, unlike Date.UTC's 1900-mapping —
+  // "0001-01-01T00:00:00Z" must not silently become 1901.
+  const d = new Date(0);
+  d.setUTCFullYear(year, month - 1, day);
+  d.setUTCHours(hour, minute, second, 0);
+  const ms = d.getTime() + fracMs - offsetMs;
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return null;
+  return new Date(ms).toISOString();
+}
+
+/**
+ * Epoch seconds → UTC ISO, else null. The multiplied value must land inside
+ * the ECMAScript Date range — finite input alone does not prevent
+ * toISOString() from throwing.
+ */
+export function epochSecondsToIso(seconds: unknown): string | null {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
+  const ms = seconds * 1000;
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return null;
+  return new Date(ms).toISOString();
+}
+
+// Slack `ts`: epoch-seconds string like "1234567890.123456" — exactly 10
+// integer digits; anything else is rejected rather than guessed at.
+const SLACK_TS_RE = /^\d{10}\.\d+$/;
+
+function slackTsToIso(ts: unknown): string | null {
+  if (typeof ts !== "string" || !SLACK_TS_RE.test(ts)) return null;
+  return epochSecondsToIso(parseFloat(ts));
+}
 
 // =============================================================================
 // Format Detection & Normalization
@@ -103,13 +180,14 @@ function tryClaudeCodeJsonl(content: string): Message[] | null {
 
     const msgType = entry.type ?? "";
     const message = entry.message ?? {};
+    const ts = normalizeIsoTimestamp(entry.timestamp);
 
     if (msgType === "human" || msgType === "user") {
       const text = extractContent(message.content);
-      if (text) messages.push({ role: "user", content: text });
+      if (text) messages.push({ role: "user", content: text, ...(ts ? { timestamp: ts } : {}) });
     } else if (msgType === "assistant") {
       const text = extractContent(message.content);
-      if (text) messages.push({ role: "assistant", content: text });
+      if (text) messages.push({ role: "assistant", content: text, ...(ts ? { timestamp: ts } : {}) });
     }
   }
 
@@ -135,8 +213,9 @@ function tryCodexJsonl(content: string): Message[] | null {
     const text = typeof payload.message === "string" ? payload.message.trim() : "";
     if (!text) continue;
 
-    if (payload.type === "user_message") messages.push({ role: "user", content: text });
-    else if (payload.type === "agent_message") messages.push({ role: "assistant", content: text });
+    const ts = normalizeIsoTimestamp(entry.timestamp);
+    if (payload.type === "user_message") messages.push({ role: "user", content: text, ...(ts ? { timestamp: ts } : {}) });
+    else if (payload.type === "agent_message") messages.push({ role: "assistant", content: text, ...(ts ? { timestamp: ts } : {}) });
   }
 
   return messages.length >= 2 && hasSessionMeta ? messages : null;
@@ -150,8 +229,9 @@ function tryClaudeAiJson(data: any): Message[] | null {
       for (const item of convo.chat_messages ?? []) {
         const role = item.role ?? "";
         const text = extractContent(item.content);
-        if ((role === "user" || role === "human") && text) messages.push({ role: "user", content: text });
-        else if ((role === "assistant" || role === "ai") && text) messages.push({ role: "assistant", content: text });
+        const ts = normalizeIsoTimestamp(item.created_at);
+        if ((role === "user" || role === "human") && text) messages.push({ role: "user", content: text, ...(ts ? { timestamp: ts } : {}) });
+        else if ((role === "assistant" || role === "ai") && text) messages.push({ role: "assistant", content: text, ...(ts ? { timestamp: ts } : {}) });
       }
     }
     return messages.length >= 2 ? messages : null;
@@ -169,8 +249,9 @@ function tryClaudeAiJson(data: any): Message[] | null {
     if (typeof item !== "object" || !item) continue;
     const role = item.role ?? "";
     const text = extractContent(item.content);
-    if ((role === "user" || role === "human") && text) messages.push({ role: "user", content: text });
-    else if ((role === "assistant" || role === "ai") && text) messages.push({ role: "assistant", content: text });
+    const ts = normalizeIsoTimestamp(item.created_at);
+    if ((role === "user" || role === "human") && text) messages.push({ role: "user", content: text, ...(ts ? { timestamp: ts } : {}) });
+    else if ((role === "assistant" || role === "ai") && text) messages.push({ role: "assistant", content: text, ...(ts ? { timestamp: ts } : {}) });
   }
   return messages.length >= 2 ? messages : null;
 }
@@ -197,14 +278,15 @@ function tryChatGptJson(data: any): Message[] | null {
   const visited = new Set<string>();
   while (currentId && !visited.has(currentId)) {
     visited.add(currentId);
-    const node = (mapping as any)[currentId];
+    const node: any = (mapping as any)[currentId];
     if (node?.message) {
       const role = node.message.author?.role ?? "";
       const content = node.message.content;
       const parts = content?.parts ?? [];
       const text = parts.filter((p: any) => typeof p === "string").join(" ").trim();
-      if (role === "user" && text) messages.push({ role: "user", content: text });
-      else if (role === "assistant" && text) messages.push({ role: "assistant", content: text });
+      const ts = epochSecondsToIso(node.message.create_time);
+      if (role === "user" && text) messages.push({ role: "user", content: text, ...(ts ? { timestamp: ts } : {}) });
+      else if (role === "assistant" && text) messages.push({ role: "assistant", content: text, ...(ts ? { timestamp: ts } : {}) });
     }
     currentId = node?.children?.[0] ?? null;
   }
@@ -225,10 +307,10 @@ function trySlackJson(data: any): Message[] | null {
   if (speakers.size < 2) return null;
 
   const messages: Message[] = [];
-  const speakerList = [...speakers];
+  const [speakerA, speakerB] = [...speakers] as [string, string];
   const roleMap: Record<string, "user" | "assistant"> = {
-    [speakerList[0]]: "user",
-    [speakerList[1]]: "assistant",
+    [speakerA]: "user",
+    [speakerB]: "assistant",
   };
 
   for (const item of data) {
@@ -236,7 +318,8 @@ function trySlackJson(data: any): Message[] | null {
     const userId = item.user ?? item.username ?? "";
     const text = (item.text ?? "").trim();
     if (!text || !roleMap[userId]) continue;
-    messages.push({ role: roleMap[userId], content: text });
+    const ts = slackTsToIso(item.ts);
+    messages.push({ role: roleMap[userId], content: text, ...(ts ? { timestamp: ts } : {}) });
   }
   return messages.length >= 2 ? messages : null;
 }
@@ -316,13 +399,22 @@ export function chunkConversation(conv: NormalizedConversation): ConversationChu
   const { messages, source } = conv;
 
   for (let i = 0; i < messages.length; i++) {
-    if (messages[i].role !== "user") continue;
+    const msg = messages[i]!;
+    if (msg.role !== "user") continue;
 
-    const userMsg = messages[i].content;
+    const userMsg = msg.content;
+    // §51.1 D4: authoredAt = max timestamp among THIS exchange's messages only.
+    // An exchange with no timestamps stays null — never inherit a transcript-level
+    // value (privacy exports flatten multiple conversations into one stream, so a
+    // transcript-wide max would cross conversation boundaries).
+    const exchangeTimestamps: string[] = [];
+    if (msg.timestamp) exchangeTimestamps.push(msg.timestamp);
     // Collect ALL consecutive assistant messages (handles split replies)
     const assistantParts: string[] = [];
-    while (i + 1 < messages.length && messages[i + 1].role === "assistant") {
-      assistantParts.push(messages[i + 1].content);
+    while (i + 1 < messages.length && messages[i + 1]!.role === "assistant") {
+      const next = messages[i + 1]!;
+      assistantParts.push(next.content);
+      if (next.timestamp) exchangeTimestamps.push(next.timestamp);
       i++;
     }
     const assistantMsg = assistantParts.join("\n\n");
@@ -337,6 +429,11 @@ export function chunkConversation(conv: NormalizedConversation): ConversationChu
         body,
         sourcePath: source,
         chunkIndex: chunks.length,
+        // Normalized toISOString values are uniform-width UTC strings, so the
+        // lexicographic max is the chronological max.
+        authoredAt: exchangeTimestamps.length > 0
+          ? exchangeTimestamps.reduce((a, b) => (b > a ? b : a))
+          : null,
       });
     }
   }
@@ -346,7 +443,7 @@ export function chunkConversation(conv: NormalizedConversation): ConversationChu
 
 function extractExchangeTitle(userMessage: string, index: number): string {
   // Use the first line/sentence of the user message, capped at 80 chars
-  const firstLine = userMessage.split("\n")[0].trim();
+  const firstLine = userMessage.split("\n")[0]!.trim();
   if (firstLine.length <= 80) return firstLine;
   return firstLine.slice(0, 77) + "...";
 }

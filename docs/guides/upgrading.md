@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.26.0**.
+Guide for upgrading between released versions. Current: **v0.27.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,18 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.27.0: authorship time (`authored_at`) + entity-edge IDF fix
+
+Drop-in; the `authored_at` column and its index auto-migrate on first open. What changes and what to know:
+
+- **Ranking recency now runs on effective time** — `authored_at` (when the content was originally written) when known, `modified_at` otherwise. Documents without `authored_at` behave exactly as before, so an existing vault is unaffected until content carries dates.
+- **New mines are dated automatically.** `clawmem mine` extracts per-message timestamps from Claude Code / codex / Claude.ai / ChatGPT / Slack exports and stamps each exchange chunk; synthesized facts inherit their source's date.
+- **Dating an already-mined vault:** either re-run `clawmem mine` over the same export directory — previously-mined documents take a metadata-only "dated" transition (no `modified_at` bump, no re-enrichment, no re-embed) — or run `clawmem mine <dir> -c <collection> --backfill-dates` (dry-run report), then `--backfill-dates --apply`. Both are safe to repeat; documents whose content no longer matches the source are skipped.
+- **Colliding source filenames are now disambiguated.** Two transcripts that sanitize to the same staging name (e.g. `a/b.jsonl` and `a_b.jsonl`) previously overwrote each other silently; they now mine under distinct hash-suffixed names. Non-colliding sources keep their existing names — no path churn.
+- **Hand-dated notes:** any indexed file may declare `authored_at:` in frontmatter (RFC3339 with timezone, or date-only `YYYY-MM-DD` = UTC midnight; quoted or unquoted). Removing the line clears the stored date on the next content change.
+- Temporal queries ("what did we plan in March"), the recent-decision windows (postcompact, session bootstrap, `clawmem reflect`, profile), and directory context all use effective time; operational clocks (dedup window, lifecycle sweeps, staleness review) intentionally do not.
+- Entity-graph enrichment now computes IDF over active documents only and never creates edges toward archived documents (completes the v0.25.0 hub-bias fix); existing edges are unaffected.
 
 ## v0.26.0: offline eval harness + short memory-query fix
 

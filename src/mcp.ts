@@ -602,6 +602,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
         return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items, scoreBasis: sScoreBasis } };
@@ -682,6 +683,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
         return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${vsDegradedNote}` }], structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded } };
@@ -802,18 +804,21 @@ This is the recommended entry point for ALL memory queries.`,
         const temporalExclSql = excl && excl.length > 0
           ? ` AND d.collection NOT IN (${excl.map(() => '?').join(',')})`
           : "";
+        // §51.1: the proximity channel measures content time — authorship when
+        // known, filing time otherwise — in the WHERE, the ORDER, and the
+        // proximity math itself.
         const temporalDocs = store.db.prepare(`
           SELECT 'clawmem://' || d.collection || '/' || d.path as filepath,
                  d.collection || '/' || d.path as displayPath,
-                 d.title, d.modified_at
+                 d.title, COALESCE(d.authored_at, d.modified_at) as effective_at
           FROM documents d
-          WHERE d.active = 1 AND d.invalidated_at IS NULL AND d.modified_at >= ? AND d.modified_at <= ?${temporalExclSql}
-          ORDER BY d.modified_at DESC LIMIT 30
-        `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; modified_at: string }[];
+          WHERE d.active = 1 AND d.invalidated_at IS NULL AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?${temporalExclSql}
+          ORDER BY COALESCE(d.authored_at, d.modified_at) DESC LIMIT 30
+        `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; effective_at: string }[];
 
         if (temporalDocs.length > 0) {
           const temporalRanked: RankedResult[] = temporalDocs.map(d => {
-            const docMs = new Date(d.modified_at).getTime();
+            const docMs = new Date(d.effective_at).getTime();
             const proximity = 1.0 - Math.min(1.0, Math.abs(docMs - centerMs) / rangeMs);
             return { file: d.filepath, displayPath: d.displayPath, title: d.title, body: "", score: proximity };
           });
@@ -954,6 +959,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${docidMap.get(r.filepath) || r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
         return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${queryDegradedNote}` }], structuredContent: { results: items, ...queryDegraded } };
@@ -1458,7 +1464,7 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ vault }) => {
       const store = getStore(vault);
       const collections = listCollections();
-      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
+      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
 
       for (const col of collections) {
         const stats = await indexCollection(store, col.name, col.path, col.pattern);
@@ -1466,6 +1472,7 @@ This is the recommended entry point for ALL memory queries.`,
         totalStats.updated += stats.updated;
         totalStats.unchanged += stats.unchanged;
         totalStats.removed += stats.removed;
+        totalStats.dated += stats.dated;
       }
 
       const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed`;
@@ -2003,6 +2010,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
         }));
         return {
           content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${planDegradedNote}` }],

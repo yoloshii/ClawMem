@@ -755,12 +755,15 @@ export async function enrichDocumentEntities(
       // Rare entities justify edges; ubiquitous entities alone cannot
       const totalDocs = (db.prepare(`SELECT COUNT(*) as cnt FROM documents WHERE active = 1`).get() as { cnt: number }).cnt;
 
-      // Collect candidate target docs and their shared entities
+      // Collect candidate target docs and their shared entities.
+      // BL-001 residual: candidates are ACTIVE docs only — edges must never
+      // target archived documents.
       const targetEntityMap = new Map<number, string[]>(); // docId → [entityIds]
       for (const entityId of resolvedIds) {
         const otherDocs = db.prepare(`
-          SELECT doc_id FROM entity_mentions
-          WHERE entity_id = ? AND doc_id != ?
+          SELECT em.doc_id FROM entity_mentions em
+          JOIN documents d ON d.id = em.doc_id
+          WHERE em.entity_id = ? AND em.doc_id != ? AND d.active = 1
           LIMIT 20
         `).all(entityId, docId) as { doc_id: number }[];
 
@@ -771,12 +774,18 @@ export async function enrichDocumentEntities(
         }
       }
 
-      // Compute IDF per entity (cache for this enrichment)
+      // Compute IDF per entity (cache for this enrichment).
+      // BL-001 residual: totalDocs above is active-only, so doc_freq must be
+      // active-only too — an all-docs denominator lets archived history deflate
+      // specificity (IDF can even go negative), suppressing edges for entities
+      // that are specific among the LIVE corpus.
       const entityIdf = new Map<string, number>();
       for (const entityId of resolvedIds) {
         if (!entityIdf.has(entityId)) {
           const docFreq = (db.prepare(
-            `SELECT COUNT(DISTINCT doc_id) as cnt FROM entity_mentions WHERE entity_id = ?`
+            `SELECT COUNT(DISTINCT em.doc_id) as cnt FROM entity_mentions em
+             JOIN documents d ON d.id = em.doc_id
+             WHERE em.entity_id = ? AND d.active = 1`
           ).get(entityId) as { cnt: number }).cnt;
           entityIdf.set(entityId, Math.log((totalDocs + 1) / (docFreq + 1)));
         }

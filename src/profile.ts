@@ -44,7 +44,8 @@ export function buildStaticProfile(store: Store): string[] {
   const seen = new Set<string>();
 
   // Extract from decisions
-  const decisions = store.getDocumentsByType("decision", 20);
+  // §51.1 D13: static profile reflects currently-true decisions — effective order
+  const decisions = store.getDocumentsByType("decision", 20, { orderBy: "effective" });
   for (const d of decisions) {
     const body = store.getDocumentBody({
       filepath: `${d.collection}/${d.path}`,
@@ -123,11 +124,12 @@ export function buildDynamicProfile(store: Store): string[] {
   // Recent progress documents
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - 7);
-  const progress = store.getDocumentsByType("progress", 5);
-  const recent = progress.filter(p => p.modifiedAt >= cutoff.toISOString());
+  // §51.1 D13: content-currency — cutoff and display on effectiveAt
+  const progress = store.getDocumentsByType("progress", 5, { orderBy: "effective" });
+  const recent = progress.filter(p => p.effectiveAt >= cutoff.toISOString());
 
   for (const p of recent) {
-    items.push(`Progress: ${p.title} (${p.modifiedAt.slice(0, 10)})`);
+    items.push(`Progress: ${p.title} (${p.effectiveAt.slice(0, 10)})`);
   }
 
   // Truncate to budget

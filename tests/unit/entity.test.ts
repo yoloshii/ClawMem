@@ -503,6 +503,85 @@ describe("entity graph neighbors", () => {
 });
 
 // =============================================================================
+// BL-001 residual — enrichment/edge-creation IDF population mismatch
+// =============================================================================
+//
+// The v0.25.0 BL-001 fix aligned the NEIGHBOR path's IDF populations
+// (active-only numerator AND denominator). The enrichment path had the same
+// mismatch: totalDocs counted active docs while doc_freq counted mentions in
+// ALL docs, so archived history deflated specificity (IDF could go negative)
+// and suppressed edges for entities specific among the LIVE corpus; candidates
+// could also be archived docs. Bug-first: both tests fail on the pre-fix SQL.
+// =============================================================================
+
+describe("enrichment IDF active-vs-all population (BL-001 residual)", () => {
+  const ENTITY_JSON = JSON.stringify([{ name: "ZanzibarProtocol", type: "project" }]);
+
+  function seedActivePool(n: number): number[] {
+    return seedDocuments(store, Array.from({ length: n }, (_, i) => ({
+      path: `pool-${i}.md`, title: `Pool ${i}`, body: `filler content ${i}`,
+    }))) as number[];
+  }
+
+  function archiveDoc(id: number): void {
+    store.db.prepare(`UPDATE documents SET active = 0 WHERE id = ?`).run(id);
+  }
+
+  it("archived mentions must not deflate specificity below the edge gate", async () => {
+    // 70 active docs. The entity is mentioned in ONE active partner doc (+ the
+    // enriched doc itself during enrichment) and TWO archived docs.
+    // Active-only IDF: ln(71/3) ≈ 3.16 ≥ 3.0 → edge. All-docs denominator
+    // (pre-fix): ln(71/5) ≈ 2.65 < 3.0 → wrongly suppressed.
+    const pool = seedActivePool(70);
+    const targetDoc = pool[0]!;
+    const enrichedDoc = pool[1]!;
+    const [arch1, arch2] = seedDocuments(store, [
+      { path: "arch-1.md", title: "Arch 1", body: "old mention one" },
+      { path: "arch-2.md", title: "Arch 2", body: "old mention two" },
+    ]);
+    archiveDoc(arch1!);
+    archiveDoc(arch2!);
+
+    const entityId = upsertEntity(store.db, "ZanzibarProtocol", "project", "default");
+    recordEntityMention(store.db, entityId, targetDoc, "ZanzibarProtocol");
+    recordEntityMention(store.db, entityId, arch1!, "ZanzibarProtocol");
+    recordEntityMention(store.db, entityId, arch2!, "ZanzibarProtocol");
+
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValue({ text: ENTITY_JSON, model: "mock", done: true });
+    await enrichDocumentEntities(store.db as any, llm as any, enrichedDoc);
+
+    const edge = store.db.prepare(
+      `SELECT 1 FROM memory_relations WHERE source_id = ? AND target_id = ? AND relation_type = 'entity'`
+    ).get(enrichedDoc, targetDoc);
+    expect(edge).not.toBeNull();
+  });
+
+  it("edges are never created toward archived documents", async () => {
+    // Entity shared ONLY with an archived doc, and specific enough that the
+    // pre-fix code (which admitted archived candidates) would have linked it.
+    const pool = seedActivePool(70);
+    const enrichedDoc = pool[1]!;
+    const [archOnly] = seedDocuments(store, [
+      { path: "arch-only.md", title: "Arch Only", body: "sole other mention" },
+    ]);
+    archiveDoc(archOnly!);
+
+    const entityId = upsertEntity(store.db, "ZanzibarProtocol", "project", "default");
+    recordEntityMention(store.db, entityId, archOnly!, "ZanzibarProtocol");
+
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValue({ text: ENTITY_JSON, model: "mock", done: true });
+    await enrichDocumentEntities(store.db as any, llm as any, enrichedDoc);
+
+    const edge = store.db.prepare(
+      `SELECT 1 FROM memory_relations WHERE source_id = ? AND target_id = ?`
+    ).get(enrichedDoc, archOnly!);
+    expect(edge ?? null).toBeNull();
+  });
+});
+
+// =============================================================================
 // §1.5 v0.8.3 — Content-type-aware entity cap
 // =============================================================================
 //

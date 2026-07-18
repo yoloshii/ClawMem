@@ -29,6 +29,10 @@ clawmem mine <dir> --embed                     # Import + embed in one pass
 clawmem mine <dir> --dry-run                   # Preview without importing
 clawmem mine <dir> --synthesize                # v0.7.2: import + post-import LLM fact extraction
 clawmem mine <dir> --synthesize --synthesis-max-docs 50   # Cap synthesis to first 50 conversations (default 20)
+clawmem mine <dir> -c convos --backfill-dates  # v0.27.0: derive authored_at for ALREADY-mined docs from
+                                               # source transcripts — dry-run report by default
+clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill (metadata-only: modified_at,
+                                               # stored confidence, and embeddings are never touched)
 clawmem reindex                                # Force re-scan all collections
 clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
@@ -47,6 +51,12 @@ clawmem embed --force --recalibrate-canary    # v0.21.0: replace the stored cana
 - **Plain text** — files with `User:`/`Assistant:` markers
 
 Each user+assistant exchange pair becomes one indexed document with `content_type: conversation`. Files are chunked, written to a temporary staging directory, indexed through the standard pipeline (including A-MEM enrichment), then staging is cleaned up.
+
+#### Authorship time (v0.27.0)
+
+Mining preserves **when the content was originally written**: message timestamps are extracted per format (strict RFC3339 for Claude Code / codex / Claude.ai; epoch seconds for ChatGPT / Slack; plain text has none), each exchange chunk is stamped `authored_at` = the max timestamp within that exchange, and synthesized facts inherit their source doc's date. `created_at`/`modified_at` remain filing/update time. Ranking recency, temporal filters ("from March"), and recency windows (postcompact, session bootstrap, `reflect`, profile) all run on **effective time** — `authored_at` when known, `modified_at` otherwise — so a 2025 conversation mined today no longer ranks as if written today. Any vault file may also declare `authored_at:` in frontmatter (full timestamp or date-only `YYYY-MM-DD`, quoted or not).
+
+For vaults mined before v0.27.0, `--backfill-dates` re-derives dates from the source transcripts and applies a **metadata-only** update (dry-run report by default; `--apply` executes; documents whose content no longer matches the source are skipped, never guessed).
 
 #### `--synthesize` (v0.7.2)
 

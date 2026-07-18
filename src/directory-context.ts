@@ -135,7 +135,8 @@ export function generateDirectoryBlock(
     lines.push("## Decisions");
     lines.push("");
     for (const d of decisions.slice(0, MAX_DECISIONS_PER_DIR)) {
-      lines.push(`- **${d.title}** (${d.modifiedAt.slice(0, 10)})`);
+      // §51.1 D13: displayed dates use effective time (authorship when known)
+      lines.push(`- **${d.title}** (${d.effectiveAt.slice(0, 10)})`);
     }
     lines.push("");
   }
@@ -158,16 +159,20 @@ export function generateDirectoryBlock(
 // Data Retrieval
 // =============================================================================
 
-function getDecisionsForDirectory(store: Store, dirPath: string): DocumentRow[] {
+// Exported as a narrow test seam: the effective-time cutoff below is a §51.1
+// acceptance requirement and full directory-context orchestration is excessive
+// to pin it.
+export function getDecisionsForDirectory(store: Store, dirPath: string): DocumentRow[] {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - DECISION_LOOKBACK_DAYS);
   const cutoffStr = cutoff.toISOString();
 
-  const allDecisions = store.getDocumentsByType("decision", 50);
+  // §51.1 D13: content-currency caller — cutoff on effectiveAt
+  const allDecisions = store.getDocumentsByType("decision", 50, { orderBy: "effective" });
   const results: DocumentRow[] = [];
 
   for (const d of allDecisions) {
-    if (d.modifiedAt < cutoffStr) continue;
+    if (d.effectiveAt < cutoffStr) continue;
 
     // Check if any files_modified in this decision are in the target directory
     // files_modified is stored as JSON array in the observation columns

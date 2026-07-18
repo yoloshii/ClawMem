@@ -4,6 +4,34 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.27.0 — authorship time: memories rank by when they were written
+
+Fixes a confirmed recency-contamination defect: ClawMem had exactly one time axis per document (filing/update time), so a 2025 conversation mined today ranked — and filtered, and injected — as if written today. Worst under recency intent, where recency carries 70% of the composite weight. Documents now carry a second, nullable axis: `authored_at`, when the content was originally written.
+
+### Authorship capture end-to-end (`src/normalize.ts`, `src/clawmem.ts`, `src/indexer.ts`, `src/store.ts`)
+
+- **Mining extracts message timestamps** from all supported formats through strict per-format adapters — RFC3339-with-explicit-offset for Claude Code / codex / Claude.ai (timezone-less values are rejected, never host-interpreted; impossible dates are rejected, not normalized), epoch-seconds for ChatGPT / Slack with range guards. Each exchange chunk is stamped with the max timestamp *within that exchange only* — never a transcript-level fallback (privacy exports flatten multiple conversations into one stream, so a transcript max would cross conversation boundaries).
+- **Synthesized facts inherit** their source conversation's authorship; the shared `saveMemory` API advances `authored_at` monotonically (a newer repeated assertion moves it forward; reprocessing older evidence never regresses it; NULL-safe).
+- **Any vault file can declare `authored_at:` in frontmatter** — full timestamp or date-only `YYYY-MM-DD` (UTC midnight), quoted or unquoted. Frontmatter is authoritative: removing the line clears the stored date on the next content change.
+- **Re-mining an existing vault dates documents without churn**: a body-identical re-index whose only change is `authored_at` takes a metadata-only "dated" transition — `modified_at` preserved, stored confidence untouched, no re-enrichment queued.
+- **`clawmem mine <dir> -c <collection> --backfill-dates [--apply]`**: recoverable-only backfill for already-mined vaults. Dry-run report by default; the apply phase is transactional and re-asserts the validated content hash on every row, so a concurrent change can never receive a mismatched date; documents whose content no longer matches the source are skipped, never guessed.
+- **Colliding transcript names no longer overwrite each other**: sources that sanitize to the same staging name (`a/b.jsonl` vs `a_b.jsonl`) previously clobbered each other silently; they now mine under distinct hash-suffixed identities, decided once per source and stable across re-runs (non-colliding sources keep their existing names — zero path churn).
+
+### Effective time in ranking and retrieval (`src/memory.ts`, `src/mcp.ts`, callers)
+
+- **Composite recency ages documents by `authored_at ?? modified_at`**, and the confidence signal's internal recency uses the same effective date (the access-pattern sentinel stays on filing time). Documents without authorship behave exactly as before.
+- **Temporal filters and the temporal-proximity channel** ("what did we plan in March") select, order, and score by effective time on both the FTS and vector legs.
+- **Recent-content windows** — postcompact recent decisions/antipatterns, session-bootstrap current focus, `clawmem reflect`, directory context, profile — apply their cutoffs and display their dates on effective time, so a freshly-mined historical decision no longer masquerades as this week's work. Operational clocks (the dedup window, lifecycle sweeps, staleness review, session log) intentionally keep filing/update time.
+- **Result metadata**: compact search results now carry `authored_at` (null = unknown).
+
+### Entity-edge IDF population fix (`src/entity.ts`)
+
+Completes the v0.25.0 hub-bias fix: the enrichment/edge-creation path computed IDF with an active-only numerator over an all-documents denominator, letting archived history deflate specificity (below zero in the extreme) and suppress edges for entities that are specific among the live corpus — and could create edges toward archived documents. Both populations are now active-only and archived candidates are excluded, matching the neighbor path. Bug-first tests demonstrate the pre-fix failure.
+
+### Quality gates
+
+Full suite 1,681/0 (62 new tests, including direct caller-level pins for every recency window and a live CLI backfill lane). The authorship design was adversarially design-reviewed before any code (6 turns, 29 findings absorbed — including the two-axes consumer classification, the confidence-lane uniformity rule, and set-independent mine identity), then the implementation was reviewed to verbatim "Zero remaining findings — ship as is." in 3 turns (7 findings, among them a year-0000–0099 date-construction bug and a backfill validation race); the entity fix cleared in 1 turn. Cross-model adversarial passes (codex / GPT-5.6) throughout.
+
 ## v0.26.0 — offline eval harness (evidence-overlap replay) + short memory-query gate fix
 
 Retrieval quality becomes measurable: a gold-labeled replay harness scores the real `query` pipeline against hand-labeled evidence, ending the era of ranking/extraction changes shipping un-measured. Plus a gate-ordering bug fix that was dropping short explicit memory questions.

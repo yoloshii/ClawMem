@@ -19,7 +19,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Surfaces relevant context** on every prompt (context-surfacing hook)
 - **Bootstraps sessions** with your profile, latest handoff, recent decisions, and stale notes
 - **Captures decisions, preferences, milestones, and problems** from session transcripts using a local GGUF observer model
-- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`, with optional post-import LLM fact extraction (`--synthesize`) that pulls structured decisions / preferences / milestones / problems and cross-fact links out of otherwise full-text conversation dumps (v0.7.2)
+- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`, with optional post-import LLM fact extraction (`--synthesize`) that pulls structured decisions / preferences / milestones / problems and cross-fact links out of otherwise full-text conversation dumps (v0.7.2). Imports preserve **authorship time** (v0.27.0): ranking recency and temporal queries run on when content was actually written, so historical conversations mined today don't rank as fresh — with a metadata-only `--backfill-dates` lane for vaults mined earlier
 - **Generates handoffs** at session end so the next session can pick up where you left off
 - **Learns what matters** via a feedback loop that boosts referenced notes and decays unused ones
 - **Guards against prompt injection** in surfaced content
@@ -493,7 +493,8 @@ clawmem collection list                         List collections
 clawmem collection remove <name>                Remove a collection
 
 clawmem update [--pull] [--embed]               Incremental re-scan
-clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (--synthesize runs post-import LLM fact extraction, v0.7.2)
+clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (--synthesize runs post-import LLM fact extraction, v0.7.2; preserves per-exchange authored_at, v0.27.0)
+clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs (metadata-only; dry-run without --apply)
 clawmem embed [-f]                              Generate fragment embeddings
 clawmem reindex [--force]                       Full re-index
 clawmem watch                                   File watcher daemon

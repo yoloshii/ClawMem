@@ -95,10 +95,11 @@ export async function postcompactInject(
     try {
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - 7);
-      const recentDocs = store.getDocumentsByType("decision", 5);
+      // §51.1 D13: content-currency caller — order, cutoff, and display on effectiveAt
+      const recentDocs = store.getDocumentsByType("decision", 5, { orderBy: "effective" });
 
       const recentDecisions = recentDocs.filter(
-        (d) => d.modifiedAt && d.modifiedAt >= cutoff.toISOString()
+        (d) => d.effectiveAt && d.effectiveAt >= cutoff.toISOString()
       );
 
       if (recentDecisions.length > 0) {
@@ -106,7 +107,7 @@ export async function postcompactInject(
 
         let budgetLeft = DECISIONS_BUDGET;
         for (const doc of recentDecisions) {
-          const line = `- **${doc.title}** (${doc.modifiedAt?.slice(0, 10)})`;
+          const line = `- **${doc.title}** (${doc.effectiveAt?.slice(0, 10)})`;
           const lineTokens = estimateTokens(line);
           if (budgetLeft - lineTokens < 0) break;
           decisionLines.push(line);
@@ -128,16 +129,16 @@ export async function postcompactInject(
     try {
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - 7);
-      const recentAnti = store.getDocumentsByType("antipattern", 3);
+      const recentAnti = store.getDocumentsByType("antipattern", 3, { orderBy: "effective" });
       const filteredAnti = recentAnti.filter(
-        (d) => d.modifiedAt && d.modifiedAt >= cutoff.toISOString()
+        (d) => d.effectiveAt && d.effectiveAt >= cutoff.toISOString()
       );
 
       if (filteredAnti.length > 0) {
         const antiLines: string[] = ["## Recent Antipatterns (avoid these)", ""];
         let budgetLeft = 150; // small budget for antipatterns
         for (const doc of filteredAnti) {
-          const line = `- **Avoid:** ${doc.title} (${doc.modifiedAt?.slice(0, 10)})`;
+          const line = `- **Avoid:** ${doc.title} (${doc.effectiveAt?.slice(0, 10)})`;
           const lineTokens = estimateTokens(line);
           if (budgetLeft - lineTokens < 0) break;
           antiLines.push(line);

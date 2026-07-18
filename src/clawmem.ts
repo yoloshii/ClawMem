@@ -5,7 +5,7 @@
 
 import { parseArgs } from "util";
 import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
-import { resolve as pathResolve, basename } from "path";
+import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
@@ -57,7 +57,9 @@ import {
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
 import { GoldFileError } from "./eval/gold.ts";
-import { indexCollection, parseDocument } from "./indexer.ts";
+import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
+import type { Store as StoreType } from "./store.ts";
+import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
@@ -272,6 +274,97 @@ async function cmdUpdate(args: string[]) {
   }
 }
 
+// =============================================================================
+// §51.1 D10 — mine/backfill shared identity derivation
+// =============================================================================
+
+/**
+ * One staging-content formatter for mine writes AND the backfill body-hash
+ * guard — a second formatter would drift and break the guard.
+ */
+function buildMineStagingContent(chunk: ConversationChunk): string {
+  const esc = (s: string) => s.replace(/"/g, '\\"');
+  return [
+    "---",
+    `title: "${esc(chunk.title)}"`,
+    `content_type: conversation`,
+    `source: "${esc(chunk.sourcePath)}"`,
+    ...(chunk.authoredAt ? [`authored_at: "${chunk.authoredAt}"`] : []),
+    "---",
+    "",
+    chunk.body,
+  ].join("\n");
+}
+
+/**
+ * Has this source ever produced suffixed chunks in the collection?
+ * Prepared prefix-range existence query over UNIQUE(collection, path) — NOT a
+ * raw LIKE (its % and _ wildcards would misread path characters). The probe
+ * prefix ends in "_" (0x5F); replacing that final character with backtick
+ * (0x60, its successor code point) gives exact bounds under SQLite binary text
+ * ordering. Active AND inactive rows both count: once suffixed, always suffixed.
+ */
+function suffixedPathExists(store: StoreType, collectionName: string, suffixedBase: string): boolean {
+  const lower = `${suffixedBase}_`;
+  const upper = `${suffixedBase}\``;
+  const row = store.db.prepare(
+    `SELECT 1 FROM documents WHERE collection = ? AND path >= ? AND path < ? LIMIT 1`
+  ).get(collectionName, lower, upper);
+  return row !== null && row !== undefined;
+}
+
+/**
+ * Decide each source's staging-name base ONCE per source, before any chunk name
+ * is derived. A source uses the suffixed scheme `<base>-h<8-hex sha256(relPosixPath)>`
+ * when (a) it collides with another source in the current batch after
+ * sanitization, or (b) any of its suffixed chunk paths already exist in the
+ * target collection — so group-membership changes (a collision partner removed,
+ * a transcript growing new chunks) can never flip an already-suffixed source
+ * back to the legacy namespace. Also fixes the pre-existing silent overwrite:
+ * two sources sanitizing to one staging name used to clobber each other's
+ * chunks via concurrent Bun.write.
+ */
+function deriveMineIdentity(
+  sourceRelPaths: string[],
+  store: StoreType,
+  collectionName: string
+): Map<string, { base: string; suffixed: boolean }> {
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const sanitize = (p: string) => p.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
+
+  const bySafe = new Map<string, string[]>();
+  for (const rel of [...new Set(sourceRelPaths)]) {
+    const safe = sanitize(norm(rel));
+    const list = bySafe.get(safe) ?? [];
+    list.push(rel);
+    bySafe.set(safe, list);
+  }
+
+  const out = new Map<string, { base: string; suffixed: boolean }>();
+  for (const [safe, rels] of bySafe) {
+    for (const rel of rels) {
+      const relPosix = norm(rel);
+      const hash8 = new Bun.CryptoHasher("sha256").update(relPosix).digest("hex").slice(0, 8);
+      const suffixedBase = `${safe}-h${hash8}`;
+      const suffixed = rels.length > 1 || suffixedPathExists(store, collectionName, suffixedBase);
+      out.set(rel, { base: suffixed ? suffixedBase : safe, suffixed });
+    }
+  }
+
+  // Final output-name uniqueness assertion: an 8-hex hash collision (or a file
+  // literally named like another source's suffixed base) is a hard error —
+  // never a silent overwrite.
+  const seen = new Map<string, string>();
+  for (const [rel, id] of out) {
+    const prior = seen.get(id.base);
+    if (prior !== undefined) {
+      die(`mine: staging name collision between "${prior}" and "${rel}" (base "${id.base}") — cannot derive unique identities`);
+    }
+    seen.set(id.base, rel);
+  }
+  return out;
+}
+
 async function cmdMine(args: string[]) {
   const { values, positionals } = parseArgs({
     args,
@@ -281,12 +374,14 @@ async function cmdMine(args: string[]) {
       "dry-run": { type: "boolean", default: false },
       synthesize: { type: "boolean", default: false },
       "synthesis-max-docs": { type: "string" },
+      "backfill-dates": { type: "boolean", default: false },
+      apply: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   const dir = positionals[0];
-  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N]");
+  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N] | --backfill-dates [--apply]");
   const absDir = pathResolve(dir);
   if (!existsSync(absDir)) die(`Directory not found: ${absDir}`);
 
@@ -300,7 +395,7 @@ async function cmdMine(args: string[]) {
   // Normalize and chunk
   let totalChunks = 0;
   let totalConversations = 0;
-  const allChunks: { title: string; body: string; sourcePath: string; chunkIndex: number }[] = [];
+  const allChunks: ConversationChunk[] = [];
 
   for (const file of files) {
     const conv = normalizeFile(file);
@@ -312,7 +407,9 @@ async function cmdMine(args: string[]) {
 
     console.log(`  ${c.green}✓${c.reset} ${conv.source} (${conv.format}, ${conv.messages.length} messages → ${chunks.length} chunks)`);
     for (const chunk of chunks) {
-      chunk.sourcePath = file.replace(absDir + "/", "");
+      // §51.1 D10: relative POSIX form — identity hashes must not depend on
+      // the machine's absolute path or separator style.
+      chunk.sourcePath = pathRelative(absDir, file).replace(/\\/g, "/");
     }
     allChunks.push(...chunks);
     totalChunks += chunks.length;
@@ -321,42 +418,47 @@ async function cmdMine(args: string[]) {
   if (totalConversations === 0) die("No conversation files could be parsed");
   console.log(`\n${c.bold}Parsed:${c.reset} ${totalConversations} conversations → ${totalChunks} exchange chunks`);
 
+  const collectionName = values.collection || "conversations";
+
+  // §51.1 D10 — exclusive backfill mode: derive authored_at for already-mined
+  // docs from their source transcripts. Metadata-only; dry-run by default.
+  if (values["backfill-dates"]) {
+    if (values.embed || values.synthesize || values["dry-run"] || values["synthesis-max-docs"]) {
+      die("--backfill-dates is an exclusive mode (dry-run by default; --apply executes) — it cannot combine with --embed, --synthesize, --dry-run, or --synthesis-max-docs");
+    }
+    runBackfillDates(allChunks, collectionName, values.apply as boolean);
+    return;
+  }
+  if (values.apply) die("--apply only applies to --backfill-dates");
+
   if (values["dry-run"]) {
     console.log(`${c.yellow}Dry run — no changes made${c.reset}`);
     return;
   }
 
   // Write chunks as markdown to a staging directory (outside source tree), then index
-  const collectionName = values.collection || "conversations";
   const { tmpdir } = await import("os");
   const stagingDir = pathResolve(tmpdir(), `clawmem-mine-${Date.now()}`);
   mkdirSync(stagingDir, { recursive: true });
 
   const { rmSync } = await import("fs");
+  const s = getStore();
+  // §51.1 D10: per-source identity decided before any chunk name is derived
+  const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
   try {
     const writePromises: Promise<number>[] = [];
     for (const chunk of allChunks) {
-      const safeSource = chunk.sourcePath.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
-      const filename = `${safeSource}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
-      const esc = (s: string) => s.replace(/"/g, '\\"');
-      const frontmatter = [
-        "---",
-        `title: "${esc(chunk.title)}"`,
-        `content_type: conversation`,
-        `source: "${esc(chunk.sourcePath)}"`,
-        "---",
-        "",
-        chunk.body,
-      ].join("\n");
-      writePromises.push(Bun.write(pathResolve(stagingDir, filename), frontmatter));
+      const id = identity.get(chunk.sourcePath)!;
+      const filename = `${id.base}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+      writePromises.push(Bun.write(pathResolve(stagingDir, filename), buildMineStagingContent(chunk)));
     }
     await Promise.all(writePromises);
 
     // Index through existing pipeline
-    const s = getStore();
     console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
     const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md");
-    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged`);
+    const datedNote = stats.dated > 0 ? `, ${c.cyan}◷${stats.dated}${c.reset} dated` : "";
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged${datedNote}`);
 
     // Ext 4 — post-import conversation synthesis (opt-in via --synthesize)
     // Runs AFTER indexCollection has committed. Failure is non-fatal and never
@@ -393,6 +495,77 @@ async function cmdMine(args: string[]) {
   } finally {
     rmSync(stagingDir, { recursive: true, force: true });
   }
+}
+
+/**
+ * §51.1 D10 — recoverable-only authored_at backfill.
+ *
+ * Matches already-mined documents to their re-derived chunks via the shared
+ * identity derivation, then applies a metadata-only UPDATE of authored_at.
+ * Guards (all mandatory): the naming rule's collision handling; body-hash
+ * equality (parser/chunker evolution can shift chunk indices while preserving
+ * filenames — a mismatched chunk is skipped, never guessed); exact
+ * collection+path match; idempotence. Never touches hash/content/modified_at/
+ * stored confidence/embeddings. Dry-run by default; one transaction on --apply.
+ */
+function runBackfillDates(allChunks: ConversationChunk[], collectionName: string, apply: boolean): void {
+  const s = getStore();
+  const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
+
+  const counts = { chunks: 0, noDate: 0, unmatched: 0, bodyMismatch: 0, unchanged: 0 };
+  const updates: { id: number; authoredAt: string; expectedHash: string; path: string }[] = [];
+
+  for (const chunk of allChunks) {
+    counts.chunks++;
+    if (!chunk.authoredAt) { counts.noDate++; continue; }
+    const id = identity.get(chunk.sourcePath)!;
+    const path = `${id.base}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+    const row = s.db.prepare(
+      `SELECT id, hash, authored_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
+    ).get(collectionName, path) as { id: number; hash: string; authored_at: string | null } | null;
+    if (!row) { counts.unmatched++; continue; }
+
+    // Body-hash equality guard — rebuild the staging content and parse it
+    // through the SAME pipeline the indexer used, so the comparison cannot
+    // drift from what was actually hashed at mine time.
+    const { body } = parseDocument(buildMineStagingContent(chunk), path);
+    const expectedHash = hashContent(body);
+    if (expectedHash !== row.hash) { counts.bodyMismatch++; continue; }
+
+    if (row.authored_at === chunk.authoredAt) { counts.unchanged++; continue; }
+    updates.push({ id: row.id, authoredAt: chunk.authoredAt, expectedHash, path });
+  }
+
+  console.log(`\n${c.bold}Backfill dates${c.reset} (collection '${collectionName}'${apply ? "" : ", DRY RUN"}):`);
+  console.log(`  ${counts.chunks} chunks scanned — ${c.green}${updates.length}${c.reset} to update, ${c.dim}${counts.unchanged} already set, ${counts.noDate} without source timestamps${c.reset}, ${c.yellow}${counts.unmatched} unmatched${c.reset}, ${c.red}${counts.bodyMismatch} body-mismatch skipped${c.reset}`);
+
+  if (!apply) {
+    if (updates.length > 0) console.log(`  Run again with ${c.cyan}--apply${c.reset} to write.`);
+    return;
+  }
+  if (updates.length === 0) { console.log("  Nothing to write."); return; }
+
+  // Guarded, transactional apply: the UPDATE re-asserts the validated hash and
+  // active state so a concurrent mine/index between validation and write can
+  // never attach a source timestamp to content that did not pass the guard.
+  // BEGIN IMMEDIATE takes the write lock up front.
+  let applied = 0;
+  s.db.exec("BEGIN IMMEDIATE");
+  try {
+    const stmt = s.db.prepare(
+      `UPDATE documents SET authored_at = ? WHERE id = ? AND hash = ? AND active = 1`
+    );
+    for (const u of updates) {
+      applied += stmt.run(u.authoredAt, u.id, u.expectedHash).changes;
+    }
+    s.db.exec("COMMIT");
+  } catch (err) {
+    s.db.exec("ROLLBACK");
+    throw err;
+  }
+  const raced = updates.length - applied;
+  console.log(`  ${c.green}✓${c.reset} ${applied} document(s) dated (metadata-only — modified_at/embeddings untouched)`);
+  if (raced > 0) console.log(`  ${c.yellow}⚠${c.reset} ${raced} document(s) changed concurrently and were skipped — re-run to reconcile`);
 }
 
 // SQLITE_BUSY retry helper lives in busy-retry.ts (testable — importing THIS module runs
@@ -3165,8 +3338,9 @@ async function cmdReflect(args: string[]) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
 
-  const recentDocs = store.getDocumentsByType("decision", 50)
-    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+  // §51.1 D13: reflection is about when content was authored, not when it was filed
+  const recentDocs = store.getDocumentsByType("decision", 50, { orderBy: "effective" })
+    .filter(d => d.effectiveAt && d.effectiveAt >= cutoff.toISOString());
 
   if (recentDocs.length === 0) {
     console.log(`No decisions found in the last ${days} days.`);
@@ -3220,13 +3394,13 @@ async function cmdReflect(args: string[]) {
   }
 
   // Also report antipatterns
-  const antiDocs = store.getDocumentsByType("antipattern", 10)
-    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+  const antiDocs = store.getDocumentsByType("antipattern", 10, { orderBy: "effective" })
+    .filter(d => d.effectiveAt && d.effectiveAt >= cutoff.toISOString());
 
   if (antiDocs.length > 0) {
     console.log(`\n${c.bold}Recent Antipatterns (${antiDocs.length}):${c.reset}`);
     for (const d of antiDocs) {
-      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.modifiedAt?.slice(0, 10)})`);
+      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.effectiveAt?.slice(0, 10)})`);
     }
   }
 
@@ -3613,7 +3787,8 @@ ${c.bold}Setup:${c.reset}
 
 ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
-  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction
+  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction; preserves per-exchange authored_at
+  clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs from source transcripts (metadata-only; dry-run without --apply)
   clawmem embed [-f]                   Generate fragment embeddings
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon

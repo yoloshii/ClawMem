@@ -33,7 +33,7 @@ Raw relevance from the search backend — BM25, vector cosine similarity, or RRF
 
 ### Recency score (0.0 - 1.0)
 
-Exponential decay based on document age and content type half-life:
+Exponential decay based on document age and content type half-life. **Age is measured on effective time (v0.27.0): `authored_at` — when the content was originally written — when known, `modified_at` otherwise.** Mined conversations and synthesized facts carry `authored_at` from their source transcripts, and any vault file can declare it in frontmatter, so historical content ranks by its true age instead of its filing date. The confidence signal's internal recency uses the same effective date; all operational clocks (the dedup window, lifecycle sweeps, the attention-decay access sentinel) stay on filing/update time.
 
 | Content type | Half-life | Behavior |
 |-------------|-----------|----------|

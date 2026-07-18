@@ -12,6 +12,7 @@ import { createHash } from "crypto";
 import type { Store } from "./store.ts";
 import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
+import { normalizeIsoTimestamp } from "./normalize.ts";
 
 // =============================================================================
 // Types
@@ -24,6 +25,37 @@ export interface DocumentMeta {
   workstream?: string;
   content_type?: ContentType;
   review_by?: string;
+  /** §51.1: authorship time (UTC ISO) from frontmatter; null = declared-but-invalid or absent → clears/leaves per branch */
+  authored_at?: string | null;
+}
+
+// =============================================================================
+// Authored-at Frontmatter Adapter (§51.1 D5)
+// =============================================================================
+
+// Strict date-only form, normalized to UTC midnight. Acceptance must not depend
+// on YAML quoting: quoted "2025-03-01" (string) and unquoted 2025-03-01
+// (gray-matter coerces to Date) are equivalent.
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Frontmatter-specific adapter, distinct from the transcript rule: gray-matter
+ * has already discarded the lexical form, so Date instances are validated as
+ * finite Dates rather than re-parsed as RFC3339 strings. Returns UTC ISO or
+ * null (invalid/absent). Date-only precision is legitimate for hand-dated
+ * notes — sub-day uncertainty is insignificant against ClawMem's half-lives.
+ */
+export function authoredAtFromFrontmatter(value: unknown): string | null {
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const dateOnly = DATE_ONLY_RE.exec(trimmed);
+  if (dateOnly) {
+    return normalizeIsoTimestamp(`${trimmed}T00:00:00Z`);
+  }
+  return normalizeIsoTimestamp(trimmed);
 }
 
 export interface IndexStats {
@@ -31,6 +63,8 @@ export interface IndexStats {
   updated: number;
   unchanged: number;
   removed: number;
+  /** §51.1: dated-only metadata transitions (authored_at set without touching modified_at / A-MEM) */
+  dated: number;
 }
 
 // =============================================================================
@@ -102,10 +136,15 @@ export function parseDocument(content: string, relativePath: string): { body: st
         workstream: str(data.workstream),
         content_type: (str(data.content_type) as ContentType) || inferContentType(relativePath),
         review_by: str(data.review_by),
+        // §51.1: string | null — null means "not validly declared", which CLEARS
+        // on the changed-content path (frontmatter is authoritative there).
+        authored_at: authoredAtFromFrontmatter(data.authored_at),
       },
     };
   } catch {
-    // If frontmatter parsing fails, treat entire content as body
+    // If frontmatter parsing fails, treat entire content as body.
+    // authored_at stays undefined (= leave any stored value untouched):
+    // a parse failure is not a declared absence.
     return {
       body: content,
       meta: {
@@ -173,7 +212,7 @@ export async function indexCollection(
   pattern: string = "**/*.md",
   options?: { forceEnrich?: boolean }
 ): Promise<IndexStats> {
-  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
+  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
   const activePaths = new Set<string>();
 
   // Get LLM instance for A-MEM enrichment
@@ -223,11 +262,25 @@ export async function indexCollection(
       if (existing) {
         // Check if content changed via content hash
         const existingRow = store.db.prepare(
-          "SELECT content_hash FROM documents WHERE id = ?"
-        ).get(existing.id) as { content_hash: string | null } | null;
+          "SELECT content_hash, authored_at FROM documents WHERE id = ?"
+        ).get(existing.id) as { content_hash: string | null; authored_at: string | null } | null;
 
         if (existingRow?.content_hash === contentHash) {
           stats.unchanged++;
+          // §51.1 D5: unchanged-row adoption — a NULL row whose frontmatter
+          // already declares authored_at adopts it metadata-only (no modified_at
+          // bump, no A-MEM). The frontmatter-block substring pre-check gates the
+          // full parse so undated vaults pay near-zero.
+          if (existingRow.authored_at === null && content.startsWith("---")) {
+            const fmEnd = content.indexOf("\n---", 3);
+            if (fmEnd !== -1 && content.slice(0, fmEnd).includes("authored_at")) {
+              const { meta: adoptMeta } = parseDocument(content, relativePath);
+              if (typeof adoptMeta.authored_at === "string") {
+                store.updateDocumentMeta(existing.id, { authored_at: adoptMeta.authored_at });
+                stats.dated++;
+              }
+            }
+          }
           if (options?.forceEnrich) {
             // --enrich: queue unchanged docs for full enrichment (entity extraction, links)
             enrichQueue.push({ docId: existing.id, isNew: true });
@@ -235,16 +288,45 @@ export async function indexCollection(
           continue;
         }
 
-        // Content changed — update
+        // Content changed — parse, then check for the §51.1 dated-only
+        // transition first: body and every persisted metadata field unchanged
+        // with only authored_at differing → update authored_at + content_hash
+        // only. modified_at is preserved, stored confidence stays untouched,
+        // and no A-MEM enrichment is queued — re-mining an existing vault dates
+        // documents without operational side-effects.
         const { body, meta } = parseDocument(content, relativePath);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
+        const contentType = meta.content_type || inferContentType(relativePath);
+
+        const prev = store.db.prepare(
+          "SELECT hash, title, domain, workstream, tags, content_type, review_by, authored_at FROM documents WHERE id = ?"
+        ).get(existing.id) as { hash: string; title: string; domain: string | null; workstream: string | null; tags: string | null; content_type: string; review_by: string | null; authored_at: string | null } | null;
+
+        // "Unchanged" per field mirrors what the normal path would write: fields
+        // the normal path leaves untouched (undefined) count as unchanged.
+        const datedOnly = prev !== null
+          && meta.authored_at !== undefined
+          && (meta.authored_at ?? null) !== prev.authored_at
+          && docHash === prev.hash
+          && title === prev.title
+          && (meta.domain === undefined || meta.domain === (prev.domain ?? undefined))
+          && (meta.workstream === undefined || meta.workstream === (prev.workstream ?? undefined))
+          && (meta.tags === undefined || JSON.stringify(meta.tags) === prev.tags)
+          && contentType === prev.content_type
+          && (meta.review_by === undefined || meta.review_by === (prev.review_by ?? undefined));
+
+        if (datedOnly) {
+          store.updateDocumentMeta(existing.id, { authored_at: meta.authored_at });
+          store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, existing.id);
+          stats.dated++;
+          continue;
+        }
 
         store.insertContent(docHash, body, now);
         store.updateDocument(existing.id, title, docHash, mtime.toISOString());
 
         // Update SAME metadata
-        const contentType = meta.content_type || inferContentType(relativePath);
         store.updateDocumentMeta(existing.id, {
           domain: meta.domain,
           workstream: meta.workstream,
@@ -253,6 +335,9 @@ export async function indexCollection(
           review_by: meta.review_by,
           confidence: confidenceScore(contentType, mtime, 0),
           quality_score: computeQualityScore(body, meta),
+          // §51.1: authoritative on the changed path — string sets, null clears,
+          // undefined (frontmatter parse failure) leaves the stored value.
+          authored_at: meta.authored_at,
         });
 
         // Update content_hash for next incremental check
@@ -287,6 +372,7 @@ export async function indexCollection(
             review_by: meta.review_by,
             confidence: confidenceScore(contentType, mtime, 0),
             quality_score: computeQualityScore(body, meta),
+            authored_at: meta.authored_at,
           });
           enrichQueue.push({ docId: inactive.id, isNew: false });
         } else {
@@ -302,6 +388,7 @@ export async function indexCollection(
               review_by: meta.review_by,
               confidence: confidenceScore(contentType, mtime, 0),
               quality_score: computeQualityScore(body, meta),
+              authored_at: meta.authored_at,
             });
             store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, newDoc.id);
             enrichQueue.push({ docId: newDoc.id, isNew: true });
