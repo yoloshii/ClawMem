@@ -19,7 +19,11 @@ export const HALF_LIVES: Record<string, number> = {
   research: 90,
   project: 120,
   preference: Infinity,
-  decision: Infinity,
+  // §36.11: long-finite so silently-abandoned decisions stop winning ranking
+  // (supersession only fires on an explicit contradictory write). Ranking
+  // durability only — no deletion/archival; access-freq extension still
+  // stretches frequently-resurfaced decisions toward 3×.
+  decision: 180,
   deductive: Infinity,
   hub: Infinity,
   antipattern: Infinity,

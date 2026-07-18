@@ -7,6 +7,7 @@
 
 import type { Database } from "bun:sqlite";
 import type { LlamaCpp } from "./llm.ts";
+import { withRetryAndFeedback } from "./llm-retry.ts";
 import type { Store } from "./store.ts";
 import { enrichDocumentEntities } from "./entity.ts";
 
@@ -520,22 +521,27 @@ Return ONLY valid JSON in this exact format:
   "context": "Brief summary of the document."
 }`;
 
-    const result = await llm.generate(prompt, {
-      temperature: 0.3,
+    const parsed = await withRetryAndFeedback({
+      initialPrompt: prompt,
+      llm,
       maxTokens: 300,
+      temperature: 0.3,
+      label: `amem.constructMemoryNote(doc ${docId})`,
+      parse: (text) => {
+        const note = parseMemoryNoteFromLLM(text);
+        if (!note) {
+          return {
+            ok: false,
+            error:
+              "Response was not the expected JSON object with keywords/tags/context. Return ONLY that JSON object.",
+          };
+        }
+        return { ok: true, value: note };
+      },
     });
 
-    if (!result) {
-      console.log(`[amem] LLM returned null for docId ${docId}`);
-      return EMPTY_NOTE;
-    }
-
-    const parsed = parseMemoryNoteFromLLM(result.text);
-
     if (!parsed) {
-      console.log(`[amem] RAW memory note output for docId ${docId}:`);
-      console.log(result.text);
-      console.log(`[amem] Invalid/unparseable JSON for docId ${docId}`);
+      console.log(`[amem] Invalid/unparseable JSON for docId ${docId} after retries`);
       return EMPTY_NOTE;
     }
 
@@ -724,22 +730,27 @@ Return ONLY valid JSON array in this exact format:
 
 Include all ${neighbors.length} neighbors in your response.`;
 
-    const result = await llm.generate(prompt, {
-      temperature: 0.3,
+    const parsed = await withRetryAndFeedback({
+      initialPrompt: prompt,
+      llm,
       maxTokens: 500,
+      temperature: 0.3,
+      label: `amem.generateMemoryLinks(doc ${docId})`,
+      parse: (text) => {
+        const linkGen = parseLinkGenerationFromLLM(text);
+        if (!linkGen) {
+          return {
+            ok: false,
+            error:
+              "Response was not the expected JSON array of link objects (target_idx, link_type, confidence, reasoning). Return ONLY that JSON array.",
+          };
+        }
+        return { ok: true, value: linkGen };
+      },
     });
 
-    if (!result) {
-      console.log(`[amem] LLM returned null for link generation docId ${docId}`);
-      return 0;
-    }
-
-    const parsed = parseLinkGenerationFromLLM(result.text);
-
     if (!parsed) {
-      console.log(`[amem] RAW link generation output for docId ${docId}:`);
-      console.log(result.text);
-      console.log(`[amem] Invalid/unparseable JSON for link generation docId ${docId}`);
+      console.log(`[amem] Invalid/unparseable JSON for link generation docId ${docId} after retries`);
       return 0;
     }
 
@@ -906,20 +917,41 @@ If no evolution is needed:
   "reasoning": "No significant new information."
 }`;
 
-    const result = await llm.generate(prompt, {
-      temperature: 0.4,
+    const evolution = await withRetryAndFeedback<MemoryEvolution>({
+      initialPrompt: prompt,
+      llm,
       maxTokens: 400,
+      temperature: 0.4,
+      label: `amem.evolveMemories(memory ${memoryId})`,
+      parse: (text) => {
+        const value = extractJsonFromLLM(text) as MemoryEvolution | null;
+        if (!value || typeof value.should_evolve !== "boolean") {
+          return {
+            ok: false,
+            error:
+              'Response was not the expected JSON object with a boolean "should_evolve" field. Return ONLY that JSON object.',
+          };
+        }
+        // Structural validation of the evolution payload lives INSIDE the
+        // parse closure so a malformed should_evolve=true response triggers a
+        // corrective retry instead of a silent post-loop rejection.
+        if (value.should_evolve &&
+            (!Array.isArray(value.new_keywords) ||
+             !Array.isArray(value.new_tags) ||
+             typeof value.new_context !== "string" ||
+             typeof value.reasoning !== "string")) {
+          return {
+            ok: false,
+            error:
+              'When "should_evolve" is true, the object must include "new_keywords" (array), "new_tags" (array), "new_context" (string), and "reasoning" (string). Return ONLY the corrected JSON object.',
+          };
+        }
+        return { ok: true, value };
+      },
     });
 
-    if (!result) {
-      console.log(`[amem] LLM returned null for evolution of memory ${memoryId}`);
-      return false;
-    }
-
-    const evolution = extractJsonFromLLM(result.text) as MemoryEvolution | null;
-
-    if (!evolution || typeof evolution.should_evolve !== 'boolean') {
-      console.log(`[amem] Invalid evolution JSON for memory ${memoryId}`);
+    if (!evolution) {
+      console.log(`[amem] Invalid evolution JSON for memory ${memoryId} after retries`);
       return false;
     }
 
@@ -928,14 +960,7 @@ If no evolution is needed:
       return false;
     }
 
-    // Validate evolution data
-    if (!Array.isArray(evolution.new_keywords) ||
-        !Array.isArray(evolution.new_tags) ||
-        typeof evolution.new_context !== 'string' ||
-        typeof evolution.reasoning !== 'string') {
-      console.log(`[amem] Invalid evolution data for memory ${memoryId}`);
-      return false;
-    }
+    // Payload structure already validated inside the parse closure (§13.1).
 
     // Get current version number
     const versionRow = store.db.prepare(`
@@ -1171,20 +1196,44 @@ Return ONLY valid JSON array in this exact format:
 
 Only include relationships with confidence >= 0.6. Return empty array [] if no causal relationships found.`;
 
-    const result = await llm.generate(prompt, {
-      temperature: 0.3,
+    const links = await withRetryAndFeedback<CausalLink[]>({
+      initialPrompt: prompt,
+      llm,
       maxTokens: 600,
+      temperature: 0.3,
+      label: "amem.inferCausalLinks",
+      parse: (text) => {
+        const value = extractJsonFromLLM(text) as CausalLink[] | null;
+        if (!Array.isArray(value)) {
+          return {
+            ok: false,
+            error:
+              "Response was not the expected JSON array of causal-link objects. Return ONLY that JSON array (or [] if none).",
+          };
+        }
+        // Structural validation of every entry lives INSIDE the parse closure
+        // so a malformed entry triggers a corrective retry instead of being
+        // silently dropped. Semantic filtering (confidence threshold, index
+        // ranges, self-links) stays outside — retrying would not fix those.
+        for (const link of value) {
+          if (!link || typeof link !== "object" ||
+              !Number.isInteger(link.source_fact_idx) ||
+              !Number.isInteger(link.target_fact_idx) ||
+              typeof link.confidence !== "number" ||
+              typeof link.reasoning !== "string") {
+            return {
+              ok: false,
+              error:
+                'Every array entry must be an object with integer "source_fact_idx" and "target_fact_idx", numeric "confidence", and string "reasoning" fields. Return ONLY the corrected JSON array.',
+            };
+          }
+        }
+        return { ok: true, value };
+      },
     });
 
-    if (!result) {
-      console.log(`[amem] LLM returned null for causal inference`);
-      return 0;
-    }
-
-    const links = extractJsonFromLLM(result.text) as CausalLink[] | null;
-
-    if (!Array.isArray(links)) {
-      console.log(`[amem] Invalid JSON for causal inference (not an array)`);
+    if (links === null) {
+      console.log(`[amem] Invalid JSON for causal inference after retries`);
       return 0;
     }
 
@@ -1198,14 +1247,8 @@ Only include relationships with confidence >= 0.6. Return empty array [] if no c
     `);
 
     for (const link of links) {
-      // Validate link structure
-      if (typeof link.source_fact_idx !== 'number' ||
-          typeof link.target_fact_idx !== 'number' ||
-          typeof link.confidence !== 'number' ||
-          typeof link.reasoning !== 'string') {
-        console.log(`[amem] Invalid causal link structure, skipping`);
-        continue;
-      }
+      // Structure already validated inside the parse closure (§13.1);
+      // semantic filters below are not retry-worthy.
 
       // Filter by confidence threshold
       if (link.confidence < 0.6) {

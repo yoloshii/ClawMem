@@ -4,6 +4,38 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.25.0 — extraction retry-with-error-feedback + decision half-life + entity-neighbor hub-bias fix
+
+Three independently reviewed items from the strategic queue (§13.1, §36.11, BL-001) — the first queue burndown since the ranking was locked. Three files, three pipelines, no shared invariants.
+
+### §13.1 — retry-with-error-feedback on every LLM extraction path (`src/llm-retry.ts`)
+
+ClawMem's extraction surfaces were single-shot: one `generate()` attempt, and any malformed/empty response failed open to `[]`/`null` with no signal to the model about what went wrong — invisible data loss on every transient formatting miss. All eight extraction call sites now ride `withRetryAndFeedback` (pattern re-authored from Volt's llm-map validation loop):
+
+- **Stateless corrective retries** (default 3 attempts): each retry is a fresh `generate()` call with a reconstructed prompt — original prompt + the parse error + a 500-char excerpt of the previous response — never a conversation continuation.
+- **Hard wall-clock deadline** shared across all attempts: no attempt starts past the deadline, and an in-flight `generate()` is raced against it — a backend that ignores the abort signal cannot hold the helper past the budget.
+- **Fail-open on exhaustion** (null → the same `[]`/`null` callers already handled), now with a terminal `[llm-retry] <label>: exhausted…` warning naming the call site.
+- Call sites: observer `extractObservations`/`extractSummary`, conversation-synthesis `extractFactsFromConversation`, A-MEM `constructMemoryNote`/`generateMemoryLinks`/`evolveMemories`/`inferCausalLinks`, entity `extractEntities`. Parse closures own whole-response STRUCTURAL validation (so a malformed payload triggers a corrective retry instead of a silent post-loop drop — including integer-validated causal-link indexes, closing a partial-write path); semantic/domain filtering stays outside the loop.
+- Accounting change: a transient failure that recovers on retry no longer counts as an LLM failure in `mine --synthesize` stats; only terminal exhaustion does.
+
+### §36.11 — decision ranking half-life: ∞ → 180 days (`src/memory.ts`)
+
+`HALF_LIVES.decision = Infinity` pinned recency at 1.0 forever, so a silently-abandoned decision ("we'll use X" → quietly moved to Y, with no contradictory write to trigger supersession) kept winning ranking indefinitely. Decisions now decay on a 180-day half-life. **Ranking durability only:** `decision` keeps its attention-decay exemption, nothing is deleted or archived (lifecycle policy is separate), the access-frequency extension still stretches frequently-resurfaced decisions toward 3×, and `deductive`/`preference`/`hub`/`antipattern` stay infinite. An unaccessed 180-day-old decision drops to recency 0.5 — still fully searchable, just no longer permanently ahead of fresher material.
+
+### BL-001 — `getEntityGraphNeighbors` hub-bias fix (`src/entity.ts`)
+
+The entity-neighbor path ranked by raw co-occurrence count — reintroducing exactly the hub bias the edge-creation path's IDF suppression exists to prevent (one path suppressed hubs, the other reinforced them). Neighbor ranking now blends count with IDF specificity (`min(1, log1p(count)/5) × clamp(idf/3.0)`, sharing the edge path's 3.0 threshold via `ENTITY_IDF_SPECIFICITY_THRESHOLD`):
+
+- **Score-before-limit:** every co-occurring candidate is scored, THEN the pool is capped at 30 — a specific neighbor at raw-count rank 31+ can now surface (the old SQL `ORDER BY count DESC LIMIT 30` excluded it before scoring).
+- **Best-path-per-doc:** candidates are traversed in blended-score order, so a document reachable via both a hub and a specific entity keeps the specific path's score and `viaEntity`.
+- **Active-only IDF + hydration:** IDF populations are active-documents-only (archived mentions can no longer distort specificity), archived-only candidates are dropped from the pool, and hydration excludes archived documents before its per-entity LIMIT. One grouped CTE query supplies counts and active doc-frequency together (no N+1).
+
+### Quality gates
+
+Full suite 1,577/0. Each item independently reviewed by a cross-model adversarial pass (codex / GPT-5.6) to verbatim "Zero remaining findings — ship as is.": §13.1 in 3 turns, §36.11 in 2, BL-001 in 3 (bug-first — the failing hub-bias test predates the fix).
+
+---
+
 ## v0.24.0 — raw-BM25-primary ranking for `search` (judged keyword eval) + bypass A/B toolkit
 
 v0.23.0 made the FTS relevance signal real and deliberately deferred any ranking-contract change to a judged eval. That eval ran: 43 judged keyword targets (23 discovery + 20 family-disjoint held-out) with objectively-labeled fairness shapes (14 raw-favorable "exact-old", 22 composite-favorable "fresh-among-many"), frozen floors and decision rules pre-registered before any comparison was computed. **Raw-BM25-primary beat the shipping composite decisively**: combined MRR 0.848 vs 0.415, hit@1 33 vs 6; held-out 0.875/16-at-#1 vs 0.335/zero-at-#1 (the composite missed the absolute floors outright); composite lost even on its OWN favorable shape (fresh-among-many 0.348 vs 0.801) — the recency/quality/co-activation multipliers bury keyword relevance rather than refine it. One paired regression (one position) in 43 cases; controls clean in both arms.

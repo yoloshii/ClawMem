@@ -24,9 +24,17 @@ describe("recencyScore", () => {
   test("returns 1.0 for infinite half-life types", () => {
     const now = new Date();
     const yearAgo = new Date(now.getTime() - 365 * 86400000);
-    expect(recencyScore(yearAgo, "decision", now)).toBe(1.0);
+    expect(recencyScore(yearAgo, "preference", now)).toBe(1.0);
     expect(recencyScore(yearAgo, "hub", now)).toBe(1.0);
     expect(recencyScore(yearAgo, "antipattern", now)).toBe(1.0);
+  });
+
+  test("decision decays on its 180-day half-life (§36.11 — no longer infinite)", () => {
+    const now = new Date();
+    const yearAgo = new Date(now.getTime() - 365 * 86400000);
+    const score = recencyScore(yearAgo, "decision", now);
+    expect(score).toBeLessThan(1.0);
+    expect(score).toBeCloseTo(Math.pow(0.5, 365 / 180), 2);
   });
 
   test("handles string date input", () => {

@@ -27,6 +27,7 @@
 
 import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
+import { withRetryAndFeedback } from "./llm-retry.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 import type { ContentType } from "./memory.ts";
@@ -290,21 +291,24 @@ export async function extractFactsFromConversation(
 ): Promise<ExtractedFact[] | null> {
   const prompt = buildExtractionPrompt(conversationText);
 
-  let result;
-  try {
-    result = await llm.generate(prompt, {
-      temperature: LLM_TEMPERATURE,
-      maxTokens: LLM_MAX_TOKENS,
-    });
-  } catch (err) {
-    console.log(`[synthesis] LLM generate threw for doc ${sourceDocId}:`, err);
-    return null;
-  }
-
-  if (!result || typeof result.text !== "string") return null;
-
-  const parsed = extractJsonFromLLM(result.text);
-  if (!Array.isArray(parsed)) return null;
+  const parsed = await withRetryAndFeedback<unknown[]>({
+    initialPrompt: prompt,
+    llm,
+    maxTokens: LLM_MAX_TOKENS,
+    temperature: LLM_TEMPERATURE,
+    label: `synthesis.extractFacts(doc ${sourceDocId})`,
+    parse: (text) => {
+      const value = extractJsonFromLLM(text);
+      if (!Array.isArray(value)) {
+        return {
+          ok: false,
+          error: "Response was not a JSON array of fact objects. Return ONLY the JSON array.",
+        };
+      }
+      return { ok: true, value };
+    },
+  });
+  if (parsed === null) return null;
 
   const facts: ExtractedFact[] = [];
   for (const raw of parsed) {

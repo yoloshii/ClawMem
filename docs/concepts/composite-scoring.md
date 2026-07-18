@@ -37,8 +37,9 @@ Exponential decay based on document age and content type half-life:
 
 | Content type | Half-life | Behavior |
 |-------------|-----------|----------|
-| decision, deductive, preference, hub | Infinite | Never decay |
+| deductive, preference, hub | Infinite | Never decay |
 | antipattern | Infinite | Never decay |
+| decision | 180 days | Very slow decay — silently-abandoned decisions stop winning ranking (§36.11); still attention-decay-exempt; this ranking decay does not delete or archive (lifecycle policy is separate) |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
 | problem, milestone, note | 60 days | Default |

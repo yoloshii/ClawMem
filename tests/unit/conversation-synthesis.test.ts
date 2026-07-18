@@ -737,7 +737,9 @@ describe("runConversationSynthesis — end-to-end", () => {
     let call = 0;
     llm.generate.mockImplementation(async () => {
       call++;
-      if (call === 1) return null;
+      // Doc A: attempts 1-3 all null — terminal failure after retry
+      // exhaustion (§13.1). Doc B: first attempt succeeds.
+      if (call <= 3) return null;
       return {
         text: JSON.stringify([
           {
@@ -761,6 +763,33 @@ describe("runConversationSynthesis — end-to-end", () => {
     expect(result.factsSaved).toBe(1);
   });
 
+  it("retries a transient null response and recovers it (§13.1 — no llmFailure counted)", async () => {
+    seedConversation(store, "conv/a.md", "A", "x");
+
+    const llm = createMockLLM();
+    let call = 0;
+    llm.generate.mockImplementation(async () => {
+      call++;
+      if (call === 1) return null; // transient — retry recovers on attempt 2
+      return {
+        text: JSON.stringify([
+          { title: "Recovered", contentType: "decision", narrative: "n" },
+        ]),
+        model: "mock",
+        done: true,
+      };
+    });
+
+    const result = await runConversationSynthesis(store, llm as any, {
+      collection: COLLECTION,
+    });
+    expect(result.docsScanned).toBe(1);
+    expect(result.llmFailures).toBe(0);
+    expect(result.factsExtracted).toBe(1);
+    expect(result.factsSaved).toBe(1);
+    expect(call).toBe(2);
+  });
+
   it("distinguishes llmFailures from docsWithNoFacts (valid empty extraction)", async () => {
     seedConversation(store, "conv/a.md", "A", "x");
     seedConversation(store, "conv/b.md", "B", "y");
@@ -770,11 +799,14 @@ describe("runConversationSynthesis — end-to-end", () => {
     let call = 0;
     llm.generate.mockImplementation(async () => {
       call++;
-      if (call === 1) return null; // LLM failure
-      if (call === 2) {
-        // Valid empty extraction — not an LLM failure, just "no facts here"
+      // Doc A: attempts 1-3 null — terminal LLM failure after retries (§13.1)
+      if (call <= 3) return null;
+      if (call === 4) {
+        // Doc B: valid empty extraction — not an LLM failure, just "no facts
+        // here" (a well-formed [] is NOT retried)
         return { text: "[]", model: "mock", done: true };
       }
+      // Doc C: valid extraction
       return {
         text: JSON.stringify([
           { title: "OK fact", contentType: "decision", narrative: "n" },

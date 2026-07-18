@@ -673,7 +673,7 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 
 | Type | Half-life | Baseline | Notes |
 |---|---|---|---|
-| `decision` | ∞ | 0.85 | Never decays |
+| `decision` | 180d | 0.85 | Very slow ranking decay (§36.11) — silently-abandoned decisions stop winning ranking; attention-decay-exempt; lifecycle policy separate |
 | `deductive` | ∞ | 0.85 | Never decays — cross-session derived insights with source provenance |
 | `preference` | ∞ | 0.80 | Never decays — user preferences are durable facts |
 | `hub` | ∞ | 0.80 | Never decays |
@@ -918,7 +918,7 @@ Each project gets its own collection. Same structure, with optional Beads integr
 | User Profile | `_clawmem/user/profile.md` | Auto | ∞ | Static facts + dynamic context |
 | User Preferences | `_clawmem/user/preferences/*.md` | Auto | ∞ | Extracted preferences (update_existing merge) |
 | User Entities | `_clawmem/user/entities/*.md` | Auto | ∞ | Named entities across sessions |
-| Observations | `_clawmem/agent/observations/*.md` | Auto | ∞ (decision) | Decisions + observations from transcripts |
+| Observations | `_clawmem/agent/observations/*.md` | Auto | 180d (decision) | Decisions + observations from transcripts |
 | Handoffs | `_clawmem/agent/handoffs/*.md` | Auto | 30 days | Session summaries with next steps |
 | Antipatterns | `_clawmem/agent/antipatterns/*.md` | Auto | ∞ | Accumulated negative patterns |
 | Beads | `_clawmem/agent/beads/*.md` | Auto | ∞ | Beads issues synced from Dolt, relations in memory graph |

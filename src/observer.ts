@@ -8,7 +8,7 @@
 
 import type { TranscriptMessage } from "./hooks.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
-import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
+import { withRetryAndFeedback } from "./llm-retry.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 
 // =============================================================================
@@ -397,34 +397,37 @@ export async function extractObservations(
   const transcript = prepareTranscript(messages);
   const prompt = `${OBSERVATION_SYSTEM_PROMPT}\n\n--- TRANSCRIPT ---\n${transcript}\n--- END TRANSCRIPT ---\n\nExtract observations:`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MAX_LLM_GENERATE_TIMEOUT_MS);
-  try {
-    const llm = getDefaultLlamaCpp();
-    const result = await llm.generate(prompt, {
-      maxTokens: GENERATION_MAX_TOKENS,
-      temperature: GENERATION_TEMPERATURE,
-      signal: controller.signal,
-    });
+  const parsed = await withRetryAndFeedback<Observation[]>({
+    initialPrompt: prompt,
+    llm: getDefaultLlamaCpp(),
+    maxTokens: GENERATION_MAX_TOKENS,
+    temperature: GENERATION_TEMPERATURE,
+    label: "observer.extractObservations",
+    parse: (text) => {
+      // Parse all <observation>...</observation> blocks
+      const observations: Observation[] = [];
+      let blocks = 0;
+      const regex = /<observation>([\s\S]*?)<\/observation>/g;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        blocks++;
+        const obs = parseObservationXml(match[1]!);
+        if (obs) observations.push(obs);
+      }
+      if (observations.length === 0) {
+        return {
+          ok: false,
+          error:
+            blocks === 0
+              ? "No <observation>...</observation> blocks found in the response. Wrap each observation in <observation> tags."
+              : `Found ${blocks} <observation> block(s) but none contained the required fields. Each block needs valid <type>, <content>, and the documented child tags.`,
+        };
+      }
+      return { ok: true, value: observations };
+    },
+  });
 
-    if (!result?.text) return [];
-
-    // Parse all <observation>...</observation> blocks
-    const observations: Observation[] = [];
-    const regex = /<observation>([\s\S]*?)<\/observation>/g;
-    let match;
-    while ((match = regex.exec(result.text)) !== null) {
-      const obs = parseObservationXml(match[1]!);
-      if (obs) observations.push(obs);
-    }
-
-    return observations;
-  } catch (err) {
-    console.error("Observer: observation extraction failed:", err);
-    return [];
-  } finally {
-    clearTimeout(timer);
-  }
+  return parsed ?? [];
 }
 
 export async function extractSummary(
@@ -435,26 +438,28 @@ export async function extractSummary(
   const transcript = prepareTranscript(messages);
   const prompt = `${SUMMARY_SYSTEM_PROMPT}\n\n--- TRANSCRIPT ---\n${transcript}\n--- END TRANSCRIPT ---\n\nGenerate summary:`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MAX_LLM_GENERATE_TIMEOUT_MS);
-  try {
-    const llm = getDefaultLlamaCpp();
-    const result = await llm.generate(prompt, {
-      maxTokens: 500,
-      temperature: GENERATION_TEMPERATURE,
-      signal: controller.signal,
-    });
-
-    if (!result?.text) return null;
-
-    const summaryMatch = result.text.match(/<summary>([\s\S]*?)<\/summary>/);
-    if (!summaryMatch?.[1]) return null;
-
-    return parseSummaryXml(summaryMatch[1]);
-  } catch (err) {
-    console.error("Observer: summary extraction failed:", err);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  return withRetryAndFeedback<SessionSummary>({
+    initialPrompt: prompt,
+    llm: getDefaultLlamaCpp(),
+    maxTokens: 500,
+    temperature: GENERATION_TEMPERATURE,
+    label: "observer.extractSummary",
+    parse: (text) => {
+      const summaryMatch = text.match(/<summary>([\s\S]*?)<\/summary>/);
+      if (!summaryMatch?.[1]) {
+        return {
+          ok: false,
+          error: "No <summary>...</summary> block found in the response. Wrap the summary in <summary> tags.",
+        };
+      }
+      const summary = parseSummaryXml(summaryMatch[1]);
+      if (!summary) {
+        return {
+          ok: false,
+          error: "A <summary> block was found but its child tags were missing or invalid.",
+        };
+      }
+      return { ok: true, value: summary };
+    },
+  });
 }

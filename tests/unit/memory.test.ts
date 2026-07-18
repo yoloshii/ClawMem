@@ -111,9 +111,9 @@ describe("recencyScore", () => {
     expect(score).toBeCloseTo(0.5, 1);
   });
 
-  it("returns 1.0 for Infinity half-life types (decision)", () => {
+  it("returns 1.0 for Infinity half-life types (preference)", () => {
     const old = new Date("2020-01-01");
-    expect(recencyScore(old, "decision", NOW)).toBe(1.0);
+    expect(recencyScore(old, "preference", NOW)).toBe(1.0);
   });
 
   it("returns 0.5 for invalid dates", () => {
@@ -134,6 +134,54 @@ describe("recencyScore", () => {
   it("handles string date input", () => {
     const score = recencyScore("2026-03-01T12:00:00Z", "note", NOW);
     expect(score).toBe(1.0);
+  });
+});
+
+// ─── §36.11 — decision half-life Infinity → 180 ─────────────────────
+//
+// Ranking-staleness fix: a silently-abandoned decision (never contradicted,
+// so supersession never fires) must stop winning ranking indefinitely.
+// Ranking durability only — decision keeps its attention-decay exemption and
+// nothing is deleted or archived.
+
+describe("decision half-life (§36.11)", () => {
+  it("decision half-life is 180 days (long-finite, no longer Infinity)", () => {
+    expect(HALF_LIVES.decision).toBe(180);
+  });
+
+  it("an old unaccessed decision ranks below a fresh decision on recency", () => {
+    const old = new Date(NOW);
+    old.setDate(old.getDate() - 180);
+    const oldScore = recencyScore(old, "decision", NOW);
+    const freshScore = recencyScore(NOW, "decision", NOW);
+    expect(freshScore).toBe(1.0);
+    expect(oldScore).toBeCloseTo(0.5, 1);
+    expect(oldScore).toBeLessThan(freshScore);
+  });
+
+  it("a frequently re-accessed decision decays more slowly (access-freq extension)", () => {
+    const old = new Date(NOW);
+    old.setDate(old.getDate() - 180);
+    const recentAccess = new Date(NOW);
+    recentAccess.setDate(recentAccess.getDate() - 1);
+    const unaccessed = recencyScore(old, "decision", NOW, 0);
+    const reAccessed = recencyScore(old, "decision", NOW, 20, recentAccess);
+    expect(reAccessed).toBeGreaterThan(unaccessed);
+  });
+
+  it("the other Infinity types are untouched — decision is the odd one out", () => {
+    const old = new Date("2020-01-01");
+    expect(recencyScore(old, "preference", NOW)).toBe(1.0);
+    expect(recencyScore(old, "deductive", NOW)).toBe(1.0);
+    expect(recencyScore(old, "hub", NOW)).toBe(1.0);
+    expect(recencyScore(old, "antipattern", NOW)).toBe(1.0);
+  });
+
+  it("decision keeps its attention-decay exemption (DECAY_EXEMPT unchanged)", () => {
+    const staleAccess = new Date("2025-01-01");
+    const withStaleAccess = confidenceScore("decision", NOW, 5, NOW, staleAccess);
+    const withoutAccessDate = confidenceScore("decision", NOW, 5, NOW);
+    expect(withStaleAccess).toBeCloseTo(withoutAccessDate, 5);
   });
 });
 

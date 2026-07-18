@@ -76,7 +76,7 @@ The agents that get the most from ClawMem are the ones with rich, diverse collec
 | Domain expertise | Reference docs, runbooks, SOPs | Provides stable context that rarely changes |
 | Project notes | Status updates, meeting notes, specs | Keeps the agent current on project state |
 
-A practical starting point: configure each project collection to index every `.md` file in the project (`pattern: "**/*.md"`). The composite scoring system handles the rest — decisions and hubs never decay, progress notes fade after 45 days, and the quality multiplier rewards well-structured documents over flat text dumps.
+A practical starting point: configure each project collection to index every `.md` file in the project (`pattern: "**/*.md"`). The composite scoring system handles the rest — hubs and preferences never decay, decisions fade very slowly (180-day half-life), progress notes fade after 45 days, and the quality multiplier rewards well-structured documents over flat text dumps.
 
 ### Document structure matters
 

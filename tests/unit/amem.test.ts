@@ -1,12 +1,15 @@
 import { describe, it, expect } from "bun:test";
 
 import {
+  evolveMemories,
   extractJsonFromLLM,
   generateMemoryLinks,
+  inferCausalLinks,
   parseLinkGenerationFromLLM,
   parseMemoryNoteFromLLM,
 } from "../../src/amem.ts";
 import { insertContent, insertDocument } from "../../src/store.ts";
+import { createMockLLM } from "../helpers/mock-llm.ts";
 import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
@@ -467,5 +470,218 @@ describe("generateMemoryLinks vector readiness", () => {
     await expect(generateMemoryLinks(store, {} as any, row.id)).rejects.toThrow(
       "no such column: d2.active"
     );
+  });
+});
+
+// ─── §13.1 — evolveMemories structural validation inside the parse closure ───
+//
+// A malformed should_evolve=true payload must trigger a corrective retry
+// (not a silent post-loop rejection), while should_evolve=false needs no
+// payload fields at all.
+
+function seedEvolutionFixture() {
+  const store = createTestStore();
+  const [memId, nbId] = seedDocuments(store, [
+    { path: "mem.md", title: "Memory A", body: "memory body" },
+    { path: "nb.md", title: "Neighbor B", body: "neighbor body" },
+  ]) as [number, number];
+
+  store.db
+    .prepare(
+      "UPDATE documents SET amem_context = ?, amem_keywords = ?, amem_tags = ? WHERE id = ?"
+    )
+    .run("Original context.", '["orig"]', '["old-tag"]', memId);
+  store.db
+    .prepare("UPDATE documents SET amem_context = ? WHERE id = ?")
+    .run("Neighbor context.", nbId);
+  store.db
+    .prepare(
+      "INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at) VALUES (?, ?, 'related', 0.9, ?)"
+    )
+    .run(memId, nbId, new Date().toISOString());
+
+  return { store, memId, nbId };
+}
+
+describe("evolveMemories retry-with-error-feedback (§13.1)", () => {
+  const MALFORMED_EVOLUTION = JSON.stringify({
+    should_evolve: true,
+    new_keywords: "not-an-array",
+    new_tags: [],
+    new_context: "",
+    reasoning: "",
+  });
+  const VALID_EVOLUTION = JSON.stringify({
+    should_evolve: true,
+    new_keywords: ["fresh"],
+    new_tags: ["new-tag"],
+    new_context: "Updated context.",
+    reasoning: "New evidence arrived.",
+  });
+
+  it("retries a malformed should_evolve=true payload and applies the corrected evolution", async () => {
+    const { store, memId, nbId } = seedEvolutionFixture();
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true })
+      .mockResolvedValueOnce({ text: VALID_EVOLUTION, model: "mock", done: true });
+
+    const result = await evolveMemories(store, llm as any, memId, nbId);
+
+    expect(result).toBe(true);
+    expect(llm.generate).toHaveBeenCalledTimes(2);
+    const retryPrompt = llm.generate.mock.calls[1]?.[0] as string;
+    expect(retryPrompt).toContain("did not match the expected structure");
+
+    const row = store.db
+      .prepare("SELECT amem_keywords, amem_context FROM documents WHERE id = ?")
+      .get(memId) as { amem_keywords: string; amem_context: string };
+    expect(row.amem_keywords).toBe('["fresh"]');
+    expect(row.amem_context).toBe("Updated context.");
+  });
+
+  it("fails open (no evolution) when every attempt returns a malformed payload", async () => {
+    const { store, memId, nbId } = seedEvolutionFixture();
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true })
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true })
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true });
+
+    const result = await evolveMemories(store, llm as any, memId, nbId);
+
+    expect(result).toBe(false);
+    expect(llm.generate).toHaveBeenCalledTimes(3);
+    const row = store.db
+      .prepare("SELECT amem_context FROM documents WHERE id = ?")
+      .get(memId) as { amem_context: string };
+    expect(row.amem_context).toBe("Original context.");
+  });
+
+  it("accepts should_evolve=false without payload fields — no retry burned on it", async () => {
+    const { store, memId, nbId } = seedEvolutionFixture();
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: '{"should_evolve": false}',
+      model: "mock",
+      done: true,
+    });
+
+    const result = await evolveMemories(store, llm as any, memId, nbId);
+
+    expect(result).toBe(false);
+    expect(llm.generate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── §13.1 — inferCausalLinks structural validation inside the parse closure ─
+//
+// A structurally broken link entry must trigger a corrective retry; semantic
+// filters (confidence threshold, index range) stay outside and never retry.
+
+function seedCausalFixture() {
+  const store = createTestStore();
+  const [d1, d2] = seedDocuments(store, [
+    { path: "obs-1.md", title: "Obs One", body: "first observation" },
+    { path: "obs-2.md", title: "Obs Two", body: "second observation" },
+  ]) as [number, number];
+  const observations = [
+    { docId: d1, facts: ["Fact zero happened"] },
+    { docId: d2, facts: ["Fact one followed"] },
+  ];
+  return { store, d1, d2, observations };
+}
+
+describe("inferCausalLinks retry-with-error-feedback (§13.1)", () => {
+  const VALID_LINKS = JSON.stringify([
+    { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.9, reasoning: "zero led to one" },
+  ]);
+
+  it("retries a structurally invalid link entry and inserts the corrected link", async () => {
+    const { store, d1, d2, observations } = seedCausalFixture();
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({
+        text: '[{"source_fact_idx": "0", "target_fact_idx": 1, "confidence": 0.9, "reasoning": "r"}]',
+        model: "mock",
+        done: true,
+      })
+      .mockResolvedValueOnce({ text: VALID_LINKS, model: "mock", done: true });
+
+    const created = await inferCausalLinks(store, llm as any, observations);
+
+    expect(created).toBe(1);
+    expect(llm.generate).toHaveBeenCalledTimes(2);
+    const row = store.db
+      .prepare(
+        "SELECT source_id, target_id FROM memory_relations WHERE relation_type = 'causal'"
+      )
+      .get() as { source_id: number; target_id: number };
+    expect(row.source_id).toBe(d1);
+    expect(row.target_id).toBe(d2);
+  });
+
+  it("fails open to 0 links when every attempt is structurally invalid", async () => {
+    const { store, observations } = seedCausalFixture();
+    const llm = createMockLLM();
+    const malformed = { text: '[{"confidence": "high"}]', model: "mock", done: true };
+    llm.generate
+      .mockResolvedValueOnce(malformed)
+      .mockResolvedValueOnce(malformed)
+      .mockResolvedValueOnce(malformed);
+
+    const created = await inferCausalLinks(store, llm as any, observations);
+
+    expect(created).toBe(0);
+    expect(llm.generate).toHaveBeenCalledTimes(3);
+    const count = store.db
+      .prepare("SELECT COUNT(*) as n FROM memory_relations WHERE relation_type = 'causal'")
+      .get() as { n: number };
+    expect(count.n).toBe(0);
+  });
+
+  it("rejects fractional indexes structurally — a valid preceding entry causes NO partial write", async () => {
+    const { store, observations } = seedCausalFixture();
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({
+        // Valid first entry + fractional-index second entry: the WHOLE
+        // response must be rejected in parse (retry), so the valid entry is
+        // never inserted from the malformed attempt.
+        text: JSON.stringify([
+          { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.9, reasoning: "valid" },
+          { source_fact_idx: 0.5, target_fact_idx: 1, confidence: 0.9, reasoning: "fractional" },
+        ]),
+        model: "mock",
+        done: true,
+      })
+      .mockResolvedValueOnce({ text: VALID_LINKS, model: "mock", done: true });
+
+    const created = await inferCausalLinks(store, llm as any, observations);
+
+    expect(created).toBe(1);
+    expect(llm.generate).toHaveBeenCalledTimes(2);
+    const count = store.db
+      .prepare("SELECT COUNT(*) as n FROM memory_relations WHERE relation_type = 'causal'")
+      .get() as { n: number };
+    expect(count.n).toBe(1);
+  });
+
+  it("does NOT retry semantically filtered links (low confidence, out-of-range index)", async () => {
+    const { store, observations } = seedCausalFixture();
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: JSON.stringify([
+        { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.3, reasoning: "too weak" },
+        { source_fact_idx: 5, target_fact_idx: 1, confidence: 0.9, reasoning: "bad index" },
+      ]),
+      model: "mock",
+      done: true,
+    });
+
+    const created = await inferCausalLinks(store, llm as any, observations);
+
+    expect(created).toBe(0);
+    expect(llm.generate).toHaveBeenCalledTimes(1);
   });
 });

@@ -11,6 +11,7 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "crypto";
 import type { LLM } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
+import { withRetryAndFeedback } from "./llm-retry.ts";
 import { tokenizeForFTS5 } from "./store.ts";
 
 // =============================================================================
@@ -255,32 +256,46 @@ Rules:
 - Only extract entities that could meaningfully appear in OTHER documents
 Return ONLY the JSON array. /no_think`;
 
-  try {
-    const result = await llm.generate(prompt, {
-      temperature: 0.2,
-      maxTokens: 400,
-    });
+  const parsed = await withRetryAndFeedback<ExtractedEntity[]>({
+    initialPrompt: prompt,
+    llm,
+    maxTokens: 400,
+    temperature: 0.2,
+    label: "entity.extractEntities",
+    parse: (text) => {
+      const value = extractJsonFromLLM(text) as ExtractedEntity[] | null;
+      if (!Array.isArray(value)) {
+        return {
+          ok: false,
+          error:
+            'Response was not the expected JSON array of {"name", "type"} objects. Return ONLY that JSON array (or [] if no entities).',
+        };
+      }
+      // Structural validation is retry-worthy; an empty [] is valid, not retried.
+      for (const e of value) {
+        if (!e || typeof e !== "object" || typeof e.name !== "string" || typeof e.type !== "string") {
+          return {
+            ok: false,
+            error:
+              'Every array entry must be an object with string "name" and "type" fields. Return ONLY the corrected JSON array.',
+          };
+        }
+      }
+      return { ok: true, value };
+    },
+  });
 
-    if (!result) return [];
+  if (!parsed) return [];
 
-    const parsed = extractJsonFromLLM(result.text) as ExtractedEntity[] | null;
-    if (!Array.isArray(parsed)) return [];
-
-    // Validate, filter, and quality-check
-    return parsed
-      .filter(e =>
-        typeof e.name === 'string' &&
-        typeof e.type === 'string' &&
-        e.name.length >= 2 &&
-        e.name.length <= 100 &&
-        ['person', 'project', 'service', 'tool', 'concept', 'org', 'location'].includes(e.type)
-      )
-      .filter(e => !isLowQualityEntity(e.name, e.type, title))
-      .slice(0, cap);
-  } catch (err) {
-    console.log(`[entity] LLM extraction failed:`, err);
-    return [];
-  }
+  // Semantic quality filtering stays outside the retry loop.
+  return parsed
+    .filter(e =>
+      e.name.length >= 2 &&
+      e.name.length <= 100 &&
+      ['person', 'project', 'service', 'tool', 'concept', 'org', 'location'].includes(e.type)
+    )
+    .filter(e => !isLowQualityEntity(e.name, e.type, title))
+    .slice(0, cap);
 }
 
 // =============================================================================
@@ -768,10 +783,9 @@ export async function enrichDocumentEntities(
       }
 
       // Create edges only when max entity IDF exceeds threshold
-      const idfThreshold = 3.0; // ln-based: filters entities in >5% of docs (e.g., 13+ docs in 262-doc corpus)
       for (const [targetDocId, sharedEntities] of targetEntityMap) {
         const maxIdf = Math.max(...sharedEntities.map(eid => entityIdf.get(eid) || 0));
-        if (maxIdf < idfThreshold) continue; // Skip — only ubiquitous entities shared
+        if (maxIdf < ENTITY_IDF_SPECIFICITY_THRESHOLD) continue; // Skip — only ubiquitous entities shared
 
         // Weight: IDF specificity + shared-count bonus (multi-entity overlap outranks single)
         const sharedBonus = Math.min(0.15, 0.05 * (sharedEntities.length - 1));
@@ -810,6 +824,14 @@ export async function enrichDocumentEntities(
 // =============================================================================
 
 /**
+ * ln-based IDF above which an entity counts as "specific" — filters entities
+ * in >5% of docs (e.g., 13+ docs in a 262-doc corpus). Shared by edge
+ * creation (gate) and neighbor ranking (BL-001 specificity blend) so the two
+ * hub-suppression paths cannot drift apart.
+ */
+const ENTITY_IDF_SPECIFICITY_THRESHOLD = 3.0;
+
+/**
  * Get entity co-occurrence neighbors for a set of seed entities.
  * Returns document IDs reachable via entity co-occurrence graph.
  */
@@ -833,35 +855,78 @@ export function getEntityGraphNeighbors(
   const entityIds = seedEntities.map(e => e.entity_id);
   const entityPlaceholders = entityIds.map(() => '?').join(',');
 
+  // No SQL-side ORDER BY count / LIMIT here (BL-001): a raw-count-ordered
+  // candidate pool would let high-count hubs exclude specific neighbors
+  // before specificity is ever computed. MAX(count) per neighbor collapses
+  // duplicate rows (a neighbor co-occurring with several seed entities). One
+  // grouped query also returns each candidate's ACTIVE-doc frequency (no
+  // per-candidate N+1), and the active-only INNER joins drop archived-only
+  // candidates entirely — they would otherwise take maximum specificity.
   const cooccurring = db.prepare(`
-    SELECT
-      CASE WHEN entity_a IN (${entityPlaceholders}) THEN entity_b ELSE entity_a END as neighbor_entity,
-      count
-    FROM entity_cooccurrences
-    WHERE entity_a IN (${entityPlaceholders}) OR entity_b IN (${entityPlaceholders})
-    ORDER BY count DESC
-    LIMIT 30
-  `).all(...entityIds, ...entityIds, ...entityIds) as { neighbor_entity: string; count: number }[];
+    WITH cooc AS (
+      SELECT
+        CASE WHEN entity_a IN (${entityPlaceholders}) THEN entity_b ELSE entity_a END as neighbor_entity,
+        MAX(count) as count
+      FROM entity_cooccurrences
+      WHERE entity_a IN (${entityPlaceholders}) OR entity_b IN (${entityPlaceholders})
+      GROUP BY neighbor_entity
+    )
+    SELECT c.neighbor_entity, c.count, COUNT(DISTINCT em.doc_id) as active_doc_freq
+    FROM cooc c
+    JOIN entity_mentions em ON em.entity_id = c.neighbor_entity
+    JOIN documents d ON d.id = em.doc_id AND d.active = 1
+    GROUP BY c.neighbor_entity, c.count
+  `).all(...entityIds, ...entityIds, ...entityIds) as {
+    neighbor_entity: string;
+    count: number;
+    active_doc_freq: number;
+  }[];
 
   if (cooccurring.length === 0) return [];
 
-  // Step 3: Find documents mentioning co-occurring entities
+  const totalDocs = (db.prepare(
+    `SELECT COUNT(*) as cnt FROM documents WHERE active = 1`
+  ).get() as { cnt: number }).cnt;
+
+  // BL-001: weight raw co-occurrence by IDF specificity (same ln form as the
+  // edge-creation path above) so ubiquitous hub entities stop dominating the
+  // neighbor ordering that IDF suppression elsewhere exists to prevent.
+  // Both IDF populations are active-only — mixing them lets archived
+  // mentions distort specificity; clamp to [0,1]. Score EVERY candidate,
+  // then rank by the blended score and cap the pool — candidate traversal
+  // below is therefore in best-score order, so per-doc first-assignment IS
+  // best-path assignment (a doc reachable via both a hub and a specific
+  // entity keeps the specific path's score and viaEntity).
+  const scored = cooccurring
+    .map(co => {
+      const idf = Math.log((totalDocs + 1) / (co.active_doc_freq + 1));
+      const specificity = Math.max(0, Math.min(1.0, idf / ENTITY_IDF_SPECIFICITY_THRESHOLD));
+      return {
+        neighborEntity: co.neighbor_entity,
+        score: Math.min(1.0, Math.log1p(co.count) / 5) * specificity,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 30);
+
+  // Step 3: Find ACTIVE documents mentioning co-occurring entities — the
+  // active guard sits before LIMIT so archived mentions cannot consume the
+  // per-entity slots or leak archived doc IDs into results.
   const results: { docId: number; score: number; viaEntity: string }[] = [];
   const seen = new Set(seedDocIds);
 
-  for (const co of cooccurring) {
+  for (const co of scored) {
     const docs = db.prepare(`
-      SELECT doc_id FROM entity_mentions
-      WHERE entity_id = ?
+      SELECT em.doc_id FROM entity_mentions em
+      JOIN documents d ON d.id = em.doc_id AND d.active = 1
+      WHERE em.entity_id = ?
       LIMIT 10
-    `).all(co.neighbor_entity) as { doc_id: number }[];
+    `).all(co.neighborEntity) as { doc_id: number }[];
 
     for (const doc of docs) {
       if (!seen.has(doc.doc_id)) {
         seen.add(doc.doc_id);
-        // Score: normalized co-occurrence count (log scale)
-        const score = Math.min(1.0, Math.log1p(co.count) / 5);
-        results.push({ docId: doc.doc_id, score, viaEntity: co.neighbor_entity });
+        results.push({ docId: doc.doc_id, score: co.score, viaEntity: co.neighborEntity });
       }
     }
   }

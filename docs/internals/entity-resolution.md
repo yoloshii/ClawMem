@@ -71,7 +71,7 @@ Types not listed in `ENTITY_BUCKETS` automatically form their own single-type bu
 When multiple entities are extracted from the same document, all pairs are recorded in `entity_cooccurrences`. This powers:
 - The entity graph channel in `query` (conditional 1-hop entity walk from seed results)
 - Entity-aware MPFP meta-path patterns (`[entity, semantic]`)
-- `getEntityGraphNeighbors()` for discovering related documents through shared entities
+- `getEntityGraphNeighbors()` for discovering related documents through shared entities — ranked by co-occurrence count blended with the same IDF specificity used for edge weights (v0.25.0, BL-001), so ubiquitous hub entities do not dominate the ordering; archived-only candidates and archived documents are excluded
 
 ## Entity edges
 

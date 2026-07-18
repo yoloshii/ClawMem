@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.24.0**.
+Guide for upgrading between released versions. Current: **v0.25.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,14 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.25.0: extraction retries + decision half-life + entity-neighbor ranking
+
+No migration steps, no schema change, no re-embed — drop-in. Restart long-lived processes per the quick path. Behavior notes:
+
+- **LLM extraction paths retry on malformed responses** (observer, conversation-synthesis, A-MEM, entity extraction): up to 3 attempts with error feedback under one hard wall-clock budget. Expect occasional multi-call extraction where a single call previously failed silently; terminal exhaustion logs `[llm-retry] <site>: exhausted…`. `mine --synthesize` failure counts now reflect terminal failures only (transient-recovered calls no longer count).
+- **`decision` recency now decays on a 180-day half-life** (was infinite). Old, unaccessed decisions gradually stop outranking fresh material on composite surfaces; frequently-accessed decisions stretch toward 3× via the existing access extension. No deletion or archival — lifecycle policy is unchanged.
+- **Entity-neighbor ranking (`intent_search` ENTITY channel and the `query` entity walk) reorders**: neighbors now rank by co-occurrence blended with IDF specificity instead of raw count — ubiquitous hub entities drop, specific entities rise; archived documents no longer appear in neighbor results.
 
 ## v0.24.0: raw-BM25-primary ranking on `search`
 
