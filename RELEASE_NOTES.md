@@ -4,6 +4,33 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.28.0 — hook write-path contracts: extraction guards, honest counters
+
+Two Stop-hook write paths — A-MEM causal inference and contradiction detection — reported success while persisting nothing. Instrumentation counted *attempts* against `INSERT OR IGNORE`, so a total write failure was indistinguishable from a healthy run. This release makes the reporting truthful and hardens the validation ahead of every mutation. It enables no new writer; the extraction quality work is separate.
+
+### Counters report outcomes, not attempts (`src/amem.ts`, `src/store.ts`, `src/mcp.ts`, `src/server.ts`)
+
+- **`inferCausalLinks` sums `.changes`** from each insert instead of incrementing per candidate, and warns when candidates clear every filter but no row lands (the signature of silent `INSERT OR IGNORE` suppression). The summary line now reports proposed / passed-filters / placeholder-rejected / range-rejected rather than a single fabricated success count.
+- **Both graph builders** (`buildTemporalBackbone`, `buildSemanticGraph`) count inserted rows the same way — the two feed one response and previously reported in different units.
+- **`build_graphs` reports standing totals** alongside the delta, on the MCP tool *and* the REST endpoint: `N new edge(s), M total`. An idempotent rebuild legitimately writes 0 new edges, which read as "the graph is empty" without the total. **Response-shape change** — see below.
+- **Totals count the ACTIVE graph.** Only edges whose *both* endpoints are active are counted, matching the population the builders operate on; a raw count reported edges the live graph no longer contained. Shared via `store.countActiveRelations()` so the two surfaces cannot drift.
+
+### Validation ahead of every mutation (`src/hooks/decision-extractor.ts`, `src/schema-placeholder.ts`)
+
+- **`validateContradictionEntry`** is a pure, exported, typed-verdict validator applied to every classifier entry before any document is mutated: exact relation-enum membership, strict `typeof reasoning === "string"` (coercion was a fail-open on every JSON-valid non-string), finite `[0,1]` confidence, and *both* index bounds.
+- **Array-level admission** (`admitContradictionEntries`, exported and pure). Only repeats identical across the fields that can drive a mutation (relation, confidence, reasoning) are collapsed; a pair the classifier answered more than one way — differing label, confidence, or reasoning — is dropped whole. Repeats compounded the confidence penalty on a single document and could cross the invalidation floor a single classification never reaches, and a first-wins collapse would have made the outcome depend on array order. Whether several *distinct* new facts may penalize one old document repeatedly is a separate open question, unchanged here.
+- **The shared anti-parrot guard normalizes before matching.** Residue comparison folds NFKC, drops `Default_Ignorable_Code_Point` characters, lowercases, collapses whitespace runs, and strips outer punctuation — so a doubled space, a newline, fullwidth text, a trailing period, or an invisible zero-width character inside a word no longer walks past the guard. Internal punctuation is deliberately *not* normalized: doing so mapped plausible identifiers like `canonical_entity_name` onto blocklist entries. Marker detection folds NFKC, drops invisibles, removes every template marker, and asks whether any letter or digit remains — so arbitrary punctuation envelopes (`**{{x}}**`, `- {{x}}`, `|{{x}}|`, `【{{x}}】`, fullwidth `｛｛x｝｝`) and multi-line markers are all caught without enumerating wrapper characters. A value whose every letter and digit sits inside a marker is filtered as carrying no assertable content, whether it is echoed residue or a bare code fragment; content that merely *contains* a marker, like `"${HOME} is the user home directory"`, is untouched. **That applies to claim fields only.** Identifier fields — conversation-synthesis aliases and link targets, SPO subjects and objects — are names, not assertions, so no marker shape is rejected there on shape alone (`${HOME}` is a legitimate object of `uses`; `{{user.name}}` is a Handlebars path). Their residue is caught by consumer-scoped sets naming the exact skeleton that field's own prompt emits. Link targets were previously unguarded entirely despite their prompt carrying a copyable skeleton. Residue sets stay consumer-scoped — a memory *about* this defect is legitimate content, not residue.
+- **The contradiction parse gate reports instead of returning silently**, emitting response shape, length, content hash and served model identity. Raw model text stays opt-in behind `CLAWMEM_DEBUG_LLM_RAW` — the prompt carries transcript-derived material, so logging it by default would be a content-exposure path.
+- **`/no_think` is applied idempotently** — six prompts already carry the token inline for the local fallback and were being sent a doubled control token.
+
+### Upgrade note — `build_graphs` response shape
+
+Additive, but a contract change. Both surfaces gain `temporalTotal` / `semanticTotal`, and the MCP text line changes from `Temporal graph: N edges` to `Temporal graph: N new edge(s), M total`. Anything parsing that text should be updated. The REST endpoint continues to emit all four keys unconditionally (its pre-existing shape); the MCP tool continues to include only the graph types requested.
+
+### Quality gates
+
+Full suite 1,751/0. Cross-model adversarial passes (codex / GPT-5.6) throughout — fourteen turns, including successive fail-opens in the same validator, a duplicate-entry defect that compounded mutations on one document, and a round in which the newly-added regression tests were shown not to exercise the guard they were written for.
+
 ## v0.27.0 — authorship time: memories rank by when they were written
 
 Fixes a confirmed recency-contamination defect: ClawMem had exactly one time axis per document (filing/update time), so a 2025 conversation mined today ranked — and filtered, and injected — as if written today. Worst under recency intent, where recency carries 70% of the composite weight. Documents now carry a second, nullable axis: `authored_at`, when the content was originally written.

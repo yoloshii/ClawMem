@@ -269,7 +269,7 @@ export const VALID_PREDICATES = new Set([
 // Predicates whose <object> should be stored as a literal (not resolved to an entity).
 export const LITERAL_PREDICATES = new Set(["prefers", "avoids"]);
 
-// Anti-parrot residue guard (SCHEMA_PLACEHOLDER_STRINGS / PLACEHOLDER_REGEX / isSchemaPlaceholder)
+// Anti-parrot residue guard (SCHEMA_PLACEHOLDER_STRINGS / isMarkerOnly / isSchemaPlaceholder)
 // now lives in ./schema-placeholder.ts, shared with the consolidation + conversation-synthesis
 // extraction paths. Imported at the top of this file.
 
@@ -335,7 +335,10 @@ function extractTriples(xml: string): ParsedTriple[] {
     if (subject.length < 2 || subject.length > 80) continue;
     if (object.length < 2 || object.length > 120) continue;
 
-    if (isSchemaPlaceholder(subject) || isSchemaPlaceholder(object)) continue;
+    // Identifier scope: a subject/object is an entity name or literal value, not an
+    // assertion — `${HOME}` is a legitimate object of `uses` / `depends_on` / `prefers`.
+    if (isSchemaPlaceholder(subject, undefined, "identifier") ||
+        isSchemaPlaceholder(object, undefined, "identifier")) continue;
 
     results.push({ subject, predicate, object });
 

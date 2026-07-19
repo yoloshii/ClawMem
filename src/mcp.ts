@@ -1657,7 +1657,7 @@ This is the recommended entry point for ALL memory queries.`,
       const shouldBuildTemporal = types.includes('temporal') || types.includes('all');
       const shouldBuildSemantic = types.includes('semantic') || types.includes('all');
 
-      const results: { temporal?: number; semantic?: number } = {};
+      const results: { temporal?: number; semantic?: number; temporalTotal?: number; semanticTotal?: number } = {};
 
       if (shouldBuildTemporal) {
         results.temporal = store.buildTemporalBackbone();
@@ -1667,9 +1667,23 @@ This is the recommended entry point for ALL memory queries.`,
         results.semantic = await store.buildSemanticGraph(semantic_threshold);
       }
 
+      // The builders count rows SQLite actually inserted, so a second idempotent build
+      // legitimately reports 0 new edges while the graph is fully populated. Report the
+      // standing total alongside, or "0 edges" reads as "the graph is empty".
+      //
+      // Counts only edges whose BOTH endpoints are active — the same population the builders
+      // operate on. Shared with the REST endpoint via the store so the two cannot drift.
+      const totalFor = (t: string) => store.countActiveRelations(t);
+
       const lines = [];
-      if (results.temporal !== undefined) lines.push(`Temporal graph: ${results.temporal} edges`);
-      if (results.semantic !== undefined) lines.push(`Semantic graph: ${results.semantic} edges`);
+      if (results.temporal !== undefined) {
+        results.temporalTotal = totalFor("temporal");
+        lines.push(`Temporal graph: ${results.temporal} new edge(s), ${results.temporalTotal} total`);
+      }
+      if (results.semantic !== undefined) {
+        results.semanticTotal = totalFor("semantic");
+        lines.push(`Semantic graph: ${results.semantic} new edge(s), ${results.semanticTotal} total`);
+      }
 
       return {
         content: [{

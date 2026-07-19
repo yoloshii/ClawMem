@@ -95,7 +95,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw routes — vector + `search` non-recency). Use PROACTIVELY for constraints, architecture decisions, corrections. |
 | `memory_snooze` | Use PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days. |
 | `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. Weak matches return a disambiguation list instead of acting (v0.23.0). |
-| `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. |
+| `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. Reports `N new edge(s), M total` — `0 new` on a rebuild is correct, not an empty graph. |
 | `timeline` | Temporal neighborhood around a doc. Progressive disclosure: search → timeline → get. |
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
 | `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default) / restore auto-archived. |

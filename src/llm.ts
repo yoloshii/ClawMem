@@ -1164,6 +1164,20 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  /**
+   * Append ` /no_think` only when the prompt does not already carry it, so a prompt written
+   * with an inline suffix (for the local fallback, which gets the prompt verbatim) is not sent
+   * a doubled control token.
+   */
+  private applyNoThinkSuffix(prompt: string): string {
+    if (!this.remoteLlmNoThink) return prompt;
+    // Detect the control token as a standalone token ANYWHERE, not only terminally: the
+    // query-expansion prompt deliberately leads with `/no_think`, so a suffix-only test
+    // still doubled it. Requiring a line/whitespace boundary on both sides keeps a path
+    // fragment like `foo/no_think` from counting as the control token.
+    return /(^|\s)\/no_think(\s|$)/.test(prompt) ? prompt : `${prompt} /no_think`;
+  }
+
   private async generateRemote(
     prompt: string,
     maxTokens: number,
@@ -1175,7 +1189,11 @@ export class LlamaCpp implements LLM {
     try {
       const body: Record<string, unknown> = {
         model: this.remoteLlmModel,
-        messages: [{ role: "user", content: this.remoteLlmNoThink ? `${prompt} /no_think` : prompt }],
+        // Idempotent: six prompts already end with a literal `/no_think` (consolidation x2,
+        // decision-extractor, entity, intent, merge-guards) because the LOCAL fallback receives
+        // the prompt directly and needs it inline. Appending unconditionally sent those a
+        // doubled suffix. Do not strip the prompt-local ones instead — the local path needs them.
+        messages: [{ role: "user", content: this.applyNoThinkSuffix(prompt) }],
         max_tokens: maxTokens,
         temperature,
       };

@@ -560,7 +560,26 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
     semanticEdges = await store.buildSemanticGraph();
   }
 
-  return jsonResponse({ temporal: temporalEdges, semantic: semanticEdges });
+  // Same COUNTING semantics as the MCP `build_graphs` tool: the builders count rows actually
+  // inserted, so an idempotent rebuild legitimately returns 0 new edges. Report the standing
+  // totals alongside, or a caller reads "0" as "the graph is empty".
+  //
+  // The response SHAPE deliberately differs from MCP and always carries all four keys. That
+  // is this endpoint's pre-existing contract — it emitted both `temporal` and `semantic`
+  // unconditionally before totals existed — whereas the MCP tool includes only the graph
+  // types that were requested. Narrowing REST to match would break existing callers; the
+  // difference is stated here rather than papered over.
+  //
+  // Counts only edges whose BOTH endpoints are active — the same population the builders
+  // operate on. Shared with the MCP tool via the store so the two cannot drift.
+  const totalFor = (t: string) => store.countActiveRelations(t);
+
+  return jsonResponse({
+    temporal: temporalEdges,
+    semantic: semanticEdges,
+    temporalTotal: totalFor("temporal"),
+    semanticTotal: totalFor("semantic"),
+  });
 }
 
 // --- Unified Retrieve (mirrors memory_retrieve from MCP) ---

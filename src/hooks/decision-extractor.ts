@@ -25,6 +25,7 @@ import type { ObservationWithDoc } from "../amem.ts";
 import { extractJsonFromLLM } from "../amem.ts";
 import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
+import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
 
 // Observation types that are allowed to contribute SPO triples. Widened from the
 // original {decision, preference, milestone, problem} gate, which rejected 77% of
@@ -191,6 +192,153 @@ export function extractAntipatterns(
 // Contradiction Detection
 // =============================================================================
 
+export type ContradictionEntryVerdict =
+  | "ok"
+  | "invalid-relation"
+  | "invalid-reasoning"
+  | "placeholder-reasoning"
+  | "invalid-confidence"
+  | "index-out-of-range";
+
+/**
+ * Runtime semantic validation for ONE classifier entry, ahead of any mutation.
+ *
+ * Extracted as a pure function so it is testable without an LLM: the hook resolves its own
+ * model internally, so an end-to-end test would assert whatever the deployed model happens
+ * to return that day. It is also why the `reasoning: "..."` bypass stayed invisible — the
+ * only tests exercised `isSchemaPlaceholder` directly, never the real decision boundary.
+ *
+ * The parse gate upstream only proves the ROOT of the response is an array. Entries were
+ * never checked at all, so the deployed model's echoed skeleton reached the mutation path.
+ */
+export function validateContradictionEntry(
+  entry: unknown,
+  candidateCount: number,
+  newFactCount: number,
+): ContradictionEntryVerdict {
+  const rel = (entry ?? {}) as Record<string, unknown>;
+  // Relation must be an exact enum member. The prompt's `"update|contradiction|same"`
+  // skeleton is echoed as this VALUE by the deployed model and is rejected here.
+  if (typeof rel.relation !== "string" || !VALID_RELATIONS.has(rel.relation)) {
+    return "invalid-relation";
+  }
+
+  // Strict typing, NOT coercion. `String(rel.reasoning ?? "")` turned 123, {}, true and
+  // ["real"] into plausible strings that cleared the residue check and proceeded toward
+  // mutation — a fail-open on every JSON-valid non-string value.
+  if (typeof rel.reasoning !== "string") return "invalid-reasoning";
+
+  // Reasoning must not be the prompt's own `"..."` skeleton, nor quote/punctuation residue.
+  if (isSchemaPlaceholder(rel.reasoning, CONTRADICTION_RESIDUE)) {
+    return "placeholder-reasoning";
+  }
+
+  if (
+    typeof rel.confidence !== "number" ||
+    !Number.isFinite(rel.confidence) ||
+    rel.confidence < 0 ||
+    rel.confidence > 1
+  ) {
+    return "invalid-confidence";
+  }
+
+  // Both indices must address real entries. `old_idx` is incidentally bounded by the
+  // candidate lookup, but `new_idx` feeds only a log line today — and once the filepath
+  // contract is repaired an out-of-range `new_idx` would mutate the old document while
+  // reporting `undefined`. Bound both before any mutation can occur.
+  const inRange = (value: unknown, bound: number): boolean =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0 && value < bound;
+
+  if (!inRange(rel.old_idx, candidateCount) || !inRange(rel.new_idx, newFactCount)) {
+    return "index-out-of-range";
+  }
+
+  return "ok";
+}
+
+const VALID_RELATIONS = new Set(["same", "update", "contradiction"]);
+
+export type ContradictionBatch = {
+  /** Entries cleared for mutation, at most one per (old, new) pair, in first-seen order. */
+  accepted: any[];
+  /** Entries that failed per-entry validation. */
+  rejected: number;
+  /** Repeats identical across mutation-relevant fields, collapsed. */
+  duplicates: number;
+  /** Pairs dropped whole because the classifier gave more than one answer for them. */
+  inconsistent: number;
+};
+
+/**
+ * Array-level admission for one classifier response, ahead of ANY mutation.
+ *
+ * `validateContradictionEntry` proves each object is well-formed and says nothing about the
+ * SET. Two entries for the same (old, new) pair each decrement that document's confidence, so
+ * a repeat compounds the penalty and can cross the invalidation floor a single classification
+ * never reaches — and a model that echoes its prompt, which is this model's established
+ * failure mode, emits repeats readily.
+ *
+ * A pair the classifier answered more than one way is dropped ENTIRELY rather than first-wins.
+ * First-wins made the outcome depend on array order: `[0.69, 0.99]` kept the sub-threshold
+ * entry and mutated nothing, while `[0.99, 0.69]` mutated — for the same classification. That
+ * is also why differing confidence or reasoning counts as inconsistent, not as a duplicate:
+ * only a repeat identical across the mutation-relevant fields is safely collapsible. Entries
+ * differing solely in fields that cannot reach the mutation path ARE collapsed — they are the
+ * same classification, so this is deliberately not object identity.
+ *
+ * Exported and pure so the batch contract is testable without an LLM — `detectContradictions`
+ * resolves its own model, so an end-to-end test would assert whatever the deployed model
+ * returned that day.
+ *
+ * NOT decided here: whether several DISTINCT new facts may penalize one old document
+ * repeatedly. That is the unresolved document-identity question.
+ */
+export function admitContradictionEntries(
+  parsed: any[],
+  candidateCount: number,
+  newFactCount: number,
+): ContradictionBatch {
+  // Group EVERY signature per pair before deriving any count. Comparing each later entry
+  // against only the first made the telemetry depend on array order — `[0.9, 0.9, 0.8]`
+  // reported one duplicate while `[0.8, 0.9, 0.9]` reported none, for the same multiset.
+  const groups = new Map<string, { first: any; signatures: string[] }>();
+  let rejected = 0;
+
+  for (const rel of parsed) {
+    if (validateContradictionEntry(rel, candidateCount, newFactCount) !== "ok") {
+      rejected++;
+      continue;
+    }
+
+    const pairKey = `${rel.old_idx}:${rel.new_idx}`;
+    // Every field that drives a mutation participates in identity — relation selects the
+    // branch, confidence gates it, reasoning is the evidence. Fields outside this set cannot
+    // reach the mutation path, so entries differing only in those are genuinely the same
+    // classification.
+    const signature = JSON.stringify([rel.relation, rel.confidence, rel.reasoning]);
+
+    const group = groups.get(pairKey);
+    if (group) group.signatures.push(signature);
+    else groups.set(pairKey, { first: rel, signatures: [signature] });
+  }
+
+  const accepted: any[] = [];
+  let duplicates = 0;
+  let inconsistent = 0;
+
+  for (const { first, signatures } of groups.values()) {
+    const distinct = new Set(signatures);
+    if (distinct.size > 1) {
+      inconsistent++;               // the classifier answered this pair more than one way
+    } else {
+      accepted.push(first);         // insertion order — deterministic for a given input
+      duplicates += signatures.length - 1;
+    }
+  }
+
+  return { accepted, rejected, duplicates, inconsistent };
+}
+
 async function detectContradictions(
   store: Store,
   newObservations: Observation[],
@@ -253,9 +401,36 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
     const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 400 });
     if (!result) return 0;
     const parsed = extractJsonFromLLM(result.text);
-    if (!Array.isArray(parsed)) return 0;
+    if (!Array.isArray(parsed)) {
+      // A silent `return 0` here is indistinguishable from "no contradictions found",
+      // which is how a permanently-failing parse gate stayed invisible. Say which it is.
+      //
+      // Deliberately NOT logging raw model output by default: this model echoes prompt
+      // material, and the prompt carries transcript-derived decisions. A raw head would
+      // be a content-exposure path in ordinary operation. Emit shape + identity only;
+      // raw text is opt-in via CLAWMEM_DEBUG_LLM_RAW and still truncated.
+      const category = parsed === null ? "unparseable" : Array.isArray(parsed) ? "array" : typeof parsed;
+      console.warn(
+        `[decision-extractor] contradiction parse gate REJECTED the model response ` +
+        `(expected JSON array, got ${category}; len=${result.text.length} ` +
+        `sha256=${hashContent(result.text).slice(0, 12)} model=${JSON.stringify(result.model)}) — ` +
+        `no contradiction was evaluated.`,
+      );
+      if (process.env.CLAWMEM_DEBUG_LLM_RAW === "true") {
+        console.warn(
+          `[decision-extractor] raw (debug): ${JSON.stringify(result.text.slice(0, 160))}`,
+        );
+      }
+      return 0;
+    }
 
-    for (const rel of parsed) {
+    // Per-entry validation AND array-level admission, both ahead of any mutation. The parse
+    // gate only proves the ROOT is an array; entries were never checked at all, so the
+    // deployed model's echoed skeleton reached the mutation path.
+    const { accepted, rejected, duplicates, inconsistent } =
+      admitContradictionEntries(parsed, candidates.length, newFacts.length);
+
+    for (const rel of accepted) {
       if (rel.confidence < 0.7) continue;
       const oldDoc = candidates[rel.old_idx];
       if (!oldDoc) continue;
@@ -302,6 +477,20 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
           confidence: Math.max(0.3, currentConfidence - 0.15),
         });
       }
+    }
+    if (rejected > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: rejected ${rejected} entr(ies) failing runtime ` +
+        `validation (unknown relation label, placeholder reasoning, non-finite confidence, ` +
+        `or non-integer index) — the classifier is emitting schema residue, not classifications`,
+      );
+    }
+    if (duplicates > 0 || inconsistent > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: collapsed ${duplicates} identical repeat(s) and ` +
+        `dropped ${inconsistent} pair(s) the classifier answered more than one way, before ` +
+        `mutation — repeats would have compounded the confidence penalty on one document`,
+      );
     }
   } catch (err) {
     console.error(`[decision-extractor] Contradiction classification failed:`, err);

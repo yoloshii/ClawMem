@@ -107,11 +107,33 @@ curl http://localhost:7438/sessions?limit=5
 | GET | `/graph/causal/:docid` | Causal chain traversal |
 | GET | `/graph/similar/:docid` | k-NN semantic neighbors |
 | GET | `/graph/evolution/:docid` | Document evolution timeline |
+| POST | `/graphs/build` | Build temporal backbone and/or semantic graph |
 
 ```bash
 curl http://localhost:7438/graph/causal/a1b2c3?direction=both&depth=3
 curl http://localhost:7438/graph/similar/a1b2c3?limit=5
 ```
+
+**POST /graphs/build**
+
+```json
+{ "graph_types": ["all"], "semantic_threshold": 0.7 }
+```
+
+Response (v0.28.0+):
+
+```json
+{ "temporal": 12, "semantic": 43, "temporalTotal": 541, "semanticTotal": 3878 }
+```
+
+`temporal` / `semantic` are edges **newly written by this call** — inserts are idempotent, so a
+rebuild over an unchanged corpus correctly returns `0`. `temporalTotal` / `semanticTotal` are
+edges of that type **currently in the active graph** (both endpoints active). `0 new` does not
+mean the graph is empty; read the total.
+
+Unlike the MCP `build_graphs` tool, which returns only the graph types you requested, this
+endpoint always emits all four keys — that is its pre-existing shape, kept so existing callers
+do not break.
 
 ### Lifecycle
 

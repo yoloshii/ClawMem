@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.27.0**.
+Guide for upgrading between released versions. Current: **v0.28.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,18 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.28.0: hook write-path contracts
+
+No migration, no re-embed, no config change. Drop-in.
+
+**One behavior change to be aware of:** `build_graphs` now reports `N new edge(s), M total`
+instead of `N edges`, and both the MCP tool and the REST endpoint gained `temporalTotal` /
+`semanticTotal` fields. The counts also changed meaning — they report rows actually written
+rather than insert attempts, so an idempotent rebuild now correctly reports 0 new edges (the
+standing total tells you the graph is populated). If you parse that text output, update it.
+
+Totals count only edges whose both endpoints are active, matching what the builders operate on.
 
 ## v0.27.0: authorship time (`authored_at`) + entity-edge IDF fix
 

@@ -98,6 +98,7 @@ A second, longer-interval consolidation lane with DB-backed exclusivity, stale-f
 | `CLAWMEM_SESSION_ID` | (Claude Code exposes its own) | Session id for the per-session focus topic; set explicitly in non-Claude-Code environments. |
 | `CLAWMEM_FOCUS_ROOT` | `~/.cache/clawmem/sessions` | Directory for per-session focus files (`clawmem focus`). |
 | `CLAWMEM_SESSION_FOCUS` | (none) | **Debug only.** Directly overrides the session focus topic, bypassing the focus file. |
+| `CLAWMEM_DEBUG_LLM_RAW` | `false` | **Debug only.** Set `true` to log the raw model response when the contradiction parse gate rejects it (truncated to 160 chars). Off by default because the extraction prompt carries transcript-derived material, so raw output is a content-exposure path in ordinary operation — the gate always logs response shape, length, content hash and served model identity regardless. |
 | `CLAWMEM_HEARTBEAT_PATTERNS` | (built-in set) | Comma-separated prompt patterns treated as heartbeats (skipped by context-surfacing). |
 | `CLAWMEM_DISABLE_HEARTBEAT_SUPPRESSION` | `false` | Set `true` to disable heartbeat-prompt suppression in the context-surfacing hook. |
 | `CLAWMEM_HOOK_DEDUP_WINDOW_SEC` | (built-in) | Window (seconds) for deduplicating hook-generated observations by normalized content hash. |

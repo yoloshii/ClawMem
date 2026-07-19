@@ -284,6 +284,20 @@ Build temporal backbone and semantic graph.
 | `semantic_threshold` | number | 0.7 | Similarity threshold for semantic edges |
 | `vault` | string | — | Named vault |
 
+**Response** (v0.28.0+):
+
+| Field | Meaning |
+|---|---|
+| `temporal` / `semantic` | Edges **newly written by this call**. Inserts are idempotent, so a rebuild over an unchanged corpus correctly returns `0`. |
+| `temporalTotal` / `semanticTotal` | Edges of that type **currently in the active graph** — both endpoints active. |
+
+Text output reads `Temporal graph: N new edge(s), M total`.
+
+`0 new` does **not** mean the graph is empty — check the total. Before v0.28.0 these counters
+reported insert *attempts* rather than rows written, so a call that persisted nothing could
+still report a non-zero count. Only the graph types you request appear in the response; the
+REST endpoint differs (see [rest-api.md](rest-api.md)).
+
 ### profile
 
 Get or rebuild the user profile (static facts + dynamic context).

@@ -29,7 +29,7 @@ import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
 import { extractJsonFromLLM } from "./amem.ts";
-import { isSchemaPlaceholder } from "./schema-placeholder.ts";
+import { isSchemaPlaceholder, ALIAS_RESIDUE, LINK_TARGET_RESIDUE } from "./schema-placeholder.ts";
 import type { ContentType } from "./memory.ts";
 
 // =============================================================================
@@ -204,7 +204,7 @@ Shape (structure only — not example content):
     "facts": ["{{supporting evidence string}}"],
     "aliases": ["{{optional alternative title}}"],
     "links": [
-      { "targetTitle": "{{another fact's title}}", "relationType": "{{one of: semantic, supporting, contradicts, causal, temporal, entity}}", "weight": 0.6 }
+      { "targetTitle": "{{target fact title}}", "relationType": "{{one of: semantic, supporting, contradicts, causal, temporal, entity}}", "weight": 0.6 }
     ]
   }
 ]`;
@@ -239,7 +239,7 @@ function normalizeExtractedFact(
     : [];
 
   const aliases: string[] = Array.isArray(obj.aliases)
-    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim().length > 0 && !isSchemaPlaceholder(a))
+    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim().length > 0 && !isSchemaPlaceholder(a, ALIAS_RESIDUE, "identifier"))
     : [];
 
   const links: ExtractedFactLink[] = Array.isArray(obj.links)
@@ -252,6 +252,10 @@ function normalizeExtractedFact(
           const relationType =
             typeof link.relationType === "string" ? link.relationType : "";
           if (!targetTitle || !VALID_RELATION_TYPES.has(relationType)) return null;
+          // Identifier scope: a link target is a NAME used for resolution, so no marker shape
+          // is rejected — but this prompt emits a copyable `{{target fact title}}` skeleton,
+          // which would otherwise cross normalization and could resolve against legacy content.
+          if (isSchemaPlaceholder(targetTitle, LINK_TARGET_RESIDUE, "identifier")) return null;
           const weight =
             typeof link.weight === "number" && Number.isFinite(link.weight)
               ? Math.max(0, Math.min(1, link.weight))

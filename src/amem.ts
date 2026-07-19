@@ -5,6 +5,7 @@
  * All operations are non-fatal and log errors with [amem] prefix.
  */
 
+import { isSchemaPlaceholder, CAUSAL_RESIDUE } from "./schema-placeholder.ts";
 import type { Database } from "bun:sqlite";
 import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
@@ -1238,7 +1239,10 @@ Only include relationships with confidence >= 0.6. Return empty array [] if no c
     }
 
     // Filter by confidence threshold and insert causal links
-    let linksCreated = 0;
+    let linksCreated = 0;      // rows SQLite actually wrote
+    let candidatesAccepted = 0; // links that cleared every filter and were attempted
+    let placeholderRejects = 0; // links rejected as echoed prompt-skeleton residue
+    let invalidRejects = 0;     // links rejected for non-finite / out-of-range confidence
     const timestamp = new Date().toISOString();
     const insertStmt = store.db.prepare(`
       INSERT OR IGNORE INTO memory_relations (
@@ -1249,6 +1253,25 @@ Only include relationships with confidence >= 0.6. Return empty array [] if no c
     for (const link of links) {
       // Structure already validated inside the parse closure (§13.1);
       // semantic filters below are not retry-worthy.
+
+      // Anti-parrot: a weak extraction model run out-of-distribution echoes the prompt's
+      // skeleton instead of extracting. Structurally valid residue passes the parse gate,
+      // the structural validator AND the confidence threshold, so without this check it
+      // reaches the INSERT. The observer, consolidation and conversation-synthesis paths
+      // have shared this guard since the 1.7B mining failure; causal never adopted it.
+      if (isSchemaPlaceholder(link.reasoning, CAUSAL_RESIDUE)) {
+        placeholderRejects++;
+        continue;
+      }
+
+      // Range validation. The parse closure only asserts `typeof confidence === "number"`,
+      // and Infinity is a number: `1e309` cleared the >= 0.6 threshold and wrote a row whose
+      // `weight` column landed as NULL. Reject non-finite and out-of-unit-interval values
+      // before they can reach the INSERT.
+      if (!Number.isFinite(link.confidence) || link.confidence < 0 || link.confidence > 1) {
+        invalidRejects++;
+        continue;
+      }
 
       // Filter by confidence threshold
       if (link.confidence < 0.6) {
@@ -1278,11 +1301,33 @@ Only include relationships with confidence >= 0.6. Return empty array [] if no c
         target_fact: targetEntry.fact,
       });
 
-      insertStmt.run(sourceEntry.docId, targetEntry.docId, link.confidence, metadata, timestamp);
-      linksCreated++;
+      // Count what SQLite actually wrote, not what we attempted. `INSERT OR IGNORE`
+      // silently suppresses PK/FK conflicts, so an attempt counter reports success
+      // for a run that persisted nothing — which is exactly how a total failure of
+      // this path stayed invisible for months.
+      linksCreated += insertStmt.run(
+        sourceEntry.docId, targetEntry.docId, link.confidence, metadata, timestamp,
+      ).changes;
+      candidatesAccepted++;
     }
 
-    console.log(`[amem] Created ${linksCreated} causal links from ${links.length} identified relationships`);
+    if (linksCreated !== candidatesAccepted) {
+      console.warn(
+        `[amem] causal: ${candidatesAccepted} candidate(s) passed filters but only ` +
+        `${linksCreated} row(s) were written — suppressed by INSERT OR IGNORE`,
+      );
+    }
+    if (placeholderRejects > 0) {
+      console.warn(
+        `[amem] causal: rejected ${placeholderRejects} link(s) whose reasoning was echoed ` +
+        `prompt-skeleton residue — the extraction model is parroting, not extracting`,
+      );
+    }
+    console.log(
+      `[amem] Wrote ${linksCreated} causal link(s) ` +
+      `(${links.length} proposed, ${candidatesAccepted} passed filters, ` +
+      `${placeholderRejects} placeholder-rejected, ${invalidRejects} range-rejected)`,
+    );
     return linksCreated;
   } catch (err) {
     console.log(`[amem] Error in inferCausalLinks:`, err);

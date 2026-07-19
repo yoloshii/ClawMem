@@ -31,7 +31,7 @@ Brain.
 test-beads/
 config.yaml
 dist/
-.codex-review-session.txt
+.codex-review-session.txt*
 .codex-review/
 .codex-review-jobs/
 .no-test-on-stop

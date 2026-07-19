@@ -88,6 +88,19 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - Graph may be sparse (few A-MEM edges).
 - Fix: Run `build_graphs` to add temporal backbone + semantic edges.
 
+### `build_graphs` reports 0 new edges
+
+Expected on a rebuild. Inserts are idempotent, so a second call over an unchanged corpus writes
+nothing and correctly reports `0 new`. Read the accompanying total (`N new edge(s), M total`) —
+if the total is non-zero the graph is populated and there is nothing to fix.
+
+Before v0.28.0 these counters reported insert *attempts* rather than rows written, so a call
+that persisted nothing could still report a healthy-looking count. If you are on an older
+version, a non-zero count is not evidence that edges landed.
+
+Totals count only edges whose **both endpoints are active**, matching the population the
+builders operate on — so archiving documents legitimately lowers the total.
+
 **search returns results but query returns nothing**
 - `query` applies stricter scoring (composite + MMR + expansion). If expansion LLM is down, the pipeline may return empty.
 - Fix: Check GPU connectivity. Use `search` or `vsearch` as a fallback.

@@ -1436,6 +1436,7 @@ export type Store = {
 
   // MAGMA graph building
   buildTemporalBackbone: () => number;
+  countActiveRelations: (relationType: string) => number;
   buildSemanticGraph: (threshold?: number) => Promise<number>;
 
   // A-MEM: Self-Evolving Memory
@@ -1708,6 +1709,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // MAGMA graph building
     buildTemporalBackbone: () => buildTemporalBackbone(db),
+    countActiveRelations: (relationType: string) => countActiveRelations(db, relationType),
     buildSemanticGraph: (threshold?: number) => buildSemanticGraph(db, threshold),
 
     // A-MEM: Self-Evolving Memory
@@ -5304,6 +5306,26 @@ export { detectBeadsProject };
  * Build temporal backbone - connect documents in chronological order.
  * Returns number of edges created.
  */
+/**
+ * Count edges of one relation type whose BOTH endpoints are still active.
+ *
+ * The graph builders only ever operate on active documents, so a raw `COUNT(*)` over
+ * `memory_relations` reports edges the live graph no longer contains — deactivating one
+ * endpoint left the reported total unchanged while the active graph had shrunk. Counting the
+ * same population the builders work on is what makes "N new, M total" internally consistent.
+ *
+ * Lives here rather than inline at each caller so the MCP tool and the REST endpoint cannot
+ * drift apart: they previously carried separate copies of this query.
+ */
+export function countActiveRelations(db: Database, relationType: string): number {
+  return (db.prepare(
+    `SELECT COUNT(*) c FROM memory_relations r
+       JOIN documents src ON src.id = r.source_id AND src.active = 1
+       JOIN documents tgt ON tgt.id = r.target_id AND tgt.active = 1
+     WHERE r.relation_type = ?`,
+  ).get(relationType) as { c: number }).c;
+}
+
 export function buildTemporalBackbone(db: Database): number {
   // Get all documents ordered by creation time
   const docs = db.prepare(`
@@ -5320,12 +5342,12 @@ export function buildTemporalBackbone(db: Database): number {
     const prev = docs[i - 1]!;
     const curr = docs[i]!;
 
-    db.prepare(`
+    // Count rows SQLite actually wrote — `INSERT OR IGNORE` suppresses conflicts,
+    // so an attempt counter reports edges that were never persisted.
+    edges += db.prepare(`
       INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
       VALUES (?, ?, 'temporal', 1.0, ?)
-    `).run(prev.id, curr.id, new Date().toISOString());
-
-    edges++;
+    `).run(prev.id, curr.id, new Date().toISOString()).changes;
   }
 
   return edges;
@@ -5371,11 +5393,12 @@ export async function buildSemanticGraph(
 
     for (const sim of similar) {
       const similarity = 1 - sim.distance;
-      db.prepare(`
+      // Count rows SQLite actually wrote, matching buildTemporalBackbone — the two
+      // counters feed one `build_graphs` response and must report the same unit.
+      edges += db.prepare(`
         INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
         VALUES (?, ?, 'semantic', ?, ?)
-      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString());
-      edges++;
+      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString()).changes;
     }
   }
 
