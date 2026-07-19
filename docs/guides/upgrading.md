@@ -71,6 +71,14 @@ standing total tells you the graph is populated). If you parse that text output,
 
 Totals count only edges whose both endpoints are active, matching what the builders operate on.
 
+**Contradiction detection starts having an effect.** The hook always classified, but two contract
+defects discarded every verdict before it could mutate anything — it will now lower the confidence of documents a
+session's facts contradict (`-0.25`, floored at `0.2`). That is a ranking signal only; nothing
+leaves retrieval. The terminal step that *does* remove a document from retrieval — invalidation —
+is **off by default** behind `CLAWMEM_CONTRADICTION_INVALIDATE` and logs `WOULD invalidate`
+instead of writing. Nothing to do on upgrade. Before arming it, calibrate against your own vault:
+[contradiction invalidation](contradiction-invalidation.md).
+
 ## v0.27.0: authorship time (`authored_at`) + entity-edge IDF fix
 
 Drop-in; the `authored_at` column and its index auto-migrate on first open. What changes and what to know:

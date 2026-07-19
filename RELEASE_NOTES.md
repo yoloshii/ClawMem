@@ -6,7 +6,7 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ## v0.28.0 — hook write-path contracts: extraction guards, honest counters
 
-Two Stop-hook write paths — A-MEM causal inference and contradiction detection — reported success while persisting nothing. Instrumentation counted *attempts* against `INSERT OR IGNORE`, so a total write failure was indistinguishable from a healthy run. This release makes the reporting truthful and hardens the validation ahead of every mutation. It enables no new writer; the extraction quality work is separate.
+Two Stop-hook write paths — A-MEM causal inference and contradiction detection — reported success while persisting nothing. Instrumentation counted *attempts* against `INSERT OR IGNORE`, so a total write failure was indistinguishable from a healthy run. This release makes the reporting truthful, hardens the validation ahead of every mutation, and repairs the two contract defects that left contradiction detection unable to apply a classification at all. The terminal mutation that repair unblocks — invalidation — ships **shadowed behind an opt-in flag**, not armed.
 
 ### Counters report outcomes, not attempts (`src/amem.ts`, `src/store.ts`, `src/mcp.ts`, `src/server.ts`)
 
@@ -23,13 +23,37 @@ Two Stop-hook write paths — A-MEM causal inference and contradiction detection
 - **The contradiction parse gate reports instead of returning silently**, emitting response shape, length, content hash and served model identity. Raw model text stays opt-in behind `CLAWMEM_DEBUG_LLM_RAW` — the prompt carries transcript-derived material, so logging it by default would be a content-exposure path.
 - **`/no_think` is applied idempotently** — six prompts already carry the token inline for the local fallback and were being sent a doubled control token.
 
+### Contradiction detection could never apply a classification (`src/hooks/decision-extractor.ts`)
+
+Two independent defects sat between a valid classification and any effect on the vault. Both are model-independent, and both failed silently.
+
+- **The document lookup was handed a URI where it expected a path.** `SearchResult.filepath` is a *virtual* path — `clawmem://<collection>/<path>`, assembled in the store's projection — while `findActiveDocument` matches the bare `documents.path` column. The hook passed the URI straight through, so no candidate could ever resolve to a row, and the miss exited through a bare `continue`. Every classification that survived the parse gate and every validation above it died there without mutating anything. The path is now resolved with `parseVirtualPath` before lookup, and a target that still fails to resolve increments a counter and warns rather than disappearing.
+- **The parse gate rejected the deployed model's response shape.** The model wraps its array in an object (`{"result": [...]}`). `parseLinkGenerationFromLLM` in `amem.ts` has unwrapped that form since it was written; this path never did, so structurally valid responses were counted as malformed. Both forms are accepted now.
+
+Taken together these are why contradiction detection had no observable effect on any vault regardless of what its logs reported. Precisely: the hook ran, called the model, and parsed a verdict — but no verdict could ever be *applied*, and no document was mutated, in any version shipping this implementation. Read it as newly-effective, not as newly-fixed.
+
+### Invalidation ships shadowed — `CLAWMEM_CONTRADICTION_INVALIDATE`
+
+Repairing the lookup made the soft-invalidation branch reachable for the first time, so it is gated rather than simply switched on. The two mutations behind a contradiction are not symmetrical:
+
+- **Confidence erosion** (`-0.25`, floored at `0.2`) is a ranking signal — 25% of the default composite. A degraded document ranks lower and stays fully retrievable. **Live.**
+- **Invalidation** sets `invalidated_at`, which is a hard predicate on the FTS join and both vector joins. An invalidated document leaves retrieval entirely, with no query-time signal that anything was suppressed. **Off unless `CLAWMEM_CONTRADICTION_INVALIDATE=true`.**
+
+Unarmed, the hook logs `WOULD invalidate "<collection>/<path>"` per suppressed write plus per-session summaries, so precision can be adjudicated against real traffic before anything is removed.
+
+**Shadow mode reports exactly what arming would remove — no more.** Candidates are selected by *pathname* (`decisions/`, `observations/`), but the armed writer only touches `content_type='observation'`: on the reference vault, roughly three times as many candidates as eligible rows. Eligibility is now asked once and gates the shadow log and the armed write identically, so calibration cannot be aimed at a population two thirds of which could never have been invalidated. Documents that reach the floor while ineligible are reported separately, and the armed write checks `.changes` rather than discarding its result — a swallowed outcome is how the original defect stayed invisible.
+
+Exposure is vault-specific along five axes: the eligible population's confidence distribution (`(0.95, 1.0]` needs four classifications to reach the floor, `(0.70, 0.95]` three, `(0.45, 0.70]` two, `<= 0.45` one), content-type mix, the classifier model, corpus semantics, and classification opportunity (only the top 5 search results per session are ever classified, from a pool that changes when the vector leg falls back to FTS). The [contradiction invalidation guide](docs/guides/contradiction-invalidation.md) has the measurement queries, the adjudication procedure, and the restore statements.
+
+**Eligibility is `content_type='observation'` only.** A superseded *decision* is eroded but never retired — decision records are outside the writer's reach by design. **Shadow output is not reachable under OpenClaw**, where the plugin surfaces hook stderr only on a non-zero exit and a successful shadow run exits zero; this flag should not be armed on that host, and calibrating under Claude Code is not an equivalent substitute because exposure is host-dependent. No shipped systemd unit runs this hook — `clawmem-watcher.service` is the indexer.
+
 ### Upgrade note — `build_graphs` response shape
 
 Additive, but a contract change. Both surfaces gain `temporalTotal` / `semanticTotal`, and the MCP text line changes from `Temporal graph: N edges` to `Temporal graph: N new edge(s), M total`. Anything parsing that text should be updated. The REST endpoint continues to emit all four keys unconditionally (its pre-existing shape); the MCP tool continues to include only the graph types requested.
 
 ### Quality gates
 
-Full suite 1,751/0. Cross-model adversarial passes (codex / GPT-5.6) throughout — fourteen turns, including successive fail-opens in the same validator, a duplicate-entry defect that compounded mutations on one document, and a round in which the newly-added regression tests were shown not to exercise the guard they were written for.
+Full suite 1,775/0. Cross-model adversarial passes (codex / GPT-5.6) throughout — seventeen turns, including successive fail-opens in the same validator, a duplicate-entry defect that compounded mutations on one document, and a round in which the newly-added regression tests were shown not to exercise the guard they were written for.
 
 ## v0.27.0 — authorship time: memories rank by when they were written
 

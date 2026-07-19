@@ -13,9 +13,16 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createStore, buildTemporalBackbone, type Store } from "../../src/store.ts";
+import { createStore, buildTemporalBackbone, searchFTS, type Store } from "../../src/store.ts";
 import { inferCausalLinks } from "../../src/amem.ts";
-import { validateContradictionEntry, admitContradictionEntries } from "../../src/hooks/decision-extractor.ts";
+import {
+  validateContradictionEntry,
+  admitContradictionEntries,
+  unwrapContradictionArray,
+  applyContradictionOutcomes,
+  applyContradictionResponse,
+  INVALIDATION_ELIGIBLE_CONTENT_TYPE,
+} from "../../src/hooks/decision-extractor.ts";
 import {
   isSchemaPlaceholder,
   CAUSAL_RESIDUE,
@@ -606,5 +613,388 @@ describe("identifier guards are wired into the production extraction path", () =
     // Residue removed, legitimate marker-shaped identifiers kept.
     expect(fact.aliases).toEqual(["{{user.name}}", "Bun migration"]);
     expect(fact.links?.map(l => l.targetTitle)).toEqual(["{{user.name}}", "Runtime selection"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 — the contradiction WRITE path.
+//
+// Everything above guards what reaches the mutation boundary. These cover the boundary itself,
+// which had no coverage at all because it was only reachable through a live model call. Two
+// contract defects sat there: the parse gate rejected the deployed model's response envelope,
+// and the document lookup was handed a `clawmem://` URI where it matched a bare `path` column,
+// so no classification could resolve a row in any shipped version.
+// ---------------------------------------------------------------------------
+
+describe("contradiction parse gate accepts the model's response envelope", () => {
+  test("bare array passes through unchanged", () => {
+    const arr = [{ old_idx: 0, new_idx: 0, relation: "contradiction" }];
+    expect(unwrapContradictionArray(arr)).toBe(arr);
+  });
+
+  test("{result: [...]} is unwrapped to the inner array", () => {
+    const inner = [{ old_idx: 0, new_idx: 0, relation: "contradiction" }];
+    expect(unwrapContradictionArray({ result: inner })).toBe(inner);
+  });
+
+  test("empty wrapped array unwraps — an explicit 'no contradictions' is not malformed", () => {
+    expect(unwrapContradictionArray({ result: [] })).toEqual([]);
+  });
+
+  // The caller decides malformed-ness with `!Array.isArray(parsed)`. Anything this helper cannot
+  // unwrap must therefore come back UNCHANGED, or a genuinely broken response would be swallowed
+  // as an empty classification instead of reported.
+  test.each([
+    ["object with no result key", { foo: 1 }],
+    ["result present but not an array", { result: "nope" }],
+    ["result explicitly null", { result: null }],
+    ["nested one level too deep", { result: { result: [] } }],
+    ["bare string", "not json at all"],
+    ["null", null],
+  ])("%s is returned unchanged so the caller still rejects it", (_label, input) => {
+    const out = unwrapContradictionArray(input);
+    expect(out).toEqual(input as any);
+    expect(Array.isArray(out)).toBe(false);
+  });
+});
+
+describe("contradiction write path — target resolution and eligibility", () => {
+  withStore();
+
+  const ARMED = "CLAWMEM_CONTRADICTION_INVALIDATE";
+
+  function mkTypedDoc(path: string, contentType: string, confidence: number): number {
+    const id = mkDoc(path);
+    (store as any).updateDocumentMeta(id, { content_type: contentType, confidence });
+    return id;
+  }
+
+  /**
+   * Candidates come from the REAL search projection, not a hand-built literal — the defect was a
+   * mismatch between what `searchFTS` emits as `filepath` and what `findActiveDocument` matches,
+   * so a test that constructs the URI itself would only assert my reading of the contract.
+   */
+  function candidateFor(path: string) {
+    const hit = searchFTS((store as any).db, "body", 50)
+      .find(r => r.filepath.endsWith(`/${path}`));
+    if (!hit) throw new Error(`searchFTS did not return a candidate for ${path}`);
+    return hit;
+  }
+
+  const entry = (overrides: Record<string, unknown> = {}) => ({
+    old_idx: 0, new_idx: 0, relation: "contradiction", confidence: 0.9, reasoning: "r", ...overrides,
+  });
+
+  const invalidatedAt = (id: number) =>
+    ((store as any).db.prepare(`SELECT invalidated_at FROM documents WHERE id = ?`)
+      .get(id) as { invalidated_at: string | null }).invalidated_at;
+
+  const confidenceOf = (id: number) =>
+    ((store as any).db.prepare(`SELECT confidence FROM documents WHERE id = ?`)
+      .get(id) as { confidence: number }).confidence;
+
+  test("a NESTED virtual path resolves to the intended row and lowers its confidence", () => {
+    // Multi-segment path: the collection boundary is the FIRST slash, everything after is the
+    // bare path. Handing the whole URI to findActiveDocument matched nothing — that was the bug.
+    const id = mkTypedDoc("observations/2026/07/alpha.md", "observation", 0.8);
+    const cand = candidateFor("observations/2026/07/alpha.md");
+    expect(cand.filepath).toStartWith("clawmem://");
+
+    const out = applyContradictionOutcomes(store, [entry()], [cand], ["new fact"], [null, null]);
+
+    expect(out.contradictions).toBe(1);
+    expect(out.unparseableTarget).toBe(0);
+    expect(out.missingTarget).toBe(0);
+    expect(confidenceOf(id)).toBeCloseTo(0.55, 5);
+  });
+
+  test("unarmed: an eligible doc reaches the floor but is NOT invalidated", () => {
+    delete process.env[ARMED];
+    const id = mkTypedDoc("observations/beta.md", INVALIDATION_ELIGIBLE_CONTENT_TYPE, 0.45);
+    const out = applyContradictionOutcomes(
+      store, [entry()], [candidateFor("observations/beta.md")], ["f"], [null, null]);
+
+    expect(confidenceOf(id)).toBeCloseTo(0.2, 5);
+    expect(invalidatedAt(id)).toBeNull();
+    expect(out.shadowInvalidations).toBe(1);
+    expect(out.invalidated).toBe(0);
+  });
+
+  test("armed: exactly one eligible row is invalidated", () => {
+    process.env[ARMED] = "true";
+    try {
+      const id = mkTypedDoc("observations/gamma.md", INVALIDATION_ELIGIBLE_CONTENT_TYPE, 0.45);
+      const out = applyContradictionOutcomes(
+        store, [entry()], [candidateFor("observations/gamma.md")], ["f"], [null, null]);
+
+      expect(out.invalidated).toBe(1);
+      expect(out.shadowInvalidations).toBe(0);
+      expect(out.invalidationNoOp).toBe(0);
+      expect(invalidatedAt(id)).not.toBeNull();
+    } finally {
+      delete process.env[ARMED];
+    }
+  });
+
+  test("any value other than exactly 'true' leaves the writer unarmed", () => {
+    process.env[ARMED] = "TRUE";
+    try {
+      const id = mkTypedDoc("observations/delta.md", INVALIDATION_ELIGIBLE_CONTENT_TYPE, 0.45);
+      const out = applyContradictionOutcomes(
+        store, [entry()], [candidateFor("observations/delta.md")], ["f"], [null, null]);
+      expect(out.shadowInvalidations).toBe(1);
+      expect(invalidatedAt(id)).toBeNull();
+    } finally {
+      delete process.env[ARMED];
+    }
+  });
+
+  // The defect this locks: candidates are selected by PATHNAME, but only one content_type can
+  // ever be invalidated. Reporting an intent the armed writer cannot honour would aim shadow-mode
+  // calibration at the wrong population — on the reference vault, ~2/3 of candidates.
+  test("an ineligible content_type at the floor is neither shadowed nor invalidated — armed OR not", () => {
+    for (const armed of [false, true]) {
+      if (armed) process.env[ARMED] = "true"; else delete process.env[ARMED];
+      try {
+        const path = `observations/decision-${armed}.md`;
+        const id = mkTypedDoc(path, "decision", 0.45);
+        const out = applyContradictionOutcomes(
+          store, [entry()], [candidateFor(path)], ["f"], [null, null]);
+
+        expect(out.floorIneligible).toBe(1);
+        expect(out.shadowInvalidations).toBe(0);
+        expect(out.invalidated).toBe(0);
+        expect(invalidatedAt(id)).toBeNull();
+        // Erosion is NOT gated on eligibility — the ranking signal still applies.
+        expect(confidenceOf(id)).toBeCloseTo(0.2, 5);
+      } finally {
+        delete process.env[ARMED];
+      }
+    }
+  });
+
+  test("a malformed virtual path and a missing row are counted separately", () => {
+    mkTypedDoc("observations/eps.md", "observation", 0.8);
+    const cand = candidateFor("observations/eps.md");
+
+    const unparseable = { ...candidateFor("observations/eps.md"), filepath: "not-a-virtual-path" };
+    const missing = { ...cand, filepath: "clawmem://_clawmem/observations/never-existed.md" };
+
+    const out = applyContradictionOutcomes(
+      store,
+      [entry({ old_idx: 0 }), entry({ old_idx: 1 })],
+      [unparseable as any, missing as any],
+      ["f"],
+      [null, null],
+    );
+
+    // Collapsing these into one counter would hide a URI-contract regression behind an
+    // ordinary archived-document race.
+    expect(out.unparseableTarget).toBe(1);
+    expect(out.missingTarget).toBe(1);
+    expect(out.contradictions).toBe(0);
+  });
+
+  test("the 'update' relation uses its own 0.3 floor and never invalidates", () => {
+    process.env[ARMED] = "true";
+    try {
+      const id = mkTypedDoc("observations/zeta.md", INVALIDATION_ELIGIBLE_CONTENT_TYPE, 0.35);
+      const out = applyContradictionOutcomes(
+        store, [entry({ relation: "update" })], [candidateFor("observations/zeta.md")], ["f"], [null, null]);
+
+      expect(confidenceOf(id)).toBeCloseTo(0.3, 5);
+      expect(out.invalidated).toBe(0);
+      expect(invalidatedAt(id)).toBeNull();
+    } finally {
+      delete process.env[ARMED];
+    }
+  });
+
+  test("a second contradiction against an already-invalidated row is a no-op, not a double write", () => {
+    process.env[ARMED] = "true";
+    try {
+      const id = mkTypedDoc("observations/eta.md", INVALIDATION_ELIGIBLE_CONTENT_TYPE, 0.45);
+      const cand = candidateFor("observations/eta.md");
+      applyContradictionOutcomes(store, [entry()], [cand], ["f"], [null, null]);
+      const firstStamp = invalidatedAt(id);
+      expect(firstStamp).not.toBeNull();
+
+      const second = applyContradictionOutcomes(store, [entry()], [cand], ["f"], [null, null]);
+      // isInvalidationEligible excludes already-invalidated rows, so this stops before the write.
+      expect(second.invalidated).toBe(0);
+      expect(second.floorIneligible).toBe(1);
+      expect(invalidatedAt(id)).toBe(firstStamp);
+    } finally {
+      delete process.env[ARMED];
+    }
+  });
+});
+
+describe("contradiction response — the production-wired unwrap → admit → apply path", () => {
+  withStore();
+
+  // The pure-helper tests above would stay green if the unwrap call were deleted from the
+  // production path entirely. These drive the seam production actually calls, so the wiring
+  // itself is under test — not just the function it is supposed to call.
+  function seed(path: string, confidence: number) {
+    const id = mkDoc(path);
+    (store as any).updateDocumentMeta(id, {
+      content_type: INVALIDATION_ELIGIBLE_CONTENT_TYPE, confidence,
+    });
+    const cand = searchFTS((store as any).db, "body", 50).find(r => r.filepath.endsWith(`/${path}`))!;
+    return { id, cand };
+  }
+  const conf = (id: number) =>
+    ((store as any).db.prepare(`SELECT confidence FROM documents WHERE id = ?`)
+      .get(id) as { confidence: number }).confidence;
+
+  const REL = [{ old_idx: 0, new_idx: 0, relation: "contradiction", confidence: 0.9, reasoning: "r" }];
+
+  test("a WRAPPED response reaches the mutation and lowers confidence", () => {
+    const { id, cand } = seed("observations/wrapped.md", 0.8);
+    const out = applyContradictionResponse(store, { result: REL }, [cand], ["f"], [null]);
+
+    expect(out.parseFailed).toBe(false);
+    expect(out.outcomes.contradictions).toBe(1);
+    expect(conf(id)).toBeCloseTo(0.55, 5);
+  });
+
+  test("a BARE-array response behaves identically", () => {
+    const { id, cand } = seed("observations/bare.md", 0.8);
+    const out = applyContradictionResponse(store, REL, [cand], ["f"], [null]);
+
+    expect(out.parseFailed).toBe(false);
+    expect(out.outcomes.contradictions).toBe(1);
+    expect(conf(id)).toBeCloseTo(0.55, 5);
+  });
+
+  test("an unwrappable root mutates nothing and reports its shape", () => {
+    const { id, cand } = seed("observations/broken.md", 0.8);
+    const out = applyContradictionResponse(store, { nope: 1 }, [cand], ["f"], [null]);
+
+    expect(out.parseFailed).toBe(true);
+    expect(out.parsedCategory).toBe("object");
+    expect(out.outcomes.contradictions).toBe(0);
+    expect(conf(id)).toBeCloseTo(0.8, 5);
+  });
+
+  test("invalidated_by names the fact's OWN source document, not the newest in the session", () => {
+    process.env.CLAWMEM_CONTRADICTION_INVALIDATE = "true";
+    try {
+      const srcA = mkDoc("observations/src-a.md");
+      const srcB = mkDoc("observations/src-b.md");
+      const { id, cand } = seed("observations/victim.md", 0.45);
+
+      // new_idx=1 → the SECOND fact, whose source is srcB. The previous implementation ignored
+      // new_idx and took the newest session document, so both facts attributed to the same row.
+      applyContradictionResponse(
+        store,
+        [{ old_idx: 0, new_idx: 1, relation: "contradiction", confidence: 0.9, reasoning: "r" }],
+        [cand], ["fact from A", "fact from B"], [srcA, srcB],
+      );
+
+      const row = (store as any).db.prepare(
+        `SELECT invalidated_by FROM documents WHERE id = ?`).get(id) as { invalidated_by: number | null };
+      expect(row.invalidated_by).toBe(srcB);
+      expect(row.invalidated_by).not.toBe(srcA);
+    } finally {
+      delete process.env.CLAWMEM_CONTRADICTION_INVALIDATE;
+    }
+  });
+
+  test("an unattributable fact records a null source rather than guessing one", () => {
+    process.env.CLAWMEM_CONTRADICTION_INVALIDATE = "true";
+    try {
+      const { id, cand } = seed("observations/orphan.md", 0.45);
+      applyContradictionResponse(store, REL, [cand], ["f"], [null]);
+
+      const row = (store as any).db.prepare(
+        `SELECT invalidated_at, invalidated_by FROM documents WHERE id = ?`)
+        .get(id) as { invalidated_at: string | null; invalidated_by: number | null };
+      expect(row.invalidated_at).not.toBeNull();
+      expect(row.invalidated_by).toBeNull();
+    } finally {
+      delete process.env.CLAWMEM_CONTRADICTION_INVALIDATE;
+    }
+  });
+});
+
+describe("contradiction write path — armed-write failure branches", () => {
+  withStore();
+
+  // `invalidationNoOp` and `invalidationErrors` are only reachable when the row changes under
+  // the write, or the write throws. Both are races against a live database, so they are driven
+  // through a store whose UPDATE behaves that way rather than by contriving vault state.
+  function storeWithUpdate(run: () => { changes: number }) {
+    const real = store as any;
+    return {
+      ...real,
+      db: {
+        prepare: (sql: string) => {
+          if (sql.includes("SET invalidated_at")) return { run, get: () => undefined };
+          return real.db.prepare(sql);
+        },
+      },
+      findActiveDocument: real.findActiveDocument.bind(real),
+      updateDocumentMeta: real.updateDocumentMeta.bind(real),
+    } as any;
+  }
+
+  const REL = [{ old_idx: 0, new_idx: 0, relation: "contradiction", confidence: 0.9, reasoning: "r" }];
+
+  function seededCandidate(path: string, confidence = 0.45) {
+    const id = mkDoc(path);
+    (store as any).updateDocumentMeta(id, {
+      content_type: INVALIDATION_ELIGIBLE_CONTENT_TYPE, confidence,
+    });
+    const cand = searchFTS((store as any).db, "body", 50).find(r => r.filepath.endsWith(`/${path}`))!;
+    return { id, cand };
+  }
+  const confOf = (id: number) =>
+    ((store as any).db.prepare(`SELECT confidence FROM documents WHERE id = ?`)
+      .get(id) as { confidence: number }).confidence;
+
+  test("a zero-row armed write is counted, not read as a success", () => {
+    process.env.CLAWMEM_CONTRADICTION_INVALIDATE = "true";
+    try {
+      const { cand } = seededCandidate("observations/raced.md");
+      const out = applyContradictionOutcomes(
+        storeWithUpdate(() => ({ changes: 0 })), REL, [cand], ["f"], [null]);
+
+      expect(out.invalidationNoOp).toBe(1);
+      expect(out.invalidated).toBe(0);
+    } finally {
+      delete process.env.CLAWMEM_CONTRADICTION_INVALIDATE;
+    }
+  });
+
+  test("a throwing armed write is counted and the REST of the batch still runs", () => {
+    process.env.CLAWMEM_CONTRADICTION_INVALIDATE = "true";
+    try {
+      // Two verdicts: the first drives an invalidation that throws, the second is an ordinary
+      // update on a different document. Asserting only the first would leave a `return out` in
+      // the catch block undetected — the error would be counted while the batch silently aborted.
+      const first = seededCandidate("observations/throws.md", 0.45);
+      const second = seededCandidate("observations/survivor.md", 0.8);
+
+      const out = applyContradictionOutcomes(
+        storeWithUpdate(() => { throw new Error("database is locked"); }),
+        [
+          { old_idx: 0, new_idx: 0, relation: "contradiction", confidence: 0.9, reasoning: "r" },
+          { old_idx: 1, new_idx: 0, relation: "update", confidence: 0.9, reasoning: "r" },
+        ],
+        [first.cand, second.cand], ["f"], [null],
+      );
+
+      expect(out.invalidationErrors).toBe(1);
+      expect(out.invalidated).toBe(0);
+      // The erosion ahead of the failed write stands...
+      expect(out.contradictions).toBe(1);
+      expect(confOf(first.id)).toBeCloseTo(0.2, 5);
+      // ...and the SECOND verdict was still applied, which is what proves the loop continued.
+      expect(confOf(second.id)).toBeCloseTo(0.65, 5);
+    } finally {
+      delete process.env.CLAWMEM_CONTRADICTION_INVALIDATE;
+    }
   });
 });

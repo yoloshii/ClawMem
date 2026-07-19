@@ -116,6 +116,18 @@ The `context-surfacing` hook suppresses duplicate prompts using SHA-256 hashing 
 
 The Stop-event hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`) use `saveMemory()` which enforces a 30-minute normalized content hash dedup window, preventing duplicate observations across concurrent or rapid sessions.
 
+## What the Stop hooks write
+
+`decision-extractor` does more than persist observations: it classifies each session's new facts
+against the memories they resemble, and a `contradiction` verdict lowers the older document's
+confidence by 0.25 (floored at 0.2). That is a ranking signal — the document stays retrievable.
+
+When erosion reaches the floor the hook can additionally set `invalidated_at`, which removes the
+document from FTS and vector retrieval outright. **That step is off by default** — it logs
+`WOULD invalidate` and writes nothing until you set `CLAWMEM_CONTRADICTION_INVALIDATE=true`. How
+much it would affect your vault depends on your confidence distribution and content-type mix, so
+measure before arming: [contradiction invalidation](contradiction-invalidation.md).
+
 ## Adding custom hooks alongside ClawMem
 
 If you add your own hooks to `~/.claude/settings.json` alongside ClawMem's (e.g., a custom Stop hook for context management), every code path in your script must output valid JSON to stdout. Claude Code treats a hook that exits 0 with no stdout as an error.

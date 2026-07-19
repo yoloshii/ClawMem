@@ -23,7 +23,7 @@ import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
 import { extractJsonFromLLM } from "../amem.ts";
-import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, type SearchResult } from "../store.ts";
+import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, parseVirtualPath, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
 import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
 
@@ -339,10 +339,228 @@ export function admitContradictionEntries(
   return { accepted, rejected, duplicates, inconsistent };
 }
 
+/**
+ * The deployed model wraps its array in an object (`{"result": [...]}`) rather than returning a
+ * bare array. `parseLinkGenerationFromLLM` in amem.ts has unwrapped that shape since it was
+ * written; this path never did, so the gate rejected structurally-valid responses as unparseable.
+ *
+ * Anything that is neither shape is returned UNCHANGED, so the caller's existing
+ * `!Array.isArray(parsed)` reporting branch still catches genuinely malformed responses.
+ */
+export function unwrapContradictionArray(raw: unknown): unknown {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object") {
+    const inner = (raw as { result?: unknown }).result;
+    if (Array.isArray(inner)) return inner;
+  }
+  return raw;
+}
+
+/**
+ * The only `content_type` the armed invalidation writer can touch.
+ *
+ * Candidate selection matches on PATHNAME (`decisions/`, `observations/`), which is a much wider
+ * population than this — roughly 3x on the vault this was developed against.
+ * Reporting an invalidation intent the armed writer could never honour would point shadow-mode
+ * calibration at the wrong population — roughly two thirds of what it flagged would have been
+ * un-invalidatable — so eligibility is asked ONCE, here, and both the shadow log and the armed
+ * write are gated on the same answer.
+ */
+export const INVALIDATION_ELIGIBLE_CONTENT_TYPE = "observation";
+
+export type ContradictionOutcomes = {
+  contradictions: number;
+  /** Virtual path failed to PARSE — a URI-contract regression. */
+  unparseableTarget: number;
+  /** Parsed fine, but no active row — benign (archived/deleted between search and apply). */
+  missingTarget: number;
+  /** Hit the confidence floor but cannot be invalidated: wrong content_type, or already invalidated. */
+  floorIneligible: number;
+  /** Eligible and at floor, but the writer is unarmed. */
+  shadowInvalidations: number;
+  invalidated: number;
+  /** Armed write matched zero rows — lost a race after the eligibility check. */
+  invalidationNoOp: number;
+  invalidationErrors: number;
+};
+
+function isInvalidationEligible(store: Store, docId: number): boolean {
+  const row = store.db
+    .prepare(`SELECT content_type FROM documents WHERE id = ? AND invalidated_at IS NULL`)
+    .get(docId) as { content_type: string | null } | undefined;
+  return row?.content_type === INVALIDATION_ELIGIBLE_CONTENT_TYPE;
+}
+
+/**
+ * Applies validated classifier verdicts to the vault. Split out of `detectContradictions` as the
+ * mutation boundary: everything above it is inference and validation, everything here is a write.
+ * Exported so the write path can be driven directly by tests without an LLM — the branches below
+ * had no coverage precisely because they were only reachable through a live model call.
+ */
+export function applyContradictionOutcomes(
+  store: Store,
+  accepted: any[],
+  candidates: SearchResult[],
+  newFacts: string[],
+  /** Source document of each entry in `newFacts`, positionally aligned. Null = unattributable. */
+  newFactDocIds: ReadonlyArray<number | null>,
+): ContradictionOutcomes {
+  const out: ContradictionOutcomes = {
+    contradictions: 0,
+    unparseableTarget: 0,
+    missingTarget: 0,
+    floorIneligible: 0,
+    shadowInvalidations: 0,
+    invalidated: 0,
+    invalidationNoOp: 0,
+    invalidationErrors: 0,
+  };
+
+  for (const rel of accepted) {
+    if (rel.confidence < 0.7) continue;
+    const oldDoc = candidates[rel.old_idx];
+    if (!oldDoc) continue;
+
+    // `SearchResult.filepath` is a VIRTUAL path — `clawmem://<collection>/<path>`, built in
+    // store.ts by `'clawmem://' || d.collection || '/' || d.path`. `findActiveDocument` matches
+    // the bare `documents.path` column. Passing the URI straight through could never match any
+    // row, so every contradiction that survived the parse gate and validation died here,
+    // silently. Parse it back to the bare path first — and keep the two failure modes apart:
+    // a parse failure means the URI contract itself broke, a missing row is an ordinary race.
+    const virtual = parseVirtualPath(oldDoc.filepath);
+    if (!virtual) {
+      out.unparseableTarget++;
+      continue;
+    }
+    const existingDoc = store.findActiveDocument(virtual.collectionName, virtual.path);
+    if (!existingDoc) {
+      out.missingTarget++;
+      continue;
+    }
+
+    if (rel.relation === "contradiction") {
+      // Lower old doc confidence by 0.25 (floor 0.2)
+      const currentConfidence = existingDoc.confidence ?? 0.5;
+      const newConfidence = Math.max(0.2, currentConfidence - 0.25);
+      store.updateDocumentMeta(existingDoc.id, {
+        confidence: newConfidence,
+      });
+      out.contradictions++;
+      console.error(
+        `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
+      );
+
+      // Soft invalidation: if confidence drops to floor AND the row is invalidation-eligible,
+      // mark as invalidated (Pattern I — prevents stale contradicted knowledge from surfacing)
+      //
+      // SHADOWED BY DEFAULT. Repairing the virtual-path contract above made this reachable for
+      // the first time; no shipped version could apply a classification here. Unlike the
+      // confidence adjustment — bounded, floored, reversible — invalidation hard-gates FTS *and*
+      // vector retrieval, so a false positive makes a real document invisible with no signal.
+      // The classifier feeding it is a model with a demonstrated habit of echoing its prompt,
+      // and hits-to-floor depends entirely on where the document's confidence started.
+      //
+      // Shadow mode logs exactly what the armed writer would remove — no more and no less — so
+      // precision can be adjudicated against real traffic first. Set
+      // CLAWMEM_CONTRADICTION_INVALIDATE=true to arm it.
+      if (newConfidence <= 0.2) {
+        if (!isInvalidationEligible(store, existingDoc.id)) {
+          out.floorIneligible++;
+          continue;
+        }
+        if (process.env.CLAWMEM_CONTRADICTION_INVALIDATE !== "true") {
+          out.shadowInvalidations++;
+          console.warn(
+            `[decision-extractor] contradiction: WOULD invalidate "${oldDoc.displayPath}" ` +
+            `(confidence ${currentConfidence} -> ${newConfidence}) — shadow mode, nothing ` +
+            `written. Set CLAWMEM_CONTRADICTION_INVALIDATE=true to arm.`,
+          );
+          continue;
+        }
+        try {
+          // The content_type predicate is redundant against isInvalidationEligible above and
+          // kept deliberately: it makes a lost race a zero-row no-op rather than a wrong write.
+          const res = store.db.prepare(`
+            UPDATE documents
+            SET invalidated_at = datetime('now'),
+                invalidated_by = ?
+            WHERE id = ? AND invalidated_at IS NULL AND content_type = ?
+          `).run(newFactDocIds[rel.new_idx] ?? null, existingDoc.id, INVALIDATION_ELIGIBLE_CONTENT_TYPE);
+
+          // A swallowed result is how the original defect stayed invisible for four months.
+          if (res.changes === 0) out.invalidationNoOp++;
+          else out.invalidated++;
+        } catch (e) {
+          out.invalidationErrors++;
+          console.warn(
+            `[decision-extractor] contradiction: invalidation FAILED for ` +
+            `"${oldDoc.displayPath}": ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+
+    } else if (rel.relation === "update") {
+      // Lower old doc confidence by 0.15 (floor 0.3)
+      const currentConfidence = existingDoc.confidence ?? 0.5;
+      store.updateDocumentMeta(existingDoc.id, {
+        confidence: Math.max(0.3, currentConfidence - 0.15),
+      });
+    }
+  }
+
+  return out;
+}
+
+export type ContradictionResponseResult = {
+  /** Root was neither a bare array nor `{result: [...]}` — nothing was applied. */
+  parseFailed: boolean;
+  /** Shape of the post-unwrap value, for the operator-facing rejection diagnostic. */
+  parsedCategory: string;
+  outcomes: ContradictionOutcomes;
+  rejected: number;
+  duplicates: number;
+  inconsistent: number;
+};
+
+const EMPTY_OUTCOMES = (): ContradictionOutcomes => ({
+  contradictions: 0, unparseableTarget: 0, missingTarget: 0, floorIneligible: 0,
+  shadowInvalidations: 0, invalidated: 0, invalidationNoOp: 0, invalidationErrors: 0,
+});
+
+/**
+ * unwrap -> admit -> apply, as one unit, called by production.
+ *
+ * The three steps were previously wired together only inside `detectContradictions`, which meant
+ * the envelope repair could be unwired at the call site without a single test noticing. This is
+ * the seam a regression test drives; `detectContradictions` adds only the LLM call and the
+ * operator-facing reporting around it.
+ */
+export function applyContradictionResponse(
+  store: Store,
+  rawJson: unknown,
+  candidates: SearchResult[],
+  newFacts: string[],
+  newFactDocIds: ReadonlyArray<number | null>,
+): ContradictionResponseResult {
+  const parsed = unwrapContradictionArray(rawJson);
+  const parsedCategory = parsed === null ? "unparseable" : Array.isArray(parsed) ? "array" : typeof parsed;
+  if (!Array.isArray(parsed)) {
+    return {
+      parseFailed: true, parsedCategory,
+      outcomes: EMPTY_OUTCOMES(), rejected: 0, duplicates: 0, inconsistent: 0,
+    };
+  }
+  const { accepted, rejected, duplicates, inconsistent } =
+    admitContradictionEntries(parsed, candidates.length, newFacts.length);
+  const outcomes = applyContradictionOutcomes(store, accepted, candidates, newFacts, newFactDocIds);
+  return { parseFailed: false, parsedCategory, outcomes, rejected, duplicates, inconsistent };
+}
+
 async function detectContradictions(
   store: Store,
   newObservations: Observation[],
-  sessionId: string
+  sessionId: string,
+  docIdByObservation?: ReadonlyMap<Observation, number>,
 ): Promise<number> {
   const decisions = newObservations.filter(o => o.type === "decision");
   if (decisions.length === 0) return 0;
@@ -351,8 +569,19 @@ async function detectContradictions(
   const llm = await getDefaultLlamaCpp();
   if (!llm) return 0;
 
-  // Batch all new decision facts
-  const newFacts = decisions.flatMap(d => d.facts);
+  // Batch all new decision facts, carrying each fact's source document alongside it so
+  // `invalidated_by` names the document that actually contradicted, not whichever row a
+  // heuristic lookup happened to land on. Null where the observation failed to persist —
+  // an unattributable contradiction is recorded as such rather than mis-attributed.
+  const newFacts: string[] = [];
+  const newFactDocIds: (number | null)[] = [];
+  for (const d of decisions) {
+    const docId = docIdByObservation?.get(d) ?? null;
+    for (const f of d.facts) {
+      newFacts.push(f);
+      newFactDocIds.push(docId);
+    }
+  }
   if (newFacts.length === 0) return 0;
 
   // Vector search for existing decisions on overlapping topics
@@ -400,8 +629,10 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
   try {
     const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 400 });
     if (!result) return 0;
-    const parsed = extractJsonFromLLM(result.text);
-    if (!Array.isArray(parsed)) {
+    const applied = applyContradictionResponse(
+      store, extractJsonFromLLM(result.text), candidates, newFacts, newFactDocIds);
+
+    if (applied.parseFailed) {
       // A silent `return 0` here is indistinguishable from "no contradictions found",
       // which is how a permanently-failing parse gate stayed invisible. Say which it is.
       //
@@ -409,7 +640,7 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
       // material, and the prompt carries transcript-derived decisions. A raw head would
       // be a content-exposure path in ordinary operation. Emit shape + identity only;
       // raw text is opt-in via CLAWMEM_DEBUG_LLM_RAW and still truncated.
-      const category = parsed === null ? "unparseable" : Array.isArray(parsed) ? "array" : typeof parsed;
+      const category = applied.parsedCategory;
       console.warn(
         `[decision-extractor] contradiction parse gate REJECTED the model response ` +
         `(expected JSON array, got ${category}; len=${result.text.length} ` +
@@ -424,65 +655,67 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
       return 0;
     }
 
-    // Per-entry validation AND array-level admission, both ahead of any mutation. The parse
-    // gate only proves the ROOT is an array; entries were never checked at all, so the
-    // deployed model's echoed skeleton reached the mutation path.
-    const { accepted, rejected, duplicates, inconsistent } =
-      admitContradictionEntries(parsed, candidates.length, newFacts.length);
+    // Per-entry validation AND array-level admission happen inside the seam above, both ahead
+    // of any mutation. The parse gate only proves the ROOT is an array; entries were never
+    // checked at all, so the deployed model's echoed skeleton reached the mutation path.
+    const { outcomes, rejected, duplicates, inconsistent } = applied;
+    contradictionCount += outcomes.contradictions;
 
-    for (const rel of accepted) {
-      if (rel.confidence < 0.7) continue;
-      const oldDoc = candidates[rel.old_idx];
-      if (!oldDoc) continue;
-
-      const existingDoc = store.findActiveDocument(oldDoc.collectionName, oldDoc.filepath);
-      if (!existingDoc) continue;
-
-      if (rel.relation === "contradiction") {
-        // Lower old doc confidence by 0.25 (floor 0.2)
-        const currentConfidence = existingDoc.confidence ?? 0.5;
-        const newConfidence = Math.max(0.2, currentConfidence - 0.25);
-        store.updateDocumentMeta(existingDoc.id, {
-          confidence: newConfidence,
-        });
-        contradictionCount++;
-        console.error(
-          `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
-        );
-
-        // Soft invalidation: if confidence drops to floor AND content is observation type,
-        // mark as invalidated (Pattern I — prevents stale contradicted knowledge from surfacing)
-        if (newConfidence <= 0.2) {
-          try {
-            // Find the new contradicting observation's doc ID (if already persisted in this session)
-            const newObsDoc = store.db.prepare(`
-              SELECT id FROM documents
-              WHERE collection = '_clawmem' AND path LIKE ? AND active = 1
-              ORDER BY created_at DESC LIMIT 1
-            `).get(`%${sessionId.slice(0, 8)}%decision%`) as { id: number } | undefined;
-
-            store.db.prepare(`
-              UPDATE documents
-              SET invalidated_at = datetime('now'),
-                  invalidated_by = ?
-              WHERE id = ? AND invalidated_at IS NULL AND content_type = 'observation'
-            `).run(newObsDoc?.id || null, existingDoc.id);
-          } catch { /* non-fatal — invalidation is best-effort */ }
-        }
-
-      } else if (rel.relation === "update") {
-        // Lower old doc confidence by 0.15 (floor 0.3)
-        const currentConfidence = existingDoc.confidence ?? 0.5;
-        store.updateDocumentMeta(existingDoc.id, {
-          confidence: Math.max(0.3, currentConfidence - 0.15),
-        });
-      }
-    }
     if (rejected > 0) {
       console.warn(
         `[decision-extractor] contradiction: rejected ${rejected} entr(ies) failing runtime ` +
         `validation (unknown relation label, placeholder reasoning, non-finite confidence, ` +
         `or non-integer index) — the classifier is emitting schema residue, not classifications`,
+      );
+    }
+    if (outcomes.unparseableTarget > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.unparseableTarget} classified pair(s) ` +
+        `named an old document whose virtual path could not be PARSED — this is a URI-contract ` +
+        `regression, not a missing row; the classification was discarded without mutating anything`,
+      );
+    }
+    if (outcomes.missingTarget > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.missingTarget} classified pair(s) parsed ` +
+        `to a valid path with no active row (archived or deleted between search and apply) — ` +
+        `the classification was discarded without mutating anything`,
+      );
+    }
+    if (outcomes.floorIneligible > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.floorIneligible} document(s) reached the ` +
+        `confidence floor but are not invalidation-eligible — either their content_type is not ` +
+        `'${INVALIDATION_ELIGIBLE_CONTENT_TYPE}' (candidates are selected by PATH, which is a ` +
+        `wider set) or they were already invalidated. Confidence was lowered; invalidation is ` +
+        `impossible for these whether or not the writer is armed.`,
+      );
+    }
+    if (outcomes.shadowInvalidations > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.shadowInvalidations} invalidation(s) ` +
+        `suppressed by shadow mode. Confidence was still lowered. Adjudicate these before arming ` +
+        `CLAWMEM_CONTRADICTION_INVALIDATE — invalidation removes a document from FTS and ` +
+        `vector retrieval entirely.`,
+      );
+    }
+    if (outcomes.invalidated > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: INVALIDATED ${outcomes.invalidated} document(s) — ` +
+        `they are now absent from FTS and vector retrieval. Restore procedure: ` +
+        `docs/guides/contradiction-invalidation.md`,
+      );
+    }
+    if (outcomes.invalidationNoOp > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.invalidationNoOp} armed invalidation(s) ` +
+        `matched ZERO rows — the row changed between the eligibility check and the write`,
+      );
+    }
+    if (outcomes.invalidationErrors > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.invalidationErrors} invalidation(s) threw ` +
+        `and were skipped — see the per-document errors above`,
       );
     }
     if (duplicates > 0 || inconsistent > 0) {
@@ -524,10 +757,18 @@ export async function decisionExtractor(
 
   // Persist ALL observations unconditionally (C2 fix: not gated on decisions existing)
   const observationsWithDocs: ObservationWithDoc[] = [];
+  // Exact provenance for contradiction attribution. Reconstructing it later from a session-prefix
+  // LIKE + `ORDER BY created_at DESC LIMIT 1` is position-blind: every observation in one
+  // invocation shares a timestamp, so all of them resolve to the same row regardless of which
+  // fact actually did the contradicting.
+  const docIdByObservation = new Map<Observation, number>();
   if (observations.length > 0) {
     for (const obs of observations) {
       const wit = persistObservationDoc(store, obs, sessionId, dateStr, timestamp);
-      if (wit) observationsWithDocs.push(wit);
+      if (wit) {
+        observationsWithDocs.push(wit);
+        docIdByObservation.set(obs, wit.docId);
+      }
     }
 
     // Infer causal links from observations with facts
@@ -562,7 +803,7 @@ export async function decisionExtractor(
 
     // Detect contradictions with existing decisions
     try {
-      const contradictions = await detectContradictions(store, observedDecisions, sessionId);
+      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation);
       if (contradictions > 0) {
         console.error(`[decision-extractor] Found ${contradictions} contradiction(s) with prior decisions`);
       }

@@ -108,6 +108,22 @@ export function loadConfig(): CollectionConfig {
       config.collections = {};
     }
 
+    // `clawmem collection add` enforces isValidCollectionName, but a hand-edited config.yaml
+    // bypasses it entirely. A name containing '/' makes every virtual path for that collection
+    // ambiguous — `clawmem://a/b/doc.md` parses as collection 'a', path 'b/doc.md' — so lookups
+    // that round-trip through parseVirtualPath silently resolve to the wrong pair or to nothing.
+    // Warn rather than throw: rejecting outright would lock an existing vault out of its own
+    // config, and the damage is confined to virtual-path round-trips.
+    for (const name of Object.keys(config.collections)) {
+      if (!isValidCollectionName(name)) {
+        console.warn(
+          `[clawmem] collection name ${JSON.stringify(name)} in ${configPath} is not valid ` +
+          `(expected only letters, digits, '_' and '-'). Virtual-path lookups for this ` +
+          `collection may resolve incorrectly — rename it with 'clawmem collection add'.`,
+        );
+      }
+    }
+
     // Parse lifecycle policy if present
     const raw = YAML.parse(content);
     if (raw?.lifecycle && typeof raw.lifecycle === "object") {
