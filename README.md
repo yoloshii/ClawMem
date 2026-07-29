@@ -1,5 +1,7 @@
 # ClawMem — On-device memory layer for Claude Code, OpenClaw, and Hermes agents
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fyoloshii%2FClawMem.svg)](https://mcptoplist.com/server/glama%2Fyoloshii%2FClawMem)
+
 <p align="center">
   <img src="docs/clawmem_hero.jpg" alt="ClawMem" width="100%">
 </p>
