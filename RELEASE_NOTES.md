@@ -4,7 +4,55 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
-## v0.37.0 — a reachable-but-wrong inference endpoint now degrades instead of silently dying
+## v0.38.0 — active cross-agent memory (fact_write / fact_link / fact_query_cross_agent)
+
+ClawMem becomes a *shared active memory* rather than a passive archive: an agent that
+learns something can write a signed, witnessed fact into the knowledge graph, and every
+other agent sharing the vault can read it — without rediscovering it. This is additive;
+document indexing, the SPO graph, and all existing MCP tools are unchanged.
+
+### Three new MCP tools
+
+- **`fact_write`** — write a learned fact as a witnessed SPO triple: subject / predicate /
+  object plus attribution (`agentId`, `sessionId`, `timestamp`, `source`), a confidence
+  (0..1), `valid_to` for decay/obsolescence, and free-form tags. Cross-agent writes are
+  *appended*, so a different agent's higher-confidence fact on the same subject+predicate
+  is never clobbered — divergence and evolution survive as multiple witnessed versions.
+- **`fact_link`** — create a directed semantic relation between two entities (e.g.
+  `project:ema5 uses_infrastructure server:ema5-plc-db`) for cross-domain reference,
+  backed by the same sign/witness machinery.
+- **`fact_query_cross_agent`** — advanced query over witnessed facts: filter by
+  subject/predicate/object (each accepts `*` wildcard), `since`, `min_confidence`,
+  `written_by` agent(s), and `session_ids`; optionally `resolve_conflicts` to collapse
+  divergent witnesses to the most recent fact at/above the confidence floor.
+
+### Optional context-injection layer (default OFF)
+
+`retrieval.cross_agent_inject` (or `CLAWMEM_CROSS_AGENT_INJECT=true`) enables pre-emptive
+context injection: when an agent task references entities in the graph, facts written by
+*other* agents at or above `retrieval.cross_agent_confidence` (default 0.7) are injected
+as a separate, marked `<cross-agent-facts>` block. Hard guarantees: bounded execution
+(2s), fail-open (never blocks task startup), never steals token budget from established
+blocks, and the profile must grant a `crossAgentTokens` sub-budget for the stage to run.
+
+### Storage
+
+`entity_triples` gains idempotent witness columns (`agent_id`, `session_id`, `source_type`,
+`written_at`, `tags`) with associated indexes. Existing triples are untouched; adding the
+columns is a no-op on re-open. Legacy `addTriple` (dedup-on-weekend) is unchanged unless
+`append: true` is passed.
+
+### Use it
+
+```
+# max discovers a server is down
+clawmem mcp fact_write  (subject=server:ema5-db predicate=status object=down witness.agentId=max confidence=0.95)
+
+# scout sees it during a briefing
+clawmem mcp fact_query_cross_agent  (subject=server:ema5-db min_confidence=0.7 written_by=[max])
+```
+
+ — a reachable-but-wrong inference endpoint now degrades instead of silently dying
 
 Issue #24: when `CLAWMEM_LLM_URL` pointed at a port where an *unrelated* service answered
 HTTP (a file browser squatting `:8089`), every `generate()` call failed **silently and

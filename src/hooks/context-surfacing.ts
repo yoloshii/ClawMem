@@ -9,7 +9,7 @@
 import type { Store, SearchResult } from "../store.ts";
 import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore } from "../store.ts";
 import { searchVecBounded } from "../vector-daemon.ts";
-import { getVaultPath, getActiveProfile, surfaceSecondaryVaults } from "../config.ts";
+import { getVaultPath, getActiveProfile, surfaceSecondaryVaults, crossAgentInjectEnabled, crossAgentInjectConfidence } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -38,6 +38,7 @@ import {
   buildVaultFactsBlock,
   type VaultFactsTriple,
 } from "../vault-facts.ts";
+import { buildCrossAgentContextBlock } from "../cross-agent.ts";
 
 // =============================================================================
 // Config
@@ -629,6 +630,30 @@ export async function contextSurfacing(
       }
     } catch {
       /* fail-open: degraded vault behaves identically to pre-§11.1 */
+    }
+  }
+
+  // Cross-agent context injection (cross-agent memory PR). Optional, gated OFF by
+  // default: runs only when BOTH the global toggle (retrieval.cross_agent_inject /
+  // CLAWMEM_CROSS_AGENT_INJECT) is enabled AND the active profile grants a
+  // crossAgentTokens sub-budget. Feeds the receiver facts written by OTHER agents
+  // about prompt entities, marked `[cross-agent fact, written by <agent> at <ts>]`.
+  // Hard guarantees: bounded (cross-agent.ts withTimeout, 2s), fail-open (never
+  // throws), confidence floor via crossAgentInjectConfidence(), and it can never
+  // steal token budget from the established blocks (it appends, budget-bounded).
+  let contextInner = vaultInnerWithFacts;
+  if (profile.crossAgentTokens > 0 && crossAgentInjectEnabled()) {
+    try {
+      const body = buildCrossAgentContextBlock(
+        prompt,
+        store.db,
+        (entityId, minConf) =>
+          store.queryCrossAgentFacts({ subject: entityId, minConfidence: minConf, limit: 20 }),
+        { minConfidence: crossAgentInjectConfidence(), maxTokens: profile.crossAgentTokens }
+      );
+      if (body) contextInner = `${contextInner}\n${body}`;
+    } catch {
+      /* fail-open: no injection on any error */
     }
   }
 

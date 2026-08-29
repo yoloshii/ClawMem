@@ -1128,6 +1128,19 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_predicate ON entity_triples(predicate)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_valid ON entity_triples(valid_from, valid_to)`);
 
+  // Cross-agent fact witness columns (v0.38.0, cross-agent memory PR).
+  // A fact written by an agent carries explicit attribution (WHO wrote it, from
+  // WHICH session, HOW it was observed, WHEN) so other agents can weigh its
+  // trustworthiness. `tags` is a JSON array of free-form labels. Migrations are
+  // idempotent via try/catch so existing vaults pick the columns up on next open.
+  for (const col of ["agent_id", "session_id", "source_type", "written_at", "tags"]) {
+    try { db.exec(`ALTER TABLE entity_triples ADD COLUMN ${col} TEXT`); } catch { /* column exists */ }
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_written_at ON entity_triples(written_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_agent ON entity_triples(agent_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_session ON entity_triples(session_id)`);
+
+
   // Per-source evidence for SPO triples (v0.32.0). One row per distinct
   // (triple, source_doc, source_fact) — the base row's inline source_doc_id/source_fact stay
   // frozen as the first sighting. Uniqueness is null-normalized: a plain UNIQUE treats NULLs as
@@ -1446,6 +1459,81 @@ export class EmbedLeaseLostError extends FatalVectorError {
  *  the vector store under the new holder. */
 export type LeaseGuard = { workerName: string; token: string };
 
+// =============================================================================
+// Cross-agent fact witness + triple write options (cross-agent memory PR)
+// =============================================================================
+
+/** Who wrote an agent fact, and how — attribution for cross-agent trust. */
+export interface FactWitness {
+  /** Agent that learned/wrote the fact (e.g. "max", "scout"). */
+  agentId: string;
+  /** Session the fact was learned in, when known. */
+  sessionId?: string;
+  /** ISO timestamp of the observation. Defaults to write time. */
+  timestamp?: string;
+  /** How it was observed (e.g. "direct_observation", "document", "verification"). */
+  source?: string;
+}
+
+/** Options passed through to `Store.addTriple` / the fact-writing tools. */
+export interface AddTripleOptions {
+  validFrom?: string;
+  validTo?: string;
+  confidence?: number;
+  sourceDocId?: number;
+  sourceFact?: string;
+  /** Cross-agent attribution for the fact. */
+  witness?: FactWitness;
+  /** Explicit witness timestamp (falls back to options.witness.timestamp). */
+  writtenAt?: string;
+  /** Free-form JSON-serializable tag array ([]TEXT, stored as JSON). */
+  tags?: string[];
+  /** When true, ALWAYS insert a fresh triple row instead of deduping onto an
+   *  existing current triple — required so multiple agents can hold divergent
+   *  or evolving opinions on the same subject+predicate without clobbering. */
+  append?: boolean;
+}
+
+/** A single cross-agent fact row returned by `queryCrossAgentFacts`. */
+export interface CrossAgentFact {
+  id: number;
+  subject: string;
+  subjectEntityId: string;
+  predicate: string;
+  object: string;
+  objectEntityId: string | null;
+  validFrom: string | null;
+  validTo: string | null;
+  confidence: number;
+  current: boolean;
+  writtenAt: string | null;
+  agentId: string | null;
+  sessionId: string | null;
+  sourceType: string | null;
+  tags: string[] | null;
+}
+
+/** Filters for `Store.queryCrossAgentFacts`. All string fields accept "*" as a wildcard. */
+export interface CrossAgentQuery {
+  subject?: string;
+  predicate?: string;
+  object?: string;
+  /** ISO timestamp — only facts written on/after this time are returned. */
+  since?: string;
+  /** Lower bound (inclusive) on confidence, 0..1. */
+  minConfidence?: number;
+  /** Restrict to facts written by these agents ("*" or omitted = any). */
+  writtenBy?: string[];
+  /** Restrict to facts written from one of these sessions. */
+  sessionIds?: string[];
+  /** If true, merge arcs with different witnesses taking the most recent fact
+   *  per (subject, predicate, object) with confidence >= minConfidence. */
+  resolveConflicts?: boolean;
+  /** Max rows returned. Default 50. */
+  limit?: number;
+  vault?: string;
+}
+
 /**
  * Throw EmbedLeaseLostError if the caller no longer holds the named lease. Call as the
  * FIRST statement inside a write transaction (before any mutation), so the check and
@@ -1759,11 +1847,11 @@ export type Store = {
   getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => { docId: number; score: number; viaEntity: string }[];
 
   // SPO knowledge graph
-  addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => number;
+  addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: AddTripleOptions) => number;
   invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => number;
   queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[];
   getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
-
+  queryCrossAgentFacts: (query: CrossAgentQuery) => CrossAgentFact[];
   // Recall tracking
   insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean }[]) => number;
   recomputeRecallStats: () => number;
@@ -2030,13 +2118,15 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => getEntityGraphNeighbors(db, seedDocIds, limit),
 
     // SPO knowledge graph
-    addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => {
+    addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: AddTripleOptions): number => {
       const pred = predicate.toLowerCase().replace(/\s+/g, "_");
       const now = new Date().toISOString();
       const objClause = objectEntityId
         ? "object_entity_id = ? AND object_literal IS NULL"
         : "object_entity_id IS NULL AND object_literal = ?";
       const objParam = objectEntityId ?? objectLiteral;
+      const writtenAt = options?.writtenAt ?? options?.witness?.timestamp ?? now;
+      const tagsJson = options?.tags && Array.isArray(options.tags) ? JSON.stringify(options.tags) : null;
       // Evidence rides in the same transaction as the base row — a triple must never exist
       // without a provenance row. An entirely-unattributed sighting still writes its
       // null-normalized row (the unique index collapses repeats to one), so evidenceCount
@@ -2045,25 +2135,34 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         db.prepare(`
           INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
           VALUES (?, ?, ?, ?)
-        `).run(tripleId, options?.sourceDocId ?? null, options?.sourceFact ?? null, now);
+        `).run(tripleId, options?.sourceDocId ?? null, options?.sourceFact ?? null, writtenAt);
       };
       const txn = db.transaction(() => {
-        const existing = db.prepare(
-          `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
-        ).get(subjectEntityId, pred, objParam) as { id: number } | null;
-        if (existing) {
-          insertEvidence(existing.id);
-          return existing.id;
+        // Cross-agent append mode (fact_write): always write a NEW triple row so multiple
+        // witnesses may disagree / evolve on the same subject+predicate without clobbering
+        // each other. The default (append !== true) keeps the legacy dedup behaviour: it
+        // reuses an existing current triple and merely adds provenance evidence, matching
+        // the pre-PR contract exactly.
+        if (options?.append !== true) {
+          const existing = db.prepare(
+            `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
+          ).get(subjectEntityId, pred, objParam) as { id: number } | null;
+          if (existing) {
+            insertEvidence(existing.id);
+            return existing.id;
+          }
         }
 
         const result = db.prepare(`
-          INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at, agent_id, session_id, source_type, written_at, tags)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           subjectEntityId, pred, objectEntityId, objectLiteral,
           options?.validFrom ?? null, options?.validTo ?? null,
           options?.confidence ?? 1.0, options?.sourceDocId ?? null,
-          options?.sourceFact ?? null, now
+          options?.sourceFact ?? null, writtenAt,
+          options?.witness?.agentId ?? null, options?.witness?.sessionId ?? null,
+          options?.witness?.source ?? null, writtenAt, tagsJson
         );
         const tripleId = Number(result.lastInsertRowid);
         insertEvidence(tripleId);
@@ -2165,6 +2264,103 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       const current = (db.prepare("SELECT COUNT(*) as n FROM entity_triples WHERE valid_to IS NULL").get() as any).n;
       const predicates = db.prepare("SELECT DISTINCT predicate FROM entity_triples ORDER BY predicate").all().map((r: any) => r.predicate);
       return { totalTriples: total, currentFacts: current, expiredFacts: total - current, predicateTypes: predicates };
+    },
+
+    /**
+     * Cross-agent fact query. Returns facts carrying witness attribution, filterable by
+     * subject/predicate/object (each accepts "*"), writer agent(s), session(s), write time
+     * (`since`), and confidence. Feeds `fact_query_cross_agent` (MCP) and the optional
+     * context-injection layer. When `resolveConflicts` is true, arcs that differ only by
+     * witness are merged to the most recent fact (confidence >= minConfidence) per
+     * subject/predicate/object — divergence collapse, not deletion.
+     */
+    queryCrossAgentFacts: (query: CrossAgentQuery): CrossAgentFact[] => {
+      const where: string[] = [];
+      const params: any[] = [];
+
+      if (query.subject && query.subject !== "*") {
+        const sRes = db.prepare("SELECT entity_id FROM entity_nodes WHERE name = ? OR entity_id = ? LIMIT 1").get(query.subject, query.subject) as { entity_id: string } | undefined;
+        if (sRes) {
+          where.push("t.subject_entity_id = ?");
+          params.push(sRes.entity_id);
+        } else {
+          return [];
+        }
+      }
+
+      const isWild = (v?: string) => !v || v === "*";
+      if (!isWild(query.predicate)) { where.push("LOWER(t.predicate) = LOWER(?)"); params.push(query.predicate!.toLowerCase().replace(/\s+/g, "_")); }
+      if (!isWild(query.object)) {
+        const obj = query.object as string;
+        const oRes = db.prepare("SELECT entity_id FROM entity_nodes WHERE name = ? OR entity_id = ? LIMIT 1").get(obj, obj) as { entity_id: string } | undefined;
+        if (oRes) {
+          where.push("t.object_entity_id = ?");
+          params.push(oRes.entity_id);
+        } else {
+          where.push("(LOWER(COALESCE(t.object_literal,'')) = LOWER(?) OR EXISTS (SELECT 1 FROM entity_nodes eo WHERE eo.entity_id = t.object_entity_id AND (eo.name = ? OR eo.entity_id = ?)))");
+          params.push(obj, obj, obj);
+        }
+      }
+      if (query.since) { where.push("COALESCE(t.written_at, t.created_at) >= ?"); params.push(query.since); }
+      if (query.minConfidence != null) { where.push("t.confidence >= ?"); params.push(query.minConfidence); }
+      if (query.writtenBy && query.writtenBy.length > 0 && !query.writtenBy.includes("*")) {
+        where.push(`t.agent_id IN (${query.writtenBy.map(() => "?").join(",")})`);
+        params.push(...query.writtenBy);
+      }
+      if (query.sessionIds && query.sessionIds.length > 0 && !query.sessionIds.includes("*")) {
+        where.push(`t.session_id IN (${query.sessionIds.map(() => "?").join(",")})`);
+        params.push(...query.sessionIds);
+      }
+
+      const limit = Math.min(Math.max(1, query.limit ?? 50), 200);
+      const sql = `
+        SELECT t.id, COALESCE(s.name, t.subject_entity_id) AS subject_name, t.subject_entity_id,
+               t.predicate, COALESCE(o.name, t.object_literal, t.object_entity_id) AS object_name,
+               t.object_entity_id, t.valid_from, t.valid_to, t.confidence,
+               COALESCE(t.written_at, t.created_at) AS written_at,
+               t.agent_id, t.session_id, t.source_type, t.tags
+        FROM entity_triples t
+        LEFT JOIN entity_nodes s ON s.entity_id = t.subject_entity_id
+        LEFT JOIN entity_nodes o ON o.entity_id = t.object_entity_id
+        ${where.length ? "WHERE " + where.join(" AND ") : ""}
+        ORDER BY COALESCE(t.written_at, t.created_at) DESC, t.id DESC
+        LIMIT ?`;
+      params.push(limit);
+
+      const rows = db.prepare(sql).all(...params) as any[];
+      const out: CrossAgentFact[] = rows.map((r: any) => ({
+        id: r.id,
+        subject: r.subject_name,
+        subjectEntityId: r.subject_entity_id,
+        predicate: r.predicate,
+        object: r.object_name,
+        objectEntityId: r.object_entity_id ?? null,
+        validFrom: r.valid_from,
+        validTo: r.valid_to,
+        confidence: r.confidence,
+        current: r.valid_to === null,
+        writtenAt: r.written_at ?? null,
+        agentId: r.agent_id ?? null,
+        sessionId: r.session_id ?? null,
+        sourceType: r.source_type ?? null,
+        tags: r.tags ? (() => { try { return JSON.parse(r.tags); } catch { return null; } })() : null,
+      }));
+
+      if (query.resolveConflicts) {
+        const minConf = query.minConfidence ?? 0;
+        const byKey = new Map<string, CrossAgentFact>();
+        for (const f of out) {
+          if (f.validTo !== null) continue; // only merge current facts
+          const key = `${f.subjectEntityId}\u0000${f.predicate}\u0000${f.objectEntityId ?? f.object}`;
+          const prev = byKey.get(key);
+          if (!prev) { byKey.set(key, f); continue; }
+          if (f.confidence >= minConf && (f.writtenAt ?? "") >= (prev.writtenAt ?? "")) {
+            byKey.set(key, f);
+          }
+        }
+        return Array.from(byKey.values()).sort((a, b) => (b.writtenAt ?? "").localeCompare(a.writtenAt ?? ""));
+      }
+      return out;
     },
 
     // Co-activation tracking

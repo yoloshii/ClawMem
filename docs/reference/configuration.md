@@ -49,6 +49,9 @@ The context-surfacing hook `timeout` is **not** an env var — it lives in `~/.c
 | `CLAWMEM_VAULTS` | (none) | JSON map of vault name → SQLite path. E.g. `{"work":"~/.cache/clawmem/work.sqlite"}`. Paths support `~`. (Also configurable in `~/.config/clawmem/config.yaml` under `vaults:`.) |
 | `CLAWMEM_SURFACE_SECONDARY_VAULTS` | `false` | Lets the `context-surfacing` hook merge a configured secondary vault's results into the automatically injected context (v0.35.0; the automatic lane is the named `skill` vault). Off, automatic surfacing reads only the general vault — explicit `vault`-parameter MCP calls are unaffected either way. Only the literal `true` enables. Also configurable as `retrieval.surface_secondary_vaults` in `config.yaml` (env wins). Process-cached — restart the watcher / MCP server after changing it. |
 
+| `CLAWMEM_CROSS_AGENT_INJECT` | `false` | Enables the cross-agent context-injection layer (v0.38.0): the `context-surfacing` hook injects facts written by OTHER agents about prompt entities as a labelled `<cross-agent-facts>` block. Also configurable as `retrieval.cross_agent_inject` in `config.yaml` (env wins). Off by default. Requires the active profile to grant a `crossAgentTokens` sub-budget (`balanced`/`deep` carry 200/250; `speed` is 0) — no existing deployment changes until it opts in. |
+| `CLAWMEM_CROSS_AGENT_CONFIDENCE` | `0.7` | Confidence floor for facts surfaced by cross-agent injection. Also configurable as `retrieval.cross_agent_confidence` (env wins). Ignored unless `CLAWMEM_CROSS_AGENT_INJECT` / `retrieval.cross_agent_inject` is enabled. |
+
 ## A-MEM & consolidation
 
 | Variable | Default | Effect |

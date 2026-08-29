@@ -25,6 +25,8 @@ import {
   type SearchResult,
   type CausalEdgeRecord,
   type EvolutionEntry,
+  type FactWitness,
+  type CrossAgentFact,
 } from "./store.ts";
 import { capCausalWire } from "./causal-reader.ts";
 import {
@@ -48,7 +50,7 @@ import {
   startHeavyMaintenanceWorker,
 } from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
-import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
+import { getEntityGraphNeighbors, searchEntities, ensureEntityCanonical } from "./entity.ts";
 
 // =============================================================================
 // Reranker fallback telemetry
@@ -2970,6 +2972,209 @@ This is the recommended entry point for ALL memory queries.`,
       return {
         content: [{ type: "text", text: lines.join('\n') }],
         structuredContent: { entries: rows },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Cross-Agent Memory tools (cross-agent memory PR)
+  // ---------------------------------------------------------------------------
+  //
+  // These three tools turn ClawMem from a passive archive into an active shared
+  // memory: an agent that learns something writes a signed, witnessed fact into
+  // the knowledge graph and every other agent can see it with full attribution.
+  // Facts store WHO wrote them (agentId), from WHICH session (sessionId), WHEN
+  // (timestamp), HOW (source), HOW confident (0..1), and for HOW LONG
+  // (valid_from / valid_to -> natural decay / obsolescence).
+
+  /** Resolve-or-create a canonical entity id from a `name[:type]` spec. */
+  function resolveFactEntity(name: string, expectedType: string | undefined, vault: string): string {
+    // Already a canonical id (vault:type:slug)? Use as-is.
+    if (/^[a-z][a-z0-9-]*:[a-z_]+:[a-z0-9_]+$/.test(name)) return name;
+    // Try resolving against existing entities by name first (keeps typing stable).
+    const existing = store.db
+      .prepare(`SELECT entity_id FROM entity_nodes WHERE name = ? AND vault = ? LIMIT 1`)
+      .get(name, vault ?? "default") as { entity_id: string } | undefined;
+    if (existing) return existing.entity_id;
+    return ensureEntityCanonical(store.db, name, expectedType ?? "concept", vault ?? "default");
+  }
+
+  // -------------------------------------------------------------------------
+  // Tool: fact_write
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "fact_write",
+    {
+      title: "Write Cross-Agent Fact",
+      description:
+        "Actively write a learned fact into the cross-agent knowledge graph. The fact is signed with your agentId, sessionId, timestamp, source, and a confidence score; every other agent sharing the vault can read it via fact_query_cross_agent or kg_query (and, if enabled, receive it through the context-injection layer). Unlike document indexing this records a first-class witnessed fact. Use when you discover or confirm something other agents should know without rediscovering it (server status, decisions, project-to-infrastructure bindings).",
+      inputSchema: {
+        subject: z.string().describe("Subject entity: a name (e.g. 'server:ema5-db') or canonical entity id ('default:service:ema5-db')."),
+        predicate: z.string().describe("Predicate / relation (e.g. 'status', 'uses_infrastructure'). Lowercased; spaces become underscores."),
+        object: z.string().describe("Object entity or literal value (e.g. 'down', or a canonical id)."),
+        subject_type: z.string().optional().describe("Entity type for the subject if it does not yet exist (e.g. 'server', 'project'). Defaults to 'concept'."),
+        object_type: z.string().optional().describe("Entity type for the object if it does not yet exist. Defaults to 'concept'."),
+        witness: z.object({
+          agentId: z.string().describe("Your agent identifier (e.g. 'max', 'scout', 'lex')."),
+          sessionId: z.string().optional().describe("The session you learned this in (e.g. 'abc-123')."),
+          timestamp: z.string().optional().describe("ISO 8601 timestamp of the observation. Defaults to now."),
+          source: z.string().optional().describe("How the fact was observed (e.g. 'direct_observation', 'verification', 'document')."),
+        }).describe("Attribution for this fact: who wrote it, from which session, when, and how."),
+        confidence: z.number().min(0).max(1).optional().default(0.9).describe("Confidence 0..1 for the fact. Default 0.9."),
+        valid_from: z.string().optional().describe("ISO date/timestamp the fact becomes valid. Defaults to now."),
+        valid_to: z.string().optional().describe("ISO date/timestamp when the fact expires (null = never expires). Enables decay / obsolescence."),
+        tags: z.array(z.string()).optional().describe("Free-form labels, e.g. ['infra', 'ema5']."),
+        vault: z.string().optional().describe("Named vault (omit for default vault)."),
+      },
+    },
+    async ({ subject, predicate, object, subject_type, object_type, witness, confidence, valid_from, valid_to, tags, vault }) => {
+      const store = getStore(vault);
+      const subjId = resolveFactEntity(subject, subject_type, vault ?? "default");
+      const objId = resolveFactEntity(object, object_type, vault ?? "default");
+      const pred = predicate.toLowerCase().replace(/\s+/g, "_");
+      const now = new Date().toISOString();
+      const w: FactWitness = {
+        agentId: witness.agentId,
+        sessionId: witness.sessionId,
+        timestamp: witness.timestamp ?? now,
+        source: witness.source,
+      };
+      // Cross-agent write: append=true so a DIFFERENT agent's higher-confidence fact on the
+      // same subject+predicate is never clobbered (divergence/evolution is kept as versions).
+      const tripleId = store.addTriple(subjId, pred, objId, null, {
+        validFrom: valid_from ?? now,
+        validTo: valid_to,
+        confidence: confidence ?? 0.9,
+        witness: w,
+        tags,
+        append: true,
+      });
+      const summary = `Fact written (#${tripleId}): ${subject} → ${pred} → ${object} (conf ${(confidence ?? 0.9).toFixed(2)}, by ${w.agentId}${w.sessionId ? " @ " + w.sessionId : ""}, ${w.timestamp})${valid_to ? `, valid_to ${valid_to}` : ""}`;
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: {
+          id: tripleId,
+          subject,
+          subjectEntityId: subjId,
+          predicate: pred,
+          object,
+          objectEntityId: objId,
+          confidence: confidence ?? 0.9,
+          witness: w,
+          validFrom: valid_from ?? now,
+          validTo: valid_to ?? null,
+          tags: tags ?? [],
+        },
+      };
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: fact_link
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "fact_link",
+    {
+      title: "Link Two Entities",
+      description:
+        "Create a semantic relation between two entities in the cross-agent graph, e.g. 'this project uses that server' or 'this skill belongs to that agent'. Backed by the same signed-witness fact machinery as fact_write, but expressed as a directed relation from entity A to entity B. Use for cross-domain reference (projects→servers, people→projects, skills→agents).",
+      inputSchema: {
+        from: z.string().describe("Source entity (name or canonical id), e.g. 'project:ema5'."),
+        relation: z.string().describe("Directed relation name, e.g. 'uses_infrastructure'. Lowercased; spaces become underscores."),
+        to: z.string().describe("Target entity (name or canonical id), e.g. 'server:ema5-plc-db'."),
+        from_type: z.string().optional().describe("Entity type for `from` if new. Defaults to 'concept'."),
+        to_type: z.string().optional().describe("Entity type for `to` if new. Defaults to 'concept'."),
+        witness: z.object({
+          agentId: z.string().describe("Agent creating the link."),
+          sessionId: z.string().optional(),
+          timestamp: z.string().optional(),
+          source: z.string().optional().describe("Observation method."),
+        }).describe("Attribution for the link."),
+        confidence: z.number().min(0).max(1).optional().default(0.9).describe("Confidence 0..1. Default 0.9."),
+        valid_to: z.string().optional().describe("Optional expiry (ISO)."),
+        tags: z.array(z.string()).optional().describe("Free-form labels."),
+        vault: z.string().optional().describe("Named vault (omit for default vault)."),
+      },
+    },
+    async ({ from, relation, to, from_type, to_type, witness, confidence, valid_to, tags, vault }) => {
+      const store = getStore(vault);
+      const fromId = resolveFactEntity(from, from_type, vault ?? "default");
+      const toId = resolveFactEntity(to, to_type, vault ?? "default");
+      const rel = relation.toLowerCase().replace(/\s+/g, "_");
+      const now = new Date().toISOString();
+      const w: FactWitness = {
+        agentId: witness.agentId,
+        sessionId: witness.sessionId,
+        timestamp: witness.timestamp ?? now,
+        source: witness.source,
+      };
+      const tripleId = store.addTriple(fromId, rel, toId, null, {
+        validFrom: now,
+        validTo: valid_to,
+        confidence: confidence ?? 0.9,
+        witness: w,
+        tags,
+        append: true,
+      });
+      return {
+        content: [{ type: "text", text: `Link created (#${tripleId}): ${from} --${rel}--> ${to} (by ${w.agentId}, conf ${(confidence ?? 0.9).toFixed(2)})` }],
+        structuredContent: { id: tripleId, from, fromEntityId: fromId, relation: rel, to, toEntityId: toId, confidence: confidence ?? 0.9, witness: w, validTo: valid_to ?? null, tags: tags ?? [] },
+      };
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: fact_query_cross_agent
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "fact_query_cross_agent",
+    {
+      title: "Query Cross-Agent Facts",
+      description:
+        "Query witnessed facts across agents. Filter by subject/predicate/object (each accepts '*' wildcard), minimum confidence, writer agent(s), session(s), and write time ('since'). Optionally resolve conflicts by collapsing divergent witnesses to the most recent fact per subject/predicate/object above the confidence floor. Use this to learn what OTHER agents know about an entity instead of rediscovering it.",
+      inputSchema: {
+        subject: z.string().optional().describe("Subject entity (name or canonical id). '*' or omit = any."),
+        predicate: z.string().optional().describe("Predicate / relation. '*' or omit = any."),
+        object: z.string().optional().describe("Object entity or literal. '*' or omit = any."),
+        since: z.string().optional().describe("ISO timestamp — only facts written on/after this time."),
+        min_confidence: z.number().min(0).max(1).optional().default(0.7).describe("Lower bound (inclusive) on confidence. Default 0.7."),
+        written_by: z.array(z.string()).optional().describe("Restrict to facts written by these agents (e.g. ['max', 'scout'])."),
+        session_ids: z.array(z.string()).optional().describe("Restrict to facts written from these sessions."),
+        resolve_conflicts: z.boolean().optional().default(false).describe("If true, merge facts that differ only by witness to the most recent with confidence >= threshold."),
+        limit: z.number().min(1).max(200).optional().default(50).describe("Max facts returned. Default 50."),
+        vault: z.string().optional().describe("Named vault (omit for default vault)."),
+      },
+    },
+    async ({ subject, predicate, object, since, min_confidence, written_by, session_ids, resolve_conflicts, limit, vault }) => {
+      const store = getStore(vault);
+      const facts: CrossAgentFact[] = store.queryCrossAgentFacts({
+        subject: subject ?? "*",
+        predicate: predicate ?? "*",
+        object: object ?? "*",
+        since,
+        minConfidence: min_confidence ?? 0.7,
+        writtenBy: written_by,
+        sessionIds: session_ids,
+        resolveConflicts: resolve_conflicts ?? false,
+        limit,
+        vault: vault ?? "default",
+      });
+      if (facts.length === 0) {
+        return {
+          content: [{ type: "text", text: `No cross-agent facts matched the given filters.` }],
+          structuredContent: { count: 0, facts: [] },
+        };
+      }
+      const lines = [`Cross-agent facts (${facts.length}):\n`];
+      for (const f of facts) {
+        const validity = f.validTo ? `valid_to ${f.validTo}` : f.current ? "current" : "ended";
+        const author = f.agentId ? `written_by ${f.agentId}${f.sessionId ? " @ " + f.sessionId : ""} at ${f.writtenAt ?? "?"}` : "unattributed";
+        const conf = Math.round(f.confidence * 100);
+        lines.push(`[${conf}%] ${f.subject} → ${f.predicate} → ${f.object} — ${author} (${validity})`);
+      }
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: { count: facts.length, facts },
       };
     }
   );

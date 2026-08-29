@@ -77,6 +77,9 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 3.  Spot checks         -> search(query) (BM25, 0 GPU)  or  vsearch(query) (vector, 1 GPU)
 4.  Chain tracing       -> find_causal_links(docid, direction="both", depth=5)
 5.  Entity facts        -> kg_query(entity)  (SPO triples; different from intent_search's reasoning chains)
+5b. Cross-agent facts   -> fact_query_cross_agent(subject=?*, written_by=[...], min_confidence=0.7)
+    What OTHER agents know about an entity. WRITE new knowledge with fact_write (or a relation
+    with fact_link) so other agents see it without rediscovering it. (Cross-agent memory, v0.38.0.)
 6.  Temporal context    -> timeline(docid, before=5, after=5)
 7.  Ranking diagnosis   -> memory_rank(query)  ("why did X outrank Y": per-factor
     composite breakdown + raw-vs-composite rank shifts; diagnostic, not retrieval)
@@ -96,6 +99,9 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `find_similar` | "what else relates to X" — k-NN vector neighbors beyond keyword overlap. |
 | `find_causal_links` | Trace decision chains ("what led to X") over observation docs. |
 | `kg_query` | Entity SPO triples with temporal validity + per-fact evidence (`evidenceCount`, up to 5 sources; v0.32.0). Entity facts, NOT causal "why" (use `intent_search`). |
+| `fact_write` | WRITE a witnessed cross-agent fact (subject → predicate → object) with agentId/sessionId/timestamp/source + confidence + valid_to + tags. Append-mode keeps alternate versions from other agents. |
+| `fact_link` | Create a directed relation between two entities (e.g. `project:ema5 uses_infrastructure server:ema5-plc-db`). Cross-domain reference. |
+| `fact_query_cross_agent` | Query facts OTHER agents wrote: `*`-wildcard subject/predicate/object, `since`, `min_confidence`, `written_by`, `session_ids`; `resolve_conflicts` collapses divergent witnesses to newest ≥ floor. |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
 | `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw routes — vector + `search` non-recency). Use PROACTIVELY for constraints, architecture decisions, corrections. |

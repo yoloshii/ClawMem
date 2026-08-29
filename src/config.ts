@@ -71,6 +71,19 @@ export interface RetrievalConfig {
    * CLAWMEM_SURFACE_SECONDARY_VAULTS=true (env wins).
    */
   surface_secondary_vaults: boolean;
+  /**
+   * Cross-agent context injection (cross-agent memory PR). When TRUE, the
+   * context-surfacing hook additionally queries facts written by OTHER agents
+   * for entities mentioned in the task prompt and injects them as a distinct,
+   * marked `[cross-agent fact ...]` block. Default FALSE (opt-in). Enable via
+   * `retrieval.cross_agent_inject: true` or CLAWMEM_CROSS_AGENT_INJECT=true (env wins).
+   */
+  cross_agent_inject: boolean;
+  /**
+   * Minimum confidence for facts surfaced by cross-agent injection. Default 0.7.
+   * CLAWMEM_CROSS_AGENT_CONFIDENCE (env) overrides YAML.
+   */
+  cross_agent_confidence: number;
 }
 
 export interface ClawMemConfig {
@@ -118,12 +131,21 @@ export interface ProfileConfig {
    * `<vault-facts>` block is dropped (established blocks take priority).
    */
   factsTokens: number;
+  /**
+   * Cross-agent memory PR: sub-budget for the `<cross-agent-facts>` injection
+   * block. The block is produced ONLY when both (a) the global toggle
+   * `retrieval.cross_agent_inject` / CLAWMEM_CROSS_AGENT_INJECT is true, AND
+   * (b) this sub-budget is > 0. `speed` is gated off by default. `balanced` /
+   * `deep` get a modest dedicated allowance that can never steal budget from
+   * `<facts>` / `<vault-facts>`. Default keeps injection OFF end-to-end.
+   */
+  crossAgentTokens: number;
 }
 
 export const PROFILES: Record<PerformanceProfile, ProfileConfig> = {
-  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, minScoreRatio: 0.65, absoluteFloor: 0.18, activationFloor: 0.24, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0,    factsTokens: 0   },
-  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, minScoreRatio: 0.55, absoluteFloor: 0.15, activationFloor: 0.20, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0,    factsTokens: 200 },
-  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.25, minScoreRatio: 0.45, absoluteFloor: 0.12, activationFloor: 0.16, thresholdMode: "adaptive", deepEscalation: true,  escalationBudgetMs: 4000, factsTokens: 250 },
+  speed:    { tokenBudget: 400,  maxResults: 5,  useVector: false, vectorTimeout: 0,    minScore: 0.55, minScoreRatio: 0.65, absoluteFloor: 0.18, activationFloor: 0.24, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0,    factsTokens: 0,   crossAgentTokens: 0   },
+  balanced: { tokenBudget: 800,  maxResults: 10, useVector: true,  vectorTimeout: 900,  minScore: 0.45, minScoreRatio: 0.55, absoluteFloor: 0.15, activationFloor: 0.20, thresholdMode: "adaptive", deepEscalation: false, escalationBudgetMs: 0,    factsTokens: 200, crossAgentTokens: 200 },
+  deep:     { tokenBudget: 1200, maxResults: 15, useVector: true,  vectorTimeout: 2000, minScore: 0.25, minScoreRatio: 0.45, absoluteFloor: 0.12, activationFloor: 0.16, thresholdMode: "adaptive", deepEscalation: true,  escalationBudgetMs: 4000, factsTokens: 250, crossAgentTokens: 250 },
 };
 
 export function getActiveProfile(): ProfileConfig {
@@ -219,9 +241,21 @@ export function loadVaultConfig(): ClawMemConfig {
   const envSurface = process.env.CLAWMEM_SURFACE_SECONDARY_VAULTS;
   const yamlSurface = !!(parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
     && parsedYaml.retrieval.surface_secondary_vaults === true);
+  // Cross-agent injection gate (default OFF) + confidence floor (default 0.7).
+  const envInject = process.env.CLAWMEM_CROSS_AGENT_INJECT;
+  const yamlInject = !!(parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
+    && parsedYaml.retrieval.cross_agent_inject === true);
+  const envConf = Number(process.env.CLAWMEM_CROSS_AGENT_CONFIDENCE);
+  const yamlConf = (parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
+    && typeof parsedYaml.retrieval.cross_agent_confidence === "number")
+    ? parsedYaml.retrieval.cross_agent_confidence as number : 0.7;
+  const resolvedConf = Number.isFinite(envConf) && envConf > 0 && envConf <= 1 ? envConf
+    : (Number.isFinite(yamlConf) && yamlConf > 0 && yamlConf <= 1 ? yamlConf : 0.7);
   retrieval = {
     mcp_direct_tuned_weights: envTuned !== undefined ? envTuned === "true" : yamlTuned,
     surface_secondary_vaults: envSurface !== undefined ? envSurface === "true" : yamlSurface,
+    cross_agent_inject: envInject !== undefined ? envInject === "true" : yamlInject,
+    cross_agent_confidence: resolvedConf,
   };
   if ((envTuned !== undefined || yamlHasTuned) && !_warnedTunedWeightsKnob) {
     _warnedTunedWeightsKnob = true;
@@ -258,6 +292,24 @@ export function listVaults(): string[] {
 export function surfaceSecondaryVaults(): boolean {
   const config = loadVaultConfig();
   return config.retrieval?.surface_secondary_vaults === true;
+}
+
+/**
+ * Whether cross-agent context injection is enabled
+ * (`retrieval.cross_agent_inject` / CLAWMEM_CROSS_AGENT_INJECT). Default false.
+ */
+export function crossAgentInjectEnabled(): boolean {
+  const config = loadVaultConfig();
+  return config.retrieval?.cross_agent_inject === true;
+}
+
+/**
+ * Minimum confidence for facts surfaced by cross-agent injection.
+ * Default 0.7.
+ */
+export function crossAgentInjectConfidence(): number {
+  const config = loadVaultConfig();
+  return config.retrieval?.cross_agent_confidence ?? 0.7;
 }
 
 /**

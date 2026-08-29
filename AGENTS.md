@@ -89,6 +89,9 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 3.  Spot checks         -> search(query) (BM25, 0 GPU)  or  vsearch(query) (vector, 1 GPU)
 4.  Causal edges        -> find_causal_links(docid, direction="both", depth=5)
 5.  Entity facts        -> kg_query(entity)  (SPO triples; NOT causal "why" — that's intent_search)
+5b. Cross-agent facts   -> fact_query_cross_agent(subject=?*, written_by=[...], min_confidence=0.7)
+    What OTHER agents know (written facts + attribution). WRITE new knowledge with fact_write /
+    fact_link so other agents learn it without rediscovery. (Cross-agent memory, v0.38.0.)
 6.  Temporal context    -> timeline(docid, before=5, after=5)
 ```
 
@@ -104,6 +107,9 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `find_similar` | "what else relates to X" — k-NN vector neighbors beyond keyword overlap. |
 | `find_causal_links` | Evidence-preserving causal edge traversal ("what led to X"): directed edge records with fact-pair witnesses + reasoning. Multi-hop CHAIN quality is experimental — depth > 1 is per-edge evidence, not a verified chain. |
 | `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why". |
+| `fact_write` | WRITE a witnessed cross-agent fact (subject→predicate→object) with agentId/sessionId/timestamp/source + confidence + valid_to + tags. Append-mode keeps alternate versions from other agents. |
+| `fact_link` | Directed relation between two entities (cross-domain reference). |
+| `fact_query_cross_agent` | Query facts OTHER agents wrote: `*`-wildcards, since, min_confidence, written_by, session_ids; resolve_conflicts collapses divergent witnesses to newest ≥ floor. |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
 | `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw routes — vector + `search` non-recency). PROACTIVELY for constraints, architecture decisions, corrections. |

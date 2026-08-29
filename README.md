@@ -215,7 +215,7 @@ ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.a
 
 > **OpenClaw v2026.4.11+ recommended (required for ClawMem v0.10.0+).** v2026.4.11 introduced a new plugin discovery contract that requires each plugin directory to ship a `package.json` with `openclaw.extensions` declared, and that rejects symlinked plugin directories. ClawMem v0.10.0 includes both fixes. Older ClawMem versions (< v0.10.0) on OpenClaw v2026.4.11+ will fail to discover silently — upgrade ClawMem, then re-run `clawmem setup openclaw`. See [docs/guides/upgrading.md](docs/guides/upgrading.md#v090--v0100).
 
-**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 33 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `agent_end` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 36 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `agent_end` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
 
 #### Hermes Agent
 
@@ -321,7 +321,7 @@ ClawMem uses three inference services — **embedding**, **LLM** (query expansio
 
 ### MCP Server
 
-ClawMem exposes 33 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
+ClawMem exposes 36 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
 
 **Claude Code (automatic):**
 
@@ -529,7 +529,7 @@ clawmem doctor                                  Full health check
 clawmem status                                  Quick index status
 ```
 
-## MCP Tools (31)
+## MCP Tools (36)
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
@@ -571,6 +571,24 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `kg_query` | Query the SPO knowledge graph: "what does X relate to?", "what was true about X when?". Returns temporal entity-relationship triples with validity windows. Accepts entity name (resolved via `searchEntities`) or canonical ID in `vault:type:slug` form. Triples are populated by the decision-extractor hook from observer-emitted `<triples>` blocks. |
 | `memory_evolution_status` | Show how a document's A-MEM metadata evolved over time |
 | `timeline` | Show the temporal neighborhood around a document — what was created/modified before and after it. Progressive disclosure: search → timeline (context) → get (full content). Supports same-collection scoping and session correlation. |
+
+### Cross-Agent Memory (v0.38.0)
+
+Active shared memory: an agent writes a signed, witnessed fact and every other agent
+sharing the vault can read it. Facts carry attribution (agent, session, timestamp, source),
+confidence, and validity — with cross-agent writes *appended* so divergent witnesses never
+clobber each other.
+
+| Tool | Description |
+|---|---|
+| `fact_write` | Write a learned fact as a witnessed SPO triple (subject → predicate → object) with `agentId`, `sessionId`, `timestamp`, `source`, `confidence`, `valid_to` (decay), and `tags`. Append-mode preserves alternate versions. |
+| `fact_link` | Create a directed semantic relation between two entities (e.g. `project:ema5 uses_infrastructure server:ema5-plc-db`) for cross-domain reference. |
+| `fact_query_cross_agent` | Query witnessed facts across agents: `*`-wildcard subject/predicate/object, `since`, `min_confidence`, `written_by`, `session_ids`; `resolve_conflicts` collapses divergent witnesses to the most recent at/above the confidence floor. |
+
+An optional **context-injection layer** (default OFF, `CLAWMEM_CROSS_AGENT_INJECT=true` /
+`retrieval.cross_agent_inject`) pre-emptively feeds an agent facts written by *other*
+agents about prompt entities (marked `<cross-agent-facts>`, confidence floor default 0.7,
+2s-bounded and fail-open).
 
 ### Beads Integration
 

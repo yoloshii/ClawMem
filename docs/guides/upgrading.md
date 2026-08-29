@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.37.0**.
+Guide for upgrading between released versions. Current: **v0.38.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -41,6 +41,22 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
 
 ---
+
+## v0.38.0: cross-agent memory (opt-in active shared memory)
+
+Additive and opt-in. No upgrade steps required for existing vaults.
+
+- Three new MCP tools: `fact_write`, `fact_link`, `fact_query_cross_agent` (see
+  [cross-agent-memory.md](../concepts/cross-agent-memory.md) and
+  [mcp-tools.md](../reference/mcp-tools.md)).
+- `entity_triples` gains idempotent witness columns (`agent_id`, `session_id`,
+  `source_type`, `written_at`, `tags`) plus indexes — a no-op on re-open for
+  existing vaults.
+- **Context injection is OFF by default.** To enable: `retrieval.cross_agent_inject: true`
+  (or `CLAWMEM_CROSS_AGENT_INJECT=true`) and a confidence floor via
+  `retrieval.cross_agent_confidence` (or `CLAWMEM_CROSS_AGENT_CONFIDENCE`). The active
+  profile must also grant a `crossAgentTokens` sub-budget (`balanced`/`deep` carry 200/250;
+  `speed` stays 0). No existing deployment is affected until it opts in.
 
 ## Reranker: zerank-2 GGUF deprecated → seq-cls sidecar
 

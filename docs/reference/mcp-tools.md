@@ -422,3 +422,79 @@ Read recent diary entries.
 | `last_n` | number | 10 | Number of entries to return |
 | `agent` | string | — | Filter by agent name |
 | `vault` | string | — | Named vault |
+## Cross-Agent Memory (v0.38.0)
+
+Active shared memory: an agent writes a signed, witnessed fact into the knowledge graph
+and every other agent sharing the vault can read it. Distinct from document indexing —
+these are first-class witnessed facts with attribution and confidence.
+
+### fact_write
+
+Write a learned fact as a witnessed SPO triple.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `subject` | string | required | Subject entity (name or canonical id) |
+| `predicate` | string | required | Relation (lowercased; spaces → `_`) |
+| `object` | string | required | Object entity or literal value |
+| `subject_type` | string | `concept` | Entity type for subject if new |
+| `object_type` | string | `concept` | Entity type for object if new |
+| `witness.agentId` | string | required | Agent writing the fact |
+| `witness.sessionId` | string | — | Session the fact was learned in |
+| `witness.timestamp` | string | now | ISO observation timestamp |
+| `witness.source` | string | — | How observed (`direct_observation`, …) |
+| `confidence` | number | `0.9` | 0..1 confidence |
+| `valid_from` | string | now | Validity start (ISO) |
+| `valid_to` | string | — | Validity end / expiry (ISO) — natural decay |
+| `tags` | string[] | — | Free-form labels |
+| `vault` | string | — | Named vault |
+
+Cross-agent writes **append** a new version rather than overwrite: a different agent's
+higher-confidence fact on the same subject+predicate survives as an alternate witnessed
+version (divergence/evolution preserved).
+
+### fact_link
+
+Create a directed semantic relation between two entities (cross-domain reference).
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `from` | string | required | Source entity |
+| `relation` | string | required | Directed relation name |
+| `to` | string | required | Target entity |
+| `from_type` / `to_type` | string | `concept` | Entity types if new |
+| `witness` | object | required | Same attribution shape as `fact_write` |
+| `confidence` | number | `0.9` | 0..1 confidence |
+| `valid_to` | string | — | Optional expiry |
+| `tags` | string[] | — | Free-form labels |
+| `vault` | string | — | Named vault |
+
+### fact_query_cross_agent
+
+Query witnessed facts across agents with filtering.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `subject` | string | `*` | Subject entity or `*` |
+| `predicate` | string | `*` | Relation or `*` |
+| `object` | string | `*` | Object entity/literal or `*` |
+| `since` | string | — | Only facts written on/after this ISO time |
+| `min_confidence` | number | `0.7` | Lower bound (inclusive) on confidence |
+| `written_by` | string[] | — | Restrict to writer agent(s) |
+| `session_ids` | string[] | — | Restrict to session(s) |
+| `resolve_conflicts` | boolean | `false` | Collapse divergent witnesses to most recent ≥ floor |
+| `limit` | number | `50` | Max facts (1..200) |
+| `vault` | string | — | Named vault |
+
+`resolve_conflicts: true` merges arcs that differ only by witness, keeping the most recent
+current fact above `min_confidence` per (subject, predicate, object).
+
+### Context injection layer (optional, default OFF)
+
+Not an MCP tool — an orchestration behaviour of the vault. Enable via
+`retrieval.cross_agent_inject: true` (or `CLAWMEM_CROSS_AGENT_INJECT=true`); confidence
+floor `retrieval.cross_agent_confidence` (default 0.7). When enabled, facts written by
+*other* agents about entities in the task prompt are injected as a labelled
+`<cross-agent-facts>` block. Bounded to 2s and fail-open by design; the active profile must
+grant a `crossAgentTokens` sub-budget for the stage to run. See the
+[cross-agent section of the README](https://github.com/yoloshii/ClawMem#readme).
