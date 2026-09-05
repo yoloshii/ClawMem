@@ -87,6 +87,21 @@ The same check also applies to the parent `~/.openclaw/` directory — if it is 
 
 Re-running setup is safe. Setup removes any existing `~/.openclaw/extensions/clawmem` (whether it is a symlink, a directory, or a stale copy from a previous version) before writing the new copy. This makes upgrades a matter of `git pull && clawmem setup openclaw && chown -R <user>:<group> ~/.openclaw/extensions/clawmem` (the chown only matters on multi-user installs).
 
+
+### OpenClaw 2026.7 and later — three things that changed
+
+Verified against OpenClaw 2026.7.1-2 (Sep 2026) with ClawMem v0.37.0:
+
+1. **Agent tools need a manifest contract.** OpenClaw's plugin registry now rejects `registerTool` unless the plugin manifest declares the tool names under `contracts.tools`. Without it the gateway logs `plugin must declare contracts.tools before registering agent tools (plugin=clawmem …)` and the plugin silently degrades to hook-only (the five retrieval tools never reach the agent). `src/openclaw/package.json` and `openclaw.plugin.json` now declare them.
+2. **`plugins install --force` is refused for a TypeScript-source plugin** (`package install requires compiled runtime output for TypeScript entry ./index.ts … TypeScript source fallback is only supported for source checkouts and local development paths`). `clawmem setup openclaw` now falls back to link mode automatically when it sees that error; `clawmem setup openclaw --link` avoids it entirely.
+3. **The `agent_end` hook needs an explicit grant.** Non-bundled plugins must set `plugins.entries.clawmem.hooks.allowConversationAccess: true` or the gateway logs `typed hook "agent_end" blocked because non-bundled plugins must set plugins.entries.clawmem.hooks.allowConversationAccess` and decision extraction / handoffs never run:
+
+```bash
+openclaw config set plugins.entries.clawmem.hooks.allowConversationAccess true
+```
+
+Also worth knowing: the plugin resolves the vault (via the `clawmem` binary's default `~/.cache/clawmem` / `~/.config/clawmem`, or `XDG_CACHE_HOME` / `CLAWMEM_CONFIG_DIR` in the gateway's environment) when the gateway starts — switching vaults means restarting the gateway.
+
 ## Architecture
 
 The plugin registers with OpenClaw as `kind: memory` and wires all its behavior through the plugin-hook event bus. There is no `ContextEngine` class. Every lifecycle surface the plugin needs (prompt injection, post-turn extraction, pre-compaction state capture, session bootstrap) is implemented as a handler on a `PluginHookName` event.
