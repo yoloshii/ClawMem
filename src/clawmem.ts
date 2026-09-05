@@ -2108,7 +2108,23 @@ async function cmdSetupOpenClaw(args: string[]) {
         { stdout: "inherit", stderr: "inherit" },
       );
       if (r.exitCode !== 0) {
-        die(`openclaw plugins install --force failed (exit ${r.exitCode}); aborting setup`);
+        {
+        // OpenClaw >= 2026.7 refuses `plugins install --force` for a TypeScript-source
+        // plugin ("package install requires compiled runtime output for TypeScript entry
+        // ./index.ts ... TypeScript source fallback is only supported for source checkouts
+        // and local development paths"). The plugin ships as TypeScript, so on those
+        // versions the copy path can never succeed: fall back to the link path OpenClaw
+        // does accept for a source checkout, and say so.
+        const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+        if (out.includes("compiled runtime output")) {
+          console.log(`${c.yellow}OpenClaw rejects --force for a TypeScript-source plugin on this version; installing in link mode instead (openclaw plugins install -l)${c.reset}`);
+          const r2 = Bun.spawnSync(["openclaw", "plugins", "install", pluginDir, "-l"], { stdout: "inherit", stderr: "inherit" });
+          if (r2.exitCode !== 0) die(`openclaw plugins install -l failed (exit ${r2.exitCode}); aborting setup`);
+          console.log(`${c.green}Linked local plugin path via openclaw plugins install -l (profile-aware, auto-enabled)${c.reset}`);
+        } else {
+          die(`openclaw plugins install --force failed (exit ${r.exitCode}); aborting setup`);
+        }
+      }
       }
       console.log(`${c.green}Installed plugin via openclaw plugins install --force (profile-aware, auto-enabled)${c.reset}`);
     }
