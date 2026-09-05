@@ -1,6 +1,9 @@
 {
   "id": "clawmem",
   "kind": "memory",
+  "contracts": {
+    "tools": ["clawmem_search", "clawmem_get", "clawmem_session_log", "clawmem_timeline", "clawmem_similar"]
+  },
   "activation": {
     "onCapabilities": ["hook", "tool"]
   },
