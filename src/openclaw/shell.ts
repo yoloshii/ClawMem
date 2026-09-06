@@ -77,10 +77,16 @@ export function execHook(
   input: Record<string, unknown>,
   timeout?: number
 ): Promise<ShellResult> {
+  // CLAWMEM_HOOK_TIMEOUT_MS overrides the per-hook default (the `deep` profile's
+  // context-surfacing can take 25–40 s on a cold process; the 10 s default kills it
+  // on every prompt — see issue #28). Unset = previous behaviour.
+  const envTimeout = parseInt(process.env.CLAWMEM_HOOK_TIMEOUT_MS || "", 10);
   const hookTimeout = timeout ?? (
-    hookName === "decision-extractor" || hookName === "handoff-generator"
-      ? EXTRACTION_TIMEOUT
-      : DEFAULT_TIMEOUT
+    Number.isFinite(envTimeout) && envTimeout > 0
+      ? envTimeout
+      : hookName === "decision-extractor" || hookName === "handoff-generator"
+        ? EXTRACTION_TIMEOUT
+        : DEFAULT_TIMEOUT
   );
 
   return new Promise((resolve) => {
