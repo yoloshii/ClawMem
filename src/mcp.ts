@@ -35,7 +35,7 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, attachRrfScores, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, attachRrfScores, scaleFusedToUnit, type RankedResult } from "./search-utils.ts";
 import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
@@ -414,7 +414,8 @@ This is the recommended entry point for ALL memory queries.`,
         } catch (e) { rethrowIfFatalVectorError(e); /* */ }
         if (vec.length > 0) {
           const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          results = attachRrfScores(fusedRanked, [...bm25, ...vec]);
+          // Composite scoring below expects a 0..1 search score; RRF's is ≤ ~0.13.
+          results = scaleFusedToUnit(attachRrfScores(fusedRanked, [...bm25, ...vec]));
         } else {
           results = bm25;
         }

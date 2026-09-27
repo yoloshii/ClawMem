@@ -229,6 +229,20 @@ export function toRanked(r: SearchResult): RankedResult {
  * (matching the previous `find`-based lookups); fused entries with no originating
  * SearchResult are dropped.
  */
+/**
+ * Rescale fused RRF scores to (0, 1] by the best fused score, preserving order. Composite
+ * scoring weighs the search score (0.5) against recency and type confidence (0.25 each),
+ * all of which live on 0..1; raw RRF scores (≤ ~0.13) would contribute at most ~0.065
+ * there, so a hybrid ranking would be decided by age and content type instead of by the
+ * query. Use only where fused results enter composite scoring; graph traversal anchors
+ * keep the fusion scale (see attachRrfScores).
+ */
+export function scaleFusedToUnit(results: SearchResult[]): SearchResult[] {
+  const top = results.reduce((max, r) => Math.max(max, r.score), 0);
+  if (!(top > 0)) return results;
+  return results.map(r => ({ ...r, score: r.score / top }));
+}
+
 export function attachRrfScores(fused: RankedResult[], originals: SearchResult[]): SearchResult[] {
   const byPath = new Map<string, SearchResult>();
   for (const r of originals) {
