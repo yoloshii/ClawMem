@@ -189,7 +189,7 @@ describe("search two-regime scoring (v0.24.0 — S49.2 SWITCH verdict)", () => {
     const got = ((res.structuredContent?.results ?? []) as { file: string }[]).map(r => r.file);
     expect(got.length).toBeGreaterThanOrEqual(2);
     // Direct composite computation over the handler's exact pool reproduces the order…
-    const pool = seedStore.searchFTS(q, 10, undefined, undefined, undefined, ["_clawmem"]);
+    const pool = seedStore.searchFTS(q, 10, undefined, undefined, undefined, ["_clawmem"], { anyTermFallback: true });
     const coFn = (p: string) => seedStore.getCoActivated(p);
     const composite = applyCompositeScoring(enrichResults(seedStore, pool, q), q, coFn)
       .filter(r => r.compositeScore >= 0).map(r => r.displayPath);

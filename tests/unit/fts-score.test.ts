@@ -252,3 +252,49 @@ describe("searchFTS exposed score (S49.1)", () => {
     expect(weak!.score).toBeLessThan(0.7);
   });
 });
+
+// ─── searchFTS any-term fallback ──────────────────────────────────────────────
+
+describe("searchFTS any-term fallback", () => {
+  const ANY = { anyTermFallback: true };
+
+  it("is opt-in: without the flag a query with an absent word still matches nothing", () => {
+    addDoc("user", "progress.md", "Materials loading progress", "Named NDJSON stages for material matching, shown under the spinner.");
+    expect(searchFTS(store.db, "document row progress percentage spinner")).toHaveLength(0);
+  });
+
+  it("finds a document when one query word is absent from it (every-term AND alone returned nothing)", () => {
+    addDoc("user", "progress.md", "Materials loading progress", "Named NDJSON stages for material matching, shown under the spinner.");
+    const results = searchFTS(store.db, "document row progress percentage spinner", 20, undefined, undefined, undefined, undefined, ANY);
+    expect(results.map(r => r.displayPath)).toContain("user/progress.md");
+  });
+
+  it("ranks every-term matches above any-term padding", () => {
+    addDoc("user", "both.md", "Frobnic Ledger", "The frobnic ledger records every ledger entry.");
+    addDoc("user", "one.md", "Frobnic Notes", "Assorted frobnic notes without the other word.");
+    const results = searchFTS(store.db, "frobnic ledger", 20, undefined, undefined, undefined, undefined, ANY);
+    expect(results[0]!.displayPath).toBe("user/both.md");
+    expect(results.map(r => r.displayPath)).toContain("user/one.md");
+    const both = results.find(r => r.displayPath === "user/both.md")!;
+    const one = results.find(r => r.displayPath === "user/one.md")!;
+    expect(both.score).toBeGreaterThan(one.score);
+  });
+
+  it("never lets an any-term-only hit pass the strong-signal bar", () => {
+    addDoc("user", "one.md", "Glimbrel Glimbrel Glimbrel", "glimbrel glimbrel glimbrel glimbrel glimbrel glimbrel");
+    const results = searchFTS(store.db, "glimbrel nonexistentword", 20, undefined, undefined, undefined, undefined, ANY);
+    expect(results[0]!.displayPath).toBe("user/one.md");
+    expect(results[0]!.score).toBeLessThanOrEqual(0.5);
+    expect(hasStrongFtsSignal(results)).toBe(false);
+  });
+
+  it("leaves single-term queries and full AND pages unchanged", () => {
+    addDoc("user", "a.md", "Quaddle", "quaddle");
+    expect(searchFTS(store.db, "quaddle", 20, undefined, undefined, undefined, undefined, ANY).map(r => r.displayPath)).toEqual(["user/a.md"]);
+    for (let i = 0; i < 3; i++) addDoc("user", `pair-${i}.md`, `Zorp Flux ${i}`, "zorp flux");
+    addDoc("user", "zorp-only.md", "Zorp", "zorp");
+    const page = searchFTS(store.db, "zorp flux", 3, undefined, undefined, undefined, undefined, ANY);
+    expect(page).toHaveLength(3);
+    expect(page.every(r => r.displayPath.startsWith("user/pair-"))).toBe(true);
+  });
+});
