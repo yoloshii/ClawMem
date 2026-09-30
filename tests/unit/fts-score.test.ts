@@ -19,7 +19,8 @@ import {
   type SearchResult,
 } from "../../src/store.ts";
 import { applyCompositeScoring } from "../../src/memory.ts";
-import { enrichResults, hasStrongFtsSignal, attachRrfScores, type RankedResult } from "../../src/search-utils.ts";
+import { enrichResults, hasStrongFtsSignal, attachRrfScores, scaleFusedToUnit, type RankedResult } from "../../src/search-utils.ts";
+import type { EnrichedResult } from "../../src/memory.ts";
 
 // ─── Pure transform ──────────────────────────────────────────────────────────
 
@@ -157,6 +158,50 @@ const FILLER = [
 beforeEach(() => {
   store = createStore(":memory:");
   FILLER.forEach((body, i) => addDoc("user", `filler-${i}.md`, `Filler ${i}`, body));
+});
+
+// ─── scaleFusedToUnit (hybrid memory_retrieve → composite) ────────────────────
+
+describe("scaleFusedToUnit", () => {
+  const fusedResult = (filepath: string, score: number): SearchResult =>
+    ({ filepath, displayPath: filepath.replace("clawmem://", ""), title: filepath, score, source: "fts" }) as SearchResult;
+
+  it("rescales to (0, 1] by the best fused score and keeps the order", () => {
+    const out = scaleFusedToUnit([fusedResult("clawmem://u/a.md", 0.13), fusedResult("clawmem://u/b.md", 0.026)]);
+    expect(out.map(r => r.filepath)).toEqual(["clawmem://u/a.md", "clawmem://u/b.md"]);
+    expect(out[0]!.score).toBeCloseTo(1, 6);
+    expect(out[1]!.score).toBeCloseTo(0.2, 6);
+  });
+
+  it("returns empty and all-zero inputs unchanged", () => {
+    expect(scaleFusedToUnit([])).toEqual([]);
+    const zero = [fusedResult("clawmem://u/a.md", 0)];
+    expect(scaleFusedToUnit(zero)).toEqual(zero);
+  });
+
+  it("lets relevance, not age, order a hybrid pool in composite scoring (raw RRF inverts it)", () => {
+    const now = new Date("2026-09-27T00:00:00.000Z");
+    const enriched = (over: Partial<EnrichedResult>): EnrichedResult => ({
+      filepath: "clawmem://c/x.md", displayPath: "c/x.md", title: "X", score: 0.5,
+      contentType: "note", modifiedAt: now.toISOString(), accessCount: 0,
+      confidence: 0.5, qualityScore: 0.5, pinned: false, context: null, hash: "h",
+      docid: "h", collectionName: "c", bodyLength: 500, source: "fts",
+      duplicateCount: 1, revisionCount: 1,
+      ...over,
+    }) as EnrichedResult;
+    // The strongly relevant decision note is two months old and ranked first by both
+    // channels (RRF ≈ 0.13); a weak fresh note was matched once, low (RRF ≈ 0.026).
+    const oldRelevant = enriched({ filepath: "clawmem://c/old.md", displayPath: "c/old.md", hash: "o", docid: "o",
+      modifiedAt: "2026-07-27T00:00:00.000Z", score: 0.13 });
+    const freshWeak = enriched({ filepath: "clawmem://c/fresh.md", displayPath: "c/fresh.md", hash: "f", docid: "f", score: 0.026 });
+
+    const raw = applyCompositeScoring([oldRelevant, freshWeak], "query terms", undefined, { now });
+    expect(raw[0]!.displayPath).toBe("c/fresh.md");
+
+    const [a, b] = scaleFusedToUnit([oldRelevant, freshWeak]) as EnrichedResult[];
+    const scaled = applyCompositeScoring([a!, b!], "query terms", undefined, { now });
+    expect(scaled[0]!.displayPath).toBe("c/old.md");
+  });
 });
 
 describe("searchFTS exposed score (S49.1)", () => {
