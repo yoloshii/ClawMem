@@ -329,7 +329,9 @@ describe("retryOnBusyAsync (design (f).2)", () => {
 });
 
 describe("no-work run end verification (T10-M1)", () => {
-  it("a fully-embedded vault with an unavailable preflight exits NONZERO and persists taint", async () => {
+  // v0.41.2 (BACKLOG 68.3): the run is still unverified (exit 1), but it wrote no vector, so no second geometry can be
+  // in the table and it no longer sets the taint (through v0.41.1 it did, and only a full `embed --force` cleared it).
+  it("a fully-embedded vault with an unavailable preflight exits NONZERO and does NOT taint (it wrote nothing)", async () => {
     const dbPath = `/tmp/clawmem-nowork-taint-${process.pid}.sqlite`;
     const { unlinkSync } = await import("node:fs");
     try { unlinkSync(dbPath); } catch { /* absent */ }
@@ -341,7 +343,7 @@ describe("no-work run end verification (T10-M1)", () => {
     store.close();
 
     // Run the REAL CLI with an unreachable embed endpoint and local fallback disabled:
-    // canary unavailable → non-force warn → no work → shared finalization must taint + exit 1.
+    // canary unavailable → non-force warn → no work → shared finalization: exit 1, no taint (0 vectors written).
     const proc = Bun.spawnSync(["bun", "src/clawmem.ts", "embed"], {
       cwd: `${import.meta.dir}/../..`,
       env: {
@@ -352,9 +354,10 @@ describe("no-work run end verification (T10-M1)", () => {
       },
     });
     expect(proc.exitCode).not.toBe(0);
+    expect(proc.stderr.toString()).toContain("wrote 0 vectors");
 
     const check = createStore(dbPath);
-    expect(check.getVaultFlag("embed_geometry_taint")).toContain("no preflight validation");
+    expect(check.getVaultFlag("embed_geometry_taint")).toBeNull();
     check.close();
     try { unlinkSync(dbPath); } catch { /* gone */ }
   }, 30_000);

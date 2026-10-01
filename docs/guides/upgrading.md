@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.41.1**.
+Guide for upgrading between released versions. Current: **v0.41.2**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,36 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.41.2: the observer counts its prompt in tokens and keeps room for its reply
+
+**No vault migration.** Upgrade every process that runs the Stop hooks (the hooks, `clawmem watch`,
+the MCP server of every open agent session, the OpenClaw and Hermes plugins) and restart the
+watcher: its stop worker resumes observer continuations and replays held ranges.
+
+- **Raise the observer model's context to `-c 8192` (recommended).** The observer now reads the
+  server's context from llama-server's `/props` and fits each prompt to it in tokens, keeping a reply
+  reserve. At `-c 4096` it works, in windows of about 1,350 to 1,770 transcript tokens; at `-c 8192`
+  a window holds about 5,090 to 5,500, so a dense turn needs far fewer calls. Measured cost: about
+  +470 MiB of VRAM. With `--parallel N`, each request gets `-c / N`. `clawmem doctor` prints the
+  context it sees and the window it leaves. See [inference services](inference-services.md#llm-server).
+- **A server without `/props`** (a cloud gateway, vLLM, Ollama): set `CLAWMEM_LLM_CONTEXT_TOKENS` to
+  its context per request. Without it ClawMem assumes 4,096 tokens and counts by a cautious estimate.
+- **Ranges v0.41.1 quarantined** on dense turns are due again on their old schedule (at most 12 hours
+  after the last attempt) and now run in windows. A range that cannot fit at all, because one message
+  is larger than a window can ever be on that server, is held with a `capacity:` reason and replays
+  on its own once the context is raised; `clawmem doctor` counts them.
+- **Until every process runs v0.41.2**, an older one can still replay a held range with v0.41.1's
+  prompt. Nothing is lost: a v0.41.2 process that finds the range committed drops its checkpoint, and
+  the watcher sweeps orphaned checkpoints.
+- **`clawmem embed`:** a run that did not clear the index (no `--force`) and stored no vector no
+  longer sets the geometry taint; it still exits 1. A taint already set, by such a run or any other,
+  stays until a verified `clawmem embed --force`. See
+  [troubleshooting](../troubleshooting.md#embedding--gpu).
+
+No re-embed, reindex or `clawmem setup hooks` is needed; the hook configuration is unchanged.
 
 ---
 

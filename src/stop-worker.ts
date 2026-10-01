@@ -19,10 +19,12 @@
 
 import { existsSync, statSync } from "fs";
 import type { Store } from "./store.ts";
-import { isoNow, epochNow, epochMs, monoNow, deadlineAfter, duration, isExpired, type MonoDeadline } from "./clock.ts";
+import { isoNow, epochNow, epochMs, monoNow, deadlineAfter, duration, earliest, isExpired, type MonoDeadline } from "./clock.ts";
 import { lastChanges, stopPipelineReady } from "./stop-schema.ts";
 import { attributeTranscript, applyMirrorSlices } from "./stop-feedback.ts";
-import { replayDueRetries } from "./stop-extract.ts";
+import { replayDueRetries, DECISION_HOOK } from "./stop-extract.ts";
+import { observerCallMeanMs } from "./observer.ts";
+import { sweepCheckpoints } from "./stop-checkpoint.ts";
 import { rejudgeDeferred } from "./stop-judge.ts";
 import { drainCausalMarkers } from "./stop-causal.ts";
 import { runHandoffDigests, renderHandoffDoc, HANDOFF_HOOK } from "./stop-handoff.ts";
@@ -33,6 +35,8 @@ export const STOP_WORKER_INTERVAL_MS = 60_000;
 export const STOP_WORKER_TICK_BUDGET_MS = 25_000;
 /** How long a transcript (or a handoff's digests) must be quiet before the worker acts for a missing Stop. */
 export const STOP_WORKER_QUIET_MS = 10 * 60_000;
+/** v0.41.2: the continuation slice's floor (it grows with the measured observer call, up to the tick budget − 2 s). */
+const CONTINUATION_SLICE_MIN_MS = 15_000;
 
 export type WorkerVault = { name: string; store: Store };
 
@@ -113,6 +117,26 @@ export async function runStopWorkerTick(
   const locator = (sessionId: string, key: string) => db.prepare(
     `SELECT session_id, transcript_key, transcript_path, host, session_key, ended_at FROM session_transcripts WHERE session_id = ? AND transcript_key = ?`
   ).get(sessionId, key) as Locator | null;
+
+  // v0.41.2 (BACKLOG 68.5, design §1.4): a due continuation — a held range whose observer checkpoint has progress to
+  // resume — runs FIRST, in its own slice, so neither older failed rows nor the other steps starve it; a tick with a
+  // responding LLM completes at least one of its windows whenever one observer call fits the slice.
+  await stepAsync(report, "continuations", async () => {
+    // The replay's own due predicate (codex T11-5): a continuation whose claimant died (its lease expired) is due too.
+    const now = isoNow();
+    const due = db.prepare(
+      `SELECT 1 FROM stop_retries WHERE hook = ? AND last_error LIKE 'continuation:%'
+         AND ((state = 'queued' AND next_retry_at <= ?) OR (state = 'claimed' AND lease_expires_at < ?)) LIMIT 1`
+    ).get(DECISION_HOOK, now, now);
+    if (!due) return;
+    const sliceMs = Math.min(Math.max(2 * observerCallMeanMs() + 5_000, CONTINUATION_SLICE_MIN_MS), STOP_WORKER_TICK_BUDGET_MS - 2_000);
+    const sliceEnd = deadlineAfter(monoNow(), duration(sliceMs));
+    const replay = await replayDueRetries(general, { deadline: earliest(sliceEnd, deadline), limit: 1, continuationOnly: true });
+    report.replayed += replay.replayed;
+    for (const r of replay.ranges) {
+      report.causal += await drainCausalMarkers(general, llm, { deadline, rangeKey: r.key, limit: 1 });
+    }
+  });
 
   // Feedback: the open rows (pending, or provisional) of registered transcripts, paged from where the last tick
   // stopped so live transcripts never keep a quiet one out (T23 #7). A live transcript is skipped: its next Stop
@@ -280,6 +304,11 @@ export async function runStopWorkerTick(
   });
   await stepAsync(report, "rejudge", async () => { report.rejudged += await rejudgeDeferred(general, deadline, { limit: limits.rejudges }); });
   await stepAsync(report, "causal", async () => { report.causal += await drainCausalMarkers(general, llm, { deadline, limit: limits.causal }); });
+  // v0.41.2: observer checkpoints nothing can resume any more (orphans only — design §1.4).
+  step(report, "checkpoint-sweep", () => {
+    const swept = sweepCheckpoints(db, nowMs);
+    if (swept > 0) console.error(`[watch] stop-pipeline: swept ${swept} orphaned observer checkpoint(s)`);
+  });
   return report;
 }
 

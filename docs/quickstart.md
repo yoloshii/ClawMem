@@ -61,9 +61,10 @@ ClawMem uses three llama-server instances for best performance. All three models
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 
-# LLM — query expansion, A-MEM notes, the Stop hooks' observer (falls back to in-process if unavailable)
+# LLM — query expansion, A-MEM notes, the Stop hooks' observer (falls back to in-process if unavailable).
+# -c 8192 leaves the observer room for its answer; 4096 works with smaller windows (inference-services.md)
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
-  --port 8089 --host 0.0.0.0 -ngl 99 -c 4096
+  --port 8089 --host 0.0.0.0 -ngl 99 -c 8192
 
 # Reranker (falls back to in-process if unavailable)
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \

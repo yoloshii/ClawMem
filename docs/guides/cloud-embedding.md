@@ -93,7 +93,9 @@ If you set `CLAWMEM_EMBED_API_KEY` but your `CLAWMEM_EMBED_URL` points to localh
 The LLM (query expansion, A-MEM, the Stop hooks' observer) and the reranker default to local
 `llama-server` or the in-process `node-llama-cpp` fallback. `CLAWMEM_LLM_URL` (with
 `CLAWMEM_LLM_API_KEY`) can also point at any OpenAI-compatible endpoint, a cloud one included, and the
-Stop hooks' observer then sends session transcripts to it. Since v0.29.0 the **contradiction judge**
+Stop hooks' observer then sends session transcripts to it. Such an endpoint does not report its
+context the way llama-server's `/props` does, so set `CLAWMEM_LLM_CONTEXT_TOKENS` to it (v0.41.2);
+otherwise the observer assumes 4,096 tokens. Since v0.29.0 the **contradiction judge**
 has its own task-scoped endpoint (`CLAWMEM_JUDGE_*`, never the global LLM vars; see
 [inference services](inference-services.md#contradiction-judge)). This means:
 

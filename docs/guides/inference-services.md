@@ -39,9 +39,9 @@ Total ~4 GB VRAM, or runs in-process via `node-llama-cpp` (Metal on Apple Silico
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 
-# LLM (QMD finetuned model)
+# LLM (QMD finetuned model). -c 8192: room for the Stop-hook observer's prompt AND its answer (see "LLM server")
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
-  --port 8089 --host 0.0.0.0 -ngl 99 -c 4096 --batch-size 512
+  --port 8089 --host 0.0.0.0 -ngl 99 -c 8192 --batch-size 512
 
 # Reranker
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
@@ -104,11 +104,12 @@ Intent classification, query expansion, A-MEM extraction and the Stop hooks' obs
 - **Performance (RTX 3090):** intent classification ~27 ms; query expansion ~333 tok/s; VRAM ~2.2–2.8 GB.
 - **Qwen3 `/no_think`:** Qwen3 emits thinking tokens by default; ClawMem appends `/no_think` to all prompts automatically for structured output.
 - **Dual-path intent:** a heuristic regex classifier handles strong why/when/who signals instantly (0.8+ confidence); the LLM refines only ambiguous queries below that threshold.
-- **Context size (`-c`):** `decision-extractor`'s observation prompt holds at most 8,000 characters of transcript and context, a retry's error feedback included (v0.41.1). That is a bound in characters, not tokens. Counted by this model's server, the largest such prompt on English prose from these docs was 2,403 tokens, and one real Claude Code turn's was 1,473. Text that tokenizes more densely (long paths, Chinese, Japanese, Korean) needs more tokens for the same characters, and a prompt near 4,096 tokens leaves the model less than the 2,000 tokens the observer allows for its answer. Raise `-c` (to 8192, say) when the server refuses requests with `the request exceeds the available context size` (HTTP 400; ClawMem logs `[generate] Remote LLM HTTP 400`). On v0.41.0 the observer's own prompt reached 5,382 tokens on that prose, and raising `-c` avoids those refusals there too.
+- **Context size (`-c`) — 8192 recommended (v0.41.2).** The Stop hooks' observer sizes its prompts in TOKENS against the server's own context: before each call it reads `-c` from the server's `/props` (the per-request slot context, `-c` divided by `--parallel`), counts the exact prompt the chat endpoint will see (`/apply-template`, then `/tokenize`), and keeps room for the answer — 40% of the context, at least 768 tokens, at most the 2,000 the observer allows. A turn too large for one prompt is read in several windows, each with its own answer room, and a window's progress is kept, so a later Stop or the watcher resumes it. Measured on this model's server, the fixed part of the prompt is 684 tokens, so at `-c 4096` a window holds 1,350–1,770 tokens of transcript (less the context section's share) and a tool-heavy turn takes several calls; at `-c 8192` it holds 5,090–5,500, and most turns take one. One observation's answer measured 360 tokens. Measured cost of 8192 over 4096 for this model: about +470 MiB of VRAM (2,144 → 2,612 MiB). `clawmem doctor` reports the context it read, how it counts, and how much transcript one window holds. Through v0.41.1 the prompt was bounded in characters (8,000), and a dense turn — paths, hashes, tool output — filled 4,072 of 4,096 tokens, so the answer was cut after a few words (see [troubleshooting](../troubleshooting.md#hooks)).
+- **A server without `/props`, `/tokenize` or `/apply-template`** (another OpenAI-compatible server, a cloud endpoint): set `CLAWMEM_LLM_CONTEXT_TOKENS` to its context, or ClawMem assumes 4096. Without `/apply-template` the chat template's tokens are measured once from a one-token probe; without `/tokenize`, prompts are estimated conservatively (dense characters at one token each). Fits are then best-effort — a refusal for size, or an answer cut short, makes the next attempt smaller — and the doctor says so.
 
 ```bash
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
-  --port 8089 --host 0.0.0.0 -ngl 99 -c 4096 --batch-size 512
+  --port 8089 --host 0.0.0.0 -ngl 99 -c 8192 --batch-size 512
 ```
 
 For better entity-extraction quality during `reindex --enrich`, point `CLAWMEM_LLM_URL` at a 7B+ model or cloud API (see [../internals/entity-resolution.md](../internals/entity-resolution.md)).

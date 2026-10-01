@@ -8,6 +8,8 @@
  */
 import { describe, it, expect, afterEach } from "bun:test";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
+import { duration } from "../../src/clock.ts";
+import { fakeBudgetLlm } from "../helpers/fake-budget-llm.ts";
 
 const obsMod = () => import("../../src/observer.ts");
 
@@ -103,12 +105,30 @@ describe("v0.41.1 the observer prompt stays inside its input bound", () => {
     recordedTitles: Array.from({ length: 30 }, (_, i) => `Recorded title ${i} ` + "t".repeat(150)),
   };
 
-  it("CONTEXT plus transcript never exceed OBSERVER_MAX_RENDER_CHARS, the budget v0.40's prompt was sized by", async () => {
-    const { extractObservationsResult, OBSERVER_MAX_RENDER_CHARS } = await obsMod();
-    const prompts = fakeLlm([""]);
-    await extractObservationsResult(msgs("batch message", 100), { context: bigContext });
-    const p = prompts[0]!;
-    expect(contextOf(p).length + transcriptOf(p).length).toBeLessThanOrEqual(OBSERVER_MAX_RENDER_CHARS);
+  // v0.41.2 (BACKLOG 68.5) replaces v0.41.1's character bound with a token budget: the character bound let a dense
+  // prompt fill 4,072 of 4,096 tokens and starve the reply (prod 2026-10-01). These two assert the token invariant.
+  it("v0.41.2: every prompt + its reply reserve fits the context in TOKENS, and every line reaches the model exactly once", async () => {
+    const { extractObservationsResult, observerReplyReserve, renderObserverLines } = await obsMod();
+    const fake = fakeBudgetLlm({ replies: [""], nCtx: 4096 });
+    setDefaultLlamaCpp(fake.llm as any);
+    const batch = msgs("batch message", 40);
+    const r = await extractObservationsResult(batch, { context: bigContext, timeoutMs: duration(600_000) });
+    expect(r.status).toBe("empty");
+    const reserve = observerReplyReserve(4096);
+    expect(fake.calls.length).toBeGreaterThan(1);   // this batch cannot fit one 4,096-token window
+    for (const c of fake.calls) expect(c.promptTokens + reserve).toBeLessThanOrEqual(4096);
+    const seen = fake.calls.flatMap(c => transcriptOf(c.prompt).split("\n"));
+    expect(seen).toEqual(renderObserverLines(batch).map(l => l.text));
+  });
+
+  it("v0.41.2: one invocation makes at most MAX_OBSERVER_CALLS calls; a unit past them is reported, never cut to fit", async () => {
+    const { extractObservationsResult, MAX_OBSERVER_CALLS } = await obsMod();
+    const fake = fakeBudgetLlm({ replies: [""], nCtx: 4096 });
+    setDefaultLlamaCpp(fake.llm as any);
+    const r = await extractObservationsResult(msgs("batch message", 100), { context: bigContext, timeoutMs: duration(600_000) });
+    expect(r.status).toBe("retryable");
+    if (r.status === "retryable") expect(r.reason).toContain("observer budget exhausted");
+    expect(fake.calls.length).toBe(MAX_OBSERVER_CALLS);
   });
 
   it("the CONTEXT keeps its bound and its latest material: the last prior message and the newest titles", async () => {
@@ -131,16 +151,15 @@ describe("v0.41.1 the observer prompt stays inside its input bound", () => {
   /** Everything after "Extract observations:" — a retry's feedback block and the blank line before it. */
   const feedbackOf = (p: string) => p.slice(p.indexOf("Extract observations:") + "Extract observations:".length);
 
-  it("a retry's prompt stays inside the bound too: its feedback comes out of the transcript's budget", async () => {
-    const { extractObservationsResult, OBSERVER_MAX_RENDER_CHARS, OBSERVER_RETRY_FEEDBACK_MAX_CHARS } = await obsMod();
-    expect(typeof OBSERVER_RETRY_FEEDBACK_MAX_CHARS).toBe("number");
-    const prompts = fakeLlm([UNPARSEABLE, ""]);
-    await extractObservationsResult(msgs("batch message", 100), { context: bigContext });
-    expect(prompts.length).toBe(2);
-    const retry = prompts[1]!;
-    expect(retry).toContain("did not match the expected structure");
-    expect(feedbackOf(retry).length).toBeLessThanOrEqual(OBSERVER_RETRY_FEEDBACK_MAX_CHARS);
-    expect(contextOf(retry).length + transcriptOf(retry).length + feedbackOf(retry).length).toBeLessThanOrEqual(OBSERVER_MAX_RENDER_CHARS);
+  it("v0.41.2: a format retry's prompt, its feedback included, still fits the context in tokens", async () => {
+    const { extractObservationsResult, observerReplyReserve } = await obsMod();
+    const fake = fakeBudgetLlm({ replies: [UNPARSEABLE, ""], nCtx: 4096 });
+    setDefaultLlamaCpp(fake.llm as any);
+    await extractObservationsResult(msgs("batch message", 100), { context: bigContext, timeoutMs: duration(600_000) });
+    const retry = fake.calls[1]!;
+    expect(retry.prompt).toContain("did not match the expected structure");
+    expect(feedbackOf(retry.prompt).length).toBeGreaterThan(0);
+    for (const c of fake.calls) expect(c.promptTokens + observerReplyReserve(4096)).toBeLessThanOrEqual(4096);
   });
 
   it("a batch within the packing bound (render budget less OBSERVER_BATCH_RESERVED_CHARS) reaches the model whole, on a retry too", async () => {

@@ -724,10 +724,22 @@ async function cmdEmbed(args: string[]) {
     // Absent preflight vectors (canary unavailable, run proceeded) → persistent
     // unverified taint + nonzero; baseline persist/recalibration happens ONLY after a
     // successful same-dimension end probe. "Not verified" is never success (T8-M2).
+    // v0.41.2 (BACKLOG 68.3): run scope, so the finalization (the no-work path included) knows what this run stored.
+    let totalFragments = 0;
+    let removedStale = 0;
     const finalizeCanary = async (failedFragmentsCount: number) => {
       const setTaint = (reason: string) =>
         markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
+      // A NON-destructive run (no --force clear) that stored no vectors cannot have mixed a second geometry into the
+      // table: it never sets the taint. It still says so and exits non-zero when it was not verified (BACKLOG 68.3).
+      const nothingStored = !values.force && totalFragments === 0;
+      const unchanged = `this run wrote 0 vectors${removedStale > 0 ? ` (removed ${removedStale} stale)` : ""}, so the vault's geometry is unchanged — no taint set`;
       if (!canaryState) {
+        if (nothingStored) {
+          console.error(`${c.yellow}WARNING: this run had NO validated preflight geometry (canary unavailable); ${unchanged}. Re-run 'clawmem embed' once the server answers.${c.reset}`);
+          process.exitCode = 1;
+          return;
+        }
         console.error(`${c.red}WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.${c.reset}`);
         await setTaint(`no preflight validation at ${isoNow()}`);
         process.exitCode = 1;
@@ -742,19 +754,28 @@ async function cmdEmbed(args: string[]) {
         }
       } catch { /* endpoint gone at the very end — endDrift stays null → unverified */ }
       if (endDrift === null) {
-        console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
-        await setTaint(`unverified end-of-run at ${isoNow()}`);
+        if (nothingStored) {
+          console.error(`${c.yellow}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed); ${unchanged}.${c.reset}`);
+        } else {
+          console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
+          await setTaint(`unverified end-of-run at ${isoNow()}`);
+        }
         process.exitCode = 1;
       } else if (endDrift < CANARY_DRIFT_FLOOR) {
-        console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
-        await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${isoNow()}`);
+        if (nothingStored) {
+          console.error(`${c.yellow}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}); ${unchanged}. Stabilize the server before the next run.${c.reset}`);
+        } else {
+          console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
+          await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${isoNow()}`);
+        }
         process.exitCode = 1;
       } else {
         // Verified end. A FULL verified rebuild (--force) clears any standing taint —
         // the mixed-geometry state the flag records has been rebuilt away (T8-M1).
         // leaseLost is re-checked first: a reclaimed holder must not clear a
         // successor's taint (T9-M4).
-        if (values.force && failedFragmentsCount === 0 && !leaseLost) {
+        // v0.41.2: only a PASSING preflight clears it — an overridden failed canary (--force-geometry) does not.
+        if (values.force && failedFragmentsCount === 0 && !leaseLost && canaryState.pass) {
           await markSafeGlobal("clearVaultFlag(taint)", () => s.clearVaultFlag("embed_geometry_taint", leaseGuard));
         }
         if (canaryState.pass) {
@@ -826,6 +847,7 @@ async function cmdEmbed(args: string[]) {
     if (!values.force) {
       try {
         const cleaned = await retryOnBusy(() => s.cleanStaleEmbeddings(leaseGuard), "cleanStaleEmbeddings", () => leaseLost);
+        removedStale = cleaned;
         if (cleaned > 0) {
           console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
         }
@@ -865,7 +887,6 @@ async function cmdEmbed(args: string[]) {
     console.log(`Embedding ${hashes.length} documents (${totalFragEstimate} fragments total)...`);
 
     let embedded = 0;
-    let totalFragments = 0;
     let failedFragments = 0;
     const batchStart = monoNow();
 
@@ -3724,6 +3745,51 @@ async function cmdVecDaemonHealth(args: string[]) {
   process.exitCode = authoritative ? 0 : 1;
 }
 
+/**
+ * v0.41.2 (BACKLOG 68.5, design §1.7): the observer's view of the LLM server — its context and where that number came
+ * from, how prompts are counted, and how much transcript one observer window holds after the system prompt and a full
+ * reply reserve. `!` when that is small on a measured/configured context, or when any part is best-effort.
+ */
+async function doctorLlmContext(): Promise<void> {
+  try {
+    // The observer's mean call as the Stop pipeline last measured it (codex T11-13; the worker needs ≤ 18 s to progress).
+    let meanCall = "mean observer call not measured yet (4 s assumed)";
+    let slowCall = false;
+    try {
+      const { OBSERVER_CALL_MEAN_FLAG } = await import("./stop-extract.ts");
+      const row = getStore().db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(OBSERVER_CALL_MEAN_FLAG) as { value: string } | null;
+      const v = row ? JSON.parse(row.value) as { ms?: unknown; samples?: unknown } : null;
+      if (v && typeof v.ms === "number" && typeof v.samples === "number") {
+        meanCall = `mean observer call ${(v.ms / 1000).toFixed(1)} s (latest ${v.samples} call(s))`;
+        slowCall = v.ms > 18_000;
+      }
+    } catch { /* an unreadable record keeps the default text */ }
+    const { observerReplyReserve, observerRequestedCount, observationSystemPrompt } = await import("./observer.ts");
+    const llm = getDefaultLlamaCpp();
+    const deadline = deadlineAfter(monoNow(), duration(10_000));
+    const cap = await llm.llmCapacityForDoctor({ deadline });
+    if (!cap) return;
+    const reserve = observerReplyReserve(cap.nCtx);
+    const fixedPrompt = `${observationSystemPrompt(observerRequestedCount(reserve))}\n\n--- TRANSCRIPT ---\n\n--- END TRANSCRIPT ---\n\nExtract observations:`;
+    const fixed = await llm.countChatTokens(llm.outboundChatContent(fixedPrompt, cap.backend), cap, { deadline });
+    const window = cap.nCtx - reserve - fixed.tokens - fixed.margin;
+    const how = fixed.method === "template" ? "template-exact" : fixed.method === "content" ? "content + template margin" : "estimate";
+    const line = `LLM context: ${cap.nCtx} tokens (${cap.source === "measured" ? "measured via /props" : cap.source === "configured" ? "CLAWMEM_LLM_CONTEXT_TOKENS" : "assumed default"}); counting ${how}; fingerprint ${cap.fingerprintStrength} — an observer window holds ${window} transcript tokens (${reserve}-token reply); ${meanCall}`;
+    const bestEffort = cap.source === "assumed" || fixed.method !== "template";
+    if (slowCall) {
+      console.log(`${c.yellow}!${c.reset} ${line}. One observer call takes longer than the watcher's 18-s slice, so long turns progress only through Stops — use a faster model or GPU`);
+    } else if (cap.source !== "assumed" && window < 1_000) {
+      console.log(`${c.yellow}!${c.reset} ${line}. Observer windows are small — raise the server's context (llama-server -c 8192, about +470 MiB VRAM measured)`);
+    } else if (bestEffort) {
+      console.log(`${c.yellow}!${c.reset} ${line}. Prompt fits are best-effort here${cap.source === "assumed" ? " — set CLAWMEM_LLM_CONTEXT_TOKENS or serve /props" : " — the server does not serve /apply-template"}`);
+    } else {
+      console.log(`${c.green}✓${c.reset} ${line}`);
+    }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} LLM context: could not check (${err instanceof Error ? err.message : String(err)})`);
+  }
+}
+
 async function cmdDoctor() {
   console.log(`${c.bold}ClawMem Doctor${c.reset}\n`);
   let issues = 0;
@@ -3779,6 +3845,47 @@ async function cmdDoctor() {
       if (h.causalStuck > 0) console.log(`${c.yellow}!${c.reset} Stop pipeline: ${h.causalStuck} causal run(s) still in progress after 1 h (a crash inside the step — at-most-once, not re-run)`);
       if (h.recoveredBodies > 0) console.log(`${c.dim}   ${h.recoveredBodies} overwritten antipattern bodies preserved — review with: clawmem recover antipatterns${c.reset}`);
       if (h.graceByWeek.some(n => n > 0)) console.log(`${c.dim}   archive grace expiries per coming week: ${h.graceByWeek.join(", ")}${c.reset}`);
+      // v0.41.2 (BACKLOG 68.5): the observer's held capacity failures, its continuations and checkpoints, and what it could not see.
+      const capacityHeld = (s.db.prepare(`SELECT COUNT(*) AS n FROM stop_retries WHERE state IN ('queued', 'claimed') AND last_error LIKE 'capacity:%'`).get() as { n: number }).n;
+      if (capacityHeld > 0) {
+        const last = (s.db.prepare(`SELECT last_error FROM stop_retries WHERE state IN ('queued', 'claimed') AND last_error LIKE 'capacity:%' ORDER BY id DESC LIMIT 1`).get() as { last_error: string }).last_error;
+        console.log(`${c.yellow}!${c.reset} Stop pipeline: ${capacityHeld} range(s) held because the observer's prompt cannot fit the LLM server's context (${last.slice(0, 160)}) — raise the server's context (llama-server -c); they replay by themselves`);
+      }
+      const continuations = (s.db.prepare(`SELECT COUNT(*) AS n FROM stop_retries WHERE state IN ('queued', 'claimed') AND last_error LIKE 'continuation:%'`).get() as { n: number }).n;
+      // codex T12-6: a continuation whose server could not be verified waits until its /props answers again, however long.
+      const unverified = (s.db.prepare(`SELECT COUNT(*) AS n FROM stop_retries WHERE state IN ('queued', 'claimed') AND last_error LIKE 'continuation:%could not be verified%'`).get() as { n: number }).n;
+      if (continuations > 0) {
+        const waiting = unverified > 0 ? `; ${unverified} wait for their LLM server to answer /props again (it could not be verified)` : "";
+        console.log(`${c.dim}   observer: ${continuations} continuation(s) queued — the watcher resumes them${waiting}${c.reset}`);
+      }
+      // codex T11-10: a live checkpoint no queued range owns (its Stop ended before queueing the range) is reached only
+      // by a later Stop of its transcript — the worker replays queued ranges, never bare checkpoints. A range is matched
+      // by its full identity, as the sweep matches it (codex T12-3). codex T13-2, T14-2: one behind the transcript's
+      // cursor (a dismissed or superseded range) is never reached again; a first Stop's that saved no cursor can still be,
+      // by a later Stop that reads the same range, until the sweep's 7 days.
+      const { parseCheckpoint, checkpointHeld, checkpointBehindCursor } = await import("./stop-checkpoint.ts");
+      let ahead = 0;
+      let firstStop = 0;
+      let behind = 0;
+      for (const row of s.db.prepare(`SELECT value FROM vault_flags WHERE flag LIKE 'observer-ckpt:%'`).all() as { value: string }[]) {
+        const ck = parseCheckpoint(row.value);   // a malformed checkpoint is reset by the processor that next reaches its unit
+        if (ck?.state !== "live" || checkpointHeld(s.db, ck)) continue;
+        const past = checkpointBehindCursor(s.db, ck);
+        if (past === false) ahead++;
+        else if (past === null) firstStop++;
+        else behind++;
+      }
+      if (ahead > 0) console.log(`${c.dim}   observer: ${ahead} live checkpoint(s) without a queued range — a later Stop resumes each one it reaches unchanged${c.reset}`);
+      if (firstStop > 0) console.log(`${c.dim}   observer: ${firstStop} first-Stop checkpoint(s) with no cursor — a later Stop that reads the same range resumes it; the watcher's sweep removes them after 7 days${c.reset}`);
+      if (behind > 0) console.log(`${c.dim}   observer: ${behind} checkpoint(s) behind their transcript's cursor (a dismissed or superseded range) — no later Stop reaches them; the watcher's sweep removes them${c.reset}`);
+      const droppedRow = s.db.prepare(`SELECT value FROM vault_flags WHERE flag = 'observer_accumulator_dropped'`).get() as { value: string } | null;
+      if (droppedRow) {
+        try {
+          const d = JSON.parse(droppedRow.value) as { total?: number; ranges?: number; recent?: { range_key: string; at: string }[] };
+          const lastAt = d.recent?.at(-1)?.at?.slice(0, 16) ?? "?";
+          console.log(`${c.yellow}!${c.reset} Stop pipeline: ${d.total ?? 0} message(s) in ${d.ranges ?? 0} range(s) were beyond the observer's 100-message window (a very long turn); last ${lastAt}`);
+        } catch { /* a malformed tally is skipped */ }
+      }
     }
   } catch (err) {
     console.log(`${c.red}✗${c.reset} Stop pipeline: could not check (${err instanceof Error ? err.message : String(err)})`);
@@ -4227,6 +4334,7 @@ async function cmdDoctor() {
       });
       if (probe.status === "ok") {
         console.log(`${c.green}✓${c.reset} LLM endpoint: ${ep} serves chat completions (model ${probe.model})`);
+        await doctorLlmContext();
       } else if (probe.status === "http") {
         console.log(`${c.red}✗${c.reset} LLM endpoint: ${ep} answered HTTP ${probe.httpStatus} — reachable but NOT serving chat completions (another service on the port, or a misconfigured model name). ${consequence}. Check CLAWMEM_LLM_URL / CLAWMEM_LLM_MODEL.`);
         issues++;

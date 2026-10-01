@@ -4,6 +4,226 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.41.2 — the observer counts its prompt in tokens and keeps room for its reply
+
+v0.41.1 bounded the observer's prompt in characters: at most 8,000 for the CONTEXT section and the
+transcript together, plus a 2,825-character system prompt outside that bound, with up to 2,000 tokens
+allowed for the reply. On prose that fits the 4,096-token context the docs prescribed for the observer
+model: prose runs about 5.7 characters per token on that model's tokenizer. Transcripts are not all
+prose. Measured on the deployed llama-server (qmd-query-expansion-1.7B), hex runs 1.13 characters per
+token, tool-like lines 1.63, and Chinese, Japanese or Korean text 1.25.
+
+On 2026-10-01 a real vault held one range of 636 KB after four attempts, each ending "no parseable
+response within the budget". A read-only reproduction with v0.41.1's modules built an 11,797-character
+prompt: 4,072 tokens of the server's 4,096. The server answered `finish_reason: "length"` after 16
+reply tokens (`usage`: 4,080 + 16 = 4,096). Three attempts measured 4,072, 4,018 and 4,042 tokens, and
+every reply stopped inside its first `<observation>`. Each retry had the same size, so the range was
+retried every 12 hours with no way to succeed. In another run the cut reply was 22 characters with no
+`<` in it, and the observer read it as "nothing to record", so that turn's observations were lost
+without a quarantine. At `-c 8192` the same prompt ended `finish_reason: "stop"`, with 360 reply tokens
+for one observation.
+
+The observer now counts tokens against the context the server reports. Before each model call of the
+Stop pipeline, retries included, it reads `/props` (the per-request context: `-c` divided by
+`--parallel`), else `CLAWMEM_LLM_CONTEXT_TOKENS`, else an assumed 4,096. It counts the assembled prompt through
+`/apply-template` and `/tokenize`: on the deployed server that count equalled the chat completion's own
+`usage.prompt_tokens` for every prompt measured, and the refused request's `n_prompt_tokens` for two
+prompts over the context. It keeps 40% of the context for the reply (768 to 2,000 tokens; 1,638 at
+4,096) and asks for as many observations as that room holds (4 at 4,096, 5 at 8,192). A batch that
+does not fit one prompt runs as windows inside the same Stop, each window seeing the titles of the
+observations the earlier ones found. A reply the server reports as cut is never parsed: its window runs
+again at half its size, and a reply that did not finish as an answer is held for a retry, never read as
+"nothing to record".
+Progress through the windows is kept in a durable checkpoint, so a range that runs out of calls or time
+resumes after its last finished window instead of starting again, and that pause is not counted as a
+failure. A range that can never fit, because one message is larger than a window can be on that
+server, is held with a `capacity:` reason that `clawmem doctor` counts, and replays by itself once the
+context is raised. The handoff summary fits its prompt the same way. The docs now prescribe `-c 8192`
+for the observer model: the fixed part of the observer's prompt measures 684 tokens, so a window holds
+1,356 to 1,774 transcript tokens at 4,096 and 5,090 to 5,508 at 8,192, for about 470 MiB more VRAM.
+
+Separately, on 2026-09-30 the embed timer ran an incremental `clawmem embed` while the embedding server
+was down. The geometry canary was unavailable, all 2,202 fragments failed, no vector was written, and
+the run still set the geometry taint, which only a verified full `clawmem embed --force` clears (99
+minutes on that vault). A run that did not clear the index and stored nothing cannot have mixed a
+second geometry into it, so it no longer sets the taint; it still exits 1. Clearing the taint now also
+needs a passing preflight: a `--force --force-geometry` run over a failed canary could clear it before,
+because its end check compares the run's vectors with themselves.
+
+### What changed
+
+- `src/llm.ts`: `generateDetailed()` reports why a reply stopped (`stop`, `length`, or `other` for a
+  reason such as `content_filter`) and the server's token usage. A server that reports no reason gets a
+  best-effort reading, logged once per process: a reply that used its whole allowance counts as cut, any
+  other as complete. A 200 without a completion choice, or one that is not JSON, is an error, never an
+  empty answer, and counts toward the endpoint's failure streak like an HTTP error (issue #24's 60-second
+  cooldown) instead of clearing it. It stays on the backend it was given: a
+  remote transport failure returns `unavailable` instead of falling through to in-process generation
+  inside the call. An HTTP 400
+  `exceed_context_size_error` is classified as `context_exceeded`; the first one per endpoint does not
+  count toward the 60-second cooldown streak for 10 minutes, and a repeat that is not smaller does.
+  `llmCapacity()` reads `/props` fresh on every call (a strong fingerprint: sha256 of the model path,
+  chat template and build, when `/props` names all three; one that gives the context alone is measured
+  but weak), else the configured or assumed context (a weak one). `countChatTokens()`
+  counts template-exact through `/apply-template` + `/tokenize` (no margin: the count is exact), else
+  the content's count plus the template's overhead, measured by a one-token probe and kept 24 hours, and
+  a margin of 8 (32 when no probe answers), else an estimate that counts hex
+  runs, digits, punctuation and non-ASCII at one character per token and other text at three, scaled by
+  a factor that only rises (margin 32). `generate()` logs once per process when the server cut a reply
+  at its context; its request body is unchanged, byte for byte. A validated oversize invalidates the
+  measured overhead that fed its count. An LLM injected through `setDefaultLlamaCpp` that implements
+  only `generate()` is counted by estimate against `CLAWMEM_LLM_CONTEXT_TOKENS`, else an assumed 32,768
+  tokens: most units go in one prompt, the largest the observer takes (100 lines of dense tool output)
+  in two windows, and a smaller configured context windows more; its replies are read as complete.
+  `extractObservationsResult()` runs one invocation without a checkpoint, so a unit that needs more
+  calls than its budget allows returns `retryable` and keeps no progress.
+- `src/observer.ts`: `extractObservationsWindowed()` — the reply reserve, the observation count, whole-turn
+  windows (a turn is cut between messages only when it alone exceeds a window), a CONTEXT for window
+  k > 1 made of the transcript just before it (`EARLIER IN THIS EXCHANGE`) and the titles recorded so
+  far (`ALREADY RECORDED`), halving on a cut reply, one format retry inside the budget, one re-size from
+  an oversize refusal's own count and `n_ctx`, `capacity:` results, and at most 6 model calls per run.
+  The capacity is read before every call and checked against the server the run is pinned to: two
+  strong fingerprints that differ restart the range; a `/props` that stops giving a fingerprint (no
+  answer, an error, a 404, a body that is not llama.cpp's, one without the model, template and build)
+  leaves it waiting with its progress kept, however long. A line that fits
+  a window alone is never held as `capacity:`: when the fit's guesses fail, it searches down to one
+  line, and the window still ends at the last turn boundary that fits, the one after its first line
+  included. The measured call time is the mean of the latest 50 model calls.
+  `extractSummaryFitted()` fits the summary prompt with a 500-token reply, dropping the recent turn text
+  first and then digests from the end, and reports how many digests it used; a digest lists at most 10
+  files, and the stored summary is capped (the request at 600 characters, each other field at 800).
+- `src/stop-checkpoint.ts` (new): checkpoints as `vault_flags` rows
+  `observer-ckpt:<session>|<transcript key>|<hook>|<range key>`, holding the windows done, the
+  observer's contract version, the server fingerprint and the pinned backend. Create is
+  `INSERT OR IGNORE`, every advance or reset a compare-and-swap on the row's raw value, and only the
+  range's committing Phase B writes the tombstone. The sweep removes orphans only, paging from where it
+  last stopped so the checkpoints that must stay never hide a newer orphan; a queued range holds a
+  checkpoint only when its full identity matches (the transcript's epoch, the offsets and the bytes).
+- `src/stop-extract.ts`: each unit loads or matches its checkpoint and saves progress after every
+  window. A unit cut short becomes a `continuation`: quarantined with attempts unchanged and due again in
+  60 s (or at once after a budget skip). A checkpoint whose server cannot be verified waits as a
+  continuation, however long, as for an unreachable backend; it restarts from its first window only on a
+  verified change (another strong fingerprint), and the operator can drop the range instead. The latest
+  50 measured observer calls, and their mean, are kept in the `observer_call_mean` flag. A first-window
+  fallback from the remote to the local backend keeps the run's call cap. A Stop ends its loop at its first quarantine, so one Stop queues at most one range. A replay that finds its range committed elsewhere ends as done without a
+  second set of effects. Observations with equal bodies from different windows merge, with their
+  triples, before the judge. Messages beyond the observer's 100-message view of one turn are counted in
+  the `observer_accumulator_dropped` flag.
+- `src/stop-worker.ts`: a due continuation runs first in each tick, in its own slice (twice the
+  process's mean observer call plus 5 s, 15 to 23 s), a continuation whose claimant died (its lease
+  expired) included, and the tick ends with the checkpoint sweep.
+- `src/stop-handoff.ts`: the summary step uses `extractSummaryFitted()`; its watermark moves only past
+  the digests the summary used.
+- `src/hooks.ts`, `src/hooks/decision-extractor.ts`: observer messages carry their turn; `formatObservation`
+  is exported for the grouping.
+- `src/clawmem.ts`: `clawmem embed` — a run without `--force` that stored no vector sets no taint (it
+  says so and exits 1), and clearing the taint needs a passing preflight. `clawmem doctor` — an
+  `LLM context` line (the context and its source, how prompts are counted, the window it leaves, and the
+  observer's mean call as the Stop pipeline last measured it, flagged above 18 s) and Stop-pipeline lines
+  for `capacity:` holds, queued continuations (with those waiting for a server that could not be
+  verified), live checkpoints no queued range owns — split into those a later Stop can still reach, a
+  first Stop's with no cursor (resumable by a later Stop that reads the same range, until the sweep's
+  7 days), and those behind the transcript's cursor (a dismissed or superseded range) — and unseen
+  messages.
+- Docs: `docs/guides/inference-services.md`, `docs/quickstart.md` and `CONTRIBUTING.md` (`-c 8192`, the
+  measured window sizes and VRAM cost, servers without `/props`), `docs/reference/configuration.md` and
+  `README.md` (`CLAWMEM_LLM_CONTEXT_TOKENS`), `docs/reference/cli.md` (the doctor's new lines, the embed taint
+  rules, the worker's continuation step), `docs/concepts/architecture.md` (the Stop pipeline's
+  windows, checkpoints, continuations and summary fit), `docs/guides/setup-hooks.md`,
+  `docs/guides/cloud-embedding.md`, `docs/troubleshooting.md` (dense turns, the doctor lines, the
+  context-cut warning, the embed run that wrote nothing), `docs/guides/upgrading.md`, `AGENTS.md`,
+  `SKILL.md`.
+
+### Verification
+
+New tests: `tests/unit/observer-budget-v0412.test.ts` (26: the reply reserve and observation count, dense
+hex in windows, cut replies and replies that did not finish, window CONTEXTs, resume and progress, the
+compare-and-swap and fingerprint outcomes, an unverified server, the oversize re-size and the overhead it
+invalidates, a capacity read before every call, a large line among many small ones, the turn boundary
+after a one-line turn, a snapped window counted before it is sent, per-call timing, the contract's
+inputs, `capacity:`, the summary fit, an injected `generate()`-only LLM up to the largest unit),
+`tests/unit/llm-budget-v0412.test.ts` (19, against a fake llama-server: `/props` answered, or not — a
+404, a 200 that is not llama.cpp's, a 500, one without the model, template or build — and the unverified
+pin it leaves, `/apply-template`, `/tokenize`, the 400, `finish_reason` and `usage`, a reply with no finish
+reason (end to end through the observer), a 200 without a choice or not JSON and the cooldown it trips,
+the oversize exemption, the overhead's expiry and invalidation, backend pinning),
+`tests/unit/stop-checkpoint-v0412.test.ts` (20: continuations through replays, contract resets, separate
+sessions, a range committed elsewhere, an unreachable backend, an unverified server however old its
+checkpoint, a `/props` answering HTML, 404 or the context alone and then the original one (the real
+LlamaCpp: the unit waits, then resumes at its saved line), a repeated first Stop with no cursor resuming
+its saved window, one held range per Stop, continuations first in the
+worker and an expired claim, merged bodies, the call cap across a backend fallback, the kept call time
+and its 50-call mean, the checkpoint transitions, the orphan sweep, its paging and its range identity),
+`tests/unit/doctor-observer-v0412.test.ts` (1, the real CLI: queued continuations and the unverified
+ones, live checkpoints no queued range owns matched by full identity and split three ways (ahead of
+the cursor, a first Stop's with none, behind it), a range dismissed through `clawmem repair stop-queue
+--dismiss`, the mean call) and
+`tests/unit/embed-taint-v0412.test.ts` (5, the real CLI against a fake `/v1/embeddings` that passes the
+real canary). In `tests/unit/stop-observer.test.ts` three token tests replace v0.41.1's two
+character-bound tests; `tests/unit/canary-validation.test.ts`'s no-work test now expects no taint.
+
+Against v0.41.1's source, with the two new constants pinned to their specified values: the three token
+tests fail (one call where windows were needed; a 100-message unit answered as "nothing to record"
+instead of reported; a retry prompt of 3,065 tokens that left 1,031 for the reply), the no-work test
+fails, and two of the five embed tests fail (an empty run set the taint; an overridden failed canary
+cleared it); the other three pin rules that did not change. The other new files test the new API and do
+not load there. The adversarial review's first implementation pass raised fifteen findings. Eighteen
+regression tests were written for them: seventeen failed against the code before their fixes, and the
+eighteenth pins behaviour that its fix only documents (an injected `generate()`-only LLM). Its second
+pass raised seven more: a 200 without a completion never counted toward the cooldown; a turn that fits a
+window whole could be cut after a one-line turn, and a snapped window was sent without its count
+checked; a re-anchored transcript's range could hold an older checkpoint; a reply with no finish reason
+read as complete; the "latest 50 calls" mean decayed instead; a checkpoint whose server could not be
+verified reset after an hour with no evidence of a change; and the injected-LLM claim was too broad.
+Twelve regression tests were written for them: eleven failed against the code before their fixes, and
+the twelfth pins the corrected claim (the largest unit in two windows). Its third pass raised two more:
+the second-pass rule that read a `/props` answering 404 or a body that is not llama.cpp's as a changed
+server could discard finished windows on a transient proxy answer, so that rule was withdrawn (only a
+verified differing fingerprint resets); and the doctor promised a resume to checkpoints no later Stop
+reaches. Their three regression tests all failed against the code before the fixes. Its fourth pass
+raised two more: a `/props` that gave the context without the model, template and build still made a
+strong fingerprint, so a transient answer of that shape reset finished windows (a strong fingerprint
+now needs all three); and a first Stop's checkpoint with no cursor can still be resumed by a later Stop
+that reads the same range, so the doctor reports those apart. Of the four tests written or extended for
+them, three failed against the code before the fixes; the fourth pins the resume the doctor now
+reports. Forty-five mutants of the fix
+(among them a cut reply parsed; no reply reserve; an advance without compare-and-swap; a sweep that
+ignores a queued range, reads one page, or matches a range without its epoch; a Stop that goes on after
+its first quarantine; a continuation counted as a failure; an empty run that taints; an overridden
+canary that clears; a reply that did not finish, parsed; a malformed 200 that does not strike; a snap
+that skips the first turn boundary; a decaying call mean; an unverified checkpoint reset after an hour;
+retries that reuse the window's capacity; a fallback with a fresh call cap) each fail at least one
+test. The first mutant pass let two through, and both exposed weak tests (a transcript's first Stop
+starts at its current turn, so one test never built more than one unit; one doctor count was
+symmetric); both tests were fixed.
+
+On the deployed server (llama.cpp, qmd-query-expansion-1.7B, `-c 8192`), with synthetic text: the
+template-exact count equalled `usage.prompt_tokens` for five prompts (15, 733, 2,136, 642 and 1,994
+tokens: short, prose, hex, Chinese and Japanese with emoji, JSON); the doctor's window is 5,508 tokens
+(684 fixed, 2,000 reply). A dense synthetic turn ran in one call at 8,192 (prompt 3,636, reply 233)
+and, with the observer's budget capped at 4,096, in 7 windows, every reply ending
+`finish_reason: "stop"`: prompts of 1,997 to 2,111 tokens against a limit of 2,458, replies of 177 to
+921 (measured again on the final code). Full suite: 3,426 pass / 0 fail across 178 files (Bun 1.4.2).
+tsc unchanged. The adversarial review (one session) cleared the design at its tenth turn and this
+implementation at its fifteenth, with zero remaining findings.
+
+### What didn't change
+
+- Batches are packed as in v0.41.1 (100 messages, 8,000 characters less the CONTEXT's and a retry's
+  share); windows split a batch only when it does not fit one prompt. The observer still reads at most
+  the last 100 messages of one turn; `clawmem doctor` now counts the ones it skipped.
+- Turns a session's last Stop did not reach (its time ran out, or it held a range) are extracted only
+  by a later Stop of the same transcript, as in v0.41.1; a watcher catch-up is planned.
+- An embed run killed after it stored vectors (`SIGKILL`, out of memory, power loss) sets no taint, as
+  in v0.41.1, because it never reaches its end check. A taint set by v0.41.1 or earlier stays until a
+  verified `clawmem embed --force`.
+- Consolidation's prompts and the exported `extractSummary()` still go through plain `generate()`.
+- A small observer model may still record a decision again in a later window that shows it again;
+  equal bodies merge, others stay.
+- No migration: checkpoints live in `vault_flags`, continuations in `stop_retries`.
+
+---
+
 ## v0.41.1 — the observer's prompt fits its documented context again
 
 v0.41.0 gave the observer a CONTEXT section: the two turns before the batch and the session's recorded

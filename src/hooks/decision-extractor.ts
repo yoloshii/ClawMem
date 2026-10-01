@@ -860,7 +860,8 @@ export function extractDecisions(messages: { role: string; content: string }[]):
 // Formatting
 // =============================================================================
 
-function formatObservation(obs: Observation, dateStr: string, sessionId: string): string {
+/** The persisted body of an observation — `persistObservationDoc` hashes it into the path (v0.41.2: exported for the window union). */
+export function formatObservation(obs: Observation, dateStr: string, sessionId: string): string {
   const lines = [
     `---`,
     `content_type: ${obs.type === "decision" ? "decision" : "note"}`,

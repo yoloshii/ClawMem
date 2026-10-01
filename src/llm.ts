@@ -25,7 +25,8 @@ type LlamaToken = any;
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
-import { timeoutSignal, type MonoDeadline, epochNow, epochMs } from "./clock.ts";
+import { createHash } from "crypto";
+import { timeoutSignal, type MonoDeadline, epochNow, epochMs, monoNow, deadlineAfter, duration, earliest } from "./clock.ts";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -75,6 +76,46 @@ export type GenerateResult = {
   model: string;
   logprobs?: TokenLogProb[];
   done: boolean;
+};
+
+/**
+ * v0.41.2 (BACKLOG 68.5): the backend one Stop-pipeline call is pinned to — the remote server by its root URL, or the
+ * in-process model by its file. A call never falls through from one to the other.
+ */
+export type LlmBackendId = { kind: "remote"; root: string } | { kind: "local"; modelPath: string };
+
+/** v0.41.2: a generation that reports WHY it stopped. `finish: "length"` is a reply the server cut. */
+export type GenerateDetail =
+  | {
+    ok: true; text: string; model: string; finish: "stop" | "length" | "other";
+    promptTokens?: number; completionTokens?: number; backend: LlmBackendId;
+  }
+  | {
+    ok: false; reason: "unavailable" | "context_exceeded" | "http" | "aborted";
+    nCtx?: number; promptTokens?: number; backend: LlmBackendId;
+  };
+
+/** v0.41.2: a backend's per-request context, and where the number came from. */
+export type LlmCapacity = {
+  backend: LlmBackendId;
+  nCtx: number;
+  source: "measured" | "configured" | "assumed";
+  /** sha256 of what identifies the serving model + template + build (strong) or only the configuration (weak). */
+  fingerprint: string;
+  fingerprintStrength: "strong" | "weak";
+};
+
+/**
+ * v0.41.2: a prompt's token count as the chat endpoint will see it. `template` = the server rendered and tokenized
+ * the exact chat prompt; `content` = the content's tokens plus `margin` for the template; `estimate` = no tokenizer.
+ */
+export type ChatTokenCount = { tokens: number; method: "template" | "content" | "estimate"; margin: number };
+
+/** v0.41.2: where a measured chat-template overhead is kept between processes (the Stop pipeline: `vault_flags`). */
+export type OverheadStore = {
+  get(key: string): string | null;
+  set(key: string, value: string): void;
+  delete(key: string): void;
 };
 
 /**
@@ -440,6 +481,98 @@ export function buildRemoteChatCompletionsUrl(remoteLlmUrl: string): string {
   return `${baseUrl}${endpoint}`;
 }
 
+/**
+ * v0.41.2: the server root a configured LLM URL names — the three shapes `buildRemoteChatCompletionsUrl` accepts (a
+ * root, `…/v1`, or a full `…/chat/completions`) — where llama.cpp serves `/props`, `/tokenize` and `/apply-template`.
+ */
+export function remoteLlmRoot(remoteLlmUrl: string): string {
+  let url = remoteLlmUrl.replace(/\/+$/, "");
+  if (url.endsWith("/chat/completions")) url = url.slice(0, -"/chat/completions".length).replace(/\/+$/, "");
+  if (url.endsWith("/v1")) url = url.slice(0, -"/v1".length).replace(/\/+$/, "");
+  return url;
+}
+
+/** Runs of 8+ hex digits — hashes, ids, addresses — tokenize at about one character per token. */
+const HEX_RUN = /[0-9a-fA-F]{8,}/g;
+/** A digit, an ASCII punctuation mark or symbol, or any non-ASCII character. */
+const DENSE_CHAR = /[0-9!-\/:-@\[-`{-~]|[^\x00-\x7F]/u;
+
+/**
+ * v0.41.2: a conservative token estimate for a backend with no tokenizer (design §1.2): dense characters — digits,
+ * hex-like runs, punctuation, non-ASCII — at 1 character per token (measured: pure hex 1.13, CJK 1.25), the rest at 3
+ * (measured: prose 5.7). The factor a caller learns may only raise it.
+ */
+export function estimateTokens(text: string): number {
+  let dense = 0;
+  let other = 0;
+  const rest = text.replace(HEX_RUN, run => { dense += run.length; return ""; });
+  for (const ch of rest) {
+    if (DENSE_CHAR.test(ch)) dense++;
+    else other++;
+  }
+  return Math.ceil(dense + other / 3);
+}
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** v0.41.2: what the Stop pipeline's observer and summary calls need from an LLM (ClawMem's `LlamaCpp` has all of it). */
+export type BudgetLlm = Pick<
+  LlamaCpp,
+  "activeLlmBackend" | "isConfiguredBackend" | "isBackendAvailable" | "llmCapacity" | "countChatTokens" | "outboundChatContent" | "generateDetailed"
+> & Partial<Pick<LlamaCpp, "invalidateOverhead">>;
+
+/**
+ * v0.41.2 (codex T11-3, T13-1): what a fresh capacity read says about the server a run or a checkpoint was pinned to.
+ * Two strong fingerprints compare. A strong one against a weak read is `unverified`, whatever made the read weak (no
+ * answer, an error status, a 404, a body that is not llama.cpp's `/props`): it gives nothing to compare, the server may
+ * be the same one, so its progress is kept and the work waits, however long. Only a verified differing fingerprint
+ * resets it (or the operator dropping the range). A weak one against a strong read is a `changed` identity (it was
+ * never verified); two weak ones compare (the configured URL and model).
+ */
+export function fingerprintVerdict(
+  expected: { fingerprint: string; strength: LlmCapacity["fingerprintStrength"] },
+  cap: Pick<LlmCapacity, "fingerprint" | "fingerprintStrength">,
+): "same" | "changed" | "unverified" {
+  if (expected.strength === "strong" && cap.fingerprintStrength === "weak") return "unverified";
+  if (expected.strength !== cap.fingerprintStrength) return "changed";
+  return expected.fingerprint === cap.fingerprint ? "same" : "changed";
+}
+
+/**
+ * The token-budget layer of `llm` (v0.41.2). ClawMem's own `LlamaCpp` is returned as is. An LLM injected through
+ * `setDefaultLlamaCpp` that implements only the `generate()` contract gets one `custom` backend with a context of
+ * `CLAWMEM_LLM_CONTEXT_TOKENS`, else an assumed 32768, estimated counts, and every reply read as complete: it cannot
+ * report a cut, so fits through it are best-effort. At the assumed 32768 most units go in one prompt; the largest the
+ * observer takes (100 lines of dense tool output) goes in two windows, and a smaller configured context windows more
+ * (codex T12-7).
+ */
+export function budgetLayerOf(llm: LlamaCpp): BudgetLlm {
+  const full = llm as Partial<BudgetLlm>;
+  if (typeof full.generateDetailed === "function" && typeof full.llmCapacity === "function" && typeof full.countChatTokens === "function"
+    && typeof full.activeLlmBackend === "function") return llm;
+  const backend: LlmBackendId = { kind: "local", modelPath: "custom-llm" };
+  const configured = Number.parseInt(process.env.CLAWMEM_LLM_CONTEXT_TOKENS ?? "", 10);
+  const nCtx = Number.isFinite(configured) && configured > 0 ? configured : 32768;
+  return {
+    activeLlmBackend: () => backend,
+    isConfiguredBackend: (b) => b.kind === "local" && b.modelPath === backend.modelPath,
+    isBackendAvailable: (b) => b.kind === "local" && b.modelPath === backend.modelPath,
+    llmCapacity: async () => ({
+      backend, nCtx, source: Number.isFinite(configured) && configured > 0 ? "configured" : "assumed",
+      fingerprint: sha256Hex("custom-llm"), fingerprintStrength: "weak",
+    }),
+    countChatTokens: async (content) => ({ tokens: estimateTokens(content), method: "estimate", margin: 32 }),
+    outboundChatContent: (prompt) => prompt,
+    invalidateOverhead: () => { /* estimate counting keeps no measured overhead */ },
+    generateDetailed: async (prompt, o) => {
+      const r = await llm.generate(prompt, { maxTokens: o.maxTokens, temperature: o.temperature, signal: o.signal });
+      return r ? { ok: true, text: r.text, model: r.model, finish: "stop", backend } : { ok: false, reason: "unavailable", backend };
+    },
+  };
+}
+
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -501,6 +634,30 @@ export class LlamaCpp implements LLM {
    * every call and still trips within REMOTE_HTTP_TRIP_STREAK calls).
    */
   private static readonly REMOTE_HTTP_INSTANT_TRIP = new Set([405, 501]);
+
+  // ── v0.41.2 (BACKLOG 68.5): the token-budget layer the Stop pipeline's observer and summary calls use ──────────
+  /** Scales `estimateTokens` up when a reply's own count shows it was low; it never comes down (design §1.2). */
+  private estimateFactor = 1;
+  /** One validated oversize answer per endpoint is exempt from the HTTP-error streak; a repeat that is not smaller is not. */
+  private oversizeExemption: { nPromptTokens: number; at: number } | null = null;
+  /** Per process: whether the remote serves `/apply-template` and `/tokenize` (null = not yet known). */
+  private templateServed: boolean | null = null;
+  private tokenizeServed: boolean | null = null;
+  /** The chat-template overhead measured on a `/tokenize`-only remote, by fingerprint (in-process copy). */
+  private measuredOverhead: { fingerprint: string; overhead: number; at: number } | null = null;
+  /** The doctor's capacity read (10 min); the Stop pipeline always reads fresh. */
+  private capacityForDoctor: { at: number; cap: LlmCapacity } | null = null;
+  /** Once per process: a remote reply the context (not `max_tokens`) cut, through the legacy `generate()`. */
+  private contextCutWarned = false;
+  /** Once per process: a remote reply with no `finish_reason`, through `generateDetailed()`. */
+  private noFinishReasonWarned = false;
+  private static readonly OVERSIZE_EXEMPTION_TTL_MS = 10 * 60_000;
+  private static readonly AUX_REQUEST_MAX_MS = 2_000;
+  private static readonly CAPACITY_CACHE_MS = 10 * 60_000;
+  private static readonly ASSUMED_CONTEXT_TOKENS = 4096;
+  /** The context the in-process fallback creates for a fitted call (min with the model's own training context). */
+  private static readonly LOCAL_FIT_CONTEXT_TOKENS = 8192;
+  private static readonly OVERHEAD_TTL_MS = 24 * 60 * 60_000;
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
@@ -992,10 +1149,12 @@ export class LlamaCpp implements LLM {
    *   - REMOTE_HTTP_TRIP_STREAK consecutive non-2xx responses (429 is excluded
    *     by the callers — rate limiting is a healthy endpoint).
    * The cooldown self-heals: a real server that recovers gets its lane back on
-   * the first attempt after expiry. Known limit: a squatter that answers 200
-   * with a non-JSON body is not counted here (the parse failure surfaces in the
-   * callers' catch as a logged error); non-2xx is the observed squatted-port
-   * signature and the conservative trigger.
+   * the first attempt after expiry. Known limit: through `generate()` and the
+   * embed lane, a squatter that answers 200 with a body that is not a
+   * completion is not counted (the parse failure surfaces in the callers'
+   * catch as a logged error); non-2xx is the observed squatted-port signature
+   * and the conservative trigger. `generateDetailed()` (v0.41.2) does count a
+   * 200 without a completion choice.
    */
   private noteRemoteHttpError(kind: "embed" | "llm", status: number, statusText: string): void {
     // Idempotent under concurrency (codex turn-1 finding 2): several requests
@@ -1381,21 +1540,7 @@ export class LlamaCpp implements LLM {
     // Re-check: concurrent call may have set cooldown while we were awaited
     if (this.isRemoteLlmDown()) return null;
     try {
-      const body: Record<string, unknown> = {
-        model: this.remoteLlmModel,
-        // Idempotent: several prompts already end with a literal `/no_think` (as of v0.29.0:
-        // consolidation x2, entity, intent, deductive-guardrails — decision-extractor and
-        // merge-guards moved to the judge module, which owns the token for judge traffic)
-        // because the LOCAL fallback receives the prompt directly and needs it inline.
-        // Appending unconditionally sent those a doubled suffix. Do not strip the
-        // prompt-local ones instead — the local path needs them.
-        messages: [{ role: "user", content: this.applyNoThinkSuffix(prompt) }],
-        max_tokens: maxTokens,
-        temperature,
-      };
-      if (this.remoteLlmReasoningEffort) {
-        body.reasoning_effort = this.remoteLlmReasoningEffort;
-      }
+      const body = this.buildRemoteChatBody(prompt, maxTokens, temperature);
       const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
         method: "POST",
         headers: this.getLlmHeaders(),
@@ -1419,9 +1564,19 @@ export class LlamaCpp implements LLM {
       this.remoteLlmHttpErrorStreak = 0;
 
       const data = await resp.json() as {
-        choices: { message: { content: string } }[];
+        choices: { message: { content: string }; finish_reason?: string }[];
         model?: string;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
+      // v0.41.2: a reply the CONTEXT cut (not this call's max_tokens) is said once per process; the result is unchanged.
+      const completion = data.usage?.completion_tokens;
+      if (!this.contextCutWarned && data.choices[0]?.finish_reason === "length" && typeof completion === "number" && completion < maxTokens) {
+        this.contextCutWarned = true;
+        console.warn(
+          `[generate] The LLM server cut a reply at its context limit (prompt ${data.usage?.prompt_tokens ?? "?"} tokens, ` +
+          `reply ${completion} of ${maxTokens}); raise the server's context (llama-server -c) — see docs/troubleshooting.md`,
+        );
+      }
 
       return {
         text: data.choices[0]?.message?.content || "",
@@ -1439,6 +1594,387 @@ export class LlamaCpp implements LLM {
         console.error("[generate] Remote LLM error:", error);
       }
       return null;
+    }
+  }
+
+  /**
+   * The remote chat-completions body — ONE builder for `generate()` and `generateDetailed()`, so both send byte-
+   * identical requests (`tests/unit/judge.test.ts` pins the bytes).
+   */
+  private buildRemoteChatBody(prompt: string, maxTokens: number, temperature: number): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      model: this.remoteLlmModel,
+      // Idempotent: several prompts already end with a literal `/no_think` (as of v0.29.0:
+      // consolidation x2, entity, intent, deductive-guardrails — decision-extractor and
+      // merge-guards moved to the judge module, which owns the token for judge traffic)
+      // because the LOCAL fallback receives the prompt directly and needs it inline.
+      // Appending unconditionally sent those a doubled suffix. Do not strip the
+      // prompt-local ones instead — the local path needs them.
+      messages: [{ role: "user", content: this.applyNoThinkSuffix(prompt) }],
+      max_tokens: maxTokens,
+      temperature,
+    };
+    if (this.remoteLlmReasoningEffort) {
+      body.reasoning_effort = this.remoteLlmReasoningEffort;
+    }
+    return body;
+  }
+
+  // ── v0.41.2 (BACKLOG 68.5): the token-budget layer ───────────────────────────────────────────────────────────────
+
+  /** The content a remote call sends for `prompt` (the ` /no_think` suffix applied) — what a count must measure. */
+  outboundChatContent(prompt: string, backend: LlmBackendId): string {
+    return backend.kind === "remote" ? this.applyNoThinkSuffix(prompt) : prompt;
+  }
+
+  /** The backend a new Stop-pipeline unit starts on: the remote when configured and not in cooldown, else local when allowed. */
+  activeLlmBackend(): LlmBackendId | null {
+    if (this.remoteLlmUrl && !this.isRemoteLlmDown()) return { kind: "remote", root: remoteLlmRoot(this.remoteLlmUrl) };
+    if (!this.localGenerationAllowed()) return null;
+    return { kind: "local", modelPath: this.generateModelUri };
+  }
+
+  /** Whether `backend` is still this instance's configuration (design §1.4, the backend pin). */
+  isConfiguredBackend(backend: LlmBackendId): boolean {
+    if (backend.kind === "remote") return !!this.remoteLlmUrl && remoteLlmRoot(this.remoteLlmUrl) === backend.root;
+    return this.localGenerationAllowed() && backend.modelPath === this.generateModelUri;
+  }
+
+  /** Whether a configured `backend` can be called now (a remote in its failure cooldown cannot). */
+  isBackendAvailable(backend: LlmBackendId): boolean {
+    if (!this.isConfiguredBackend(backend)) return false;
+    return backend.kind === "local" || !this.isRemoteLlmDown();
+  }
+
+  private localGenerationAllowed(): boolean {
+    return !this.noLocalFallback && process.env.CLAWMEM_NO_LOCAL_MODELS !== "true";
+  }
+
+  /** An aux request's signal: the phase deadline, capped at AUX_REQUEST_MAX_MS. Null when the deadline has passed. */
+  private auxSignal(deadline: MonoDeadline): AbortSignal | null {
+    const cap = deadlineAfter(monoNow(), duration(LlamaCpp.AUX_REQUEST_MAX_MS));
+    return timeoutSignal(earliest(cap, deadline));
+  }
+
+  /**
+   * `GET <root>/props` → the slot context, with a strong fingerprint only when the answer names the model path, the chat
+   * template AND the build (codex T14-1: a body that gives the context alone verifies nothing); null when absent, failed,
+   * or without `n_ctx`.
+   */
+  private async fetchProps(root: string, deadline: MonoDeadline): Promise<{ nCtx: number; fingerprint: string | null } | null> {
+    const signal = this.auxSignal(deadline);
+    if (!signal) return null;
+    try {
+      const resp = await fetch(`${root}/props`, { headers: this.getLlmHeaders(), signal });
+      if (!resp.ok) return null;
+      const data = await resp.json() as {
+        default_generation_settings?: { n_ctx?: unknown };
+        model_path?: unknown; chat_template?: unknown; build_info?: unknown;
+      };
+      const nCtx = data.default_generation_settings?.n_ctx;
+      if (typeof nCtx !== "number" || !Number.isFinite(nCtx) || nCtx <= 0) return null;
+      const identity = [data.model_path, data.chat_template, data.build_info];
+      if (!identity.every((v): v is string => typeof v === "string" && v.length > 0)) return { nCtx, fingerprint: null };
+      return { nCtx, fingerprint: sha256Hex(identity.join("\u0000")) };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A backend's per-request context (design §1.2). Remote: `/props` read FRESH (measured) → `CLAWMEM_LLM_CONTEXT_TOKENS`
+   * (configured) → 4096 (assumed); the fingerprint is strong only when `/props` names the model, template and build.
+   * Local: the context a fitted call creates (measured). Never inferred from a reply.
+   */
+  async llmCapacity(backend: LlmBackendId, opts: { deadline: MonoDeadline }): Promise<LlmCapacity> {
+    if (backend.kind === "local") {
+      const nCtx = await this.localFitContextSize();
+      return { backend, nCtx, source: "measured", fingerprint: sha256Hex(`local\u0000${backend.modelPath}`), fingerprintStrength: "strong" };
+    }
+    const props = await this.fetchProps(backend.root, opts.deadline);
+    if (props?.fingerprint) return { backend, nCtx: props.nCtx, source: "measured", fingerprint: props.fingerprint, fingerprintStrength: "strong" };
+    const weak = sha256Hex(`weak\u0000${backend.root}\u0000${this.remoteLlmModel}`);
+    if (props) return { backend, nCtx: props.nCtx, source: "measured", fingerprint: weak, fingerprintStrength: "weak" };
+    const configured = Number.parseInt(process.env.CLAWMEM_LLM_CONTEXT_TOKENS ?? "", 10);
+    if (Number.isFinite(configured) && configured > 0) {
+      return { backend, nCtx: configured, source: "configured", fingerprint: weak, fingerprintStrength: "weak" };
+    }
+    return { backend, nCtx: LlamaCpp.ASSUMED_CONTEXT_TOKENS, source: "assumed", fingerprint: weak, fingerprintStrength: "weak" };
+  }
+
+  /** The doctor's capacity read for the active backend, cached CAPACITY_CACHE_MS (the Stop pipeline never uses it). */
+  async llmCapacityForDoctor(opts: { deadline: MonoDeadline }): Promise<LlmCapacity | null> {
+    const now = epochMs(epochNow());
+    const backend = this.activeLlmBackend();
+    if (!backend) return null;
+    const hit = this.capacityForDoctor;
+    if (hit && now - hit.at < LlamaCpp.CAPACITY_CACHE_MS && JSON.stringify(hit.cap.backend) === JSON.stringify(backend)) return hit.cap;
+    const cap = await this.llmCapacity(backend, opts);
+    this.capacityForDoctor = { at: now, cap };
+    return cap;
+  }
+
+  private async localFitContextSize(): Promise<number> {
+    const model = await this.ensureGenerateModel();
+    const train = model.trainContextSize;
+    return typeof train === "number" && train > 0 ? Math.min(train, LlamaCpp.LOCAL_FIT_CONTEXT_TOKENS) : LlamaCpp.LOCAL_FIT_CONTEXT_TOKENS;
+  }
+
+  /** `POST <root>/apply-template` → the exact chat prompt, or null (absent → remembered for the process; failed). */
+  private async applyTemplateRemote(root: string, content: string, deadline: MonoDeadline): Promise<string | null> {
+    const signal = this.auxSignal(deadline);
+    if (!signal) return null;
+    try {
+      const resp = await fetch(`${root}/apply-template`, {
+        method: "POST", headers: this.getLlmHeaders(), signal,
+        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+      });
+      if (resp.status === 404 || resp.status === 405 || resp.status === 501) { this.templateServed = false; return null; }
+      if (!resp.ok) return null;
+      const data = await resp.json() as { prompt?: unknown };
+      if (typeof data.prompt !== "string") { this.templateServed = false; return null; }
+      this.templateServed = true;
+      return data.prompt;
+    } catch {
+      return null;
+    }
+  }
+
+  /** `POST <root>/tokenize {content}` → the token count, or null (absent → remembered for the process; failed). */
+  private async tokenizeRemote(root: string, content: string, deadline: MonoDeadline): Promise<number | null> {
+    const signal = this.auxSignal(deadline);
+    if (!signal) return null;
+    try {
+      const resp = await fetch(`${root}/tokenize`, {
+        method: "POST", headers: this.getLlmHeaders(), signal, body: JSON.stringify({ content }),
+      });
+      if (resp.status === 404 || resp.status === 405 || resp.status === 501) { this.tokenizeServed = false; return null; }
+      if (!resp.ok) return null;
+      const data = await resp.json() as { tokens?: unknown };
+      if (!Array.isArray(data.tokens)) { this.tokenizeServed = false; return null; }
+      this.tokenizeServed = true;
+      return data.tokens.length;
+    } catch {
+      return null;
+    }
+  }
+
+  private overheadKey(fingerprint: string): string {
+    return `llm-template-overhead:${fingerprint}`;
+  }
+
+  /** A measured template overhead for `fingerprint` younger than 24 h: this process's, else the store's. */
+  private knownOverhead(fingerprint: string, store?: OverheadStore): number | null {
+    const now = epochMs(epochNow());
+    const mem = this.measuredOverhead;
+    if (mem?.fingerprint === fingerprint && now - mem.at <= LlamaCpp.OVERHEAD_TTL_MS) return mem.overhead;
+    if (!store) return null;
+    try {
+      const raw = store.get(this.overheadKey(fingerprint));
+      if (!raw) return null;
+      const v = JSON.parse(raw) as { overhead?: unknown; at?: unknown };
+      if (typeof v.overhead !== "number" || typeof v.at !== "number") return null;
+      if (now - v.at > LlamaCpp.OVERHEAD_TTL_MS) return null;
+      this.measuredOverhead = { fingerprint, overhead: v.overhead, at: v.at };
+      return v.overhead;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Forget the measured template overhead for `fingerprint`, in this process and in `store` (design §1.2: a validated
+   * oversize means the count it fed was low). The next content count measures it again.
+   */
+  invalidateOverhead(fingerprint: string, store?: OverheadStore): void {
+    if (this.measuredOverhead?.fingerprint === fingerprint) this.measuredOverhead = null;
+    try { store?.delete(this.overheadKey(fingerprint)); } catch { /* best-effort */ }
+  }
+
+  /**
+   * Measure the chat template's overhead on a `/tokenize`-only remote with a one-token probe (design §1.2): the chat
+   * endpoint's `prompt_tokens` minus the content's own count. Best-effort; null when either side is missing.
+   */
+  private async probeOverhead(cap: LlmCapacity, deadline: MonoDeadline, store?: OverheadStore): Promise<number | null> {
+    if (cap.backend.kind !== "remote" || !this.remoteLlmUrl) return null;
+    const probe = "ok";
+    const content = this.applyNoThinkSuffix(probe);
+    const counted = await this.tokenizeRemote(cap.backend.root, content, deadline);
+    if (counted === null) return null;
+    const r = await this.generateDetailed(probe, { maxTokens: 1, temperature: 0, signal: this.auxSignal(deadline) ?? undefined, backend: cap.backend });
+    if (!r.ok || typeof r.promptTokens !== "number") return null;
+    const overhead = Math.max(0, r.promptTokens - counted);
+    const at = epochMs(epochNow());
+    this.measuredOverhead = { fingerprint: cap.fingerprint, overhead, at };
+    try { store?.set(this.overheadKey(cap.fingerprint), JSON.stringify({ overhead, at })); } catch { /* best-effort */ }
+    return overhead;
+  }
+
+  /**
+   * A prompt's tokens as the chat endpoint will count them (design §1.2), strongest method first: the server's own
+   * rendered template (`/apply-template` + `/tokenize`: exact — E11 measured it equal to the chat endpoint's own count —
+   * so margin 0); the content's count + a measured overhead (margin overhead + 8) or + 32; the estimate (margin 32).
+   * `content` is what the call sends.
+   */
+  async countChatTokens(content: string, cap: LlmCapacity, opts: { deadline: MonoDeadline; overheadStore?: OverheadStore }): Promise<ChatTokenCount> {
+    if (cap.backend.kind === "local") {
+      try {
+        const model = await this.ensureGenerateModel();
+        return { tokens: model.tokenize(content).length, method: "content", margin: 32 };
+      } catch {
+        return { tokens: Math.ceil(estimateTokens(content) * this.estimateFactor), method: "estimate", margin: 32 };
+      }
+    }
+    const root = cap.backend.root;
+    if (this.templateServed !== false) {
+      const rendered = await this.applyTemplateRemote(root, content, opts.deadline);
+      if (rendered !== null) {
+        const n = await this.tokenizeRemote(root, rendered, opts.deadline);
+        if (n !== null) return { tokens: n, method: "template", margin: 0 };
+      }
+    }
+    if (this.tokenizeServed !== false) {
+      const n = await this.tokenizeRemote(root, content, opts.deadline);
+      if (n !== null) {
+        const overhead = this.knownOverhead(cap.fingerprint, opts.overheadStore)
+          ?? await this.probeOverhead(cap, opts.deadline, opts.overheadStore);
+        return { tokens: n, method: "content", margin: overhead !== null ? overhead + 8 : 32 };
+      }
+    }
+    return { tokens: Math.ceil(estimateTokens(content) * this.estimateFactor), method: "estimate", margin: 32 };
+  }
+
+  /** A validated oversize answer's numbers (HTTP 400 `exceed_context_size_error` with both counts), or null. */
+  private async readOversize(resp: Response): Promise<{ nCtx: number; nPromptTokens: number } | null> {
+    try {
+      const data = await resp.json() as { error?: { type?: unknown; n_ctx?: unknown; n_prompt_tokens?: unknown } };
+      const e = data.error;
+      if (!e || e.type !== "exceed_context_size_error") return null;
+      if (typeof e.n_ctx !== "number" || e.n_ctx <= 0 || typeof e.n_prompt_tokens !== "number" || e.n_prompt_tokens <= 0) return null;
+      return { nCtx: e.n_ctx, nPromptTokens: e.n_prompt_tokens };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The per-endpoint oversize exemption (design §1.2): with none open, a validated oversize opens one and does not
+   * strike; a further one for a request NOT smaller in tokens strikes like any HTTP error (issue #24's streak); a
+   * success closes it; it expires after OVERSIZE_EXEMPTION_TTL_MS.
+   */
+  private noteOversize(nPromptTokens: number, status: number, statusText: string): void {
+    const now = epochMs(epochNow());
+    const open = this.oversizeExemption;
+    if (open && now - open.at < LlamaCpp.OVERSIZE_EXEMPTION_TTL_MS && nPromptTokens >= open.nPromptTokens) {
+      this.noteRemoteHttpError("llm", status, statusText);
+      return;
+    }
+    this.oversizeExemption = { nPromptTokens, at: now };
+  }
+
+  /** The estimate factor only rises: a reply whose own prompt count exceeds the estimate raises it to that ratio. */
+  private observeEstimate(content: string, promptTokens: number | undefined): void {
+    if (typeof promptTokens !== "number" || promptTokens <= 0) return;
+    const base = estimateTokens(content);
+    if (base > 0 && promptTokens > base * this.estimateFactor) this.estimateFactor = promptTokens / base;
+  }
+
+  /**
+   * One generation pinned to `backend` (design §1.2): no remote → local fall-through inside the call — a remote
+   * transport failure returns `unavailable` (and marks the remote down, as `generate()` does); the caller re-fits.
+   */
+  async generateDetailed(
+    prompt: string,
+    opts: { maxTokens: number; temperature?: number; signal?: AbortSignal; backend: LlmBackendId },
+  ): Promise<GenerateDetail> {
+    const backend = opts.backend;
+    const temperature = opts.temperature ?? 0;
+    if (backend.kind === "remote") {
+      if (!this.isBackendAvailable(backend)) return { ok: false, reason: "unavailable", backend };
+      try {
+        const body = this.buildRemoteChatBody(prompt, opts.maxTokens, temperature);
+        const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
+          method: "POST", headers: this.getLlmHeaders(), body: JSON.stringify(body), signal: opts.signal,
+        });
+        if (!resp.ok) {
+          if (resp.status === 400) {
+            const over = await this.readOversize(resp);
+            if (over) {
+              this.noteOversize(over.nPromptTokens, resp.status, resp.statusText);
+              return { ok: false, reason: "context_exceeded", nCtx: over.nCtx, promptTokens: over.nPromptTokens, backend };
+            }
+          }
+          console.error(`[generate] Remote LLM HTTP ${resp.status}: ${resp.statusText}`);
+          if (resp.status !== 429) this.noteRemoteHttpError("llm", resp.status, resp.statusText);
+          return { ok: false, reason: "http", backend };
+        }
+        // A 200 that is not JSON (a non-JSON body reads as null here; an abort or a dropped connection still throws).
+        const data = await resp.json().catch((e: unknown) => { if (e instanceof SyntaxError) return null; throw e; }) as {
+          choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
+          model?: string;
+          usage?: { prompt_tokens?: number; completion_tokens?: number };
+        } | null;
+        const choice = data?.choices?.[0];
+        const content = choice?.message?.content;
+        // codex T11-2: a 200 without a completion is not an answer — never an empty one. codex T12-1: nor a success —
+        // it strikes like any HTTP error, so a squatter answering 200 trips the cooldown and the fallback engages.
+        if (!data || !choice || typeof content !== "string") {
+          console.error(`[generate] Remote LLM answered HTTP ${resp.status} without a completion choice`);
+          this.noteRemoteHttpError("llm", resp.status, "without a completion choice");
+          return { ok: false, reason: "http", backend };
+        }
+        this.remoteLlmHttpErrorStreak = 0;
+        this.oversizeExemption = null;
+        // `stop` is a complete reply, `length` a cut one; any other reason (`content_filter`, `tool_calls`, …) did not
+        // finish as an answer. codex T12-4: a server that reports NO reason gets a best-effort reading — a reply that used
+        // its whole allowance is cut, any other complete (a reply its context cut can be misread there).
+        const fr = choice.finish_reason;
+        let finish: "stop" | "length" | "other";
+        if (fr === "stop" || fr === "length") finish = fr;
+        else if (fr === undefined || fr === null) {
+          const used = data.usage?.completion_tokens;
+          finish = typeof used === "number" && used >= opts.maxTokens ? "length" : "stop";
+          if (!this.noFinishReasonWarned) {
+            this.noFinishReasonWarned = true;
+            console.warn(
+              `[generate] The LLM server's replies carry no finish_reason: a reply that uses its whole allowance counts as cut, ` +
+              `any other as complete (best-effort) — see docs/troubleshooting.md`,
+            );
+          }
+        } else finish = "other";
+        this.observeEstimate(this.applyNoThinkSuffix(prompt), data.usage?.prompt_tokens);
+        return {
+          ok: true, text: content, model: data.model || this.remoteLlmUrl!, finish,
+          promptTokens: data.usage?.prompt_tokens, completionTokens: data.usage?.completion_tokens, backend,
+        };
+      } catch (error) {
+        if (this.isAbortError(error)) return { ok: false, reason: "aborted", backend };
+        if (this.isTransportError(error)) this.markRemoteLlmDown();
+        else console.error("[generate] Remote LLM error:", error);
+        return { ok: false, reason: "unavailable", backend };
+      }
+    }
+    if (!this.isBackendAvailable(backend)) return { ok: false, reason: "unavailable", backend };
+    try {
+      const model = await this.ensureGenerateModel();
+      const context = await model.createContext({ contextSize: await this.localFitContextSize() });
+      try {
+        const { LlamaChatSession } = await getNodeLlamaCpp();
+        const session = new LlamaChatSession({ contextSequence: context.getSequence() });
+        const r = await session.promptWithMeta(prompt, {
+          maxTokens: opts.maxTokens, temperature, signal: opts.signal, stopOnAbortSignal: true,
+        });
+        if (r.stopReason === "abort") return { ok: false, reason: "aborted", backend };
+        const finish = r.stopReason === "maxTokens" ? "length"
+          : r.stopReason === "eogToken" || r.stopReason === "stopGenerationTrigger" || r.stopReason === "customStopTrigger" ? "stop" : "other";
+        return { ok: true, text: r.responseText, model: this.generateModelUri, finish, backend };
+      } finally {
+        await context.dispose();
+      }
+    } catch (error) {
+      if (this.isAbortError(error)) return { ok: false, reason: "aborted", backend };
+      console.error("[generate] Local generation error:", error);
+      return { ok: false, reason: "unavailable", backend };
     }
   }
 

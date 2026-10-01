@@ -293,6 +293,13 @@ export function wasPromptSeenRecently(store: Store, hookName: string, prompt: st
 export type TranscriptMessage = {
   role: "user" | "assistant" | "system";
   content: string;
+  /**
+   * v0.41.2 (BACKLOG 68.5): the message's turn within its Stop-pipeline unit, and whether it is the human entry that
+   * opens that turn — set from the transcript's line kinds (a tool result is `role: "user"` too, so `role` cannot tell
+   * them apart). Only the observer's windows read them; every other consumer ignores them.
+   */
+  turn?: number;
+  opening?: boolean;
 };
 
 /**

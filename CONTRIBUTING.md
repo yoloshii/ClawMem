@@ -20,7 +20,7 @@ bun install
 # Without these, all three models auto-download via node-llama-cpp
 # (Metal on Apple Silicon, Vulkan where available, CPU as last resort)
 llama-server -m embeddinggemma-300M-Q8_0.gguf --embeddings --port 8088 -ngl 99 -c 2048 --batch-size 2048
-llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf --port 8089 -ngl 99 -c 4096
+llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf --port 8089 -ngl 99 -c 8192
 llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf --reranking --port 8090 -ngl 99 -c 2048 --batch-size 512
 ```
 

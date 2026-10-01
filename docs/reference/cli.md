@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0, and the compaction leftovers since v0.40.0: `postcompact-inject` under a matcher other than `compact`, old `precompact-state.md` files (red when one was written after the upgrade), indexed copies of them still active)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0, and the compaction leftovers since v0.40.0: `postcompact-inject` under a matcher other than `compact`, old `precompact-state.md` files (red when one was written after the upgrade), indexed copies of them still active; since v0.41.2 the LLM server's context as the Stop hooks' observer sees it — its source, how prompts are counted, the transcript window it leaves, the observer's mean call over its latest 50 calls — the ranges held as `capacity:`, queued continuations and those waiting for a server that could not be verified, and live checkpoints no queued range owns, split into those a later Stop can still reach, a first Stop's with no cursor, and those behind the transcript's cursor)
 clawmem rerank-health           # Live cache-bypassed reranker probe: coverage + discrimination check, and provider-identity attestation (v0.38.0 — a passing probe enables remote rerank-score caching; a failed or unfingerprintable probe REVOKES it)
 ```
 
@@ -39,9 +39,9 @@ clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill
 clawmem reindex                                # Re-scan all collections
 clawmem reindex --force                        # Re-read every file, bypassing the content-hash skip
 clawmem reindex --enrich                       # Full A-MEM pipeline on all documents
-clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
+clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first; since v0.41.2 a run that stores no vector never sets the geometry taint, and still exits 1 when unverified)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
-clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild
+clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild (since v0.41.2 only a --force rebuild whose preflight PASSES clears the taint)
 clawmem embed --force --recalibrate-canary    # v0.21.0: replace the stored canary baseline after a deliberate model/server change (requires --force)
 ```
 
@@ -94,7 +94,7 @@ clawmem bootstrap <path> --name <name>   # One-command setup: init + collection 
 clawmem watch                   # Start file watcher (indexes on .md changes)
 ```
 
-Since v0.41.0 the watcher also runs the stop-pipeline worker every 60 s (feedback of quiet or ended transcripts, named-vault slices, handoff digests and renders, quarantined ranges, deferred judge pairs, queued causal steps), and it keeps running with no collection configured. Its first start preserves the antipattern bodies older versions overwrote and recomputes the feedback counters once (see [`repair counters`](#stop-pipeline-v0410)).
+Since v0.41.0 the watcher also runs the stop-pipeline worker every 60 s (feedback of quiet or ended transcripts, named-vault slices, handoff digests and renders, quarantined ranges, deferred judge pairs, queued causal steps; since v0.41.2 a due observer continuation first, then an orphaned-checkpoint sweep), and it keeps running with no collection configured. Its first start preserves the antipattern bodies older versions overwrote and recomputes the feedback counters once (see [`repair counters`](#stop-pipeline-v0410)).
 
 ## Setup
 

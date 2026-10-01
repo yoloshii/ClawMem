@@ -39,7 +39,7 @@ import {
 } from "./stop-cursor.ts";
 import { accumulateLine, accumulateLines, accumulatedMessages, newAccumulator, type LineAccumulator } from "./stop-extract.ts";
 import {
-  extractSummaryIncremental, observerRenderChars, prepareTranscript, renderDigestLine, renderSummaryText,
+  extractSummaryFitted, observerRenderChars, prepareTranscript, renderDigestLine, renderSummaryText,
   OBSERVER_MAX_RENDER_CHARS, type SessionSummary, type TurnDigestText,
 } from "./observer.ts";
 import { insertStopItem, markSessionDocRenderNeeded, readSessionDoc, upsertSessionDoc, type SessionDocWrite } from "./stop-session-docs.ts";
@@ -443,15 +443,18 @@ export async function runHandoffSummary(store: Store, args: SummaryArgs): Promis
     if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) break;
     // Phase A — the model; no memory writes.
     const previous = readHandoffSummary(db, sessionId, key);
-    const { batch, used } = packDigestBatch(previous, pending);
-    const recent = recentTurnText(cursor.transcriptPath, batch, OBSERVER_MAX_RENDER_CHARS - used);
+    // The character pack is an upper bound; v0.41.2 fits the batch in TOKENS (design §1.5) — the recent text goes
+    // first, then digests from the end, and the watermark moves only past the digests the summary used.
+    const { batch: packed, used } = packDigestBatch(previous, pending);
+    const recent = recentTurnText(cursor.transcriptPath, packed, OBSERVER_MAX_RENDER_CHARS - used);
     run.batches++;
-    const r = await extractSummaryIncremental(previous?.summary ?? null, batch.map(d => d.digest), recent, { timeoutMs: remaining });
+    const r = await extractSummaryFitted(previous?.summary ?? null, packed.map(d => d.digest), recent, { deadline: args.deadline });
     if (r.status === "retryable") {
       recordSummaryFailure(db, sessionId, key, r.reason);
       run.failed = true;
       break;
     }
+    const batch = packed.slice(0, r.digestsUsed);
     args.beforePhaseB?.();
     // Phase B — the watermark CAS, the summary, the prune, the render: one transaction.
     const through = batch.at(-1)!.seq;

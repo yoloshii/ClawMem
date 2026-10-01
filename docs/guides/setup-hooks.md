@@ -182,10 +182,14 @@ The Stop-event hooks do not deduplicate by content window (through v0.40.3 they 
 
 - **`decision-extractor`** sends the turns after its cursor to the observer in batches, with the two
   turns before them and the session's recorded observation titles as context (at most 2,000
-  characters of the observer's 8,000-character input, v0.41.1). A batch with no
+  characters of the observer's 8,000-character input, v0.41.1). Since v0.41.2 each prompt is fitted
+  in tokens to the LLM server's own context with room kept for the reply, and a batch too large for
+  one prompt runs as windows whose progress is checkpointed. A batch with no
   assistant message of 40 characters or more and no tool call is skipped. A batch whose model call
   fails is quarantined and retried later (1 minute, 5 minutes, 30 minutes, 2 hours, then every 12
-  hours) by later Stops and the watcher; its turns are never committed as empty.
+  hours) by later Stops and the watcher; its turns are never committed as empty. A batch that ran
+  out of time partway is quarantined as a continuation instead, due again in a minute, and resumes
+  after its last finished window.
 - **Session documents.** The session's decisions and antipatterns are items, rendered into its own
   `_clawmem/decisions/<date>-<sid8>.md` and `_clawmem/antipatterns/<date>-<sid8>.md` at a path fixed
   when each is first written; a second transcript of the same session id adds `-<tk6>`. They are

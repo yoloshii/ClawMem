@@ -14,7 +14,8 @@
  */
 
 import { closeSync, existsSync, openSync, readSync } from "fs";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
+import type { Database } from "bun:sqlite";
 import type { Store } from "./store.ts";
 import type { TranscriptMessage } from "./hooks.ts";
 import { isoNow } from "./clock.ts";
@@ -33,14 +34,23 @@ import {
   STOP_READ_MAX_BYTES, type StopCursor, type TranscriptLine, type FileIdentity, type StreamEnd,
 } from "./stop-cursor.ts";
 import {
-  extractObservationsResult, observerRenderChars, OBSERVER_MAX_MESSAGES, OBSERVER_MAX_RENDER_CHARS, OBSERVER_BATCH_RESERVED_CHARS,
-  type Observation, type ObservationResult,
+  observerRenderChars, OBSERVER_MAX_MESSAGES, OBSERVER_MAX_RENDER_CHARS, OBSERVER_BATCH_RESERVED_CHARS,
+  renderObserverLines, observerLinesSha, observerContract, extractObservationsWindowed, takeObserverCallSamples, MAX_OBSERVER_CALLS,
+  OBSERVER_CALL_SAMPLES,
+  type Observation, type WindowProgress,
 } from "./observer.ts";
+import {
+  getDefaultLlamaCpp, budgetLayerOf, fingerprintVerdict, type LlmBackendId, type LlmCapacity, type OverheadStore,
+} from "./llm.ts";
+import {
+  checkpointKey, readCheckpoint, checkpointMatches, liveCheckpoint, createCheckpoint, swapCheckpoint, finishCheckpoint,
+  type ObserverCheckpoint,
+} from "./stop-checkpoint.ts";
 import { insertStopItem, itemFingerprint, reconcileSessionDocs } from "./stop-session-docs.ts";
 import { PERSIST_RESERVE_MS, CAUSAL_MIN_BUDGET_MS } from "./causal-writer.ts";
 import type { ObservationWithDoc } from "./amem.ts";
 import {
-  persistObservationDoc, insertObservationTriples, extractDecisions, extractAntipatterns,
+  persistObservationDoc, insertObservationTriples, extractDecisions, extractAntipatterns, formatObservation,
 } from "./hooks/decision-extractor.ts";
 
 export const DECISION_HOOK = "decision-extractor";
@@ -62,13 +72,20 @@ export const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]
 const ACCUMULATED_FILES_MAX = 50;
 export { RETRY_BACKOFF_MS };
 
-/** A transcript's lines as the observer's messages: human → user, assistant and tool results as rendered. */
+/**
+ * A transcript's lines as the observer's messages: human → user, assistant and tool results as rendered. v0.41.2: each
+ * message carries its turn (a human entry after the first message starts the next) and `opening` on the human entry.
+ */
 export function toObserverMessages(lines: readonly TranscriptLine[]): TranscriptMessage[] {
   const out: TranscriptMessage[] = [];
+  let turn = 0;
   for (const l of lines) {
-    if (l.kind === "human") out.push({ role: "user", content: l.text });
-    else if (l.kind === "assistant") out.push({ role: "assistant", content: l.rendered });
-    else if (l.kind === "tool_result") out.push({ role: "user", content: l.rendered });
+    if (l.kind === "human") {
+      if (out.length > 0) turn++;
+      out.push({ role: "user", content: l.text, turn, opening: true });
+    }
+    else if (l.kind === "assistant") out.push({ role: "assistant", content: l.rendered, turn });
+    else if (l.kind === "tool_result") out.push({ role: "user", content: l.rendered, turn });
   }
   return out;
 }
@@ -89,6 +106,8 @@ export type LineAccumulator = {
   start: number;
   end: number;
   lines: number;
+  /** v0.41.2: the turn the next message belongs to (a human entry after the first message starts the next). */
+  turn: number;
   humanText: string | null;
   humanTs: number | null;
   humanStart: number | null;
@@ -112,7 +131,7 @@ export type LineAccumulator = {
 
 export function newAccumulator(start: number): LineAccumulator {
   return {
-    start, end: start, lines: 0, humanText: null, humanTs: null, humanStart: null, firstTs: null, messages: [],
+    start, end: start, lines: 0, turn: 0, humanText: null, humanTs: null, humanStart: null, firstTs: null, messages: [],
     messageCount: 0, admits: false, lastAssistantText: "", files: [], decisions: [], antipatterns: [], lastLineSha: null,
     stopMarked: false, answered: false, itemKeys: new Set(), itemsCapped: false,
   };
@@ -137,7 +156,9 @@ export function accumulateLine(acc: LineAccumulator, l: TranscriptLine): void {
   if (acc.lines === 0) acc.start = l.start;
   if (l.kind === "human" && acc.humanStart === null) { acc.humanText = l.text; acc.humanTs = l.ts; acc.humanStart = l.start; }
   if (acc.firstTs === null && l.ts !== null) acc.firstTs = l.ts;
-  for (const m of toObserverMessages([l])) {
+  for (const raw of toObserverMessages([l])) {
+    if (raw.opening && acc.messageCount > 0) acc.turn++;
+    const m: TranscriptMessage = { ...raw, turn: acc.turn };
     if (m.role === "assistant") {
       const recent = [...acc.messages.slice(-3), m];
       pushUnique(acc, "d", extractDecisions(recent).map(d => ({ text: d.text, context: d.context })));
@@ -167,9 +188,14 @@ export function accumulateLine(acc: LineAccumulator, l: TranscriptLine): void {
 /** The observer's messages of an accumulated stretch: its human request first even when the kept tail dropped it. */
 export function accumulatedMessages(acc: LineAccumulator): TranscriptMessage[] {
   if (acc.humanText !== null && acc.messageCount > acc.messages.length) {
-    return [{ role: "user", content: acc.humanText }, ...acc.messages.slice(1)];
+    return [{ role: "user", content: acc.humanText, turn: 0, opening: true }, ...acc.messages.slice(1)];
   }
   return acc.messages;
+}
+
+/** v0.41.2: how many messages the accumulator's 100-message tail dropped upstream (T24's bound — reported, unchanged). */
+export function accumulatorDropped(acc: LineAccumulator): number {
+  return Math.max(0, acc.messageCount - acc.messages.length);
 }
 
 /**
@@ -313,54 +339,287 @@ function writeBatchEffects(
   return persisted;
 }
 
-/** Quarantine a failed range (inside the Phase B transaction): retried with backoff, never skipped. */
-function quarantineRange(store: Store, p: { sessionId: string; key: string; path: string; file: FileIdentity; range: RangeRef; reason: string; now: string }): void {
-  const next = nextRetryAt(p.now, 1);
+/**
+ * Quarantine a range (inside the Phase B transaction): retried, never skipped. A failure takes `attempts = 1` and the
+ * failure backoff; a v0.41.2 continuation (its checkpoint kept) takes `attempts = 0` and is due again in 60 s.
+ */
+function quarantineRange(store: Store, p: {
+  sessionId: string; key: string; path: string; file: FileIdentity; range: RangeRef; reason: string; now: string; continuation?: boolean;
+}): void {
+  const next = p.continuation ? isoAfter(p.now, CONTINUATION_DELAY_MS) : nextRetryAt(p.now, 1);
   store.db.prepare(
     `INSERT OR IGNORE INTO stop_retries (session_id, transcript_key, hook, transcript_path, file_dev, file_ino, first_line_sha,
        anchor_epoch, from_offset, to_offset, range_key, range_sha, source_time, attempts, last_error, first_failed_at,
        next_retry_at, state)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'queued')`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`
   ).run(p.sessionId, p.key, DECISION_HOOK, p.path, p.file.dev, p.file.ino, p.file.firstLineSha, p.range.anchorEpoch,
-    p.range.from, p.range.to, p.range.key, p.range.sha, p.range.sourceTime, p.reason, p.now, next);
+    p.range.from, p.range.to, p.range.key, p.range.sha, p.range.sourceTime, p.continuation ? 0 : 1, p.reason, p.now, next);
+}
+
+/** v0.41.2: the flag that reports the messages a committed range held that the observer could not see. */
+export const OBSERVER_DROPPED_FLAG = "observer_accumulator_dropped";
+const DROPPED_RING = 50;
+
+/** Add a committed range's unseen messages to OBSERVER_DROPPED_FLAG (inside the Phase B transaction). */
+function noteDropped(db: Database, p: { sessionId: string; rangeKey: string; dropped: number; now: string }): void {
+  if (p.dropped <= 0) return;
+  const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(OBSERVER_DROPPED_FLAG) as { value: string } | null;
+  let v: { total: number; ranges: number; recent: { range_key: string; session: string; dropped: number; at: string }[] } = { total: 0, ranges: 0, recent: [] };
+  try { if (row) v = { ...v, ...JSON.parse(row.value) }; } catch { /* a malformed value restarts the tally */ }
+  v.total += p.dropped;
+  v.ranges += 1;
+  v.recent = [...(Array.isArray(v.recent) ? v.recent : []), { range_key: p.rangeKey, session: p.sessionId, dropped: p.dropped, at: p.now }].slice(-DROPPED_RING);
+  db.prepare(`INSERT INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(flag) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+    .run(OBSERVER_DROPPED_FLAG, JSON.stringify(v), p.now);
+  console.error(`[decision-extractor] range ${p.rangeKey}: ${p.dropped} message(s) beyond the observer's 100-message window were not seen`);
 }
 
 class CursorMoved extends Error {}
 class ClaimLost extends Error {}
 
+/**
+ * A unit's Phase A outcome (62.1 D3 + v0.41.2 §1.4). `ok` / `empty` commit the range; `retryable` quarantines it as a
+ * failure (attempts + 1, failure backoff); `continuation` quarantines it with its checkpoint kept and attempts unchanged
+ * (`due`: "soon" = in 60 s, "now" = at the next replay); `abandon` decides nothing here — the range was committed by
+ * another processor, or another processor is ahead on it.
+ */
+type UnitOutcome =
+  | { status: "ok"; observations: Observation[] }
+  | { status: "empty" }
+  | { status: "retryable"; reason: string }
+  | { status: "continuation"; reason: string; due: "soon" | "now" }
+  | { status: "abandon"; committedElsewhere: boolean };
+
 type PhaseAOut = {
-  result: ObservationResult;
+  result: UnitOutcome;
   judged: JudgePrepared | null;
   decisionFacts: { obs: Observation; fact: string }[];
+  /** Messages the unit held that the observer could not see: T24's accumulator tail + the 100-message render cap. */
+  dropped: number;
 };
 
+/** The pause before a continuation is due again (the worker's tick). */
+const CONTINUATION_DELAY_MS = 60_000;
+/** v0.41.2 (codex T11-13): the observer's measured mean call, as the Stop pipeline keeps it for the doctor. */
+export const OBSERVER_CALL_MEAN_FLAG = "observer_call_mean";
+
+function isoAfter(iso: string, ms: number): string {
+  return new Date(Date.parse(iso) + ms).toISOString();
+}
+
+/** `vault_flags` as the LLM layer's template-overhead store (design §1.2). */
+function vaultFlagStore(db: Database): OverheadStore {
+  return {
+    get: (key) => (db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(key) as { value: string } | null)?.value ?? null,
+    set: (key, value) => {
+      db.prepare(`INSERT INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(flag) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+        .run(key, value, isoNow());
+    },
+    delete: (key) => { db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(key); },
+  };
+}
+
 /**
- * Phase A for one range — admission, the observer (with CONTEXT), the judge's call. No memory writes. `null` when the
- * budget does not allow starting it and the caller should stop rather than quarantine (`quarantineIfNoBudget` false).
+ * Add the observer calls this process measured since its last take to OBSERVER_CALL_MEAN_FLAG (codex T11-13, T12-5):
+ * the latest OBSERVER_CALL_SAMPLES calls recorded by every process that runs the observer, and their mean — what the
+ * doctor shows. Best-effort.
+ */
+export function persistObserverCallMean(db: Database): void {
+  const taken = takeObserverCallSamples();
+  if (taken.length === 0) return;
+  try {
+    const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(OBSERVER_CALL_MEAN_FLAG) as { value: string } | null;
+    let kept: number[] = [];
+    try {
+      const v = row ? JSON.parse(row.value) as { recent?: unknown } : {};
+      if (Array.isArray(v.recent)) kept = v.recent.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0);
+    } catch { /* a malformed value restarts the record */ }
+    const recent = [...kept, ...taken.map(Math.round)].slice(-OBSERVER_CALL_SAMPLES);
+    const ms = Math.round(recent.reduce((sum, x) => sum + x, 0) / recent.length);
+    const now = isoNow();
+    db.prepare(`INSERT INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(flag) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+      .run(OBSERVER_CALL_MEAN_FLAG, JSON.stringify({ ms, samples: recent.length, recent, at: now }), now);
+  } catch { /* best-effort: the doctor shows "not measured yet" */ }
+}
+
+/**
+ * Group equal observation bodies before the judge and Phase B (v0.41.2 §1.4): `persistObservationDoc` stores one
+ * document per formatted body (the path embeds its hash) and returns null for a repeat, so a repeat's triples and its
+ * judge mapping would be lost. One body per group, carrying the union of the members' triples. The date only enters the
+ * body's header, so one fixed date for the whole unit leaves equality unchanged.
+ */
+function groupEqualBodies(observations: Observation[], sessionId: string): Observation[] {
+  const byBody = new Map<string, Observation>();
+  for (const o of observations) {
+    const k = createHash("sha256").update(formatObservation(o, "1970-01-01", sessionId)).digest("hex");
+    const kept = byBody.get(k);
+    if (!kept) {
+      byBody.set(k, { ...o, ...(o.triples ? { triples: [...o.triples] } : {}) });
+      continue;
+    }
+    for (const t of o.triples ?? []) {
+      kept.triples ??= [];
+      if (!kept.triples.some(x => x.subject === t.subject && x.predicate === t.predicate && x.object === t.object)) kept.triples.push(t);
+    }
+  }
+  return [...byBody.values()];
+}
+
+/**
+ * The windowed, checkpointed observer for one unit (v0.41.2 §1.4). A matching live checkpoint is resumed on its pinned
+ * backend only (unreachable → a continuation, no reset; no longer configured or its server's fingerprint changed →
+ * reset); otherwise the unit starts on the active backend and creates its checkpoint. Progress after each window goes
+ * through a compare-and-swap; a lost swap abandons the unit to the processor that is ahead.
+ */
+async function observeUnit(
+  store: Store,
+  p: {
+    sessionId: string; transcriptKey: string; range: RangeRef; messages: TranscriptMessage[]; prior: TranscriptLine[];
+    sourceTime: string | null; deadline: MonoDeadline; observerMaxCalls?: number;
+  },
+): Promise<UnitOutcome> {
+  const db = store.db;
+  const llm = budgetLayerOf(getDefaultLlamaCpp());
+  const lines = renderObserverLines(p.messages);
+  const want = {
+    sessionId: p.sessionId, transcriptKey: p.transcriptKey, hook: DECISION_HOOK, range: p.range,
+    linesSha: observerLinesSha(lines), contract: observerContract(),
+  };
+  const key = checkpointKey(p.sessionId, p.transcriptKey, DECISION_HOOK, p.range.key);
+  const context = { priorMessages: toObserverMessages(p.prior), recordedTitles: recordedTitles(store, p.sessionId, p.sourceTime) };
+  const overheadStore = vaultFlagStore(db);
+  const rangeOf = { anchorEpoch: p.range.anchorEpoch, from: p.range.from, to: p.range.to, sha: p.range.sha };
+
+  const loaded = readCheckpoint(db, key);
+  if (loaded?.value?.state === "done") return { status: "abandon", committedElsewhere: true };
+  let raw: string | null = loaded?.raw ?? null;
+  let current: ObserverCheckpoint | null = null;
+  let resume: WindowProgress | undefined;
+  let backend: LlmBackendId | null = null;
+  let fingerprint: string | undefined;
+  let strength: LlmCapacity["fingerprintStrength"] | undefined;
+
+  if (loaded?.value && checkpointMatches(loaded.value, want)) {
+    const c = loaded.value;
+    if (llm.isConfiguredBackend(c.backend)) {
+      if (!llm.isBackendAvailable(c.backend)) {
+        return { status: "continuation", reason: `continuation: ${c.doneThroughLine}/${lines.length} lines — its backend is unavailable`, due: "soon" };
+      }
+      const cap = await llm.llmCapacity(c.backend, { deadline: p.deadline });   // the fingerprint, read FRESH before a resume
+      const verdict = fingerprintVerdict({ fingerprint: c.fingerprint, strength: c.fingerprintStrength }, cap);
+      if (verdict === "same") {
+        backend = c.backend; fingerprint = c.fingerprint; strength = c.fingerprintStrength; current = c;
+        resume = { doneThroughLine: c.doneThroughLine, observations: c.observations, titles: c.titles };
+      } else if (verdict === "unverified") {
+        // codex T11-3, T13-1: `/props` gave no fingerprint (no answer, an error, a body that is not llama.cpp's, or one
+        // without the model, template and build) — the server may be the same one; keep the windows done and wait,
+        // however long (as for an unreachable backend). Only a verified differing fingerprint resets the checkpoint.
+        return { status: "continuation", reason: `continuation: ${c.doneThroughLine}/${lines.length} lines — its server could not be verified`, due: "soon" };
+      }
+    }
+  }
+
+  // Start (or reset): the active backend, a fresh checkpoint at line 0 — created, or swapped over an invalid row.
+  const start = async (): Promise<UnitOutcome | null> => {
+    backend = llm.activeLlmBackend();
+    if (!backend) return { status: "retryable", reason: "model unavailable" };
+    const cap = await llm.llmCapacity(backend, { deadline: p.deadline });
+    fingerprint = cap.fingerprint;
+    strength = cap.fingerprintStrength;
+    const fresh = liveCheckpoint({
+      rev: (current?.rev ?? loaded?.value?.rev ?? 0) + 1, sessionId: p.sessionId, transcriptKey: p.transcriptKey, hook: DECISION_HOOK,
+      range: rangeOf, linesSha: want.linesSha, contract: want.contract, backend, fingerprint, fingerprintStrength: strength,
+      doneThroughLine: 0, observations: [], titles: [],
+    });
+    const stored = raw === null ? createCheckpoint(db, key, fresh) : swapCheckpoint(db, key, raw, fresh);
+    if (stored === null) {
+      return { status: "abandon", committedElsewhere: readCheckpoint(db, key)?.value?.state === "done" };
+    }
+    raw = stored; current = fresh; resume = undefined;
+    return null;
+  };
+  if (!resume) {
+    const stop = await start();
+    if (stop) return stop;
+  }
+
+  const onProgress = (prog: WindowProgress): boolean => {
+    if (!current || raw === null) return false;
+    const next: ObserverCheckpoint = {
+      ...current, rev: current.rev + 1, doneThroughLine: prog.doneThroughLine, observations: prog.observations, titles: prog.titles, at: isoNow(),
+    };
+    const stored = swapCheckpoint(db, key, raw, next);
+    if (stored === null) return false;
+    raw = stored; current = next;
+    return true;
+  };
+
+  const run = (maxCalls: number) => extractObservationsWindowed(p.messages, {
+    llm, backend: backend!, deadline: p.deadline, context, resume, onProgress, overheadStore, expectFingerprint: fingerprint,
+    expectStrength: strength, maxCalls,
+  });
+  const callCap = p.observerMaxCalls ?? MAX_OBSERVER_CALLS;
+  let r = await run(callCap);
+  if (r.status === "unavailable" && r.doneThroughLine === 0 && !resume) {
+    // A unit's first window: re-fit for the next backend (the remote is now in cooldown → local, when allowed) and pin to it.
+    // codex T11-14: the fallback gets what this invocation's call cap has left, never a fresh cap.
+    const alt = llm.activeLlmBackend();
+    if (alt && JSON.stringify(alt) !== JSON.stringify(backend)) {
+      const stop = await start();
+      if (stop) return stop;
+      r = await run(Math.max(0, callCap - r.calls));
+    }
+  }
+  persistObserverCallMean(db);
+  switch (r.status) {
+    case "ok": return { status: "ok", observations: r.observations };
+    case "empty": return { status: "empty" };
+    case "retryable": return { status: "retryable", reason: r.reason };
+    case "partial": return { status: "continuation", reason: `continuation: ${r.doneThroughLine}/${r.totalLines} lines`, due: "soon" };
+    case "unavailable":
+      if (r.doneThroughLine > 0 || resume) {
+        return { status: "continuation", reason: `continuation: ${r.doneThroughLine}/${r.totalLines} lines — its backend is unavailable`, due: "soon" };
+      }
+      return { status: "retryable", reason: "model unavailable" };
+    case "server_changed": {
+      const stop = await start();   // reset now; the next invocation restarts the unit on the server as it is
+      return stop ?? { status: "continuation", reason: "continuation: 0 lines — the LLM server changed", due: "soon" };
+    }
+    case "unverified":
+      // codex T11-3: the server stopped answering `/props` mid-run — the progress stays in the checkpoint; retry soon.
+      return { status: "continuation", reason: `continuation: ${r.doneThroughLine}/${r.totalLines} lines — its server could not be verified`, due: "soon" };
+    case "overtaken": return { status: "abandon", committedElsewhere: readCheckpoint(db, key)?.value?.state === "done" };
+  }
+}
+
+/**
+ * Phase A for one range — admission, the observer (with CONTEXT), the judge's call. No range effects (v0.41.2: the
+ * observer's checkpoint is provisional state, not an effect). `null` when the budget does not allow starting it and the
+ * caller should stop rather than quarantine (`quarantineIfNoBudget` false).
  */
 async function phaseA(
   store: Store,
   p: {
-    sessionId: string; admits: boolean; messages: TranscriptMessage[]; prior: TranscriptLine[];
-    sourceTime: string | null; deadline: MonoDeadline; quarantineIfNoBudget: boolean; phaseSkipNotes?: string[];
+    sessionId: string; transcriptKey: string; range: RangeRef; admits: boolean; messages: TranscriptMessage[];
+    prior: TranscriptLine[]; sourceTime: string | null; deadline: MonoDeadline; quarantineIfNoBudget: boolean;
+    phaseSkipNotes?: string[]; dropped?: number; observerMaxCalls?: number;
   },
 ): Promise<PhaseAOut | null> {
-  let result: ObservationResult;
+  const dropped = (p.dropped ?? 0) + Math.max(0, p.messages.length - OBSERVER_MAX_MESSAGES);
+  let result: UnitOutcome;
   if (!p.admits) {
     result = { status: "empty" };
   } else {
     const remaining = remainingForTimeout(deadlineBefore(p.deadline, duration(PERSIST_RESERVE_MS)));
     if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) {
       if (!p.quarantineIfNoBudget) return null;
-      p.phaseSkipNotes?.push("observation extraction skipped: Stop budget below the floor — range quarantined");
-      result = { status: "retryable", reason: "Stop budget below the observer floor" };
+      p.phaseSkipNotes?.push("observation extraction skipped: Stop budget below the floor — range deferred");
+      result = { status: "continuation", reason: "continuation: 0 lines — the budget was below the observer floor", due: "now" };
     } else {
-      result = await extractObservationsResult(p.messages, {
-        timeoutMs: remaining,
-        context: { priorMessages: toObserverMessages(p.prior), recordedTitles: recordedTitles(store, p.sessionId, p.sourceTime) },
-      });
+      result = await observeUnit(store, p);
     }
   }
+  if (result.status === "ok") result = { status: "ok", observations: groupEqualBodies(result.observations, p.sessionId) };
   // The contradiction judge for the range's decisions (D3): inference only; effects wait for Phase B.
   const decisionFacts = (result.status === "ok" ? result.observations : [])
     .filter(o => o.type === "decision").flatMap(o => o.facts.map(fact => ({ obs: o, fact })));
@@ -372,7 +631,7 @@ async function phaseA(
       console.error(`[decision-extractor] Error in contradiction detection:`, err);
     }
   }
-  return { result, judged, decisionFacts };
+  return { result, judged, decisionFacts, dropped };
 }
 
 /** Phase B effects of an `ok`/`empty` range (inside the transaction): documents, items, renders, causal marker, verdicts. */
@@ -417,6 +676,8 @@ export type ExtractionArgs = {
   deadline?: MonoDeadline;
   /** Test seam: stop after this many batches. */
   maxBatches?: number;
+  /** Test seam (v0.41.2): the observer's model calls per unit in this invocation (default: its budget, at most 6). */
+  observerMaxCalls?: number;
   /** Test seam: runs between a batch's Phase A and its Phase B. */
   beforePhaseB?: () => void;
   phaseSkipNotes?: string[];
@@ -446,11 +707,13 @@ type Unit = {
   humans: number;
   /** The CONTEXT lines the NEXT unit sees (this unit's last turns). */
   tailLines: TranscriptLine[];
+  /** v0.41.2: messages the streamed accumulator dropped upstream (T24's 100-message tail), reported at commit. */
+  dropped?: number;
 };
 
 function unitOfBatch(path: string, epoch: number, batch: Turn[]): Unit {
   const lines = batch.flatMap(t => t.lines);
-  const messages = batch.flatMap(t => t.messages);
+  const messages = batch.flatMap((t, i) => t.messages.map(m => ({ ...m, turn: i })));   // v0.41.2: turn = its index in the unit
   const humans = lines.filter(l => l.kind === "human");
   return {
     range: rangeRefOf(path, epoch, lines), messages, admits: admitsBatch(lines), regex: regexItemsOf(messages),
@@ -494,7 +757,7 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
     units = [{
       range: rangeOfAccumulator(path, start.anchorEpoch, acc), messages: accumulatedMessages(acc), admits: acc.admits,
       regex: { decisions: acc.decisions, antipatterns: acc.antipatterns }, tailSha: acc.lastLineSha!,
-      lastHumanStart: acc.humanStart, humans: acc.humanStart !== null ? 1 : 0, tailLines: [],
+      lastHumanStart: acc.humanStart, humans: acc.humanStart !== null ? 1 : 0, tailLines: [], dropped: accumulatorDropped(acc),
     }];
   } else {
     const turns: Turn[] = segs.map(s => ({ lines: s.lines, messages: toObserverMessages(s.lines), start: s.start, end: s.end }));
@@ -510,13 +773,14 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
     if (args.maxBatches !== undefined && run.batches >= args.maxBatches) break;
     const range = u.range;
 
-    // Phase A — inference, no memory writes. The first batch of a Stop is always decided (a budget skip quarantines
-    // it); later batches wait for the next Stop.
+    // Phase A — inference, no range effects. The first batch of a Stop is always decided (a budget skip quarantines
+    // it as a continuation); later batches wait for the next Stop.
     const a = await phaseA(store, {
-      sessionId: args.sessionId, admits: u.admits, messages: u.messages, prior, sourceTime: null, deadline,
-      quarantineIfNoBudget: run.batches === 0, phaseSkipNotes: args.phaseSkipNotes,
+      sessionId: args.sessionId, transcriptKey: key, range, admits: u.admits, messages: u.messages, prior, sourceTime: null, deadline,
+      quarantineIfNoBudget: run.batches === 0, phaseSkipNotes: args.phaseSkipNotes, dropped: u.dropped, observerMaxCalls: args.observerMaxCalls,
     });
     if (!a) break;
+    if (a.result.status === "abandon") break;   // v0.41.2: committed, or being worked, by another processor
     run.batches++;
     args.beforePhaseB?.();
 
@@ -525,10 +789,15 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
     let persisted: ObservationWithDoc[] = [];
     try {
       db.transaction(() => {
-        if (a.result.status === "retryable") {
-          quarantineRange(store, { sessionId: args.sessionId, key, path, file: start.file, range, reason: a.result.reason, now });
+        if (a.result.status === "retryable" || a.result.status === "continuation") {
+          quarantineRange(store, {
+            sessionId: args.sessionId, key, path, file: start.file, range, reason: a.result.reason, now,
+            continuation: a.result.status === "continuation",
+          });
         } else {
           persisted = commitRangeEffects(store, { sessionId: args.sessionId, key, range, a, regex: u.regex, now, replay: false });
+          finishCheckpoint(db, checkpointKey(args.sessionId, key, DECISION_HOOK, range.key), { sessionId: args.sessionId, transcriptKey: key, hook: DECISION_HOOK, range });
+          noteDropped(db, { sessionId: args.sessionId, rangeKey: range.key, dropped: a.dropped, now });
         }
         const moved = !casAdvanceCursor(db, args.sessionId, DECISION_HOOK, key, cursor, {
           transcriptPath: path, file: start.file, anchorEpoch: start.anchorEpoch, byteOffset: range.to,
@@ -542,8 +811,9 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
       throw err;
     }
     cursor = readStopCursor(db, args.sessionId, DECISION_HOOK, key);
-    if (a.result.status === "retryable") {
+    if (a.result.status === "retryable" || a.result.status === "continuation") {
       run.quarantined++;
+      break;   // v0.41.2 (T9-1): the loop ends at its first quarantined unit — at most one retry row per Stop
     } else {
       const observations = a.result.status === "ok" ? a.result.observations : [];
       run.committed++;
@@ -576,7 +846,13 @@ export type ReplayRun = { replayed: number; unavailable: number; rescheduled: nu
  */
 export async function replayDueRetries(
   store: Store,
-  opts: { deadline: MonoDeadline; sessionId?: string; limit?: number; beforePhaseB?: () => void; afterClaim?: () => void },
+  opts: {
+    deadline: MonoDeadline; sessionId?: string; limit?: number; beforePhaseB?: () => void; afterClaim?: () => void;
+    /** v0.41.2: only continuation rows (the worker's first slice). */
+    continuationOnly?: boolean;
+    /** Test seam (v0.41.2): the observer's model calls per range in this invocation. */
+    observerMaxCalls?: number;
+  },
 ): Promise<ReplayRun> {
   const out: ReplayRun = { replayed: 0, unavailable: 0, rescheduled: 0, persisted: [], ranges: [] };
   const db = store.db;
@@ -587,6 +863,7 @@ export async function replayDueRetries(
      FROM stop_retries WHERE hook = ?
        AND ((state = 'queued' AND next_retry_at <= ?) OR (state = 'claimed' AND lease_expires_at < ?))
        ${opts.sessionId ? "AND session_id = ?" : ""}
+       ${opts.continuationOnly ? "AND last_error LIKE 'continuation:%'" : ""}
      ORDER BY next_retry_at, id LIMIT ?`
   ).all(...[DECISION_HOOK, now0, now0, ...(opts.sessionId ? [opts.sessionId] : []), opts.limit ?? 1]) as RetryRow[];
   for (const r of due) {
@@ -618,9 +895,17 @@ export async function replayDueRetries(
     const range: RangeRef = { anchorEpoch: r.anchor_epoch, from: r.from_offset, to: r.to_offset, sha: r.range_sha, key: r.range_key, sourceTime: r.source_time };
     const prior = lastTurnsBefore(r.transcript_path, r.from_offset, CONTEXT_PRIOR_TURNS);
     const a = await phaseA(store, {
-      sessionId: r.session_id, admits: acc.admits, messages: accumulatedMessages(acc), prior, sourceTime: r.source_time,
-      deadline: opts.deadline, quarantineIfNoBudget: true,
+      sessionId: r.session_id, transcriptKey: r.transcript_key, range, admits: acc.admits, messages: accumulatedMessages(acc), prior,
+      sourceTime: r.source_time, deadline: opts.deadline, quarantineIfNoBudget: true, dropped: accumulatorDropped(acc),
+      observerMaxCalls: opts.observerMaxCalls,
     });
+    if (a!.result.status === "abandon") {
+      // v0.41.2: committed by another processor (its tombstone) → this row is done; another processor ahead → due again soon.
+      if (a!.result.committedElsewhere) setState(`state = 'done', claim_token = NULL, lease_expires_at = NULL, last_error = 'committed by another processor'`);
+      else setState(`state = 'queued', claim_token = NULL, lease_expires_at = NULL, next_retry_at = ?`, isoAfter(isoNow(), CONTINUATION_DELAY_MS));
+      out.rescheduled++;
+      continue;
+    }
     opts.beforePhaseB?.();
     const now = isoNow();
     let persisted: ObservationWithDoc[] = [];
@@ -631,16 +916,24 @@ export async function replayDueRetries(
             a!.result.reason, nextRetryAt(now, r.attempts + 1))) throw new ClaimLost();
           return;
         }
+        if (a!.result.status === "continuation") {
+          // v0.41.2: progress kept in the checkpoint, not a failure — attempts unchanged, no failure backoff.
+          const due = a!.result.due === "now" ? now : isoAfter(now, CONTINUATION_DELAY_MS);
+          if (!setState(`state = 'queued', claim_token = NULL, lease_expires_at = NULL, last_error = ?, next_retry_at = ?`, a!.result.reason, due)) throw new ClaimLost();
+          return;
+        }
         persisted = commitRangeEffects(store, {
           sessionId: r.session_id, key: r.transcript_key, range, a: a!, regex: { decisions: acc.decisions, antipatterns: acc.antipatterns }, now, replay: true,
         });
+        finishCheckpoint(db, checkpointKey(r.session_id, r.transcript_key, DECISION_HOOK, range.key), { sessionId: r.session_id, transcriptKey: r.transcript_key, hook: DECISION_HOOK, range });
+        noteDropped(db, { sessionId: r.session_id, rangeKey: range.key, dropped: a!.dropped, now });
         if (!setState(`state = 'done', claim_token = NULL, lease_expires_at = NULL`)) throw new ClaimLost();
       }).immediate();
     } catch (err) {
       if (err instanceof ClaimLost) continue;   // the lease expired and another processor took it: nothing of ours stands
       throw err;
     }
-    if (a!.result.status === "retryable") { out.rescheduled++; continue; }
+    if (a!.result.status === "retryable" || a!.result.status === "continuation") { out.rescheduled++; continue; }
     out.replayed++;
     out.persisted.push(...persisted);
     out.ranges.push(range);
