@@ -285,7 +285,7 @@ export async function probeRerankHealth(
 
   if (maxScore < calibFloor) {
     failures.push(
-      `calibration: max relevant-doc score ${maxScore.toExponential(2)} < floor ${calibFloor} — reranker is inert/degenerate (likely the deprecated zerank-2 GGUF; re-deploy the seq-cls sidecar)`,
+      `calibration: max relevant-doc score ${maxScore.toExponential(2)} < floor ${calibFloor} — reranker is inert/degenerate (likely a zerank-2 GGUF without its score head; serve the Q8_0 GGUF that carries it, or the seq-cls sidecar)`,
     );
   }
   if (minMargin === Infinity) minMargin = 0; // no pair scored

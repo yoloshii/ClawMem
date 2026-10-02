@@ -4199,7 +4199,7 @@ async function cmdDoctor() {
     } else {
       console.log(`${c.red}✗${c.reset} Reranker: degenerate / not discriminating (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)})`);
       for (const f of health.failures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
-      console.log(`   ${c.dim}Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".${c.reset}`);
+      console.log(`   ${c.dim}Likely a zerank-2 GGUF without its score head (most uploads lack it) — serve the Q8_0 GGUF that carries it, or the seq-cls sidecar. See docs/guides/inference-services.md.${c.reset}`);
       issues++;
     }
   } catch (err) {
@@ -4515,7 +4515,7 @@ async function cmdRerankHealth(args: string[]) {
   } else {
     console.log(`${c.red}✗ Reranker degenerate / not discriminating${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)}`);
     for (const f of health.failures) console.log(`  - ${f}`);
-    console.log(`Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".`);
+    console.log(`Likely a zerank-2 GGUF without its score head (most uploads lack it) — serve the Q8_0 GGUF that carries it, or the seq-cls sidecar. See docs/guides/inference-services.md.`);
   }
   // Non-zero exit on degeneracy so systemd OnFailure= / a scheduled check can alert. Use exitCode
   // (not process.exit) so main()'s finally { closeStore() } still runs.
