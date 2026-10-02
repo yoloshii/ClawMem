@@ -1,6 +1,6 @@
 # ClawMem zerank-2 seq-cls reranker sidecar.
 # Serves zeroentropy/zerank-2-reranker as a faithful Qwen3ForSequenceClassification cross-encoder
-# (the llama.cpp GGUF route drops zerank's score head; this serves the real one via transformers).
+# (llama.cpp's standard GGUF converter drops zerank's score head; this serves the real one via transformers).
 #
 # LICENSE: this image bundles only the MIT recipe code. zerank-2's WEIGHTS are Apache-2.0
 # (relicensed by ZeroEntropy on 2026-07-24) and are downloaded at convert time — never bundled here.

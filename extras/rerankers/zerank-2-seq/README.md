@@ -1,4 +1,4 @@
-# zerank-2 seq-cls reranker sidecar (SOTA)
+# zerank-2 seq-cls reranker sidecar (bf16 reference)
 
 A drop-in `/v1/rerank` sidecar that serves **ZeroEntropy [zerank-2](https://huggingface.co/zeroentropy/zerank-2-reranker)** — a state-of-the-art cross-encoder (NDCG@10 ≈ 0.671, ahead of Cohere rerank-3.5 and Gemini-2.5-Flash listwise) — **faithfully**, via transformers, with a reproducible correctness gate.
 
@@ -10,11 +10,13 @@ export CLAWMEM_RERANK_URL=http://<this-host>:8090
 
 ClawMem's `query` and `intent_search` pipelines call `/v1/rerank` on that URL exactly as before.
 
+> **Most setups should serve the Q8_0 GGUF instead.** ClawMem's [inference services guide](../../../docs/guides/inference-services.md#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar) serves zerank-2 as a Q8_0 GGUF that carries its score head: ~6 GB of VRAM instead of this sidecar's ~9 GB, measured to rank like it. Use this sidecar for the unquantized bf16 model, or for a correctness gate you can re-run yourself.
+
 ---
 
-## Why this exists (and why the GGUF is deprecated)
+## Why this exists (and why most zerank-2 GGUFs are broken)
 
-The previously-recommended `zerank-2-Q4_K_M.gguf` reranker is **broken** and is deprecated. zerank-2 is a `Qwen3ForCausalLM` that scores a `(query, document)` pair on the logit of a single relevance token (`"Yes"`, id `9454`) via a sentence-transformers `LogitScore` head. llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when it finds the literal string `# Qwen3-Reranker` in the model card — zerank-2's card lacks it, so the previously-recommended GGUF (and anything built by the current/standard llama.cpp converter path) is a **headless causal LM**. Served under `--reranking` it produces near-zero, uninformative scores → reranking degrades to an inert RRF-dominated passthrough, silently.
+The `zerank-2-Q4_K_M.gguf` reranker ClawMem recommended before v0.11.3 is **broken**. zerank-2 is a `Qwen3ForCausalLM` that scores a `(query, document)` pair on the logit of a single relevance token (`"Yes"`, id `9454`) via a sentence-transformers `LogitScore` head. llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when it finds the literal string `# Qwen3-Reranker` in the model card — zerank-2's card lacks it, so the previously-recommended GGUF (and anything built by the current/standard llama.cpp converter path) is a **headless causal LM**. Served under `--reranking` it produces near-zero, uninformative scores → reranking degrades to an inert RRF-dominated passthrough, silently. A GGUF made with a modified converter that adds the head does work: the Q8_0 GGUF in the inference guide is one, validated against this sidecar.
 
 This recipe sidesteps GGUF entirely. Because zerank-2 uses **tied embeddings**, the relevance logit `hidden · embed_tokens.weight[9454]` is reproduced **exactly** by a standard `Qwen3ForSequenceClassification` whose `num_labels=1` score head is that one embedding row. We convert to that form, **prove** the conversion is bit-exact, and serve it with the model's real chat template and `sigmoid(logit/5)` calibration.
 

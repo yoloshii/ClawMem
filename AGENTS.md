@@ -12,11 +12,11 @@ Three services — **embedding**, **LLM** (query expansion / intent / A-MEM / St
 
 **Choose a stack:**
 - **native** (default) — EmbeddingGemma-300M + qmd-query-expansion-1.7B + qwen3-reranker-0.6B · ~4 GB or in-process · **permissive, commercial OK** · zero-config.
-- **z / SOTA** — zembed-1 + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** · ~16 GB · **Apache-2.0, commercial OK** · best recall.
+- **z / SOTA** — zembed-1 + qmd-query-expansion-1.7B + zerank-2 **Q8_0 GGUF** (carries its score head; or the bf16 seq-cls sidecar) · ~13 GB (~16 GB with the sidecar) · **Apache-2.0, commercial OK** · best recall.
 - **cloud embedding** — Jina/OpenAI/Voyage/Cohere · embedding **only** (LLM + reranker stay local) · no local GPU needed.
 
 **Landmines:**
-- The zerank-2 **GGUF is inert** — llama.cpp drops the score head → ranking silently collapses to RRF. Use the **seq-cls sidecar**; verify with `clawmem rerank-health` (liveness ≠ correctness).
+- Most zerank-2 **GGUFs are inert** — llama.cpp's standard converter drops the score head → ranking silently collapses to RRF. Serve the validated **Q8_0 GGUF that carries the head** (`seamon67/Zerank-2-GGUF`, see [inference services](docs/guides/inference-services.md)) or the bf16 **seq-cls sidecar**; verify with `clawmem rerank-health` (liveness ≠ correctness).
 - **A squatted port answers HTTP but serves nothing** — an unrelated service on 8088/8089 used to disable enrichment silently forever. Since v0.37.0 persistent HTTP errors trip the 60s cooldown (405/501 instantly, other non-2xx after 3 consecutive) so the fallback engages, and `clawmem doctor` shape-probes `CLAWMEM_LLM_URL` with a real completion.
 - `-ub` must equal `-b` for embedding/reranking (non-causal attention) or `llama-server` asserts.
 - Changing embedding dimensions → `clawmem embed --force` (full re-embed).

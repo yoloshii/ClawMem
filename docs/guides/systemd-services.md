@@ -303,11 +303,11 @@ EOF
 
 Repeat for the LLM (port 8089) and the **default** reranker (port 8090 — `qwen3-reranker-0.6B` via `--reranking`) with their respective models and flags.
 
-> **The SOTA reranker is not a `llama-server` unit.** The zerank-2 SOTA reranker runs as a transformers **sidecar** (a small container behind the same `/v1/rerank` contract), not a systemd `llama-server` instance — see [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/). The old `zerank-2-Q4_K_M` GGUF served via `--reranking` is deprecated (llama.cpp drops zerank's score head → near-zero, uninformative scores).
+> **The zerank-2 SOTA reranker runs as the same kind of unit** when you serve its Q8_0 GGUF: take the pinned download and the launch line (`--reranking -c 2048 -b 2048 -ub 2048 --parallel 1`) from [inference services](inference-services.md#sota-stack--z-models-16-gb-gpu-apache-20). The bf16 seq-cls sidecar runs as a container instead (same `/v1/rerank` contract) — see [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/). Most other zerank-2 GGUFs, including the old `zerank-2-Q4_K_M`, have no score head and return near-zero, uninformative scores under `--reranking`.
 
 ## Reranker health check (scheduled)
 
-`clawmem rerank-health` probes the reranker for **discrimination** (not just liveness) and exits non-zero when it is degenerate — catching the failure mode where a mis-converted reranker (e.g. the deprecated zerank-2 GGUF, whose llama.cpp conversion drops the score head) returns HTTP 200 + valid JSON but near-zero, non-discriminating scores, silently collapsing the final ranking to RRF. The same probe runs inside `clawmem doctor`; this scheduled unit alerts proactively without query traffic. Schedule it when the reranker is a remote sidecar that could be redeployed/reverted out from under you.
+`clawmem rerank-health` probes the reranker for **discrimination** (not just liveness) and exits non-zero when it is degenerate — catching the failure mode where a mis-converted reranker (e.g. a zerank-2 GGUF whose conversion dropped the score head) returns HTTP 200 + valid JSON but near-zero, non-discriminating scores, silently collapsing the final ranking to RRF. The same probe runs inside `clawmem doctor`; this scheduled unit alerts proactively without query traffic. Schedule it when the reranker is a remote service that could be redeployed/reverted out from under you.
 
 ```bash
 # clawmem-rerank-health.service — oneshot probe; exits 1 if the reranker is degenerate

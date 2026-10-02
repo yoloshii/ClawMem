@@ -11,14 +11,14 @@ Three stacks, picked by hardware, license, and quality needs. This is the decisi
 | Stack | Models | VRAM | License | Retrieval quality / context | Pick when |
 |---|---|---|---|---|---|
 | **QMD native** (default) | EmbeddingGemma-300M (768d) + qmd-query-expansion-1.7B + qwen3-reranker-0.6B | ~4 GB total, or **in-process** (Metal/Vulkan/CPU) | **Permissive — commercial OK** | Good · 2K embed context | Any GPU **or no GPU**; zero-config start (auto-downloads) |
-| **z / SOTA** | zembed-1 (2560d, zELO-distilled from zerank-2) + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** (bf16) | ~16 GB (4.4 + 2.2 + 9) | **Apache-2.0 — commercial OK** | Best (zerank-2 NDCG@10 ahead of Cohere rerank-3.5) · 32K embed context | 16 GB+ GPU; want top recall |
+| **z / SOTA** | zembed-1 (2560d, zELO-distilled from zerank-2) + qmd-query-expansion-1.7B + zerank-2 (**Q8_0 GGUF** that carries its score head) | ~13 GB (4.4 + 2.2 + 6); ~16 GB with the bf16 sidecar reranker | **Apache-2.0 — commercial OK** | Best (zerank-2 NDCG@10 ahead of Cohere rerank-3.5) · 32K embed context | 16 GB+ GPU; want top recall |
 | **Cloud embedding** | Jina v5-text-small (1024d, rec.) / OpenAI / Voyage / Cohere — **embedding only** | none (embedding) | provider ToS | provider-dependent · up to 128K (Cohere) | No local GPU for embedding, or prefer managed. **LLM + reranker still run local/in-process.** |
 
 **Decision axes:** VRAM budget · retrieval quality · context length. Both local stacks allow commercial use; cloud embedding follows the provider's terms. The default native stack is the right starting point for most users; upgrade to the z-stack with a 16 GB+ GPU when you want top recall; use cloud embedding when you have no local GPU to spare for embeddings.
 
 ## Landmines (read before serving)
 
-- **The zerank-2 GGUF is deprecated and inert.** llama.cpp's converter drops zerank's CrossEncoder/LogitScore head, so under `--reranking` it returns HTTP 200 with near-zero, non-discriminating scores — the final ordering silently collapses to RRF. Serve the SOTA reranker via the **seq-cls sidecar** (`extras/rerankers/zerank-2-seq/`), never as a GGUF. Run `clawmem rerank-health` to confirm a reranker actually discriminates (liveness ≠ correctness). Since v0.38.0 a passing probe also **attests the served provider's behavioral fingerprint**, which is what enables remote rerank-score caching (`CLAWMEM_RERANK_PROVIDER_ID` optionally refines the identity; attestations expire after 7 days, and a failed or unfingerprintable probe revokes them — see [configuration](../reference/configuration.md)).
+- **Most zerank-2 GGUFs are inert.** llama.cpp's standard converter drops zerank's CrossEncoder/LogitScore head, so a GGUF built with it — including the `zerank-2-Q4_K_M` GGUF ClawMem recommended before v0.11.3 — returns HTTP 200 under `--reranking` with near-zero, non-discriminating scores, and the final ordering silently collapses to RRF. Serve the SOTA reranker as the **Q8_0 GGUF that carries the head** ([below](#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar)) or as the bf16 **seq-cls sidecar** (`extras/rerankers/zerank-2-seq/`). Run `clawmem rerank-health` to confirm a reranker actually discriminates (liveness ≠ correctness). Since v0.38.0 a passing probe also **attests the served provider's behavioral fingerprint**, which is what enables remote rerank-score caching (`CLAWMEM_RERANK_PROVIDER_ID` optionally refines the identity; attestations expire after 7 days, and a failed or unfingerprintable probe revokes them — see [configuration](../reference/configuration.md)).
 - **`-ub` must equal `-b`** for embedding/reranking models (non-causal attention) or `llama-server` asserts (`non-causal attention requires n_ubatch >= n_tokens`). The zerank-2 sidecar is transformers-served and exempt; the qwen3-reranker GGUF does not need it. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
 - **Changing embedding dimensions requires a full re-embed:** `clawmem embed --force` (idempotent, safe to interrupt/resume).
 - **Set `CLAWMEM_NO_LOCAL_MODELS=true`** for remote-only / dedicated-server setups to fail fast on an unreachable endpoint instead of silently auto-downloading multi-GB GGUFs and running them in-process.
@@ -52,13 +52,13 @@ On CPU, omit `-ngl 99`. If the LLM endpoint (self-hosted or cloud) or the self-h
 
 ## SOTA stack — z models (16 GB+ GPU, Apache-2.0)
 
-ZeroEntropy's distillation-paired stack — best retrieval quality, total ~16 GB VRAM. zembed-1 is distilled from zerank-2 via [zELO](https://docs.zeroentropy.dev), so the pair is mutually optimal. ZeroEntropy relicensed both models from CC-BY-NC-4.0 to Apache-2.0 on 2026-07-24, so commercial use is allowed, and their Hugging Face repos are no longer gated.
+ZeroEntropy's distillation-paired stack — best retrieval quality, total ~13 GB VRAM with the zerank-2 Q8_0 GGUF (~16 GB with the bf16 sidecar instead). zembed-1 is distilled from zerank-2 via [zELO](https://docs.zeroentropy.dev), so the pair is mutually optimal. ZeroEntropy relicensed both models from CC-BY-NC-4.0 to Apache-2.0 on 2026-07-24, so commercial use is allowed, and their Hugging Face repos are no longer gated.
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
 | Embedding | 8088 | [zembed-1-Q4_K_M](https://huggingface.co/Abhiray/zembed-1-Q4_K_M-GGUF) (2.4 GB, 2560d, 32K ctx) | ~4.4 GB | SOTA embedding |
 | LLM | 8089 | qmd-query-expansion-1.7B-q4_k_m | ~2.2 GB | (same as default) |
-| Reranker | 8090 | [zerank-2 seq-cls sidecar](../../extras/rerankers/zerank-2-seq/) (transformers, bf16) | ~9 GB | SOTA reranker — **not** a GGUF |
+| Reranker | 8090 | [zerank-2 Q8_0 GGUF](https://huggingface.co/seamon67/Zerank-2-GGUF) (4.3 GB, carries the score head) | ~6 GB | SOTA reranker |
 
 ```bash
 # Embedding (zembed-1) — -ub MUST equal -b for non-causal attention.
@@ -74,7 +74,37 @@ llama-server -m zembed-1-Q4_K_M.gguf \
   --override-kv tokenizer.ggml.add_eos_token=bool:true \
   --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 
-# Reranker (zerank-2) — seq-cls SIDECAR (transformers, bf16), NOT a llama-server GGUF:
+# Reranker (zerank-2) — the Q8_0 GGUF that carries zerank's score head, pinned to the
+# revision validated below. Check the hash: most other zerank-2 GGUFs have no head.
+wget -O Zerank-2-4B-Q8_0.gguf \
+  https://huggingface.co/seamon67/Zerank-2-GGUF/resolve/bc7449f38bc0ea3ecc36ef75bdedd1575927607f/Zerank-2-4B-Q8_0.gguf
+echo "0c59e6160ac5ff1637ce7879cae8ee58ec613e974929f709d394edcaad1f7165  Zerank-2-4B-Q8_0.gguf" | sha256sum -c
+llama-server -m Zerank-2-4B-Q8_0.gguf \
+  --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 -b 2048 -ub 2048 --parallel 1
+```
+
+### zerank-2 reranker: the Q8_0 GGUF or the bf16 sidecar
+
+[`seamon67/Zerank-2-GGUF`](https://huggingface.co/seamon67/Zerank-2-GGUF) is a community conversion (Apache-2.0) that adds what llama.cpp's standard converter leaves out: a classification head on zerank's single `Yes` token, rank pooling, and zerank's own chat template. llama.cpp then returns scores on zerank's native `sigmoid(logit/5)` scale, so the `clawmem rerank-health` thresholds apply unchanged.
+
+Check that it scores like zerank-2 before you point ClawMem at it:
+
+```bash
+curl -s -X POST localhost:8090/v1/rerank -H 'Content-Type: application/json' \
+  -d '{"query":"What is the capital of France?","documents":["The capital of France is Paris.","Bananas are rich in potassium and grow in tropical climates."]}'
+# -> ~0.96 for Paris, ~0.08 for bananas. A GGUF without the head scores both near zero.
+clawmem rerank-health
+```
+
+**Measured against the bf16 sidecar** on 240 query–document pairs from a real vault (24 queries): the same top document for 24 of 24 queries, the same top-three set for 24 of 24, mean Kendall τ 0.994, and scores within 0.021 (mean 0.005). That run used an early-2026 llama.cpp-based build; upstream llama.cpp b11347 then served the same GGUF on the same 240 pairs and ranked them exactly as that build did (τ 1.000), with scores within 0.013 of it. On an RTX 3090 the GGUF used ~6 GB of VRAM with `--parallel 1`, against the sidecar's ~9 GB, and it was slower per document: 42 vs 33 ms at ClawMem's request shape (400-character documents, four per request).
+
+- **Use Q8_0.** The same repo's Q4_K_M (~4.3 GB VRAM) changed the top document for 2 of 24 queries and moved scores by up to 0.10.
+- **`-c 2048` fits ordinary queries.** ClawMem sends a remote reranker at most the first 400 characters of each document, but sends the query (with any intent prefix) whole, and llama-server refuses a pair that does not fit. With `--parallel 1` one pair can use all 2,048 tokens; if you rerank very long queries, raise `-c`, `-b` and `-ub` together. A larger `-ub` grows the compute buffer (about 2.5 GB at 4096).
+- **Re-run `clawmem rerank-health` after any llama.cpp upgrade.** The GGUF was validated on llama.cpp b11347.
+
+**The bf16 sidecar** ([`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/)) serves the original weights through transformers and ships a reproducible correctness gate. It is the reference the GGUF was measured against: use it when you want the unquantized model, or a gate you can re-run yourself.
+
+```bash
 cd extras/rerankers/zerank-2-seq
 docker compose build
 docker compose run --rm convert                   # download + convert + verify (all gates must pass)
@@ -192,9 +222,9 @@ certification — precision is measured from your vault's audit rows.
 
 ## Reranker server
 
-Cross-encoder reranking for the `query` (4000-char context, deep) and `intent_search` (200-char context, fast) pipelines on port 8090, via the `/v1/rerank` endpoint.
+Cross-encoder reranking for the `query` (4000-char context, deep) and `intent_search` (200-char context, fast) pipelines on port 8090, via the `/v1/rerank` endpoint. Those contexts are the text each pipeline selects per candidate; a remote reranker receives at most the first 400 characters of it.
 
-- **GPU with VRAM to spare:** the zerank-2 seq-cls sidecar (recipe above). **Apache-2.0.**
+- **GPU with VRAM to spare:** zerank-2 — the Q8_0 GGUF (~6 GB) or the bf16 seq-cls sidecar (~9 GB), both [above](#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar). **Apache-2.0.**
 - **CPU / limited VRAM:** qwen3-reranker-0.6B-Q8_0 (~600 MB, ~1.3 GB VRAM), the QMD native reranker — auto-downloaded if no server is running.
 
 ```bash
@@ -202,7 +232,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
 
-See the landmines above: the zerank-2 **GGUF is inert** (use the sidecar), and verify discrimination with `clawmem rerank-health`.
+See the landmines above: most zerank-2 **GGUFs are inert** (serve the Q8_0 GGUF that carries the head, or the sidecar), and verify discrimination with `clawmem rerank-health`.
 
 ## Remote GPU
 

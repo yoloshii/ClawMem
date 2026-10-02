@@ -42,18 +42,21 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 
 ---
 
-## Reranker: zerank-2 GGUF deprecated → seq-cls sidecar
+## Reranker: replace a headless zerank-2 GGUF
 
 If you followed an earlier "SOTA upgrade" and are running the **`zerank-2-Q4_K_M` GGUF reranker** on `:8090`, **replace it.** That GGUF is broken: llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when the model card contains the literal `# Qwen3-Reranker`, which zerank-2's card lacks — so the previously-recommended GGUF (and any built by the current/standard llama.cpp converter) is a headless causal LM that produces near-zero, uninformative scores under `--reranking`. Reranking silently degrades to an RRF-dominated passthrough.
 
-**Migration** — serve zerank-2 via the seq-cls sidecar instead (transformers, bf16; ships a reproducible correctness gate):
+**Migration** — serve the Q8_0 GGUF from [`seamon67/Zerank-2-GGUF`](https://huggingface.co/seamon67/Zerank-2-GGUF), which carries the head (~6 GB VRAM; pinned download and launch line in [inference services](inference-services.md#sota-stack--z-models-16-gb-gpu-apache-20)), or the bf16 seq-cls sidecar (~9 GB; transformers, ships a reproducible correctness gate):
 
 ```bash
+# The bf16 sidecar (for the GGUF, use the launch line linked above):
 cd extras/rerankers/zerank-2-seq
 docker compose build
 docker compose run --rm convert                   # download + convert + verify
 docker compose up -d reranker                      # /v1/rerank on :8090
 ```
+
+**Already on the sidecar?** It stays correct, and nothing requires a change. The Q8_0 GGUF frees about 3 GB of VRAM, is somewhat slower per document, and ranked like the sidecar in a side-by-side comparison ([measurements](inference-services.md#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar)). To switch, stop the sidecar (`docker compose stop reranker`; its `unless-stopped` policy keeps it down across reboots), start the GGUF on `:8090`, and run `clawmem rerank-health`.
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
 

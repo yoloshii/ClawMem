@@ -5,7 +5,7 @@ Set up ClawMem as persistent memory for AI coding agents in under 5 minutes. By 
 ## Prerequisites
 
 - [Bun](https://bun.sh) v1.0+ — install via `curl -fsSL https://bun.sh/install | bash`, not snap (snap Bun has stdin restrictions that break hooks)
-- A GPU for local inference (default models need ~4GB VRAM; the full SOTA stack needs ~16GB, the zerank-2 sidecar alone ~9GB). Or use [cloud embedding](guides/cloud-embedding.md)
+- A GPU for local inference (default models need ~4GB VRAM; the full SOTA stack needs ~13GB with the zerank-2 Q8_0 GGUF, ~16GB with the bf16 sidecar). Or use [cloud embedding](guides/cloud-embedding.md)
 - Claude Code, OpenClaw, or any MCP-compatible client
 
 ## Install
@@ -71,7 +71,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
 
-> **SOTA upgrade (16GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`, **plus `--pooling last --override-kv tokenizer.ggml.add_eos_token=bool:true`** — last-token models need their EOS anchor; the exact launch line is in [the inference services guide](guides/inference-services.md)). For the reranker, use the **zerank-2 seq-cls sidecar** (transformers, bf16) at [`extras/rerankers/zerank-2-seq/`](../extras/rerankers/zerank-2-seq/) — the `zerank-2-Q4_K_M` GGUF is deprecated (llama.cpp drops its score head). **Apache-2.0** — commercial use OK.
+> **SOTA upgrade (16GB+ GPU):** Replace embedding with zembed-1-Q4_K_M (2560d, `-b 2048 -ub 2048`, **plus `--pooling last --override-kv tokenizer.ggml.add_eos_token=bool:true`** — last-token models need their EOS anchor; the exact launch line is in [the inference services guide](guides/inference-services.md)). For the reranker, serve the **zerank-2 Q8_0 GGUF that carries its score head** (pinned download and launch line in the same guide) or the bf16 **seq-cls sidecar** at [`extras/rerankers/zerank-2-seq/`](../extras/rerankers/zerank-2-seq/). Most other zerank-2 GGUFs, including the `zerank-2-Q4_K_M` one recommended before v0.11.3, have no score head and score near zero. **Apache-2.0** — commercial use OK.
 
 See [GPU services guide](guides/systemd-services.md) for systemd setup and remote GPU configuration.
 
