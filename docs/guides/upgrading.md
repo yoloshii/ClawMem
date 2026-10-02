@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.41.2**.
+Guide for upgrading between released versions. Current: **v0.41.3**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,6 +59,27 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 **Already on the sidecar?** It stays correct, and nothing requires a change. The Q8_0 GGUF frees about 3 GB of VRAM, is somewhat slower per document, and ranked like the sidecar in a side-by-side comparison ([measurements](inference-services.md#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar)). To switch, stop the sidecar (`docker compose stop reranker`; its `unless-stopped` policy keeps it down across reboots), start the GGUF on `:8090`, and run `clawmem rerank-health`.
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
+
+---
+
+## v0.41.3: zerank-2 runs as a Q8_0 GGUF; two zembed-1 launch lines gain their flags
+
+**No vault migration.** The docs and one CLI hint changed.
+
+- **Running the zerank-2 sidecar?** It stays correct, and switching is optional — see
+  [Reranker: replace a headless zerank-2 GGUF](#reranker-replace-a-headless-zerank-2-gguf). Running a
+  zerank-2 GGUF from any other source? Check it with `clawmem rerank-health`: most have no score head.
+- **Launched zembed-1 from the cloud-embedding guide or the systemd example?** Those lines lacked
+  `--pooling last` and `--override-kv tokenizer.ggml.add_eos_token=bool:true`. Add both, restart the
+  server, then run a full `clawmem embed --force`: if either flag changed the server's pooling or EOS
+  handling, the vectors already stored are not comparable with new ones
+  ([troubleshooting](../troubleshooting.md#search--retrieval)). Skip the re-embed only if you know both
+  flags were no-ops for your GGUF, because its metadata already sets last-token pooling and
+  `tokenizer.ggml.add_eos_token`.
+- **License:** zerank-2 and zembed-1 are Apache-2.0 since 2026-07-24, and the sidecar's convert step
+  needs no `HF_TOKEN`.
+
+Otherwise no re-embed, reindex or `clawmem setup hooks` is needed.
 
 ---
 

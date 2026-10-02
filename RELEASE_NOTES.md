@@ -4,6 +4,69 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.41.3 — zerank-2 runs as a Q8_0 GGUF, and the reranker hint stops calling every GGUF broken
+
+Since v0.11.3 the docs said every zerank-2 GGUF is inert, because llama.cpp's standard converter drops
+zerank's score head, and that the SOTA reranker must run as the bf16 seq-cls sidecar (~9 GB of VRAM). A
+community conversion, `seamon67/Zerank-2-GGUF`, carries the head. Its Q8_0 file ranks like the sidecar
+in about two thirds of the VRAM, so the docs now recommend it. `clawmem doctor` and
+`clawmem rerank-health` still blamed "the deprecated zerank-2 GGUF" for a degenerate reranker and
+pointed at a CLAUDE.md section that no longer exists. Two guides launched zembed-1 without the flags its
+last-token pooling needs, and the docs still called the z models non-commercial after ZeroEntropy
+relicensed them.
+
+### What changed
+
+- **The zerank-2 reranker can run as a Q8_0 GGUF.** `docs/guides/inference-services.md` gives a
+  download pinned to revision `bc7449f` with its sha256, the launch line
+  (`llama-server --reranking -c 2048 -b 2048 -ub 2048 --parallel 1`), a scoring check and the
+  measurements below. The SOTA stack drops from ~16 GB to ~13 GB of VRAM. The bf16 sidecar in
+  `extras/rerankers/zerank-2-seq/` stays as the reference, with its reproducible correctness gate. Most
+  other zerank-2 GGUFs still have no score head, and the docs say so. README, AGENTS.md, SKILL.md, the
+  quickstart, troubleshooting and the cloud-embedding, systemd and upgrading guides point at the GGUF
+  route, and the introduction's diagram no longer names the sidecar.
+- **The degenerate-reranker hint** that `clawmem doctor` and `clawmem rerank-health` print now names a
+  zerank-2 GGUF without its score head, offers the Q8_0 GGUF or the sidecar, and points at
+  `docs/guides/inference-services.md`. The probe's calibration failure names the same cause and both
+  routes.
+- **zembed-1 launch lines.** The cloud-embedding guide and the systemd example unit now pass
+  `--pooling last` and `--override-kv tokenizer.ggml.add_eos_token=bool:true`, as the inference-services
+  guide already did. The systemd guide says to drop both for a mean-pooling model like EmbeddingGemma.
+- **License.** ZeroEntropy relicensed zerank-2 and zembed-1 from CC-BY-NC-4.0 to Apache-2.0 on
+  2026-07-24 and ungated their Hugging Face repos. The stack tables, the SOTA sections, the sidecar
+  recipe and the architecture diagram now say commercial use is allowed, and the sidecar's convert step
+  needs no `HF_TOKEN`.
+
+### Verification
+
+The Q8_0 GGUF was measured against the bf16 sidecar on 240 query–document pairs from a real vault (24
+queries): the same top document for 24 of 24 queries, the same top-three set for 24 of 24, mean Kendall
+τ 0.994, and scores within 0.021 (mean 0.005), on the same `sigmoid(logit/5)` scale. Upstream llama.cpp
+b11347 ranks the same pairs exactly as the build that measured them (τ 1.000, scores within 0.013). On
+an RTX 3090 it uses ~6 GB of VRAM against the sidecar's ~9 GB, at 42 vs 33 ms per document at
+ClawMem's request shape. The same repo's Q4_K_M changed the top document for 2 of 24 queries and is not
+recommended. `clawmem rerank-health` passes against the Q8_0 server (coverage 8/8, max score 0.97, min
+margin 0.66).
+
+Full suite on Bun 1.4.2: 3,425 pass / 1 fail across 178 files. The failure is a wall-clock test
+(`tests/hooks/hook-alignment.integration.test.ts`) whose second turn ran past its 1,000 ms budget
+under the suite's load; it passes alone, 5 of 5, both here and on v0.41.2. The suite's first run also
+hit a flake that v0.41.2 already had: two env-override tests in `tests/unit/text-similarity.test.ts`
+re-imported a module with `?t=` + `Date.now()`, so two imports in the same millisecond shared a cached
+module (the file failed in 20 of 30 runs on v0.41.2). Each re-import now gets a unique specifier, and
+the file passed 30 of 30 runs. The adversarial review (one session) cleared the docs at its second
+turn, and the hint fix and the zembed-1 lines at its third, with zero remaining findings.
+
+### What didn't change
+
+- Only the hint's text changed in code: reranking, the rerank cache, the health thresholds and the
+  in-process fallback behave as in v0.41.2.
+- The default stack (qwen3-reranker-0.6B) is unchanged, and the sidecar recipe works as before.
+- No migration, reindex or re-embed is needed for the release itself. A zembed-1 server launched
+  without the two flags may need a re-embed once they are added (see upgrading).
+
+---
+
 ## v0.41.2 — the observer counts its prompt in tokens and keeps room for its reply
 
 v0.41.1 bounded the observer's prompt in characters: at most 8,000 for the CONTEXT section and the
