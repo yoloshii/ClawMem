@@ -563,8 +563,10 @@ describe("passesMergeSafety", () => {
     // valid override without regressing on invalid inputs.
     process.env.CLAWMEM_MERGE_SCORE_NORMAL = "0.75";
     try {
-      // Re-import the module to pick up the env override
-      const mod = await import("../../src/text-similarity.ts?t=" + Date.now());
+      // Re-import the module to pick up the env override. The specifier must be
+      // unique per import: Date.now() repeats within a millisecond, and Bun then
+      // returns the previous test's cached module instance.
+      const mod = await import("../../src/text-similarity.ts?t=" + crypto.randomUUID());
       expect(mod.MERGE_SCORE_NORMAL).toBe(0.75);
     } finally {
       delete process.env.CLAWMEM_MERGE_SCORE_NORMAL;
@@ -574,7 +576,7 @@ describe("passesMergeSafety", () => {
   it("env override: invalid CLAWMEM_MERGE_SCORE_NORMAL falls back to default", async () => {
     process.env.CLAWMEM_MERGE_SCORE_NORMAL = "not-a-number";
     try {
-      const mod = await import("../../src/text-similarity.ts?t=" + Date.now());
+      const mod = await import("../../src/text-similarity.ts?t=" + crypto.randomUUID());
       expect(mod.MERGE_SCORE_NORMAL).toBe(0.93);
     } finally {
       delete process.env.CLAWMEM_MERGE_SCORE_NORMAL;
