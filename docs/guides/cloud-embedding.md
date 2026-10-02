@@ -114,7 +114,7 @@ llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 ```
 
-**SOTA upgrade (16GB+ GPU):** **ZeroEntropy zembed-1** (2560 dimensions, 32K context, SOTA retrieval quality, ~4.4GB VRAM) paired with the **zerank-2 seq-cls reranker sidecar** (distillation-paired via zELO). **CC-BY-NC-4.0** — non-commercial only.
+**SOTA upgrade (16GB+ GPU):** **ZeroEntropy zembed-1** (2560 dimensions, 32K context, SOTA retrieval quality, ~4.4GB VRAM) paired with the **zerank-2 seq-cls reranker sidecar** (distillation-paired via zELO). **Apache-2.0** — commercial use OK.
 
 ```bash
 llama-server -m zembed-1-Q4_K_M.gguf \

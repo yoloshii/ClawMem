@@ -1,4 +1,4 @@
-# zerank-2 seq-cls reranker sidecar (SOTA, non-commercial)
+# zerank-2 seq-cls reranker sidecar (SOTA)
 
 A drop-in `/v1/rerank` sidecar that serves **ZeroEntropy [zerank-2](https://huggingface.co/zeroentropy/zerank-2-reranker)** — a state-of-the-art cross-encoder (NDCG@10 ≈ 0.671, ahead of Cohere rerank-3.5 and Gemini-2.5-Flash listwise) — **faithfully**, via transformers, with a reproducible correctness gate.
 
@@ -18,7 +18,7 @@ The previously-recommended `zerank-2-Q4_K_M.gguf` reranker is **broken** and is 
 
 This recipe sidesteps GGUF entirely. Because zerank-2 uses **tied embeddings**, the relevance logit `hidden · embed_tokens.weight[9454]` is reproduced **exactly** by a standard `Qwen3ForSequenceClassification` whose `num_labels=1` score head is that one embedding row. We convert to that form, **prove** the conversion is bit-exact, and serve it with the model's real chat template and `sigmoid(logit/5)` calibration.
 
-> **License:** zerank-2 is **CC-BY-NC-4.0 (non-commercial)**. This recipe is MIT code; it **never bundles the weights** — `build_and_verify.py` downloads them for *your own* non-commercial use. ClawMem's default reranker stays the permissively-licensed `qwen3-reranker-0.6B`; this is an opt-in upgrade.
+> **License:** zerank-2 is **Apache-2.0** (ZeroEntropy relicensed it from CC-BY-NC-4.0 on 2026-07-24), so commercial use is allowed. This recipe is MIT code; it **never bundles the weights** — `build_and_verify.py` downloads them at convert time. ClawMem's default reranker stays `qwen3-reranker-0.6B`; this is an opt-in upgrade.
 
 ---
 
@@ -26,7 +26,7 @@ This recipe sidesteps GGUF entirely. Because zerank-2 uses **tied embeddings**, 
 
 - An NVIDIA GPU with **~9 GiB free VRAM** (bf16) for the reranker. A 12 GB card is comfortable for the sidecar **alone**; budget **16 GB+** for the full co-located SOTA stack (embedding + LLM + reranker).
 - **NVIDIA Container Toolkit** (for `--gpus`/`docker compose` GPU access).
-- A Hugging Face account that has **accepted the zerank-2 license**, and an `HF_TOKEN` for the one-off convert step.
+- Network access to Hugging Face for the one-off convert step. The zerank-2 repo is no longer gated, so no account or `HF_TOKEN` is needed.
 
 ---
 
@@ -37,7 +37,7 @@ cd extras/rerankers/zerank-2-seq
 docker compose build
 
 # One-off: download + convert + run ALL correctness gates into ./models/zerank-2-seq
-HF_TOKEN=hf_xxx docker compose run --rm convert
+docker compose run --rm convert
 
 # Serve on :8090 (boot-persistent)
 docker compose up -d reranker
@@ -73,7 +73,7 @@ It runs against the source model, so it verifies **any** copy of the weights —
 ## Two ways to get the weights
 
 1. **Reproduce (trustless, default).** `build_and_verify.py` downloads `zeroentropy/zerank-2-reranker` and performs the conversion itself, then gates it. You trust only ZeroEntropy's official weights + this MIT code.
-2. **Pull a pre-converted upload, then verify it.** A community conversion exists at [`baseten-admin/zerank-2-reranker-seq`](https://huggingface.co/baseten-admin/zerank-2-reranker-seq). Download it into `./models/zerank-2-seq`, then run the gate in **verify-only** mode — it skips conversion but still downloads the official `ZR_SRC` to prove the seq-cls logits match: `ZR_VERIFY_ONLY=1 HF_TOKEN=hf_xxx docker compose run --rm convert`. The gate verifies whatever you point `ZR_OUT` at, and **fails a bad upload** (e.g. one converted on the wrong token).
+2. **Pull a pre-converted upload, then verify it.** A community conversion exists at [`baseten-admin/zerank-2-reranker-seq`](https://huggingface.co/baseten-admin/zerank-2-reranker-seq). Download it into `./models/zerank-2-seq`, then run the gate in **verify-only** mode — it skips conversion but still downloads the official `ZR_SRC` to prove the seq-cls logits match: `ZR_VERIFY_ONLY=1 docker compose run --rm convert`. The gate verifies whatever you point `ZR_OUT` at, and **fails a bad upload** (e.g. one converted on the wrong token).
 
 ---
 
@@ -94,7 +94,7 @@ It runs against the source model, so it verifies **any** copy of the weights —
 | `ZR_PORT` | `8090` | sidecar port |
 | `ZR_TEMP` | `5.0` | calibration temperature → `sigmoid(logit/ZR_TEMP)` |
 | `ZR_MAXLEN` | `8192` | max tokens per pair (doc tail truncated to fit; prefix preserved) |
-| `HF_TOKEN` | — | required for the convert download (gated model) |
+| `HF_TOKEN` | — | optional: the zerank-2 repo is no longer gated |
 
 ---
 

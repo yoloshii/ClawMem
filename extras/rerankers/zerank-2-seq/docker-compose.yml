@@ -1,13 +1,13 @@
 # ClawMem zerank-2 seq-cls reranker sidecar.
 #
 #   1. Build:              docker compose build
-#   2. Convert + verify:   HF_TOKEN=hf_xxx docker compose run --rm convert
+#   2. Convert + verify:   docker compose run --rm convert
 #   3. Serve on :8090:     docker compose up -d reranker
 #
 # Then point ClawMem at it:   export CLAWMEM_RERANK_URL=http://<this-host>:8090
 #
-# Requires the NVIDIA Container Toolkit. zerank-2 weights are CC-BY-NC-4.0 (non-commercial);
-# accept the model license on Hugging Face and pass HF_TOKEN for the one-off convert step.
+# Requires the NVIDIA Container Toolkit. zerank-2 weights are Apache-2.0 and the Hugging Face repo
+# is not gated, so the one-off convert step needs no HF_TOKEN.
 x-gpu: &gpu
   deploy:
     resources:

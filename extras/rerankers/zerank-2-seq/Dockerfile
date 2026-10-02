@@ -2,8 +2,8 @@
 # Serves zeroentropy/zerank-2-reranker as a faithful Qwen3ForSequenceClassification cross-encoder
 # (the llama.cpp GGUF route drops zerank's score head; this serves the real one via transformers).
 #
-# LICENSE: this image bundles only the MIT recipe code. zerank-2's WEIGHTS are CC-BY-NC-4.0
-# (non-commercial) and are downloaded at convert time for YOUR own use — never redistributed here.
+# LICENSE: this image bundles only the MIT recipe code. zerank-2's WEIGHTS are Apache-2.0
+# (relicensed by ZeroEntropy on 2026-07-24) and are downloaded at convert time — never bundled here.
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 RUN pip install --no-cache-dir \

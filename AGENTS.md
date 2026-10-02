@@ -12,7 +12,7 @@ Three services — **embedding**, **LLM** (query expansion / intent / A-MEM / St
 
 **Choose a stack:**
 - **native** (default) — EmbeddingGemma-300M + qmd-query-expansion-1.7B + qwen3-reranker-0.6B · ~4 GB or in-process · **permissive, commercial OK** · zero-config.
-- **z / SOTA** — zembed-1 + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** · ~16 GB · **CC-BY-NC-4.0, non-commercial only** · best recall.
+- **z / SOTA** — zembed-1 + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** · ~16 GB · **Apache-2.0, commercial OK** · best recall.
 - **cloud embedding** — Jina/OpenAI/Voyage/Cohere · embedding **only** (LLM + reranker stay local) · no local GPU needed.
 
 **Landmines:**

@@ -319,8 +319,8 @@ ClawMem uses three inference services — **embedding**, **LLM** (query expansio
 
 | Stack | Models | VRAM | License | When |
 |---|---|---|---|---|
-| **QMD native** (default) | EmbeddingGemma-300M + qmd-query-expansion-1.7B + qwen3-reranker-0.6B | ~4 GB, or in-process | **Permissive — commercial OK** | Any GPU or none; commercial use; zero-config start |
-| **z / SOTA** | zembed-1 + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** | ~16 GB | **CC-BY-NC-4.0 — non-commercial only** | 16 GB+ GPU and non-commercial; best recall |
+| **QMD native** (default) | EmbeddingGemma-300M + qmd-query-expansion-1.7B + qwen3-reranker-0.6B | ~4 GB, or in-process | **Permissive — commercial OK** | Any GPU or none; zero-config start |
+| **z / SOTA** | zembed-1 + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** | ~16 GB | **Apache-2.0 — commercial OK** | 16 GB+ GPU; best recall |
 | **Cloud embedding** | Jina / OpenAI / Voyage / Cohere (embedding only) | none | provider ToS | No local GPU for embedding; LLM + reranker stay local |
 
 **Heads-up before you serve:** the zerank-2 **GGUF is deprecated and inert** — llama.cpp drops its score head, so the SOTA reranker must run as the [seq-cls sidecar](extras/rerankers/zerank-2-seq/), not a GGUF (verify with `clawmem rerank-health`). zembed-1 / reranking need `-ub` = `-b` (non-causal attention). Changing embedding dimensions requires `clawmem embed --force`. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of silent CPU fallback.

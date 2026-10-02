@@ -51,11 +51,11 @@ If you followed an earlier "SOTA upgrade" and are running the **`zerank-2-Q4_K_M
 ```bash
 cd extras/rerankers/zerank-2-seq
 docker compose build
-HF_TOKEN=hf_xxx docker compose run --rm convert   # download + convert + verify
+docker compose run --rm convert                   # download + convert + verify
 docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
-`CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+`CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
 
 ---
 

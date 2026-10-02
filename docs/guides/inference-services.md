@@ -10,11 +10,11 @@ Three stacks, picked by hardware, license, and quality needs. This is the decisi
 
 | Stack | Models | VRAM | License | Retrieval quality / context | Pick when |
 |---|---|---|---|---|---|
-| **QMD native** (default) | EmbeddingGemma-300M (768d) + qmd-query-expansion-1.7B + qwen3-reranker-0.6B | ~4 GB total, or **in-process** (Metal/Vulkan/CPU) | **Permissive — commercial OK** | Good · 2K embed context | Any GPU **or no GPU**; **commercial use**; zero-config start (auto-downloads) |
-| **z / SOTA** | zembed-1 (2560d, zELO-distilled from zerank-2) + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** (bf16) | ~16 GB (4.4 + 2.2 + 9) | **CC-BY-NC-4.0 — non-commercial only** | Best (zerank-2 NDCG@10 ahead of Cohere rerank-3.5) · 32K embed context | 16 GB+ GPU **and** non-commercial; want top recall |
+| **QMD native** (default) | EmbeddingGemma-300M (768d) + qmd-query-expansion-1.7B + qwen3-reranker-0.6B | ~4 GB total, or **in-process** (Metal/Vulkan/CPU) | **Permissive — commercial OK** | Good · 2K embed context | Any GPU **or no GPU**; zero-config start (auto-downloads) |
+| **z / SOTA** | zembed-1 (2560d, zELO-distilled from zerank-2) + qmd-query-expansion-1.7B + zerank-2 seq-cls **sidecar** (bf16) | ~16 GB (4.4 + 2.2 + 9) | **Apache-2.0 — commercial OK** | Best (zerank-2 NDCG@10 ahead of Cohere rerank-3.5) · 32K embed context | 16 GB+ GPU; want top recall |
 | **Cloud embedding** | Jina v5-text-small (1024d, rec.) / OpenAI / Voyage / Cohere — **embedding only** | none (embedding) | provider ToS | provider-dependent · up to 128K (Cohere) | No local GPU for embedding, or prefer managed. **LLM + reranker still run local/in-process.** |
 
-**Decision axes:** VRAM budget · license (commercial vs non-commercial) · retrieval quality · context length. The default native stack is the right starting point for most users and the only stack with no licensing restriction; upgrade to the z-stack only with a 16 GB+ GPU and a non-commercial use case; use cloud embedding when you have no local GPU to spare for embeddings.
+**Decision axes:** VRAM budget · retrieval quality · context length. Both local stacks allow commercial use; cloud embedding follows the provider's terms. The default native stack is the right starting point for most users; upgrade to the z-stack with a 16 GB+ GPU when you want top recall; use cloud embedding when you have no local GPU to spare for embeddings.
 
 ## Landmines (read before serving)
 
@@ -50,9 +50,9 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
 
 On CPU, omit `-ngl 99`. If the LLM endpoint (self-hosted or cloud) or the self-hosted embedding server is unreachable (ECONNREFUSED/ETIMEDOUT), or keeps answering HTTP errors (405 or 501 at once; any other non-2xx except 429 after three in a row, since v0.37.0), ClawMem pauses that endpoint for 60 seconds and uses in-process inference meanwhile, except with `CLAWMEM_NO_LOCAL_MODELS=true` and for a query-path embedding or expansion that carries its own deadline. A user-cancelled request does not start a pause, and the reranker has no such pause.
 
-## SOTA stack — z models (16 GB+ GPU, CC-BY-NC-4.0, non-commercial only)
+## SOTA stack — z models (16 GB+ GPU, Apache-2.0)
 
-ZeroEntropy's distillation-paired stack — best retrieval quality, total ~16 GB VRAM. zembed-1 is distilled from zerank-2 via [zELO](https://docs.zeroentropy.dev), so the pair is mutually optimal.
+ZeroEntropy's distillation-paired stack — best retrieval quality, total ~16 GB VRAM. zembed-1 is distilled from zerank-2 via [zELO](https://docs.zeroentropy.dev), so the pair is mutually optimal. ZeroEntropy relicensed both models from CC-BY-NC-4.0 to Apache-2.0 on 2026-07-24, so commercial use is allowed, and their Hugging Face repos are no longer gated.
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
@@ -77,7 +77,7 @@ llama-server -m zembed-1-Q4_K_M.gguf \
 # Reranker (zerank-2) — seq-cls SIDECAR (transformers, bf16), NOT a llama-server GGUF:
 cd extras/rerankers/zerank-2-seq
 docker compose build
-HF_TOKEN=hf_xxx docker compose run --rm convert   # download + convert + verify (all gates must pass)
+docker compose run --rm convert                   # download + convert + verify (all gates must pass)
 docker compose up -d reranker                      # serves /v1/rerank on :8090
 ```
 
@@ -194,7 +194,7 @@ certification — precision is measured from your vault's audit rows.
 
 Cross-encoder reranking for the `query` (4000-char context, deep) and `intent_search` (200-char context, fast) pipelines on port 8090, via the `/v1/rerank` endpoint.
 
-- **GPU with VRAM to spare:** the zerank-2 seq-cls sidecar (recipe above). **CC-BY-NC-4.0.**
+- **GPU with VRAM to spare:** the zerank-2 seq-cls sidecar (recipe above). **Apache-2.0.**
 - **CPU / limited VRAM:** qwen3-reranker-0.6B-Q8_0 (~600 MB, ~1.3 GB VRAM), the QMD native reranker — auto-downloaded if no server is running.
 
 ```bash
