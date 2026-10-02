@@ -292,7 +292,9 @@ After=default.target
 Type=simple
 ExecStart=/usr/local/bin/llama-server \
   -m %h/models/zembed-1-Q4_K_M.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
+  --embeddings --pooling last \
+  --override-kv tokenizer.ggml.add_eos_token=bool:true \
+  --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 Restart=on-failure
 RestartSec=5
 
@@ -301,7 +303,7 @@ WantedBy=default.target
 EOF
 ```
 
-Repeat for the LLM (port 8089) and the **default** reranker (port 8090 — `qwen3-reranker-0.6B` via `--reranking`) with their respective models and flags.
+The example serves zembed-1, a last-token model, so it keeps `--pooling last` and the EOS override ([why](inference-services.md#sota-stack--z-models-16-gb-gpu-apache-20)); drop both flags for a mean-pooling model like the default EmbeddingGemma. Repeat for the LLM (port 8089) and the **default** reranker (port 8090 — `qwen3-reranker-0.6B` via `--reranking`) with their respective models and flags.
 
 > **The zerank-2 SOTA reranker runs as the same kind of unit** when you serve its Q8_0 GGUF: take the pinned download and the launch line (`--reranking -c 2048 -b 2048 -ub 2048 --parallel 1`) from [inference services](inference-services.md#sota-stack--z-models-16-gb-gpu-apache-20). The bf16 seq-cls sidecar runs as a container instead (same `/v1/rerank` contract) — see [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/). Most other zerank-2 GGUFs, including the old `zerank-2-Q4_K_M`, have no score head and return near-zero, uninformative scores under `--reranking`.
 

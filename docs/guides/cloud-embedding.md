@@ -117,8 +117,11 @@ llama-server -m embeddinggemma-300M-Q8_0.gguf \
 **SOTA upgrade (16GB+ GPU):** **ZeroEntropy zembed-1** (2560 dimensions, 32K context, SOTA retrieval quality, ~4.4GB VRAM) paired with the **zerank-2** reranker (distillation-paired via zELO). **Apache-2.0** — commercial use OK.
 
 ```bash
+# zembed-1 is a last-token model: keep --pooling last and the EOS override (see inference-services.md)
 llama-server -m zembed-1-Q4_K_M.gguf \
-  --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
+  --embeddings --pooling last \
+  --override-kv tokenizer.ggml.add_eos_token=bool:true \
+  --port 8088 --host 0.0.0.0 -ngl 99 -c 8192 -b 2048 -ub 2048
 ```
 
 Serve the reranker as the Q8_0 GGUF that carries zerank-2's score head, or as the bf16 seq-cls sidecar ([`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/)); both launch recipes are in the [inference services guide](inference-services.md#sota-stack--z-models-16-gb-gpu-apache-20). Most other zerank-2 GGUFs, including the old `zerank-2-Q4_K_M`, have no score head (near-zero, uninformative scores; final ordering stays RRF-dominated).
