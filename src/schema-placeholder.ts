@@ -159,7 +159,7 @@ function isMarkerOnly(value: string): boolean {
  * Whitespace-only collapse still absorbs the reformatting that matters: doubled spaces,
  * newlines, fullwidth characters, and trailing punctuation.
  */
-function canonicalizeForMatch(text: string): string {
+export function canonicalizeForMatch(text: string): string {
   return text
     .normalize("NFKC")
     .replace(IGNORABLE, "")
@@ -167,6 +167,18 @@ function canonicalizeForMatch(text: string): string {
     .replace(/\s+/gu, " ")
     .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
     .trim();
+}
+
+/**
+ * v0.41.4 (DESIGN-v0414.md §1.1): the observer prompt's identifier skeleton tokens — what `<subject>{{entity}}</subject>`
+ * and `<file>{{path}}</file>` leave behind when a model copies them. EXACT match only (NFKC, invisibles dropped, case
+ * folded, outer whitespace trimmed — braces kept): `{{user.name}}` is a Handlebars path and `PATH` an environment
+ * variable, both legitimate identifiers. `canonicalizeForMatch` strips the braces, so it is not used here.
+ */
+export const OBSERVER_IDENTIFIER_RESIDUE: ReadonlySet<string> = new Set(["{{entity}}", "{{path}}"]);
+
+export function isObserverIdentifierResidue(value: string): boolean {
+  return OBSERVER_IDENTIFIER_RESIDUE.has(value.normalize("NFKC").replace(IGNORABLE, "").trim().toLowerCase());
 }
 
 // Canonicalized on each call rather than memoized per set. A WeakMap keyed on the set object

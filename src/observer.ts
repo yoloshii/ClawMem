@@ -9,7 +9,7 @@
 import { createHash } from "crypto";
 import type { TranscriptMessage } from "./hooks.ts";
 import {
-  monoNow, deadlineAfter, duration, remainingForTimeout, evidenceMs, elapsed, timeoutSignal,
+  monoNow, deadlineAfter, duration, remainingForTimeout, evidenceMs, elapsed, timeoutSignal, epochNow, epochMs,
   type DurationMs, type MonoDeadline,
 } from "./clock.ts";
 import {
@@ -17,8 +17,19 @@ import {
   type OverheadStore,
 } from "./llm.ts";
 import { withRetryAndFeedback, type RetryLlm } from "./llm-retry.ts";
-import { isSchemaPlaceholder } from "./schema-placeholder.ts";
+import { canonicalizeForMatch } from "./schema-placeholder.ts";
 import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
+import {
+  OBSERVATION_SYSTEM_PROMPT, OBSERVATION_FEEDBACK_TEXT, OBSERVER_GRAMMAR_VERSION, parseObservationReply, observationFeedback,
+  observerFailureClass, observerGrammar, grammarReplyClass, type ParsedReply,
+} from "./observer-reply.ts";
+
+// v0.41.4: the reply contract (prompt, parser, feedback, grammar) lives in observer-reply.ts; its public names stay here.
+export {
+  VALID_PREDICATES, LITERAL_PREDICATES, parseObservationXml, parseObservationReply, parseObservationBlock, observationFeedback,
+  observerGrammar, observerFailureClass, decodeObserverEntities, OBSERVER_GRAMMAR_VERSION,
+  type BlockRejection, type ReplyFailure, type ParseAdvisories, type GuardDrops, type ParseContext, type ParsedReply,
+} from "./observer-reply.ts";
 
 // =============================================================================
 // Types
@@ -63,61 +74,6 @@ const GENERATION_TEMPERATURE = 0.3;
 // =============================================================================
 // System Prompts
 // =============================================================================
-
-const OBSERVATION_SYSTEM_PROMPT = `You are an observer analyzing a coding session transcript. Extract structured observations.
-For each significant action, decision, or discovery, output an <observation> XML element with the structure below.
-
-Structure:
-<observation>
-  <type>...</type>
-  <title>...</title>
-  <facts>
-    <fact>...</fact>
-  </facts>
-  <triples>
-    <triple>
-      <subject>...</subject>
-      <predicate>...</predicate>
-      <object>...</object>
-    </triple>
-  </triples>
-  <narrative>...</narrative>
-  <concepts>
-    <concept>...</concept>
-  </concepts>
-  <files_read><file>...</file></files_read>
-  <files_modified><file>...</file></files_modified>
-</observation>
-
-Field rules:
-- <type>: one of decision, bugfix, feature, refactor, discovery, change, preference, milestone, problem
-- <title>: brief descriptive title, max 80 chars
-- <facts>: 1-5 <fact> elements, each a standalone atomic claim about what happened or what is true (concrete, specific, no schema placeholders or template text)
-- <triples>: 0-3 <triple> elements for structural relationships between named entities (see predicate vocabulary below). Omit entirely if no relational claims apply. Do NOT emit triples for descriptive facts — only for explicit S-P-O relations.
-- <narrative>: 2-3 sentences explaining WHY something was done, not just WHAT
-- <concepts>: 0-3 <concept> elements from: how-it-works, why-it-exists, what-changed, problem-solution, gotcha, pattern, trade-off
-- <files_read>, <files_modified>: only files explicitly mentioned in the transcript
-
-Predicate vocabulary (use EXACTLY these predicates in <predicate>, nothing else):
-- adopted, migrated_to — switching to a new tool/framework/approach
-- deployed_to, runs_on — where something runs
-- replaced — when one thing supersedes another
-- depends_on, integrates_with, uses — structural dependencies
-- prefers, avoids — user preferences (use for <subject>user</subject>)
-- caused_by, resolved_by — causal relationships between problems and fixes
-- owned_by — responsibility / ownership
-
-<subject> and <object> must be short canonical entity names (2-80 chars). No sentences. No placeholder text. If you cannot fit a claim into this vocabulary, keep it in <facts> instead and omit the triple.
-
-Observation rules:
-- Output 1-{N} observations, focusing on the MOST significant events
-- If no significant observations, output nothing
-- Never use schema example text or template placeholders in <fact>, <subject>, or <object> — emit only real content extracted from the transcript
-
-Type guidance:
-- preference: user expresses a preference, habit, or way of working (e.g., "don't use subagents for this", "I prefer single PRs")
-- milestone: significant completion point, version release, deployment, or phase transition
-- problem: persistent issue, recurring bug, architectural limitation, or unresolved blocker`;
 
 const SUMMARY_SYSTEM_PROMPT = `You are a session summarizer. Analyze this coding session transcript and output a structured summary.
 
@@ -264,109 +220,6 @@ const HIGH_SURROGATE_LAST = /[\uD800-\uDBFF]$/;
 // XML Parsers
 // =============================================================================
 
-const VALID_OBSERVATION_TYPES = new Set([
-  "decision", "bugfix", "feature", "refactor", "discovery", "change",
-  "preference", "milestone", "problem",
-]);
-
-const VALID_CONCEPTS = new Set([
-  "how-it-works", "why-it-exists", "what-changed", "problem-solution",
-  "gotcha", "pattern", "trade-off",
-]);
-
-// Canonical SPO predicate vocabulary — parser rejects anything outside this set.
-// Must stay in sync with the predicate list in OBSERVATION_SYSTEM_PROMPT.
-export const VALID_PREDICATES = new Set([
-  "adopted", "migrated_to",
-  "deployed_to", "runs_on",
-  "replaced",
-  "depends_on", "integrates_with", "uses",
-  "prefers", "avoids",
-  "caused_by", "resolved_by",
-  "owned_by",
-]);
-
-// Predicates whose <object> should be stored as a literal (not resolved to an entity).
-export const LITERAL_PREDICATES = new Set(["prefers", "avoids"]);
-
-// Anti-parrot residue guard (SCHEMA_PLACEHOLDER_STRINGS / isMarkerOnly / isSchemaPlaceholder)
-// now lives in ./schema-placeholder.ts, shared with the consolidation + conversation-synthesis
-// extraction paths. Imported at the top of this file.
-
-export function parseObservationXml(xml: string): Observation | null {
-  const typeMatch = xml.match(/<type>\s*(.*?)\s*<\/type>/s);
-  const titleMatch = xml.match(/<title>\s*(.*?)\s*<\/title>/s);
-  const narrativeMatch = xml.match(/<narrative>\s*(.*?)\s*<\/narrative>/s);
-
-  if (!typeMatch?.[1] || !titleMatch?.[1]) return null;
-
-  const type = typeMatch[1].trim().toLowerCase();
-  if (!VALID_OBSERVATION_TYPES.has(type)) return null;
-
-  const rawTitle = titleMatch[1].trim();
-  if (isSchemaPlaceholder(rawTitle)) return null;
-
-  const facts = extractMultiple(xml, "fact")
-    .filter(f => f.length >= 5)
-    .filter(f => !isSchemaPlaceholder(f));
-
-  const concepts = extractMultiple(xml, "concept")
-    .filter(c => VALID_CONCEPTS.has(c.toLowerCase()))
-    .map(c => c.toLowerCase());
-  const filesRead = extractMultiple(xml, "file", "files_read");
-  const filesModified = extractMultiple(xml, "file", "files_modified");
-
-  // Parse triples (Fix A): strict validation against canonical predicate vocabulary.
-  // Missing/malformed triples are silently dropped — fail-closed on ambiguity.
-  const triples = extractTriples(xml);
-
-  return {
-    type: type as Observation["type"],
-    title: rawTitle.slice(0, 80),
-    facts,
-    narrative: narrativeMatch?.[1]?.trim() || "",
-    concepts,
-    filesRead,
-    filesModified,
-    triples: triples.length > 0 ? triples : undefined,
-  };
-}
-
-function extractTriples(xml: string): ParsedTriple[] {
-  const parentMatch = xml.match(/<triples>([\s\S]*?)<\/triples>/s);
-  if (!parentMatch?.[1]) return [];
-
-  const blockRegex = /<triple>([\s\S]*?)<\/triple>/g;
-  const results: ParsedTriple[] = [];
-  let match;
-  while ((match = blockRegex.exec(parentMatch[1])) !== null) {
-    const block = match[1] ?? "";
-    const subject = block.match(/<subject>\s*(.*?)\s*<\/subject>/s)?.[1]?.trim();
-    const rawPredicate = block.match(/<predicate>\s*(.*?)\s*<\/predicate>/s)?.[1]?.trim();
-    const object = block.match(/<object>\s*(.*?)\s*<\/object>/s)?.[1]?.trim();
-
-    if (!subject || !rawPredicate || !object) continue;
-
-    const predicate = rawPredicate.toLowerCase().replace(/\s+/g, "_");
-    if (!VALID_PREDICATES.has(predicate)) continue;
-
-    // Length bounds — guards against sentence-shaped subjects/objects that the
-    // regex-era tests expected. Subject and object should be short canonical names.
-    if (subject.length < 2 || subject.length > 80) continue;
-    if (object.length < 2 || object.length > 120) continue;
-
-    // Identifier scope: a subject/object is an entity name or literal value, not an
-    // assertion — `${HOME}` is a legitimate object of `uses` / `depends_on` / `prefers`.
-    if (isSchemaPlaceholder(subject, undefined, "identifier") ||
-        isSchemaPlaceholder(object, undefined, "identifier")) continue;
-
-    results.push({ subject, predicate, object });
-
-    if (results.length >= 5) break; // cap per observation
-  }
-  return results;
-}
-
 export function parseSummaryXml(xml: string): SessionSummary | null {
   const request = extractSingle(xml, "request");
   const investigated = extractSingle(xml, "investigated");
@@ -390,24 +243,6 @@ function extractSingle(xml: string, tag: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
-function extractMultiple(xml: string, tag: string, parentTag?: string): string[] {
-  let scope = xml;
-  if (parentTag) {
-    const parentMatch = xml.match(new RegExp(`<${parentTag}>([\\s\\S]*?)</${parentTag}>`, "s"));
-    if (!parentMatch?.[1]) return [];
-    scope = parentMatch[1];
-  }
-
-  const results: string[] = [];
-  const regex = new RegExp(`<${tag}>\\s*(.*?)\\s*</${tag}>`, "gs");
-  let match;
-  while ((match = regex.exec(scope)) !== null) {
-    const text = match[1]?.trim();
-    if (text) results.push(text);
-  }
-  return results;
-}
-
 // =============================================================================
 // Core Extraction Functions
 // =============================================================================
@@ -421,11 +256,6 @@ export type ObservationResult =
 /** What the batch must not re-extract (62.1 D4): the turns just before it and this session's recorded titles. */
 export type ObservationContext = { priorMessages: TranscriptMessage[]; recordedTitles: string[] };
 
-/** A valid empty completion ("If no significant observations, output nothing"), passed through the retry helper. */
-const EMPTY_COMPLETION = "\u0000observer:empty-completion\u0000";
-/** A reply with no observation blocks and no markup, short enough to be a plain "nothing" rather than lost output. */
-const PLAIN_NOTHING_MAX_CHARS = 300;
-
 /**
  * The CONTEXT section's share of the render budget (v0.41.1). The section is at most this long, the transcript gets the
  * rest, and batches are packed to leave it (stop-extract.ts), so CONTEXT + transcript stay within
@@ -433,9 +263,9 @@ const PLAIN_NOTHING_MAX_CHARS = 300;
  */
 export const OBSERVER_CONTEXT_MAX_CHARS = 2_000;
 /**
- * A retry's feedback block (llm-retry.ts: its fixed lines, the parse error, up to 500 characters of the response) and
- * the blank line before it, at most (805 with the observer's longest error). A retry takes it out of the transcript's
- * budget, so every attempt stays within OBSERVER_MAX_RENDER_CHARS (v0.41.1).
+ * A retry's feedback block and the blank line before it, at most (v0.41.4: `observationFeedback` — the reply's class,
+ * up to three rejected-block lines, the type rule and the `<none/>` line; ~700 characters at most). A retry takes it out
+ * of the transcript's budget, so every attempt stays within OBSERVER_MAX_RENDER_CHARS (v0.41.1).
  */
 export const OBSERVER_RETRY_FEEDBACK_MAX_CHARS = 850;
 /** What a batch leaves of the render budget: the CONTEXT and a retry's feedback, so it reaches the model whole on every attempt. */
@@ -465,41 +295,16 @@ function renderContextSection(ctx: ObservationContext | undefined): string {
   return lines.join("\n") + "\n";
 }
 
-/**
- * A COMPLETE observer reply (the server's `finish_reason: "stop"`) as observations (62.1 D3): the observation blocks,
- * or a plain short "nothing" (no markup, ≤ PLAIN_NOTHING_MAX_CHARS) as `[]`, or a parse error. v0.41.2: never applied
- * to a reply the server cut (`finish: "length"`) — a cut reply is never `[]` (design §1.4, P2).
- */
-export function parseObservationReply(text: string): { ok: true; value: Observation[] } | { ok: false; error: string } {
-  if (text.trim() === "") return { ok: true, value: [] };
-  const observations: Observation[] = [];
-  let blocks = 0;
-  const regex = /<observation>([\s\S]*?)<\/observation>/g;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    blocks++;
-    const obs = parseObservationXml(match[1]!);
-    if (obs) observations.push(obs);
-  }
-  if (observations.length > 0) return { ok: true, value: observations };
-  if (blocks === 0 && !/[<>]/.test(text) && text.trim().length <= PLAIN_NOTHING_MAX_CHARS) return { ok: true, value: [] };
-  return {
-    ok: false,
-    error:
-      blocks === 0
-        ? "No <observation>...</observation> blocks found in the response. Wrap each observation in <observation> tags."
-        : `Found ${blocks} <observation> block(s) but none contained the required fields. Each block needs valid <type>, <content>, and the documented child tags.`,
-  };
-}
-
 // =============================================================================
 // v0.41.2 (BACKLOG 68.5): the observer's token budget and windows — DESIGN-v0412.md §1.3–§1.4
 // =============================================================================
 
 /** Bump with any change to `parseObservationXml` / `parseObservationReply` (a checkpoint's contract includes it). */
-export const OBSERVER_PARSER_VERSION = 2;
+export const OBSERVER_PARSER_VERSION = 3;
 /** Bump with any change to how the windows are assembled that the contract's hashed strings would not show. */
-export const OBSERVER_CONTRACT_VERSION = 1;
+export const OBSERVER_CONTRACT_VERSION = 2;
+/** v0.41.4 (§3.2): at most this many format retries per window per invocation, each a fresh sample with the feedback. */
+export const FORMAT_RETRIES = 2;
 /** E3: one observation's reply ran 360 tokens. */
 const OBSERVATION_REPLY_TOKENS = 360;
 const REPLY_FLOOR_TOKENS = 768;
@@ -540,18 +345,19 @@ export function observationSystemPrompt(n: number): string {
 /**
  * What the contract hashes (design §1.4): every static string the windows assemble — the system prompt, the CONTEXT /
  * EARLIER / ALREADY RECORDED sections and markers, the format-retry feedback — and every window-policy constant,
- * the CONTEXT's sizes included.
+ * the CONTEXT's sizes included. v0.41.4 (§1.5): the observer's own feedback strings and the grammar too.
  */
 export function observerContractInputs(): Record<string, unknown> {
   return {
     contract: OBSERVER_CONTRACT_VERSION, parser: OBSERVER_PARSER_VERSION, system: OBSERVATION_SYSTEM_PROMPT,
     sections: [EARLIER_HEADER, RECORDED_HEADER, CONTEXT_END, TRANSCRIPT_OPEN, TRANSCRIPT_CLOSE, "--- CONTEXT (already recorded — do not extract) ---", "Already recorded observations:"],
-    feedback: [...FORMAT_FEEDBACK_LINES, FORMAT_FEEDBACK_EXCERPT_CHARS],
+    feedback: OBSERVATION_FEEDBACK_TEXT,
+    grammar: { version: OBSERVER_GRAMMAR_VERSION, text: [1, 2, 3, 4, 5].map(observerGrammar) },
     policy: {
       replyFloor: REPLY_FLOOR_TOKENS, replyShare: 0.4, replyMax: GENERATION_MAX_TOKENS, perObservation: OBSERVATION_REPLY_TOKENS,
       minTranscript: MIN_TRANSCRIPT_TOKENS, maxCalls: MAX_OBSERVER_CALLS, earlierChars: EARLIER_CHARS,
       contextMaxChars: OBSERVER_CONTEXT_MAX_CHARS, contextPriorChars: CONTEXT_PRIOR_CHARS, contextTitlesChars: CONTEXT_TITLES_CHARS,
-      contextTitleChars: CONTEXT_TITLE_CHARS, plainNothingMaxChars: PLAIN_NOTHING_MAX_CHARS,
+      contextTitleChars: CONTEXT_TITLE_CHARS, formatRetries: FORMAT_RETRIES,
     },
   };
 }
@@ -594,8 +400,19 @@ export function observerLinesSha(lines: readonly ObserverLine[]): string {
   return createHash("sha256").update(lines.map(l => l.text).join("\n")).digest("hex");
 }
 
+/** v0.41.4 (§3.3): a size reduction for the window starting at `start` — at most `maxLines` lines; it only shrinks. */
+export type WindowBound = { start: number; maxLines: number };
+
 /** Progress a window run has made (and a checkpoint stores). */
-export type WindowProgress = { doneThroughLine: number; observations: Observation[]; titles: string[] };
+export type WindowProgress = { doneThroughLine: number; observations: Observation[]; titles: string[]; windowBound?: WindowBound };
+
+/** A stored bound if it is well-formed and belongs to the window starting at `pos` — anything else is ignored (§3.3). */
+export function validWindowBound(v: unknown, pos: number): WindowBound | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const { start, maxLines } = v as Partial<WindowBound>;
+  if (!Number.isInteger(start) || !Number.isInteger(maxLines) || (maxLines as number) < 1 || start !== pos) return undefined;
+  return { start: start as number, maxLines: maxLines as number };
+}
 
 export type WindowedResult =
   | { status: "ok"; observations: Observation[]; totalLines: number }
@@ -706,6 +523,7 @@ function windowPrompt(n: number, context: string, lines: readonly ObserverLine[]
   return feedback ? `${body}\n\n${feedback}` : body;
 }
 
+/** The handoff summary's format-retry feedback (v0.41.4 §3.1: unchanged, byte for byte; the observer uses `observationFeedback`). */
 const FORMAT_FEEDBACK_LINES = [
   "The previous response did not match the expected structure.", "Error:", "Previous response (first 500 chars):",
   "Return only the expected structure this time.",
@@ -717,7 +535,7 @@ function formatFeedback(error: string, reply: string): string {
   return [head, label, error, "", excerpt, cutAt(reply, FORMAT_FEEDBACK_EXCERPT_CHARS), "", tail].join("\n");
 }
 
-type FittedWindow = { end: number; prompt: string; count: ChatTokenCount };
+type FittedWindow = { end: number; prompt: string; count: ChatTokenCount; context: string };
 
 /**
  * Fit the next window from `start` (design §1.3–§1.4): pick the fullest CONTEXT that leaves MIN_TRANSCRIPT_TOKENS, then
@@ -743,7 +561,7 @@ async function fitWindow(a: {
   const fits = (c: ChatTokenCount) => c.tokens + c.margin <= a.budget;
   const at = async (end: number): Promise<FittedWindow> => {
     const prompt = windowPrompt(a.n, context!, a.lines.slice(a.start, end), a.feedback);
-    return { end, prompt, count: await a.count(prompt) };
+    return { end, prompt, count: await a.count(prompt), context: context! };
   };
   let w = await at(last);
   if (fits(w.count)) return w;
@@ -788,12 +606,211 @@ async function fitWindow(a: {
   return best;
 }
 
+// =============================================================================
+// v0.41.4 (BACKLOG 69.3): what persists across invocations — the validated context ceiling (§3.3a), the grammar-off
+// record (§4.4) — and the reply statistics the doctor reads (§4.5)
+// =============================================================================
+
+/** A validated context ceiling counts for this long after it was established or lowered (§3.3a). */
+const CEILING_TTL_MS = 7 * 24 * 3_600_000;
+/** Ceiling records kept per backend key, the latest by `at` (§3.3a). */
+const CEILING_RECORDS_KEPT = 4;
+/** How long a grammar request's HTTP 400 turns the grammar off for its server (§4.4). */
+const GRAMMAR_OFF_MS = 24 * 3_600_000;
+export const OBSERVER_NCTX_PREFIX = "observer-nctx:";
+export const OBSERVER_GRAMMAR_PREFIX = "observer-grammar:";
+
+const wallNow = (): number => epochMs(epochNow());
+const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+/** The backend a record is about: its request identity (server root + requested model, or the local model file). */
+export function observerBackendKey(llm: Pick<BudgetLlm, "requestIdentity">, backend: LlmBackendId): string {
+  return sha256(llm.requestIdentity?.(backend) ?? JSON.stringify(backend)).slice(0, 16);
+}
+
+/** One record's read-modify-write as plain reads and writes — the caller supplies the atomicity. */
+function readModifyWrite(store: OverheadStore, key: string, fn: (old: string | null) => string | null): void {
+  const old = store.get(key);
+  const next = fn(old);
+  if (next === old) return;
+  if (next === null) store.delete(key); else store.set(key, next);
+}
+
+/**
+ * Read-modify-write of one record, atomic where the store can be: its `update` (the Stop pipeline: one immediate
+ * transaction), else its `transaction` (codex T7-14), else plain reads and writes (a store with neither is not atomic).
+ */
+function updateRecord(store: OverheadStore, key: string, fn: (old: string | null) => string | null): void {
+  if (store.update) { store.update(key, fn); return; }
+  if (store.transaction) { store.transaction(() => readModifyWrite(store, key, fn)); return; }
+  readModifyWrite(store, key, fn);
+}
+
+type CeilingRecord = { ceiling: number; at: string };
+function parseCeiling(raw: string | null): CeilingRecord | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<CeilingRecord>;
+    if (typeof v.ceiling !== "number" || !Number.isFinite(v.ceiling) || v.ceiling <= 0) return null;
+    if (typeof v.at !== "string" || Number.isNaN(Date.parse(v.at))) return null;
+    return { ceiling: v.ceiling, at: v.at };
+  } catch {
+    return null;
+  }
+}
+const ceilingLive = (r: CeilingRecord | null, nowMs: number): r is CeilingRecord => r !== null && nowMs - Date.parse(r.at) <= CEILING_TTL_MS;
+
+/**
+ * One `/props` value's validated ceiling after a new observation (§3.3a): a stored record older than 7 days counts as
+ * absent; otherwise the ceiling becomes the minimum. `at` moves only when the record is created or its ceiling lowered,
+ * so low evidence lapses 7 days after it was established and the next oversize re-establishes the current value.
+ */
+export function mergeContextCeiling(oldRaw: string | null, ceiling: number, nowMs: number): string {
+  const old = parseCeiling(oldRaw);
+  if (ceilingLive(old, nowMs) && old.ceiling <= ceiling) return oldRaw!;
+  return JSON.stringify({ ceiling, at: new Date(nowMs).toISOString() });
+}
+
+function ceilingKey(backendKey: string, propsNCtx: number): string {
+  return `${OBSERVER_NCTX_PREFIX}${backendKey}:${propsNCtx}`;
+}
+
+/** The validated ceiling for the `/props` value just read, if its record is live (§3.3a). Best-effort: null on any error. */
+function readContextCeiling(store: OverheadStore | undefined, backendKey: string, propsNCtx: number): number | null {
+  if (!store) return null;
+  try {
+    const r = parseCeiling(store.get(ceilingKey(backendKey, propsNCtx)));
+    return ceilingLive(r, wallNow()) ? r.ceiling : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Merge a validated oversize's `n_ctx` into its `/props` value's record; keep 4 records per backend (§3.3a): the one
+ * just merged and the 3 latest others by `at` — after a backward clock step the record just merged can be the oldest
+ * by `at`, and keeping it beside 4 others would hold 5 (codex T7-4). The merge and the pruning share one transaction
+ * where the store has one, never nested (codex T7-14).
+ */
+function recordContextCeiling(store: OverheadStore, backendKey: string, propsNCtx: number, ceiling: number): void {
+  const key = ceilingKey(backendKey, propsNCtx);
+  const nowMs = wallNow();
+  const merge = (old: string | null) => mergeContextCeiling(old, ceiling, nowMs);
+  const prune = () => {
+    if (!store.entries) return;
+    const others = store.entries(`${OBSERVER_NCTX_PREFIX}${backendKey}:`)
+      .filter(e => e.key !== key)
+      .map(e => ({ key: e.key, at: Date.parse(parseCeiling(e.value)?.at ?? "") || 0 }))
+      .sort((x, y) => y.at - x.at);
+    for (const r of others.slice(CEILING_RECORDS_KEPT - 1)) store.delete(r.key);
+  };
+  try {
+    if (store.transaction) store.transaction(() => { readModifyWrite(store, key, merge); prune(); });
+    else { updateRecord(store, key, merge); prune(); }
+  } catch { /* best-effort: the in-invocation override still applies */ }
+}
+
+/**
+ * §4.4: `offUntil`/`at` are wall-clock (expiry, the doctor); `count` is the generation an obligation's clear compares;
+ * `cause` is what the latest refusal was — an HTTP 400 (its cause unconfirmed) or a grammar the in-process model could
+ * not compile (codex T7-7) — for the doctor's wording only.
+ */
+export type GrammarOffCause = "http-400" | "compile";
+type GrammarOffRecord = { offUntil: string; at: string; count: number; pending: boolean; cause?: GrammarOffCause };
+function parseGrammarOff(raw: string | null): GrammarOffRecord | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<GrammarOffRecord>;
+    if (typeof v.offUntil !== "string" || Number.isNaN(Date.parse(v.offUntil)) || typeof v.count !== "number" || typeof v.pending !== "boolean") return null;
+    const cause = v.cause === "compile" || v.cause === "http-400" ? v.cause : undefined;
+    return { offUntil: v.offUntil, at: typeof v.at === "string" ? v.at : v.offUntil, count: v.count, pending: v.pending, ...(cause ? { cause } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+/** The grammar-off record's key: the request identity, the server's fingerprint and the grammar's version (§4.4). */
+export function observerGrammarKey(llm: Pick<BudgetLlm, "requestIdentity">, backend: LlmBackendId, fingerprint: string): string {
+  return `${OBSERVER_GRAMMAR_PREFIX}${sha256(`${llm.requestIdentity?.(backend) ?? JSON.stringify(backend)}|${fingerprint}|${OBSERVER_GRAMMAR_VERSION}`)}`;
+}
+
+/** A grammar request refused (§4.4): `offUntil` only extends, `count` + 1 (a generation), an obligation set. */
+function recordGrammarOff(store: OverheadStore, key: string, cause: GrammarOffCause): void {
+  const nowMs = wallNow();
+  try {
+    updateRecord(store, key, old => {
+      const o = parseGrammarOff(old);
+      const until = Math.max(o ? Date.parse(o.offUntil) : 0, nowMs + GRAMMAR_OFF_MS);
+      return JSON.stringify({ offUntil: new Date(until).toISOString(), at: new Date(nowMs).toISOString(), count: (o?.count ?? 0) + 1, pending: true, cause });
+    });
+  } catch { /* best-effort: this invocation stays grammarless regardless */ }
+}
+
+/** A grammarless call got an HTTP response: clear the obligation only if no 400 bumped the generation since (T5-1). */
+function clearGrammarObligation(store: OverheadStore, key: string, captured: number): void {
+  try {
+    updateRecord(store, key, old => {
+      const o = parseGrammarOff(old);
+      if (!o || !o.pending || o.count !== captured) return old;
+      return JSON.stringify({ ...o, pending: false });
+    });
+  } catch { /* best-effort: the obligation stays, the next grammarless response clears it */ }
+}
+
+/** What one invocation's replies showed, per backend (§4.5, §5): the Stop pipeline persists it for the doctor. */
+export type ObserverStatsDelta = {
+  grammarStructural: number; grammarContent: number; grammarRefusals: number; instructionEcho: number; eventDefinitionEcho: number;
+  tripleToolId: number; tripleSelf: number; identifierResidue: number; repeatedFact: number;
+};
+export const OBSERVER_STATS_FIELDS = [
+  "grammarStructural", "grammarContent", "grammarRefusals", "instructionEcho", "eventDefinitionEcho", "tripleToolId", "tripleSelf",
+  "identifierResidue", "repeatedFact",
+] as const satisfies readonly (keyof ObserverStatsDelta)[];
+export const emptyObserverStats = (): ObserverStatsDelta => ({
+  grammarStructural: 0, grammarContent: 0, grammarRefusals: 0, instructionEcho: 0, eventDefinitionEcho: 0, tripleToolId: 0, tripleSelf: 0,
+  identifierResidue: 0, repeatedFact: 0,
+});
+let pendingStats = new Map<string, ObserverStatsDelta>();
+
+function statsFor(backendKey: string): ObserverStatsDelta {
+  let s = pendingStats.get(backendKey);
+  if (!s) { s = emptyObserverStats(); pendingStats.set(backendKey, s); }
+  return s;
+}
+
+function noteParse(stats: ObserverStatsDelta, parsed: ParsedReply, grammarClass: "structural" | "content" | null): void {
+  stats.instructionEcho += parsed.advisories.instructionEcho;
+  stats.eventDefinitionEcho += parsed.advisories.eventDefinitionEcho;
+  stats.tripleToolId += parsed.drops.tripleToolId;
+  stats.tripleSelf += parsed.drops.tripleSelf;
+  stats.identifierResidue += parsed.drops.identifierResidue;
+  stats.repeatedFact += parsed.drops.repeatedFact;
+  if (grammarClass === "structural") stats.grammarStructural++;
+  else if (grammarClass === "content") stats.grammarContent++;
+}
+
+/** The statistics measured since the last take — totals, and per backend key — then reset. */
+export function takeObserverStats(): ObserverStatsDelta & { backends: Record<string, ObserverStatsDelta> } {
+  const backends = Object.fromEntries(pendingStats);
+  pendingStats = new Map();
+  const totals = emptyObserverStats();
+  for (const s of Object.values(backends)) for (const f of OBSERVER_STATS_FIELDS) totals[f] += s[f];
+  return { ...totals, backends };
+}
+
 /**
  * Extract a unit's observations in windows (design §1.3–§1.4). Each window's prompt + the reply reserve fits the
  * backend's context, read FRESH before every call (retries included) and checked against the server the run is pinned
  * to; a cut reply (`finish: "length"`) is never `empty` — the window is halved; a reply that did not finish as an
- * answer is retryable; one format retry per window, its feedback inside the window's budget. Progress goes to
- * `onProgress` after every completed window (the caller's durable checkpoint); `resume` continues from one.
+ * answer is retryable. Progress goes to `onProgress` after every completed window (the caller's durable checkpoint);
+ * `resume` continues from one.
+ *
+ * v0.41.4 (DESIGN-v0414.md §3–§4): a window ends inside the invocation that started it. After a reply that needs a
+ * retry — unparseable (up to FORMAT_RETRIES, each with `observationFeedback`), cut, a validated oversize, a grammar
+ * request's HTTP 400 — every exit before the retry's own reply is `retryable` with that reply's class, never `partial`.
+ * A halving or an oversize's correction persists as a shrink-only `windowBound` through `onProgress`; a validated
+ * oversize below `/props` also records a context ceiling for that `/props` value. A strong-fingerprint backend gets the
+ * GBNF grammar unless `CLAWMEM_OBSERVER_GRAMMAR=off` or its grammar-off record holds.
  */
 export async function extractObservationsWindowed(
   messages: TranscriptMessage[],
@@ -813,14 +830,27 @@ export async function extractObservationsWindowed(
   if (pos >= total) return observations.length > 0 ? { status: "ok", observations, totalLines: total } : { status: "empty", totalLines: total };
   let calls = observerCallBudget(opts.deadline, opts.maxCalls);
   let made = 0;
-  let maxLines = Number.POSITIVE_INFINITY;
   let pinned = opts.expectFingerprint !== undefined
     ? { fingerprint: opts.expectFingerprint, strength: opts.expectStrength ?? ("strong" as const) }
     : null;
   let sinceCall = monoNow();
+  const store = opts.overheadStore;
+  const backendKey = observerBackendKey(opts.llm, opts.backend);
+  const stats = statsFor(backendKey);
+  const grammarOn = (process.env.CLAWMEM_OBSERVER_GRAMMAR ?? "auto").trim().toLowerCase() !== "off";
+  /** A grammar request's 400 in THIS invocation: grammarless from here on, whatever the store holds (§4.4). */
+  let grammarRefusedHere = false;
+  /** The resumed window's persisted bound (§3.3); a malformed or foreign one is ignored. */
+  let bound = validWindowBound(opts.resume?.windowBound, pos);
 
-  type Budget = { cap: LlmCapacity; reserve: number; n: number; budget: number; count: (prompt: string) => Promise<ChatTokenCount> };
-  /** The capacity, read FRESH (design §1.2) and checked against the pin; `override` = a validated oversize's n_ctx. */
+  type Budget = {
+    cap: LlmCapacity; propsNCtx: number; reserve: number; n: number; budget: number;
+    count: (prompt: string) => Promise<ChatTokenCount>;
+  };
+  /**
+   * The capacity, read FRESH (design §1.2) and checked against the pin. Its context is the least of the `/props` value,
+   * that value's live validated ceiling (§3.3a) and `override` (a validated oversize's n_ctx in this invocation).
+   */
   const readBudget = async (override?: number): Promise<Budget | "changed" | "unverified"> => {
     const read = await opts.llm.llmCapacity(opts.backend, { deadline: opts.deadline });
     if (pinned) {
@@ -829,18 +859,41 @@ export async function extractObservationsWindowed(
     } else {
       pinned = { fingerprint: read.fingerprint, strength: read.fingerprintStrength };
     }
-    const cap = override !== undefined && override < read.nCtx ? { ...read, nCtx: override } : read;
+    let nCtx = read.nCtx;
+    const ceiling = readContextCeiling(store, backendKey, read.nCtx);
+    if (ceiling !== null && ceiling < nCtx) nCtx = ceiling;
+    if (override !== undefined && override < nCtx) nCtx = override;
+    const cap = nCtx === read.nCtx ? read : { ...read, nCtx };
     const reserve = observerReplyReserve(cap.nCtx);
     return {
-      cap, reserve, n: observerRequestedCount(reserve), budget: cap.nCtx - reserve,
+      cap, propsNCtx: read.nCtx, reserve, n: observerRequestedCount(reserve), budget: cap.nCtx - reserve,
       count: (prompt: string) => opts.llm.countChatTokens(opts.llm.outboundChatContent(prompt, opts.backend), cap, {
         deadline: opts.deadline, overheadStore: opts.overheadStore,
       }),
     };
   };
+  /** §4.1/§4.4: the grammar for this call, or why not — and, for a grammarless call owed by an obligation, its generation. */
+  const selectGrammar = (bb: Budget): { grammar?: string; key: string; captured?: number } => {
+    const key = observerGrammarKey(opts.llm, opts.backend, bb.cap.fingerprint);
+    let rec: GrammarOffRecord | null = null;
+    try { rec = store ? parseGrammarOff(store.get(key)) : null; } catch { rec = null; }
+    // A grammarless call owed by an obligation captures its generation whatever made it grammarless — the record, this
+    // invocation's own refusal, the fingerprint or the configuration (codex T7-6).
+    const captured = rec?.pending ? rec.count : undefined;
+    if (!grammarOn || bb.cap.fingerprintStrength !== "strong") return { key, captured };
+    if (grammarRefusedHere || (rec !== null && (Date.parse(rec.offUntil) > wallNow() || rec.pending))) return { key, captured };
+    return { key, grammar: observerGrammar(bb.n) };
+  };
   const partial = (): WindowedResult => ({ status: "partial", doneThroughLine: pos, totalLines: total });
+  const retryable = (reason: string): WindowedResult => ({ status: "retryable", reason });
   const notSame = (v: "changed" | "unverified"): WindowedResult =>
     v === "changed" ? { status: "server_changed" } : { status: "unverified", doneThroughLine: pos, totalLines: total };
+  /** §3.3: the reduced bound for the window at `pos`, written through the caller's CAS before the smaller window is tried. */
+  const persistBound = async (maxLines: number): Promise<boolean> => {
+    bound = { start: pos, maxLines: bound?.start === pos ? Math.min(bound.maxLines, maxLines) : maxLines };
+    if (!opts.onProgress) return true;
+    return await opts.onProgress({ doneThroughLine: pos, observations: [...observations], titles: [...produced], windowBound: bound });
+  };
 
   while (pos < total) {
     if (calls <= 0 || remainingMs(opts.deadline) < CALL_FLOOR_MS + CALL_RESERVE_MS) return partial();
@@ -855,38 +908,59 @@ export async function extractObservationsWindowed(
     const recorded = [...(opts.context?.recordedTitles ?? []), ...produced];
     const contexts = pos === 0 ? firstWindowContexts(opts.context) : laterWindowContexts(lines.slice(0, pos), anchorOf(pos), recorded);
     let feedback: string | undefined;
+    let maxLines = bound?.start === pos ? bound.maxLines : Number.POSITIVE_INFINITY;
     const fit = (bb: Budget) => fitWindow({
       lines, start: pos, maxLines, n: bb.n, contexts, budget: bb.budget, feedback, count: bb.count, nCtx: bb.cap.nCtx, source: bb.cap.source,
     });
     let fitted = await fit(b);
-    if ("capacity" in fitted) return { status: "retryable", reason: fitted.capacity };
 
     let correctedOnce = false;
-    let formatRetried = false;
+    let formatRetries = 0;
     let override: number | undefined;
-    let retry: "format" | "resize" | null = null;
+    /** §3.2(b): the class of the reply that needs a retry; every exit before the retry's own reply returns it. */
+    let pending: string | null = null;
+    let retryKind: "format" | "resize" | "grammar" = "resize";
     for (;;) {
-      if (calls <= 0 || remainingMs(opts.deadline) < CALL_FLOOR_MS + CALL_RESERVE_MS) return partial();
-      if (retry !== null) {
+      if (calls <= 0 || remainingMs(opts.deadline) < CALL_FLOOR_MS + CALL_RESERVE_MS) return pending !== null ? retryable(pending) : partial();
+      if (pending !== null) {
         // Every retry reads the capacity again (design §1.2) and re-fits to it.
         const nb = await readBudget(override);
-        if (typeof nb === "string") return notSame(nb);
+        if (nb === "changed") return { status: "server_changed" };
+        if (nb === "unverified") return retryable(pending);
         b = nb;
-        const refit = await fit(b);
-        if ("capacity" in refit) return { status: "retryable", reason: retry === "format" ? "no parseable response within the budget" : refit.capacity };
-        fitted = refit;
+        fitted = await fit(b);
       }
+      // Reading and counting go over the network: the deadline is checked again after them — before the fit's result is
+      // read — and the call's signal is taken once, so an expired deadline neither becomes a call without a timeout
+      // (codex T7-13) nor reads as a capacity failure (codex T8-2).
+      const signal = remainingMs(opts.deadline) < CALL_FLOOR_MS + CALL_RESERVE_MS ? null : timeoutSignal(opts.deadline);
+      if (signal === null) return pending !== null ? retryable(pending) : partial();
+      if ("capacity" in fitted) {
+        if (pending === null) return retryable(fitted.capacity);
+        // §3.2(b): an exit before the retry's own reply keeps that reply's class (codex T7-2); §3.4 names the one case
+        // in which the retry itself is what cannot fit — the format retry's feedback.
+        return retryable(retryKind === "format" ? `capacity: the format retry's feedback leaves no room (${fitted.capacity.replace(/^capacity: /, "")})` : pending);
+      }
+      const g = selectGrammar(b);
       calls--;
       made++;
       const maxTokens = Math.max(1, Math.min(GENERATION_MAX_TOKENS, b.cap.nCtx - fitted.count.tokens - fitted.count.margin));
       const reply = await opts.llm.generateDetailed(fitted.prompt, {
-        maxTokens, temperature: GENERATION_TEMPERATURE, signal: timeoutSignal(opts.deadline) ?? undefined, backend: opts.backend,
+        maxTokens, temperature: GENERATION_TEMPERATURE, signal, backend: opts.backend,
+        ...(g.grammar !== undefined ? { grammar: g.grammar } : {}),
       });
       if (reply.ok) noteCall(evidenceMs(elapsed(sinceCall)));
       sinceCall = monoNow();
+      // §4.4: an owed grammarless request reached the server (any HTTP response, not a transport failure).
+      if (store && g.captured !== undefined && (reply.ok || reply.reason === "http" || reply.reason === "context_exceeded")) {
+        clearGrammarObligation(store, g.key, g.captured);
+      }
       if (!reply.ok && reply.reason === "context_exceeded") {
         // A validated oversize: the count that fed this prompt was low — a measured overhead behind it is stale (§1.2).
         if (fitted.count.method === "content") opts.llm.invalidateOverhead?.(b.cap.fingerprint, opts.overheadStore);
+        // §3.3a: the server's own n_ctx below what /props claims — a ceiling for that /props value, for later invocations;
+        // every validated oversize counts, not only the one the single correction answers (codex T7-3).
+        if (store && typeof reply.nCtx === "number" && reply.nCtx < b.propsNCtx) recordContextCeiling(store, backendKey, b.propsNCtx, reply.nCtx);
         if (!correctedOnce && typeof reply.promptTokens === "number") {
           // Re-size once from the server's own count and n_ctx (design §1.2): this window's lines scaled to the room left.
           correctedOnce = true;
@@ -895,40 +969,64 @@ export async function extractObservationsWindowed(
           const room = nCtx - observerReplyReserve(nCtx) - fitted.count.margin;
           const scale = Math.max(0.1, Math.min(0.9, room / reply.promptTokens));
           maxLines = Math.max(1, Math.floor((fitted.end - pos) * scale));
-          retry = "resize";
+          if (!(await persistBound(maxLines))) return { status: "overtaken" };
+          pending = "capacity: the corrected window was not tried";
+          retryKind = "resize";
           continue;
         }
       }
       if (!reply.ok) {
-        if (reply.reason === "unavailable" || reply.reason === "aborted") return { status: "unavailable", doneThroughLine: pos, totalLines: total, calls: made };
-        return { status: "retryable", reason: reply.reason === "context_exceeded" ? "context exceeded after a corrected window" : "model unavailable" };
+        const compileFailed = reply.reason === "grammar_rejected";
+        if (g.grammar !== undefined && (compileFailed || (reply.reason === "http" && reply.status === 400))) {
+          // §4.4: a grammar request refused — an HTTP 400 (no cause claimed) or a grammar the in-process model could not
+          // compile (codex T7-7) — the grammar-off record at once, then a grammarless retry.
+          grammarRefusedHere = true;
+          stats.grammarRefusals++;
+          if (store) recordGrammarOff(store, g.key, compileFailed ? "compile" : "http-400");
+          pending = compileFailed
+            ? "grammar: the in-process model could not compile the grammar; the grammarless retry was not reached"
+            : "grammar: HTTP 400 on a grammar request; the grammarless retry was not reached";
+          retryKind = "grammar";
+          continue;
+        }
+        if (reply.reason === "unavailable" || reply.reason === "aborted") {
+          if (pending !== null) return retryable(pending);   // T3b-4: the retry's own call never answered
+          return { status: "unavailable", doneThroughLine: pos, totalLines: total, calls: made };
+        }
+        return retryable(reply.reason === "context_exceeded" ? "context exceeded after a corrected window" : "model unavailable");
       }
       if (reply.finish === "length") {
         // A cut reply is never success (P2): halve the window and redo it; one line still cut is a capacity limit.
         const size = fitted.end - pos;
-        if (size <= 1) return { status: "retryable", reason: `capacity: one message's observations exceed the ${b.reserve}-token reply` };
+        if (size <= 1) return retryable(`capacity: one message's observations exceed the ${b.reserve}-token reply`);
         maxLines = Math.max(1, Math.floor(size / 2));
         feedback = undefined;
-        retry = "resize";
+        if (!(await persistBound(maxLines))) return { status: "overtaken" };
+        pending = "capacity: the reply was cut and the halved window was not tried";
+        retryKind = "resize";
         continue;
       }
       // codex T11-2: only a reply that finished as an answer is parsed (design §1.4) — never read as "nothing".
-      if (reply.finish !== "stop") return { status: "retryable", reason: "the model's reply did not finish as an answer" };
-      const parsed = parseObservationReply(reply.text);
+      if (reply.finish !== "stop") return retryable("the model's reply did not finish as an answer");
+      const evidence = canonicalizeForMatch(`${fitted.context}\n${lines.slice(pos, fitted.end).map(l => l.text).join("\n")}`);
+      const parsed = parseObservationReply(reply.text, { evidence });
+      noteParse(stats, parsed, g.grammar !== undefined ? grammarReplyClass(parsed, reply.text) : null);
       if (parsed.ok) {
         observations.push(...parsed.value);
         produced.push(...parsed.value.map(o => o.title));
         break;
       }
-      if (formatRetried) return { status: "retryable", reason: "no parseable response within the budget" };
-      // One format retry: its feedback comes out of THIS window's budget (the same lines, re-fitted, re-counted).
-      formatRetried = true;
-      feedback = formatFeedback(parsed.error, reply.text);
+      const reason = `no parseable response: ${observerFailureClass(parsed.failure)}`;
+      if (formatRetries >= FORMAT_RETRIES) return retryable(reason);
+      // A format retry: a fresh sample with feedback that names the failing field, out of THIS window's budget.
+      formatRetries++;
+      feedback = observationFeedback(parsed.failure);
       maxLines = fitted.end - pos;
-      retry = "format";
+      pending = reason;
+      retryKind = "format";
     }
     pos = fitted.end;
-    maxLines = Number.POSITIVE_INFINITY;
+    bound = undefined;
     if (opts.onProgress && pos < total) {
       const kept = await opts.onProgress({ doneThroughLine: pos, observations: [...observations], titles: [...produced] });
       if (!kept) return { status: "overtaken" };

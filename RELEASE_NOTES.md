@@ -4,6 +4,118 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.41.4 — the observer's replies parse, and a reply that is not an answer is never "nothing"
+
+v0.41.2 made the observer's prompt fit the server's context. Its replies still failed on the documented observer
+model. In the vault that found this, 35 ranges were quarantined with "no parseable response within the budget"
+between the v0.41.2 upgrade and 2026-10-03, and 14 were still held. A read-only re-run of three held ranges against
+the documented model (qmd-query-expansion-1.7B) got 2 usable answers from 34 replies:
+
+- 21 replies typed an observation `tool_use`: the transcript renders tool calls as `[tool_use name="…"]`, and the
+  parser dropped every block whose type was not on its list.
+- 4 replies copied the prompt's own placeholder: the prompt's structure wrote `...` in every field.
+- 7 replies came back in the model's query-expansion format. v0.41.3 read a short reply without markup as "nothing
+  to record", so a range answered that way committed as empty and was never observed again.
+- Every format retry repeated its first reply. Its feedback named a `<content>` tag the schema does not have, said
+  nothing about which field failed or what it allows, and quoted 500 characters of the bad reply back.
+
+On a backend whose invocations each afford one call, a window that needed a retry also looped. The retry's state
+lived inside the invocation, so the invocation ended `partial`, the range was queued as a continuation (no failure
+backoff), and the next invocation sent the same first call again — every minute, indefinitely.
+
+### What changed
+
+- **Only `<none/>` means "nothing".** The prompt asks for exactly `<none/>` when nothing significant happened; the
+  sentinel counts alone or inside one complete code fence. An empty reply, prose, or another format is a format
+  failure (`empty-reply`, `no-blocks`), never `[]`. A reply that
+  holds valid blocks and `<none/>` yields the blocks. The 300-character "plain nothing" rule is gone.
+- **The prompt names the types and has nothing to copy.** The type rule lists the nine types and says a type is never
+  a transcript role or tool name. The structure's `...` placeholders became `{{type}}`, `{{title}}`, `{{fact}}`,
+  `{{entity}}`, `{{why}}`, `{{path}}` skeleton tokens, which the placeholder guards drop when a model copies them. (A
+  first draft wrote the type list into the structure's `<type>` line; without the grammar the model copied that line as
+  the type in 28 of 39 replies.) The prompt states the escapes (`&lt;` `&gt;` `&amp;`) and the field limits in
+  characters.
+- **A rejected block says why, in classes.** `type-not-allowed` (with the value's class: `tool-role`,
+  `placeholder`, `type-list`, `other`), `type-missing`, `title-missing`, `title-empty`, `title-placeholder`,
+  `facts-empty`. A block with no usable fact is now rejected (it was kept with no facts). A held range's reason carries
+  the class (`no parseable response: type-not-allowed (tool-role)`), never transcript text.
+- **Feedback that can repair.** A format retry names the failing field, its class and the allowed values, and says
+  to output exactly `<none/>` if nothing happened. It never mentions `<content>` and never quotes the reply. The
+  handoff summary keeps its feedback unchanged, byte for byte.
+- **A window ends inside the invocation that started it.** Up to two format retries per window, each a fresh sample
+  with that feedback. After a reply that needs a retry — unparseable, cut, a validated oversize, or a refused
+  grammar request — every exit before the retry's own reply fails the attempt (`retryable`, with the failure
+  backoff, the reason naming that reply's class) instead of queueing a continuation. A one-call backend now takes one backoff step per failure instead of
+  looping.
+- **A size reduction persists.** A cut reply's halving and an oversize's correction write a shrink-only window
+  bound into the range's checkpoint before the smaller window is tried, so the next processor starts small. Repeated
+  one-call attempts on a cut window converge. Each validated oversize whose `n_ctx` is below what `/props` claims
+  also lowers a ceiling for that `/props` value (7 days; 4 values kept per server), so the next invocation's first
+  call fits.
+- **Grammar-constrained decoding on llama.cpp.** A server whose `/props` fingerprint is strong (llama-server) and
+  the in-process node-llama-cpp model get a GBNF grammar with each request: every type, predicate and concept
+  enumerated, the fields bounded, `<none/>` allowed. A refused grammar request — an HTTP 400 (its cause is not
+  claimed) or, in process, a grammar that does not compile — turns the grammar off for that server for 24 hours, and
+  the observer retries without it at once; a grammarless request must reach that server before the grammar is used
+  again. `CLAWMEM_OBSERVER_GRAMMAR=off` disables it. Enforcement is not verified before use: completed replies to
+  grammar requests that fail structurally are counted, and `clawmem doctor` reports them.
+- **Units, decoding and guards.** Field values are decoded once (`&lt;` `&gt;` `&amp;`), then trimmed, then checked;
+  every bound counts code points, so a 41-letter astral subject keeps its triple and a long title is cut without
+  splitting a pair. A triple whose subject or object is a tool-call id or a copied rendering (the whole value: an
+  entity such as `toolu_abcdef.ts` keeps its triple), or whose subject equals its object, is dropped; repeated facts
+  in a block are kept once; an echoed `{{entity}}` or `{{path}}` is dropped. A fact or title that restates one of the
+  prompt's own clauses is kept and counted, never dropped.
+- **Consolidation fits its prompts (BACKLOG 68.6).** Cluster synthesis and the deductive pass count their prompt
+  against the LLM's context and keep the sources that fit; numbering, index bounds, document mapping, the validation
+  context and the statistics all use exactly those. Fewer than two sources fit: no synthesis that tick. A cut reply
+  is not a synthesis or a deduction.
+- **Stale causal runs (BACKLOG 68.2).** The "still in progress after 1 h" warning counts runs started 1–24 hours
+  ago. Older ones are reported once, as information: "N unfinished causal run(s) older than 24 hours; not
+  automatically replayed".
+- **`clawmem repair stop-queue --retry-now <id[,id…]|held> [--limit N]`** makes queued ranges due now (`held`: rows
+  whose last error is not a continuation; claimed rows are never touched; at most 50 by default) and prints their ids.
+  With `--run`, a pass whose replays all failed no longer ends the drain, and the command reports which of the selected
+  ranges it attempted and when the next work is due, counted with each worker's own due rules (an expired claim is
+  due now; named vaults' feedback mirrors included).
+- **`clawmem doctor`** groups held ranges by class (a v0.41.2–3 reason reads `legacy (unclassified)`), shows a
+  server's grammar-off record, and counts structural failures under the grammar.
+
+### Upgrading
+
+- A range's observer checkpoint written by v0.41.2 or v0.41.3 does not match the new contract: its unit restarts at
+  line 0 when next reached. A finished range's tombstone still counts.
+- Held ranges retry on their own backoff (up to 12 hours apart). To retry them now: `clawmem repair stop-queue
+  --retry-now held --run`.
+- Ranges v0.41.3 committed as empty after a query-expansion reply are not re-observed.
+- The observer's fixed prompt is 110 tokens longer (794 on the documented model, measured): a window holds about 1,660
+  transcript tokens at `-c 4096` and 5,400 at `-c 8192`.
+
+### Verification
+
+The three ranges the investigation started from (held for days, 5 or 6 attempts each: 100, 16 and 8 lines) were
+re-run read-only against the documented model (llama-server, `-c 8192`) with v0.41.4's code, from line 0 as an upgraded
+install will. With the grammar, each finished in one invocation; across 93 calls every reply was structurally valid,
+81 held at least one observation and 12 were `<none/>`. Without the grammar, 15 of 29 replies parsed, and 8 of 9
+re-runs finished within three invocations. On the same windows, the observer those ranges failed under parsed 2 of 34
+replies, and v0.41.3's prompt 4 of 12. The review then tightened the grammar's field boundaries; re-run on the 8-line
+range, the server accepted the revised grammar and the range finished in one call.
+
+Fifty-four new tests were written first and run on v0.41.3: 50 failed, each for the reason its name gives, and the 4
+guards passed. The implementation review added 25 more, written first the same way: 23 failed before their fix and 2
+guards passed. Every new branch has a mutant that a named test kills on an assertion, run from a clean baseline (81 of
+81). Full suite on Bun 1.4.2: 3,506 pass / 0 fail across 184 files. The adversarial review (one session) cleared the
+design at its sixth turn and this implementation at its third, after 15 and then 5 findings; a docs audit of every
+tracked doc then took three more turns (3, 1 and 0 findings), ending with zero remaining findings.
+
+### What didn't change
+
+- The handoff summary's prompt and feedback; the legacy `generate()` request body (the judge test pins its bytes).
+- No schema migration; `CHECKPOINT_SCHEMA` stays 1. Only `ok` and `empty` commit a range (62.1 D3).
+- The observer model. Content quality on the documented model stays weak, and it answers `<none/>` for about one
+  window in eight that holds real work; BACKLOG 69.4 evaluates a stronger model.
+
+---
+
 ## v0.41.3 — zerank-2 runs as a Q8_0 GGUF, and the reranker hint stops calling every GGUF broken
 
 Since v0.11.3 the docs said every zerank-2 GGUF is inert, because llama.cpp's standard converter drops

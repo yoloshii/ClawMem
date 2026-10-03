@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.41.3**.
+Guide for upgrading between released versions. Current: **v0.41.4**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,6 +59,26 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 **Already on the sidecar?** It stays correct, and nothing requires a change. The Q8_0 GGUF frees about 3 GB of VRAM, is somewhat slower per document, and ranked like the sidecar in a side-by-side comparison ([measurements](inference-services.md#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar)). To switch, stop the sidecar (`docker compose stop reranker`; its `unless-stopped` policy keeps it down across reboots), start the GGUF on `:8090`, and run `clawmem rerank-health`.
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
+
+---
+
+## v0.41.4: the observer's replies parse, and a reply that is not an answer is never "nothing"
+
+**No vault migration.** Upgrade every process that runs the Stop hooks (the hooks, `clawmem watch`, the MCP server of
+every open agent session, the OpenClaw and Hermes plugins) and restart the watcher.
+
+- **Held ranges.** Ranges that v0.41.2 or v0.41.3 held with "no parseable response within the budget" retry on their own
+  backoff, up to 12 hours apart. To retry them now: `clawmem repair stop-queue --retry-now held --run`. `clawmem doctor`
+  lists what stays held, by class ([troubleshooting](../troubleshooting.md#hooks)).
+- **Checkpoints restart.** A range's observer checkpoint written by v0.41.2 or v0.41.3 belongs to the old contract: that
+  range starts again from its first window when it is next reached. Finished ranges stay finished.
+- **Grammar.** On llama-server the observer now sends a GBNF grammar with its requests. There is nothing to configure.
+  `CLAWMEM_OBSERVER_GRAMMAR=off` turns it off, for a server behind the URL that is not llama.cpp.
+- **A slightly longer prompt.** The observer's fixed prompt measures 794 tokens on the documented model (684 in
+  v0.41.3), so a window holds about 110 fewer transcript tokens: about 1,660 at `-c 4096`, 5,400 at `-c 8192`.
+- **Not recovered:** turns that v0.41.3 committed as empty because the model answered in another format.
+
+Otherwise no re-embed, reindex or `clawmem setup hooks` is needed.
 
 ---
 

@@ -96,8 +96,11 @@ describe("v0.41.2 windows", () => {
     const msgs = hexTurn(20);
     const lines = renderObserverLines(msgs);
     const progress: number[] = [];
+    // v0.41.4: the system prompt grew (the type list, the escape rule, `<none/>`), so a 4,096-token window holds fewer
+    // dense hex lines and these ten take more than six calls; the cap is raised — the subject here is the resume line,
+    // the carried observations and the progress order, not the call count.
     const r = await extractObservationsWindowed(msgs, {
-      llm: fake.llm as any, backend: { kind: "remote", root: "http://fake-llm" }, deadline: deadline(),
+      llm: fake.llm as any, backend: { kind: "remote", root: "http://fake-llm" }, deadline: deadline(), maxCalls: 12,
       resume: { doneThroughLine: 10, observations: [{ type: "discovery", title: "earlier", facts: ["f"], narrative: "n", concepts: [], filesRead: [], filesModified: [] }], titles: ["earlier"] },
       onProgress: (p) => { progress.push(p.doneThroughLine); return true; },
     });
@@ -280,7 +283,8 @@ describe("v0.41.2 codex T11 regressions — the observer", () => {
     });
     const r = await extractObservationsWindowed(hexTurn(6), { llm: fake.llm as any, backend: B, deadline: deadline() });
     expect(r.status).toBe("ok");
-    expect(fake.calls[1]!.prompt).toContain("did not match the expected structure");
+    // v0.41.4 §3.1: the observer's own retry feedback (v0.41.3's generic text named a `<content>` tag and echoed the reply).
+    expect(fake.calls[1]!.prompt).toContain("Your previous reply could not be used:");
     expect(fake.calls[1]!.promptTokens + observerReplyReserve(4096)).toBeLessThanOrEqual(4096);
     expect(fake.capacityReads.length).toBeGreaterThanOrEqual(fake.calls.length);
   });
@@ -307,8 +311,9 @@ describe("v0.41.2 codex T11 regressions — the observer", () => {
   it("the checkpoint contract covers the format-retry text and the CONTEXT sizes (T11-11)", async () => {
     const obs = await observerModule();
     const inputs = JSON.stringify(obs.observerContractInputs?.() ?? {});
-    expect(inputs).toContain("did not match the expected structure");
-    expect(inputs).toContain("Return only the expected structure this time.");
+    // v0.41.4 §1.5: the observer's own feedback strings (and its grammar) are what a checkpoint's contract hashes now.
+    expect(inputs).toContain("Your previous reply could not be used:");
+    expect(inputs).toContain("output exactly <none/> and nothing else");
     expect(inputs).toContain('"contextMaxChars":2000');
   });
 });

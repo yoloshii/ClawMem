@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0, and the compaction leftovers since v0.40.0: `postcompact-inject` under a matcher other than `compact`, old `precompact-state.md` files (red when one was written after the upgrade), indexed copies of them still active; since v0.41.2 the LLM server's context as the Stop hooks' observer sees it — its source, how prompts are counted, the transcript window it leaves, the observer's mean call over its latest 50 calls — the ranges held as `capacity:`, queued continuations and those waiting for a server that could not be verified, and live checkpoints no queued range owns, split into those a later Stop can still reach, a first Stop's with no cursor, and those behind the transcript's cursor)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0, and the compaction leftovers since v0.40.0: `postcompact-inject` under a matcher other than `compact`, old `precompact-state.md` files (red when one was written after the upgrade), indexed copies of them still active; since v0.41.2 the LLM server's context as `/props` reports it to the Stop hooks' observer — its source, how prompts are counted, the nominal transcript allowance of one window (before the context section and any remembered context ceiling, so an actual window can be smaller), the observer's mean call over its latest 50 calls — the ranges held as `capacity:`, queued continuations and those waiting for a server that could not be verified, and live checkpoints no queued range owns, split into those a later Stop can still reach, a first Stop's with no cursor, and those behind the transcript's cursor)
 clawmem rerank-health           # Live cache-bypassed reranker probe: coverage + discrimination check, and provider-identity attestation (v0.38.0 — a passing probe enables remote rerank-score caching; a failed or unfingerprintable probe REVOKES it)
 ```
 
@@ -196,6 +196,9 @@ clawmem repair counters --restore <op>      # Put back what op <op> changed, whe
 clawmem repair counters --remove-fence      # Drop the fence triggers (before a downgrade)
 clawmem repair stop-queue                   # Queue depths: quarantined ranges, pending/provisional feedback, judge, handoffs, causal
 clawmem repair stop-queue --run             # Drain every queue now (no quiet period; up to 20 passes)
+clawmem repair stop-queue --retry-now held  # Make the held ranges due now (queued, last error not a continuation; at most 50)
+clawmem repair stop-queue --retry-now 12,15 --limit 10   # The same for named ranges (queued rows only)
+clawmem repair stop-queue --retry-now held --run         # …and drain now: reports the ranges it reached and the next due times
 clawmem repair stop-queue --dismiss <id>    # Dismiss one quarantined range for good
 clawmem repair stop-queue --dismiss-causal  # Drop the causal steps waiting while every consumer keeps CLAWMEM_CAUSAL_WRITER=off
 clawmem recover antipatterns                # List the distinct lines of the antipattern bodies older versions overwrote
@@ -215,6 +218,19 @@ again; run it after every v0.41 process has stopped. `--dismiss-causal` deletes,
 refuses while this shell's `CLAWMEM_CAUSAL_WRITER` is not `off`, and while the vault shows the writer in use
 elsewhere (a causal step queued or run in the last hour). It cannot see a consumer that runs the writer but has
 been idle: set the writer to `off` for the watcher and every hook before you use it.
+
+`--retry-now` (v0.41.4) sets the selected quarantined ranges' next retry to now and prints their ids: `held` selects the
+queued rows whose last error is not a continuation, a comma-separated list selects those ids; only `queued` rows are
+touched (a row another process has claimed keeps its lease), at most `--limit` (default 50), lowest ids first. Without
+`--run` the watcher replays them at its next tick. `--run` drains every queue the worker services, up to 20 passes: a pass
+counts as progress when anything moved or a replay row was attempted, whatever its outcome, so a pass whose replays all
+failed again does not end the drain. It then reports, for the ranges `--retry-now` selected in the same command, how many
+were attempted and which were not reached, and what each queue still has due and when its next item falls due, counted
+with the worker's own rules (a claimed range whose lease expired is due now; feedback turns are examined every pass; a
+named vault's mirror is due once its general verdict is ready; handoff renders wait for the session to end or go
+quiet). The handoff digest catch-up is not a queue (each pass re-reads quiet transcripts whose cursor is behind) and is
+not counted. It does not wait for work due later, and
+promises no exactly-once replay: other due work, continuations and each tick's time budget share every pass.
 
 ## Causal witness migration (s342)
 

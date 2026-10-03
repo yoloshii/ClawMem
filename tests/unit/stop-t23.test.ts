@@ -41,7 +41,8 @@ beforeEach(() => {
   observerPrompts = [];
   setDefaultLlamaCpp({
     generate: async (prompt: string) => {
-      if (prompt.includes("Extract observations:")) { observerPrompts.push(prompt); return { text: "", model: "fake", done: true }; }
+      // v0.41.4 §2.1: the model's "nothing" is `<none/>` (an empty reply is a format failure now).
+      if (prompt.includes("Extract observations:")) { observerPrompts.push(prompt); return { text: "<none/>", model: "fake", done: true }; }
       if (prompt.includes("session summarizer")) {
         if (failSummary) return null;
         return { text: `<summary><request>R</request><investigated>None</investigated><learned>None</learned><completed>Done</completed><next_steps>None</next_steps></summary>`, model: "fake", done: true };

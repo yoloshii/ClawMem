@@ -3843,6 +3843,8 @@ async function cmdDoctor() {
       if (h.causalWaitingOff > 0) console.log(`${c.yellow}!${c.reset} Stop pipeline: ${h.causalWaitingOff} causal step(s) wait while CLAWMEM_CAUSAL_WRITER=off (they run when it is shadow/on; dismiss with: clawmem repair stop-queue --dismiss-causal)`);
       else if (h.causalRunnable > 0) console.log(`${c.dim}   ${h.causalRunnable} causal step(s) owed — the watcher runs them${c.reset}`);
       if (h.causalStuck > 0) console.log(`${c.yellow}!${c.reset} Stop pipeline: ${h.causalStuck} causal run(s) still in progress after 1 h (a crash inside the step — at-most-once, not re-run)`);
+      // v0.41.4 (68.2, §6.2): runs older than a day are history, not a live problem — reported once, as information.
+      if (h.causalStale > 0) console.log(`${c.dim}   ${h.causalStale} unfinished causal run(s) older than 24 hours; not automatically replayed${c.reset}`);
       if (h.recoveredBodies > 0) console.log(`${c.dim}   ${h.recoveredBodies} overwritten antipattern bodies preserved — review with: clawmem recover antipatterns${c.reset}`);
       if (h.graceByWeek.some(n => n > 0)) console.log(`${c.dim}   archive grace expiries per coming week: ${h.graceByWeek.join(", ")}${c.reset}`);
       // v0.41.2 (BACKLOG 68.5): the observer's held capacity failures, its continuations and checkpoints, and what it could not see.
@@ -3850,6 +3852,42 @@ async function cmdDoctor() {
       if (capacityHeld > 0) {
         const last = (s.db.prepare(`SELECT last_error FROM stop_retries WHERE state IN ('queued', 'claimed') AND last_error LIKE 'capacity:%' ORDER BY id DESC LIMIT 1`).get() as { last_error: string }).last_error;
         console.log(`${c.yellow}!${c.reset} Stop pipeline: ${capacityHeld} range(s) held because the observer's prompt cannot fit the LLM server's context (${last.slice(0, 160)}) — raise the server's context (llama-server -c); they replay by themselves`);
+      }
+      // v0.41.4 (§7.3): why ranges are held, by class — a legacy reason (v0.41.2–3) reads `legacy (unclassified)`.
+      if (h.heldByClass.length > 0) {
+        const held = h.heldByClass.reduce((n, [, k]) => n + k, 0);
+        console.log(`${c.yellow}!${c.reset} Stop pipeline: ${held} range(s) held after failed attempts — held ranges by class: ${h.heldByClass.map(([cls, n]) => `${cls} ${n}`).join(", ")}. They retry on their own backoff; retry them now: clawmem repair stop-queue --retry-now held --run`);
+      }
+      // v0.41.4 (§4.4, §4.5): grammar refusals and what completed replies to grammar requests showed.
+      for (const row of s.db.prepare(`SELECT value FROM vault_flags WHERE flag LIKE 'observer-grammar:%'`).all() as { value: string }[]) {
+        try {
+          const g = JSON.parse(row.value) as { offUntil?: string; pending?: boolean; cause?: string };
+          if (typeof g.offUntil !== "string") continue;
+          // codex T7-7: an in-process compile failure is a known cause; an HTTP 400's is not (§4.4).
+          const why = g.cause === "compile" ? "after the in-process model could not compile the grammar" : "after an HTTP 400 on a grammar request (cause unconfirmed)";
+          const owed = g.pending === true ? "; a grammarless request must reach the server before the grammar is used again" : "";
+          if (Date.parse(g.offUntil) > epochMs(epochNow())) {
+            console.log(`${c.dim}   observer: grammar off until ${g.offUntil.slice(0, 16)} ${why}${owed}${c.reset}`);
+          } else if (g.pending === true) {
+            console.log(`${c.dim}   observer: grammar off ${why} until a grammarless request reaches the server${c.reset}`);
+          }
+        } catch { /* a malformed record is skipped */ }
+      }
+      const statsRow = s.db.prepare(`SELECT value FROM vault_flags WHERE flag = 'observer_stats'`).get() as { value: string } | null;
+      if (statsRow) {
+        try {
+          const v = JSON.parse(statsRow.value) as { backends?: Record<string, Record<string, unknown>> };
+          const sum = (f: string) => Object.values(v.backends ?? {}).reduce((n, b) => n + (typeof b[f] === "number" ? b[f] as number : 0), 0);
+          const lastAt = Object.values(v.backends ?? {}).map(b => String(b.at ?? "")).sort().at(-1)?.slice(0, 16) ?? "?";
+          const structural = sum("grammarStructural");
+          if (structural > 0) console.log(`${c.yellow}!${c.reset} Stop pipeline: ${structural} completed replies to grammar requests failed structurally — the server may be ignoring the grammar (last ${lastAt}; see docs/troubleshooting.md)`);
+          const content = sum("grammarContent");
+          const echoes = sum("instructionEcho") + sum("eventDefinitionEcho");
+          const dropped = sum("tripleToolId") + sum("tripleSelf") + sum("identifierResidue") + sum("repeatedFact");
+          if (content + echoes + dropped > 0) {
+            console.log(`${c.dim}   observer: ${content} grammar reply(ies) rejected on content; ${echoes} prompt-clause echo(es) kept and counted; ${dropped} residue item(s) dropped (tool-call-id or self triples, skeleton identifiers, repeated facts)${c.reset}`);
+          }
+        } catch { /* a malformed record is skipped */ }
       }
       const continuations = (s.db.prepare(`SELECT COUNT(*) AS n FROM stop_retries WHERE state IN ('queued', 'claimed') AND last_error LIKE 'continuation:%'`).get() as { n: number }).n;
       // codex T12-6: a continuation whose server could not be verified waits until its /props answers again, however long.
@@ -5864,11 +5902,14 @@ async function cmdRepair(args: string[]) {
   if (sub === "stop-queue") {
     const { values } = parseArgs({
       args: rest,
-      options: { run: { type: "boolean" }, dismiss: { type: "string" }, "dismiss-causal": { type: "boolean" } },
+      options: {
+        run: { type: "boolean" }, dismiss: { type: "string" }, "dismiss-causal": { type: "boolean" },
+        "retry-now": { type: "string" }, limit: { type: "string" },
+      },
       allowPositionals: false,
     });
     const s = getStore();
-    const { dismissStopRetry, dismissCausalMarkers, causalDismissRefusal, runStopWorkerTick } = await import("./stop-worker.ts");
+    const { dismissStopRetry, dismissCausalMarkers, causalDismissRefusal, runStopWorkerTick, retryNowStopRetries, stopQueueNextDue } = await import("./stop-worker.ts");
     if (values.dismiss) {
       console.log(dismissStopRetry(s, Number(values.dismiss)) ? `dismissed quarantined range ${values.dismiss}` : `no open quarantined range ${values.dismiss}`);
       return;
@@ -5884,22 +5925,44 @@ async function cmdRepair(args: string[]) {
       }
       return;
     }
+    // v0.41.4 (§7.1): make held ranges due now — queued rows only; a claimed row's lease is never touched.
+    let selected: number[] | null = null;
+    if (values["retry-now"] !== undefined) {
+      const raw = values["retry-now"].trim();
+      const ids = raw === "held" ? null : raw.split(",").map(x => Number(x.trim()));
+      if (ids && (ids.length === 0 || ids.some(n => !Number.isInteger(n) || n <= 0))) die("--retry-now takes `held` or a comma-separated list of range ids");
+      const limit = values.limit === undefined ? 50 : Number(values.limit);
+      if (!Number.isInteger(limit) || limit <= 0) die("--limit takes a positive whole number");
+      selected = retryNowStopRetries(s, ids ?? "held", limit);
+      console.log(selected.length > 0 ? `rescheduled ${selected.length} range(s) to retry now: ${selected.join(", ")}` : "no queued range matched --retry-now");
+    }
     if (values.run) {
+      // v0.41.4 (§7.2): a bounded drain — a pass counts as progress when anything moved OR a replay row was attempted
+      // (whatever its outcome), at most 20 passes; no exactly-once promise, and future-due work is not waited for.
       const vaults = (await stopPipelineVaults()).filter(v => !v.general).map(v => ({ name: v.name, store: v.store }));
+      const attempted = new Set<number>();
+      // One quiet window for the passes and the report, so the report counts as due what a pass would take (codex T7-10).
+      const RUN_QUIET_MS = 0;
       for (let i = 0; i < 20; i++) {
-        const r = await runStopWorkerTick(s, vaults, getDefaultLlamaCpp(), { quietMs: 0 });
+        const r = await runStopWorkerTick(s, vaults, getDefaultLlamaCpp(), { quietMs: RUN_QUIET_MS });
         const moved = r.attributed + r.provisional + r.unattributable + r.mirrors + r.digested + r.rendered + r.replayed + r.rejudged + r.causal;
-        console.log(`pass ${i + 1}: attributed ${r.attributed} (+${r.provisional} provisional), unattributable ${r.unattributable}, mirrors ${r.mirrors}, digested ${r.digested}, rendered ${r.rendered}, replayed ${r.replayed}, rejudged ${r.rejudged}, causal ${r.causal}`);
+        for (const id of r.attemptedIds) attempted.add(id);
+        console.log(`pass ${i + 1}: attributed ${r.attributed} (+${r.provisional} provisional), unattributable ${r.unattributable}, mirrors ${r.mirrors}, digested ${r.digested}, rendered ${r.rendered}, replayed ${r.replayed}, attempted ${r.attempted}, rejudged ${r.rejudged}, causal ${r.causal}`);
         for (const e of r.errors) console.log(`  ${c.yellow}!${c.reset} ${e}`);
-        if (moved === 0) break;
+        if (moved + r.attempted === 0) break;
       }
+      if (selected) {
+        const notReached = selected.filter(id => !attempted.has(id));
+        console.log(`retry-now: ${selected.length} rescheduled, ${selected.length - notReached.length} attempted, ${notReached.length} not reached${notReached.length > 0 ? ` (${notReached.join(", ")})` : ""}`);
+      }
+      console.log(stopQueueNextDue(s.db, { quietMs: RUN_QUIET_MS, vaults }));
     }
     const { stopPipelineHealth } = await import("./stop-health.ts");
     const h = stopPipelineHealth(s.db);
     console.log(`quarantined ranges ${h.stopRetries.count} (unavailable ${h.unavailableRanges}) · feedback pending ${h.feedbackPending.count} (keyless ${h.keylessPending}), provisional ${h.feedbackProvisional.count} · judge deferred ${h.judgeDeferred.count} · handoff renders ${h.handoffRenders.count} · causal runnable ${h.causalRunnable}, waiting on mode off ${h.causalWaitingOff}`);
     return;
   }
-  die("Usage: clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]\n       clawmem repair stop-queue [--run] [--dismiss <id>] [--dismiss-causal]");
+  die("Usage: clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]\n       clawmem repair stop-queue [--retry-now <id[,id…]|held> [--limit N]] [--run] [--dismiss <id>] [--dismiss-causal]");
 }
 
 async function cmdRecover(args: string[]) {
@@ -5979,7 +6042,7 @@ ${c.bold}Lifecycle:${c.reset}
 ${c.bold}Stop pipeline:${c.reset}
   clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]
                                        Recompute feedback counters from verified references (dry run without --apply)
-  clawmem repair stop-queue [--run] [--dismiss <id>] [--dismiss-causal]
+  clawmem repair stop-queue [--retry-now <id[,id…]|held> [--limit N]] [--run] [--dismiss <id>] [--dismiss-causal]
                                        Show, drain (--run) or dismiss the stop pipeline's queues
   clawmem recover antipatterns [--apply] [--min-occurrences N]
                                        List (or write) the antipatterns earlier versions overwrote

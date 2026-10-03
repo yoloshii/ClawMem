@@ -41,9 +41,31 @@ export type StopHealth = {
   handoffRenders: QueueHealth;
   causalRunnable: number;
   causalWaitingOff: number;
+  /** In-progress causal runs started 1–24 h ago: writers stopped mid-step recently — worth a look (v0.41.4 §6.2). */
   causalStuck: number;
+  /** In-progress causal runs started over 24 h ago: reported once as information, not automatically replayed. */
+  causalStale: number;
+  /** v0.41.4 (§7.3): quarantined ranges held after a failed attempt (continuations excluded), by class, most first. */
+  heldByClass: [string, number][];
   graceByWeek: number[];
 };
+
+/**
+ * A held range's class from its last error (v0.41.4 §7.3): `no parseable response: X` → X (`type-not-allowed
+ * (tool-role)`, `no-blocks`, …); `capacity: …` → capacity; `grammar: …` → grammar; v0.41.2–3's unclassified reason →
+ * `legacy (unclassified)`; a continuation → null (not held); anything else → its text before a colon.
+ */
+export function heldReasonClass(lastError: string | null): string | null {
+  const e = (lastError ?? "").trim();
+  if (e.startsWith("continuation:")) return null;
+  if (e === "no parseable response within the budget") return "legacy (unclassified)";
+  if (e.startsWith("no parseable response: ")) return e.slice("no parseable response: ".length);
+  if (e.startsWith("capacity:")) return "capacity";
+  if (e.startsWith("grammar:")) return "grammar";
+  if (e === "") return "unknown";
+  const head = e.split(":")[0]!.trim();
+  return head.length > 60 ? `${head.slice(0, 59)}…` : head;
+}
 
 function hasTable(db: Database, name: string): boolean {
   return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
@@ -60,7 +82,7 @@ export function stopPipelineHealth(db: Database): StopHealth {
   const h: StopHealth = {
     missing, legacyWriters: [], legacyWritersRecent: [], recomputeDone: false, bodiesPreserved: false, recoveredBodies: 0,
     stopRetries: empty, unavailableRanges: 0, feedbackPending: empty, feedbackProvisional: empty, keylessPending: 0, judgeDeferred: empty,
-    handoffRenders: empty, causalRunnable: 0, causalWaitingOff: 0, causalStuck: 0, graceByWeek: [],
+    handoffRenders: empty, causalRunnable: 0, causalWaitingOff: 0, causalStuck: 0, causalStale: 0, heldByClass: [], graceByWeek: [],
   };
   if (hasTable(db, "legacy_writer_log")) {
     h.legacyWriters = (db.prepare(`SELECT surface, count, first_at, last_at FROM legacy_writer_log ORDER BY last_at DESC`).all() as
@@ -75,6 +97,13 @@ export function stopPipelineHealth(db: Database): StopHealth {
   h.recoveredBodies = (db.prepare(`SELECT COUNT(*) AS n FROM recovered_antipattern_bodies`).get() as { n: number }).n;
   h.stopRetries = queue(db, `SELECT COUNT(*) AS n, MIN(first_failed_at) AS oldest FROM stop_retries WHERE state IN ('queued', 'claimed')`);
   h.unavailableRanges = (db.prepare(`SELECT COUNT(*) AS n FROM stop_retries WHERE state = 'unavailable'`).get() as { n: number }).n;
+  const byClass = new Map<string, number>();
+  for (const r of db.prepare(`SELECT last_error, COUNT(*) AS n FROM stop_retries WHERE state IN ('queued', 'claimed') GROUP BY last_error`).all() as
+    { last_error: string | null; n: number }[]) {
+    const cls = heldReasonClass(r.last_error);
+    if (cls !== null) byClass.set(cls, (byClass.get(cls) ?? 0) + r.n);
+  }
+  h.heldByClass = [...byClass].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   h.feedbackPending = queue(db,
     `SELECT COUNT(*) AS n, MIN(u.timestamp) AS oldest FROM feedback_turns f JOIN context_usage u ON u.id = f.usage_id WHERE f.state = 'pending'`);
   h.feedbackProvisional = queue(db,
@@ -90,8 +119,13 @@ export function stopPipelineHealth(db: Database): StopHealth {
   const queued = (db.prepare(`SELECT COUNT(*) AS n FROM causal_due WHERE state IN ('queued', 'claimed')`).get() as { n: number }).n;
   if (resolveCausalWriterMode() === "off") h.causalWaitingOff = queued; else h.causalRunnable = queued;
   if (hasTable(db, "causal_runs")) {
-    h.causalStuck = (db.prepare(`SELECT COUNT(*) AS n FROM causal_runs WHERE outcome = 'in_progress' AND started_at < ?`)
-      .get(new Date(epochMs(epochNow()) - HOUR_MS).toISOString()) as { n: number }).n;
+    const nowMs = epochMs(epochNow());
+    const hourAgo = new Date(nowMs - HOUR_MS).toISOString();
+    const dayAgo = new Date(nowMs - STALE_QUEUE_MS).toISOString();
+    h.causalStuck = (db.prepare(`SELECT COUNT(*) AS n FROM causal_runs WHERE outcome = 'in_progress' AND started_at < ? AND started_at >= ?`)
+      .get(hourAgo, dayAgo) as { n: number }).n;
+    h.causalStale = (db.prepare(`SELECT COUNT(*) AS n FROM causal_runs WHERE outcome = 'in_progress' AND started_at < ?`)
+      .get(dayAgo) as { n: number }).n;
   }
   h.graceByWeek = graceExpiryProjection(db);
   return h;

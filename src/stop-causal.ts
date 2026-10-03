@@ -17,6 +17,7 @@ import type { Store } from "./store.ts";
 import { isoNow, type MonoDeadline } from "./clock.ts";
 import { lastChanges, nextRetryAt } from "./stop-schema.ts";
 import { resolveCausalWriterMode, runCausalStep, type CausalLlm } from "./causal-writer.ts";
+import { CAUSAL_DUE_SQL } from "./stop-due.ts";
 import type { ObservationWithDoc } from "./amem.ts";
 
 export type CausalMode = "off" | "shadow" | "on";
@@ -79,7 +80,7 @@ export async function drainCausalMarkers(
   const now = isoNow();
   const markers = store.db.prepare(
     `SELECT id, session_id, run_key, obs_doc_ids, window_at, mode FROM causal_due
-     WHERE (state = 'queued' OR (state = 'claimed' AND lease_expires_at < ?)) AND (next_retry_at IS NULL OR next_retry_at <= ?)
+     WHERE ${CAUSAL_DUE_SQL}
        ${opts.sessionId ? "AND session_id = ?" : ""} ${opts.rangeKey ? "AND range_key = ?" : ""}
      ORDER BY id LIMIT ?`
   ).all(...[now, now, ...(opts.sessionId ? [opts.sessionId] : []), ...(opts.rangeKey ? [opts.rangeKey] : []), opts.limit ?? 3]) as Marker[];

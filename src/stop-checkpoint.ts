@@ -17,7 +17,7 @@ import type { Database } from "bun:sqlite";
 import { isoNow } from "./clock.ts";
 import { lastChanges } from "./stop-schema.ts";
 import type { LlmBackendId } from "./llm.ts";
-import type { Observation } from "./observer.ts";
+import type { Observation, WindowBound } from "./observer.ts";
 
 export const CHECKPOINT_PREFIX = "observer-ckpt:";
 const CHECKPOINT_SCHEMA = 1;
@@ -47,6 +47,12 @@ export type ObserverCheckpoint = {
   doneThroughLine: number;
   observations: Observation[];
   titles: string[];
+  /**
+   * v0.41.4 (DESIGN-v0414.md §3.3): a size reduction for the window starting at `doneThroughLine` (a cut reply's halving,
+   * a validated oversize's correction). Optional — CHECKPOINT_SCHEMA stays 1 and older rows parse unchanged; a malformed
+   * one is ignored by the observer, never invalidating the row. Shrink-only; dropped by the swap that advances the line.
+   */
+  windowBound?: WindowBound;
   at: string;
 };
 

@@ -91,8 +91,11 @@ export type GenerateDetail =
     promptTokens?: number; completionTokens?: number; backend: LlmBackendId;
   }
   | {
-    ok: false; reason: "unavailable" | "context_exceeded" | "http" | "aborted";
+    /** v0.41.4: `grammar_rejected` — the in-process model could not compile the request's grammar; nothing was generated. */
+    ok: false; reason: "unavailable" | "context_exceeded" | "http" | "aborted" | "grammar_rejected";
     nCtx?: number; promptTokens?: number; backend: LlmBackendId;
+    /** v0.41.4: the HTTP status the server answered (`http`) — a grammar request's 400 is told from any other failure. */
+    status?: number;
   };
 
 /** v0.41.2: a backend's per-request context, and where the number came from. */
@@ -116,6 +119,16 @@ export type OverheadStore = {
   get(key: string): string | null;
   set(key: string, value: string): void;
   delete(key: string): void;
+  /**
+   * v0.41.4: an atomic read-modify-write of one key (the Stop pipeline: one immediate transaction) — `fn` gets the
+   * stored value (null when absent) and returns the new one (null deletes). The observer's shared records merge through
+   * it; a store without it is read and written in two steps.
+   */
+  update?(key: string, fn: (old: string | null) => string | null): void;
+  /** v0.41.4: every key under `prefix` with its value (the observer prunes its per-backend records). */
+  entries?(prefix: string): { key: string; value: string }[];
+  /** v0.41.4: run `fn` as one immediate transaction — its get/set/delete/update/entries calls inside it. */
+  transaction?<T>(fn: () => T): T;
 };
 
 /**
@@ -521,7 +534,7 @@ function sha256Hex(text: string): string {
 export type BudgetLlm = Pick<
   LlamaCpp,
   "activeLlmBackend" | "isConfiguredBackend" | "isBackendAvailable" | "llmCapacity" | "countChatTokens" | "outboundChatContent" | "generateDetailed"
-> & Partial<Pick<LlamaCpp, "invalidateOverhead">>;
+> & Partial<Pick<LlamaCpp, "invalidateOverhead" | "requestIdentity">>;
 
 /**
  * v0.41.2 (codex T11-3, T13-1): what a fresh capacity read says about the server a run or a checkpoint was pinned to.
@@ -1599,9 +1612,10 @@ export class LlamaCpp implements LLM {
 
   /**
    * The remote chat-completions body — ONE builder for `generate()` and `generateDetailed()`, so both send byte-
-   * identical requests (`tests/unit/judge.test.ts` pins the bytes).
+   * identical requests (`tests/unit/judge.test.ts` pins the bytes). v0.41.4: `extra.grammar` (the observer's windowed
+   * calls only) adds llama-server's GBNF `grammar` field; without it the body is unchanged.
    */
-  private buildRemoteChatBody(prompt: string, maxTokens: number, temperature: number): Record<string, unknown> {
+  private buildRemoteChatBody(prompt: string, maxTokens: number, temperature: number, extra?: { grammar?: string }): Record<string, unknown> {
     const body: Record<string, unknown> = {
       model: this.remoteLlmModel,
       // Idempotent: several prompts already end with a literal `/no_think` (as of v0.29.0:
@@ -1617,7 +1631,41 @@ export class LlamaCpp implements LLM {
     if (this.remoteLlmReasoningEffort) {
       body.reasoning_effort = this.remoteLlmReasoningEffort;
     }
+    if (extra?.grammar !== undefined) body.grammar = extra.grammar;
     return body;
+  }
+
+  /**
+   * v0.41.4: what a request to `backend` is sent to — the server root and the model the body names, or the local model
+   * file. The observer keys its grammar-off record by it (with the server's fingerprint): another requested model at the
+   * same root is another record.
+   */
+  requestIdentity(backend: LlmBackendId): string {
+    return backend.kind === "remote" ? `remote\u0000${backend.root}\u0000${this.remoteLlmModel}` : `local\u0000${backend.modelPath}`;
+  }
+
+  /** v0.41.4: the local chat session one generation runs in (a seam the tests replace). */
+  private async localChatSession(context: { getSequence(): unknown }): Promise<{
+    promptWithMeta(prompt: string, o: Record<string, unknown>): Promise<{ responseText: string; stopReason: string }>;
+  }> {
+    const { LlamaChatSession } = await getNodeLlamaCpp();
+    return new LlamaChatSession({ contextSequence: context.getSequence() as any }) as any;
+  }
+
+  /**
+   * v0.41.4: a GBNF grammar compiled for the in-process model, kept per grammar text (the observer sends a handful).
+   * One that does not compile throws: the call fails `grammar_rejected`, never a reply generated without it (codex
+   * T7-7), and the observer's grammar-off record (§4.4), not a process-wide memory, decides when it is tried again.
+   */
+  private localGrammars = new Map<string, unknown>();
+  private async localGrammar(gbnf: string): Promise<unknown> {
+    const known = this.localGrammars.get(gbnf);
+    if (known !== undefined) return known;
+    const llama = await this.ensureLlama();
+    const grammar = await llama.createGrammar({ grammar: gbnf });
+    if (this.localGrammars.size >= 8) this.localGrammars.delete(this.localGrammars.keys().next().value!);
+    this.localGrammars.set(gbnf, grammar);
+    return grammar;
   }
 
   // ── v0.41.2 (BACKLOG 68.5): the token-budget layer ───────────────────────────────────────────────────────────────
@@ -1885,14 +1933,18 @@ export class LlamaCpp implements LLM {
    */
   async generateDetailed(
     prompt: string,
-    opts: { maxTokens: number; temperature?: number; signal?: AbortSignal; backend: LlmBackendId },
+    opts: {
+      maxTokens: number; temperature?: number; signal?: AbortSignal; backend: LlmBackendId;
+      /** v0.41.4: a GBNF grammar the reply must follow (llama-server's `grammar` field; node-llama-cpp's LlamaGrammar). */
+      grammar?: string;
+    },
   ): Promise<GenerateDetail> {
     const backend = opts.backend;
     const temperature = opts.temperature ?? 0;
     if (backend.kind === "remote") {
       if (!this.isBackendAvailable(backend)) return { ok: false, reason: "unavailable", backend };
       try {
-        const body = this.buildRemoteChatBody(prompt, opts.maxTokens, temperature);
+        const body = this.buildRemoteChatBody(prompt, opts.maxTokens, temperature, opts.grammar !== undefined ? { grammar: opts.grammar } : undefined);
         const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
           method: "POST", headers: this.getLlmHeaders(), body: JSON.stringify(body), signal: opts.signal,
         });
@@ -1906,7 +1958,7 @@ export class LlamaCpp implements LLM {
           }
           console.error(`[generate] Remote LLM HTTP ${resp.status}: ${resp.statusText}`);
           if (resp.status !== 429) this.noteRemoteHttpError("llm", resp.status, resp.statusText);
-          return { ok: false, reason: "http", backend };
+          return { ok: false, reason: "http", backend, status: resp.status };
         }
         // A 200 that is not JSON (a non-JSON body reads as null here; an abort or a dropped connection still throws).
         const data = await resp.json().catch((e: unknown) => { if (e instanceof SyntaxError) return null; throw e; }) as {
@@ -1921,7 +1973,7 @@ export class LlamaCpp implements LLM {
         if (!data || !choice || typeof content !== "string") {
           console.error(`[generate] Remote LLM answered HTTP ${resp.status} without a completion choice`);
           this.noteRemoteHttpError("llm", resp.status, "without a completion choice");
-          return { ok: false, reason: "http", backend };
+          return { ok: false, reason: "http", backend, status: resp.status };
         }
         this.remoteLlmHttpErrorStreak = 0;
         this.oversizeExemption = null;
@@ -1957,12 +2009,20 @@ export class LlamaCpp implements LLM {
     if (!this.isBackendAvailable(backend)) return { ok: false, reason: "unavailable", backend };
     try {
       const model = await this.ensureGenerateModel();
+      let grammar: unknown;
+      if (opts.grammar !== undefined) {
+        try {
+          grammar = await this.localGrammar(opts.grammar);
+        } catch (error) {
+          console.warn(`[generate] The in-process model could not compile the request's grammar: ${error instanceof Error ? error.message : String(error)}`);
+          return { ok: false, reason: "grammar_rejected", backend };
+        }
+      }
       const context = await model.createContext({ contextSize: await this.localFitContextSize() });
       try {
-        const { LlamaChatSession } = await getNodeLlamaCpp();
-        const session = new LlamaChatSession({ contextSequence: context.getSequence() });
+        const session = await this.localChatSession(context);
         const r = await session.promptWithMeta(prompt, {
-          maxTokens: opts.maxTokens, temperature, signal: opts.signal, stopOnAbortSignal: true,
+          maxTokens: opts.maxTokens, temperature, signal: opts.signal, stopOnAbortSignal: true, ...(grammar !== undefined ? { grammar } : {}),
         });
         if (r.stopReason === "abort") return { ok: false, reason: "aborted", backend };
         const finish = r.stopReason === "maxTokens" ? "length"

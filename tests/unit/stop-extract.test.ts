@@ -278,7 +278,7 @@ describe("v0.41.1 a backlog's batches fit the observer's bound with their CONTEX
     setDefaultLlamaCpp({
       generate: async (prompt: string) => {
         if (!prompt.includes("Extract observations:")) return { text: "", model: "fake", done: true };
-        if (!prompt.includes("did not match the expected structure")) {
+        if (!prompt.includes("Your previous reply could not be used:")) {   // v0.41.4 §3.1: the observer's own retry feedback
           return { text: "<observation><type>bogus</type></observation>" + "j".repeat(700), model: "fake", done: true };
         }
         retries.push(prompt);

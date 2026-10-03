@@ -19,6 +19,7 @@ import { insertJudgeRunBestEffort } from "./judge-audit.ts";
 import { PERSIST_RESERVE_MS, CAUSAL_MIN_BUDGET_MS } from "./causal-writer.ts";
 import { hashContent } from "./indexer.ts";
 import { lastChanges, nextRetryAt } from "./stop-schema.ts";
+import { REJUDGE_DUE_SQL } from "./stop-due.ts";
 import {
   admitContradictionEntries, unwrapContradictionArray, applyContradictionResponse, type ContradictionAuditContext,
 } from "./hooks/decision-extractor.ts";
@@ -238,7 +239,7 @@ export async function rejudgeDeferred(store: Store, deadline: MonoDeadline, opts
   const now = isoNow();
   const rows = store.db.prepare(
     `SELECT fact_fp, old_doc_id, fact_payload, session_id, attempts FROM judge_deferred
-     WHERE state = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= ?)${opts?.sessionId ? " AND session_id = ?" : ""}
+     WHERE ${REJUDGE_DUE_SQL}${opts?.sessionId ? " AND session_id = ?" : ""}
      ORDER BY queued_at LIMIT ?`
   ).all(...[now, ...(opts?.sessionId ? [opts.sessionId] : []), opts?.limit ?? 5]) as
     { fact_fp: string; old_doc_id: number; fact_payload: string; session_id: string | null; attempts: number }[];

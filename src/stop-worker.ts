@@ -18,10 +18,11 @@
  */
 
 import { existsSync, statSync } from "fs";
+import type { Database } from "bun:sqlite";
 import type { Store } from "./store.ts";
 import { isoNow, epochNow, epochMs, monoNow, deadlineAfter, duration, earliest, isExpired, type MonoDeadline } from "./clock.ts";
 import { lastChanges, stopPipelineReady } from "./stop-schema.ts";
-import { attributeTranscript, applyMirrorSlices } from "./stop-feedback.ts";
+import { attributeTranscript, applyMirrorSlices, countDueMirrors } from "./stop-feedback.ts";
 import { replayDueRetries, DECISION_HOOK } from "./stop-extract.ts";
 import { observerCallMeanMs } from "./observer.ts";
 import { sweepCheckpoints } from "./stop-checkpoint.ts";
@@ -30,6 +31,7 @@ import { drainCausalMarkers } from "./stop-causal.ts";
 import { runHandoffDigests, renderHandoffDoc, HANDOFF_HOOK } from "./stop-handoff.ts";
 import { readStopCursor } from "./stop-cursor.ts";
 import { resolveCausalWriterMode, type CausalLlm } from "./causal-writer.ts";
+import { RETRY_DUE_SQL, RETRY_DUE_AT_SQL, CAUSAL_DUE_SQL, CAUSAL_DUE_AT_SQL, REJUDGE_DUE_SQL, FEEDBACK_OPEN_SQL, RENDER_DUE_SQL, RENDER_LAST_DIGEST_SQL } from "./stop-due.ts";
 
 export const STOP_WORKER_INTERVAL_MS = 60_000;
 export const STOP_WORKER_TICK_BUDGET_MS = 25_000;
@@ -59,6 +61,9 @@ export type TickReport = {
   digested: number;
   rendered: number;
   replayed: number;
+  /** v0.41.4 (§7.2): replay rows claimed and processed this tick, whatever the outcome, and their ids. */
+  attempted: number;
+  attemptedIds: number[];
   rejudged: number;
   causal: number;
   errors: string[];
@@ -107,7 +112,10 @@ export async function runStopWorkerTick(
   llm: CausalLlm,
   opts?: TickOptions,
 ): Promise<TickReport> {
-  const report: TickReport = { attributed: 0, provisional: 0, unattributable: 0, mirrors: 0, digested: 0, rendered: 0, replayed: 0, rejudged: 0, causal: 0, errors: [] };
+  const report: TickReport = {
+    attributed: 0, provisional: 0, unattributable: 0, mirrors: 0, digested: 0, rendered: 0, replayed: 0, attempted: 0, attemptedIds: [], rejudged: 0,
+    causal: 0, errors: [],
+  };
   const db = general.db;
   if (!stopPipelineReady(db)) return report;
   const deadline = opts?.deadline ?? deadlineAfter(monoNow(), duration(STOP_WORKER_TICK_BUDGET_MS));
@@ -126,13 +134,15 @@ export async function runStopWorkerTick(
     const now = isoNow();
     const due = db.prepare(
       `SELECT 1 FROM stop_retries WHERE hook = ? AND last_error LIKE 'continuation:%'
-         AND ((state = 'queued' AND next_retry_at <= ?) OR (state = 'claimed' AND lease_expires_at < ?)) LIMIT 1`
+         AND ${RETRY_DUE_SQL} LIMIT 1`
     ).get(DECISION_HOOK, now, now);
     if (!due) return;
     const sliceMs = Math.min(Math.max(2 * observerCallMeanMs() + 5_000, CONTINUATION_SLICE_MIN_MS), STOP_WORKER_TICK_BUDGET_MS - 2_000);
     const sliceEnd = deadlineAfter(monoNow(), duration(sliceMs));
     const replay = await replayDueRetries(general, { deadline: earliest(sliceEnd, deadline), limit: 1, continuationOnly: true });
     report.replayed += replay.replayed;
+    report.attempted += replay.attempted;
+    report.attemptedIds.push(...replay.attemptedIds);
     for (const r of replay.ranges) {
       report.causal += await drainCausalMarkers(general, llm, { deadline, rangeKey: r.key, limit: 1 });
     }
@@ -152,15 +162,13 @@ export async function runStopWorkerTick(
       `SELECT u.session_id AS sid, u.transcript_key AS tk, u.session_id || char(0) || u.transcript_key AS k,
          SUM(CASE WHEN f.state = 'pending' THEN 1 ELSE 0 END) AS pend, COUNT(*) AS open
        FROM feedback_turns f JOIN context_usage u ON u.id = f.usage_id
-       WHERE (f.state = 'pending' OR (f.state = 'attributed' AND f.reason = 'provisional'))
-         AND u.session_id IS NOT NULL AND u.transcript_key IS NOT NULL AND u.session_id || char(0) || u.transcript_key > ?
+       WHERE ${FEEDBACK_OPEN_SQL} AND u.session_id || char(0) || u.transcript_key > ?
        GROUP BY u.session_id, u.transcript_key ORDER BY k LIMIT 200`
     );
     const countsOf = db.prepare(
       `SELECT SUM(CASE WHEN f.state = 'pending' THEN 1 ELSE 0 END) AS pend, COUNT(*) AS open
        FROM feedback_turns f JOIN context_usage u ON u.id = f.usage_id
-       WHERE (f.state = 'pending' OR (f.state = 'attributed' AND f.reason = 'provisional'))
-         AND u.session_id = ? AND u.transcript_key = ?`
+       WHERE ${FEEDBACK_OPEN_SQL} AND u.session_id = ? AND u.transcript_key = ?`
     );
     let processed = 0;
     let scanned = 0;
@@ -279,9 +287,7 @@ export async function runStopWorkerTick(
     const quietSince = new Date(nowMs - quietMs).toISOString();
     const due = db.prepare(
       `SELECT d.session_id, d.transcript_key FROM session_docs d
-       WHERE d.kind = 'handoff' AND d.render_needed = 1 AND (d.ended_at IS NOT NULL OR COALESCE((
-         SELECT MAX(i.created_at) FROM stop_items i
-         WHERE i.session_id = d.session_id AND i.transcript_key = d.transcript_key AND i.kind = 'turn-digest'), '') <= ?)
+       WHERE ${RENDER_DUE_SQL}
        LIMIT ?`
     ).all(quietSince, limits.renders) as { session_id: string; transcript_key: string }[];
     for (const r of due) {
@@ -298,6 +304,8 @@ export async function runStopWorkerTick(
   await stepAsync(report, "replays", async () => {
     const replay = await replayDueRetries(general, { deadline, limit: limits.replays });
     report.replayed += replay.replayed;
+    report.attempted += replay.attempted;
+    report.attemptedIds.push(...replay.attemptedIds);
     for (const r of replay.ranges) {
       report.causal += await drainCausalMarkers(general, llm, { deadline, rangeKey: r.key, limit: 1 });
     }
@@ -367,6 +375,81 @@ export function startStopPipelineWorker(
 export function dismissStopRetry(store: Store, id: number): boolean {
   store.db.prepare(`UPDATE stop_retries SET state = 'dismissed', claim_token = NULL, lease_expires_at = NULL WHERE id = ? AND state IN ('queued', 'claimed', 'unavailable')`).run(id);
   return lastChanges(store.db) === 1;
+}
+
+/**
+ * v0.41.4 (§7.1): make quarantined ranges due now — `held` (queued rows whose last error is not a continuation) or the
+ * given ids — `queued` rows only, at most `limit`, lowest ids first. A claimed row's lease is never touched. Returns the
+ * ids rescheduled.
+ */
+export function retryNowStopRetries(store: Store, select: "held" | readonly number[], limit = 50): number[] {
+  const db = store.db;
+  const n = Math.floor(limit);
+  if (!(n > 0)) return [];
+  if (select !== "held" && select.length === 0) return [];
+  let ids: number[] = [];
+  db.transaction(() => {
+    const rows = (select === "held"
+      ? db.prepare(`SELECT id FROM stop_retries WHERE state = 'queued' AND (last_error IS NULL OR last_error NOT LIKE 'continuation:%') ORDER BY id LIMIT ?`).all(n)
+      : db.prepare(`SELECT id FROM stop_retries WHERE state = 'queued' AND id IN (${select.map(() => "?").join(", ")}) ORDER BY id LIMIT ?`).all(...select, n)
+    ) as { id: number }[];
+    const now = isoNow();
+    const due = db.prepare(`UPDATE stop_retries SET next_retry_at = ? WHERE id = ? AND state = 'queued'`);
+    for (const r of rows) { due.run(now, r.id); if (lastChanges(db) === 1) ids.push(r.id); }
+  }).immediate();
+  return ids;
+}
+
+/**
+ * v0.41.4 (§7.2; codex T7-10, T8-3): what remains due across the queues a worker tick services, and when the next one
+ * not yet due becomes due — counted with the predicates the tick's own steps use (`stop-due.ts`, `mirrorReady`), so the
+ * two cannot disagree. `quietMs` is the quiet window the tick ran with (`repair stop-queue --run` runs 0); `vaults` are
+ * the named vaults it applied mirrors to. Feedback turns run on no schedule: every open one is examined each tick. The
+ * handoff digest catch-up is no queue — each tick re-reads quiet transcripts whose handoff cursor is behind, keeping
+ * in-process which made no progress — and is not counted. `--run` does not wait for future-due work.
+ */
+export function stopQueueNextDue(db: Database, opts?: { quietMs?: number; vaults?: readonly { name: string; store: Store }[] }): string {
+  const now = isoNow();
+  const quietMs = opts?.quietMs ?? STOP_WORKER_QUIET_MS;
+  const quietSince = new Date(epochMs(epochNow()) - quietMs).toISOString();
+  const has = (t: string) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t);
+  type Due = { n: number | null; next_at: string | null };
+  const line = (label: string, r: Due) => `${label} ${r.next_at ?? "none"}${(r.n ?? 0) > 0 ? ` (${r.n} due now)` : ""}`;
+  const parts: string[] = [];
+  parts.push(!has("stop_retries") ? "quarantined ranges —" : line("quarantined ranges", db.prepare(
+    `SELECT SUM(CASE WHEN ${RETRY_DUE_SQL} THEN 1 ELSE 0 END) AS n, MIN(CASE WHEN NOT ${RETRY_DUE_SQL} THEN ${RETRY_DUE_AT_SQL} END) AS next_at
+     FROM stop_retries WHERE hook = ? AND state IN ('queued', 'claimed')`
+  ).get(now, now, now, now, DECISION_HOOK) as Due));
+  parts.push(!has("feedback_turns") ? "feedback turns —" : `feedback turns ${(db.prepare(
+    `SELECT COUNT(*) AS n FROM feedback_turns f JOIN context_usage u ON u.id = f.usage_id WHERE ${FEEDBACK_OPEN_SQL}`
+  ).get() as { n: number }).n} open`);
+  if (opts?.vaults && opts.vaults.length > 0) {
+    parts.push(`vault mirrors ${opts.vaults.reduce((n, v) => n + countDueMirrors(db, v.store.db), 0)} due`);
+  }
+  parts.push(!has("judge_deferred") ? "deferred judge verdicts —" : line("deferred judge verdicts", db.prepare(
+    `SELECT SUM(CASE WHEN ${REJUDGE_DUE_SQL} THEN 1 ELSE 0 END) AS n, MIN(CASE WHEN NOT ${REJUDGE_DUE_SQL} THEN next_retry_at END) AS next_at
+     FROM judge_deferred WHERE state = 'queued'`
+  ).get(now, now) as Due));
+  if (!has("causal_due")) parts.push("causal steps —");
+  else if (resolveCausalWriterMode() === "off") {
+    // The causal step runs only with the writer on: its markers wait (doctor reports them).
+    const n = (db.prepare(`SELECT COUNT(*) AS n FROM causal_due WHERE state IN ('queued', 'claimed')`).get() as { n: number }).n;
+    parts.push(`causal steps ${n} waiting (CLAWMEM_CAUSAL_WRITER is off)`);
+  } else {
+    parts.push(line("causal steps", db.prepare(
+      `SELECT SUM(CASE WHEN ${CAUSAL_DUE_SQL} THEN 1 ELSE 0 END) AS n, MIN(CASE WHEN NOT ${CAUSAL_DUE_SQL} THEN ${CAUSAL_DUE_AT_SQL} END) AS next_at
+       FROM causal_due WHERE state IN ('queued', 'claimed')`
+    ).get(now, now, now, now) as Due));
+  }
+  if (!has("session_docs")) parts.push("handoff renders —");
+  else {
+    const r = db.prepare(
+      `SELECT SUM(CASE WHEN ${RENDER_DUE_SQL} THEN 1 ELSE 0 END) AS n, MIN(CASE WHEN NOT ${RENDER_DUE_SQL} THEN ${RENDER_LAST_DIGEST_SQL} END) AS last
+       FROM session_docs d WHERE d.kind = 'handoff' AND d.render_needed = 1`
+    ).get(quietSince, quietSince) as { n: number | null; last: string | null };
+    parts.push(line("handoff renders", { n: r.n, next_at: r.last ? new Date(Date.parse(r.last) + quietMs).toISOString() : null }));
+  }
+  return `next due: ${parts.join(" · ")}`;
 }
 
 /** How recent causal activity must be to show that some consumer still runs the writer. */

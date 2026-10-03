@@ -13,8 +13,9 @@
  */
 
 import type { Store } from "./store.ts";
-import { monoNow, deadlineAfter, duration, isExpired, isoNow, epochNow, epochMs } from "./clock.ts";
-import type { LlamaCpp } from "./llm.ts";
+import { monoNow, deadlineAfter, duration, isExpired, isoNow, epochNow, epochMs, timeoutSignal, type MonoDeadline } from "./clock.ts";
+import { budgetLayerOf, type LlamaCpp, type BudgetLlm, type LlmBackendId, type LlmCapacity, type ChatTokenCount } from "./llm.ts";
+import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 import { hashContent } from "./indexer.ts";
@@ -555,6 +556,60 @@ export async function consolidateObservations(
   console.log("[consolidation] Observation consolidation complete");
 }
 
+/** v0.41.4 (BACKLOG 68.6): the reply room consolidation's two prompts reserve — what their `generate()` calls asked. */
+const CONSOLIDATION_REPLY_TOKENS = 500;
+
+type FittedSources<T> = {
+  prompt: string; kept: T[]; llm: BudgetLlm; backend: LlmBackendId; cap: LlmCapacity; count: ChatTokenCount; deadline: MonoDeadline;
+};
+
+/**
+ * v0.41.4 (BACKLOG 68.6, DESIGN-v0414.md §6.1): the longest leading run of `sources` whose prompt and the reply fit the
+ * backend's context — read fresh and counted as the chat endpoint will see it — with that prompt and that run. The
+ * caller numbers, bounds and maps indices over `kept` only. Null when fewer than two sources fit or no backend answers
+ * (fail-open: no synthesis this tick, as before).
+ */
+async function fitSources<T>(llm: LlamaCpp, sources: readonly T[], build: (kept: readonly T[]) => string): Promise<FittedSources<T> | null> {
+  if (sources.length < 2) return null;
+  const b = budgetLayerOf(llm);
+  const backend = b.activeLlmBackend();
+  if (!backend) return null;
+  const deadline = deadlineAfter(monoNow(), duration(MAX_LLM_GENERATE_TIMEOUT_MS));
+  const cap = await b.llmCapacity(backend, { deadline });
+  const budget = cap.nCtx - CONSOLIDATION_REPLY_TOKENS;
+  const at = async (k: number) => {
+    const prompt = build(sources.slice(0, k));
+    return { k, prompt, count: await b.countChatTokens(b.outboundChatContent(prompt, backend), cap, { deadline }) };
+  };
+  const fits = (c: ChatTokenCount) => c.tokens + c.margin <= budget;
+  let best = await at(sources.length);
+  if (!fits(best.count)) {
+    best = await at(2);
+    if (!fits(best.count)) return null;
+    let hi = sources.length;   // known not to fit
+    while (hi - best.k > 1) {
+      const mid = await at(Math.floor((best.k + hi) / 2));
+      if (fits(mid.count)) best = mid; else hi = mid.k;
+    }
+  }
+  return { prompt: best.prompt, kept: sources.slice(0, best.k), llm: b, backend, cap, count: best.count, deadline };
+}
+
+/**
+ * One fitted consolidation call: its text, or why there is none — the call failed, the reply did not finish (a cut
+ * reply is no answer), or the fitting used up the deadline and no call was made (codex T7-13: an expired deadline never
+ * becomes a call without a timeout).
+ */
+async function generateFitted<T>(f: FittedSources<T>, temperature: number): Promise<{ text: string } | { failed: "call" | "cut" | "deadline" }> {
+  const signal = timeoutSignal(f.deadline);
+  if (signal === null) return { failed: "deadline" };
+  const maxTokens = Math.max(1, Math.min(CONSOLIDATION_REPLY_TOKENS, f.cap.nCtx - f.count.tokens - f.count.margin));
+  const r = await f.llm.generateDetailed(f.prompt, { maxTokens, temperature, backend: f.backend, signal });
+  if (!r.ok) return { failed: "call" };
+  if (r.finish !== "stop") return { failed: "cut" };
+  return { text: r.text };
+}
+
 /**
  * Synthesize a cluster of observations into consolidated observations using LLM.
  *
@@ -567,11 +622,13 @@ async function synthesizeCluster(
   cluster: ObservationCluster,
   opts: { guarded?: boolean } = {},
 ): Promise<void> {
-  const docsText = cluster.docs.map((d, i) =>
-    `${i + 1}. [${d.modified_at}] "${d.title}"\n   Facts: ${d.facts?.slice(0, 300) || 'none'}\n   Context: ${d.context?.slice(0, 200) || 'none'}`
-  ).join('\n\n');
+  // v0.41.4 (68.6): the prompt holds the sources that fit the context; numbering and index mapping use exactly those.
+  const clusterPrompt = (docs: readonly ObservationCluster["docs"][number][]) => {
+    const docsText = docs.map((d, i) =>
+      `${i + 1}. [${d.modified_at}] "${d.title}"\n   Facts: ${d.facts?.slice(0, 300) || 'none'}\n   Context: ${d.context?.slice(0, 200) || 'none'}`
+    ).join('\n\n');
 
-  const prompt = `Analyze these ${cluster.docs.length} session observations and identify recurring patterns or cross-session themes.
+    return `Analyze these ${docs.length} session observations and identify recurring patterns or cross-session themes.
 
 Observations:
 ${docsText}
@@ -595,13 +652,13 @@ Rules:
 - Be specific — "user frequently modifies X" > "user works on code"
 - 1-5 patterns maximum
 Return ONLY the JSON array. /no_think`;
+  };
 
-  const result = await llm.generate(prompt, {
-    temperature: 0.3,
-    maxTokens: 500,
-  });
-
-  if (!result) return;
+  const fitted = await fitSources(llm, cluster.docs, clusterPrompt);
+  if (!fitted) return;
+  const docs = fitted.kept;
+  const result = await generateFitted(fitted, 0.3);
+  if ("failed" in result) return;
 
   const parsed = extractJsonFromLLM(result.text) as Array<{
     observation: string;
@@ -614,10 +671,10 @@ Return ONLY the JSON array. /no_think`;
   for (const pattern of parsed) {
     if (!pattern.observation || !Array.isArray(pattern.source_indices) || pattern.source_indices.length < 2) continue;
 
-    // Map source indices to doc IDs
+    // Map source indices to doc IDs — over the sources the prompt showed (v0.41.4: an index past them is refused)
     const sourceDocIds = pattern.source_indices
-      .filter(i => i >= 1 && i <= cluster.docs.length)
-      .map(i => cluster.docs[i - 1]!.id);
+      .filter(i => i >= 1 && i <= docs.length)
+      .map(i => docs[i - 1]!.id);
 
     if (sourceDocIds.length < 2) continue;
 
@@ -1094,7 +1151,7 @@ export async function generateDeductiveObservations(
     ? `LEFT JOIN recall_stats rs ON rs.doc_id = d.id`
     : ``;
 
-  const recentObs = store.db.prepare(`
+  const selectedObs = store.db.prepare(`
     SELECT d.id, d.title, d.facts, d.narrative, d.observation_type, d.content_type,
            d.collection, d.path, d.modified_at
     FROM documents d
@@ -1120,15 +1177,19 @@ export async function generateDeductiveObservations(
     path: string; modified_at: string;
   }[];
 
-  stats.considered = recentObs.length;
-  if (recentObs.length < 2) return stats;
+  if (selectedObs.length < 2) {
+    stats.considered = selectedObs.length;
+    return stats;
+  }
 
-  // Build context for LLM
-  const obsText = recentObs.map((o, i) =>
-    `[${i + 1}] (${o.content_type}/${o.observation_type}) "${o.title}"\n   Facts: ${(o.facts || '').slice(0, 300)}\n   Narrative: ${(o.narrative || '').slice(0, 200)}`
-  ).join('\n\n');
+  // Build context for LLM — v0.41.4 (68.6): only the sources whose prompt fits the context; everything below (indices,
+  // validation context, document mapping, the statistics) uses exactly that array.
+  const deductivePrompt = (sources: readonly typeof selectedObs[number][]) => {
+    const obsText = sources.map((o, i) =>
+      `[${i + 1}] (${o.content_type}/${o.observation_type}) "${o.title}"\n   Facts: ${(o.facts || '').slice(0, 300)}\n   Narrative: ${(o.narrative || '').slice(0, 200)}`
+    ).join('\n\n');
 
-  const prompt = `You are analyzing recent observations from a developer's work sessions. Find logical deductions that can be drawn by combining 2-3 observations.
+    return `You are analyzing recent observations from a developer's work sessions. Find logical deductions that can be drawn by combining 2-3 observations.
 
 A deduction combines facts from different observations into a NEW conclusion that isn't stated in any single observation alone.
 
@@ -1156,11 +1217,25 @@ Rules:
 - Maximum 3 deductions
 - If no valid deductions exist, return []
 Return ONLY the JSON array. /no_think`;
+  };
 
-  const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 500 });
-  if (!result?.text) {
+  const fitted = await fitSources(llm, selectedObs, deductivePrompt);
+  // `considered` counts the sources the model was shown: none when fewer than two fit or the deadline went first (codex
+  // T7-9, T7-13).
+  if (!fitted) {
+    console.log(`[deductive] fewer than two of ${selectedObs.length} observations fit the LLM's context (or no backend) — skipping Phase 3 tick`);
+    return stats;
+  }
+  const recentObs = fitted.kept;
+  const result = await generateFitted(fitted, 0.3);
+  if ("failed" in result && result.failed === "deadline") {
+    console.log(`[deductive] fitting the prompt used up the deadline; no call made — skipping Phase 3 tick`);
+    return stats;
+  }
+  stats.considered = recentObs.length;
+  if ("failed" in result || !result.text) {
     stats.nullCalls++;
-    console.log(`[deductive] draft-generation LLM null — skipping Phase 3 tick`);
+    console.log(`[deductive] draft-generation ${"failed" in result && result.failed === "cut" ? "reply cut before it finished" : "LLM null"} — skipping Phase 3 tick`);
     return stats;
   }
 

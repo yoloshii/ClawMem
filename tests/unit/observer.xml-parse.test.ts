@@ -45,7 +45,7 @@ describe("parseObservationXml", () => {
 
   test("truncates long titles to 80 chars", () => {
     const longTitle = "A".repeat(200);
-    const xml = `<type>decision</type><title>${longTitle}</title>`;
+    const xml = `<type>decision</type><title>${longTitle}</title><fact>The block carries one valid fact</fact>`;   // v0.41.4 §2.3: a block needs a usable fact
     const obs = parseObservationXml(xml);
     expect(obs).not.toBeNull();
     expect(obs!.title.length).toBeLessThanOrEqual(80);
@@ -66,6 +66,7 @@ describe("parseObservationXml", () => {
     const xml = `
       <type>decision</type>
       <title>Test</title>
+      <fact>The block carries one valid fact</fact>
       <concepts><concept>trade-off</concept><concept>not-a-concept</concept></concepts>
     `;
     const obs = parseObservationXml(xml);

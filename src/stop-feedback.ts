@@ -25,6 +25,7 @@ import { bindKeylessUsageRows, locatorPath, registerTranscript } from "./stop-id
 import { humanLineAtOrBefore, streamLines } from "./stop-cursor.ts";
 import { dropHermesMarks, hermesGeneration, hermesMark, scanHermesTranscript, stillHermesFile, type HermesScan } from "./stop-hermes-scan.ts";
 import { verifiedReferences, type ReferenceEntry } from "./recall-attribution.ts";
+import { FEEDBACK_OPEN_ROW_SQL } from "./stop-due.ts";
 
 /**
  * One document the renderer accepted into the injected context (the spool job carries these, D6 rev 18), with its
@@ -207,7 +208,7 @@ export type AttributionRun = {
 type PendingRow = { id: number; prompt_sha: string | null; timestamp: string | null };
 
 /** A row that still owes a verdict: pending, or attributed provisionally (the worker, on a quiet transcript). */
-const OPEN_ROW = `(f.state = 'pending' OR (f.state = 'attributed' AND f.reason = 'provisional'))`;
+const OPEN_ROW = FEEDBACK_OPEN_ROW_SQL;
 
 /** A human entry as pairing sees it, with the offsets of its line (compact: pairing needs no other line). */
 type HumanEntry = PairingEntry & { start: number; end: number };
@@ -433,6 +434,32 @@ const mirrorScanFrom = new WeakMap<object, number>();
 const MIRROR_SCAN_MAX = 2_000;
 
 /**
+ * Whether an open mirror can take its general verdict now: its source is gone (it closes unattributable), or the
+ * general row has a verdict this mirror has not taken. Waiting: no general verdict yet, or — for a mirror that already
+ * took one — no newer revision of it; the revision is the general row's durable, monotonic verdict counter, never a
+ * clock (T25 #6). `applyMirrorSlices` acts on it and the `--run` report counts it (v0.41.4, codex T8-3).
+ */
+export function mirrorReady(m: { source_usage_id: number | null; m_src: number | null }, g: { state: string; revision: number } | null): boolean {
+  if (m.source_usage_id === null) return true;
+  return g !== null && g.state !== "pending" && !(m.m_src !== null && m.m_src >= g.revision);
+}
+
+/** The open mirrors in a named vault that `applyMirrorSlices` would advance now (the `--run` report; codex T8-3). */
+export function countDueMirrors(generalDb: Database, vaultDb: Database): number {
+  if (!stopPipelineReady(vaultDb) || !stopPipelineReady(generalDb)) return 0;
+  const rows = vaultDb.prepare(
+    `SELECT u.source_usage_id, f.source_revision AS m_src FROM feedback_turns f JOIN context_usage u ON u.id = f.usage_id WHERE ${OPEN_ROW}`
+  ).all() as { source_usage_id: number | null; m_src: number | null }[];
+  const generalState = generalDb.prepare(`SELECT state, revision FROM feedback_turns WHERE usage_id = ?`);
+  let n = 0;
+  for (const r of rows) {
+    const g = r.source_usage_id === null ? null : generalState.get(r.source_usage_id) as { state: string; revision: number } | null;
+    if (mirrorReady(r, g)) n++;
+  }
+  return n;
+}
+
+/**
  * A named vault applies its slice of the general verdicts: each open mirror (pending, or provisional) whose general row
  * is attributed gets that row's verdicts for this vault's entries, in this vault's own transaction, and takes the
  * general row's finality — a provisional general verdict may still grow, so its mirror stays open and the next pass
@@ -474,10 +501,7 @@ export function applyMirrorSlices(general: Store, vault: Store, vaultName: strin
           if (setTerminal(vault.db, r.id, "unattributable", "no-source", now)) completed++;
         } else {
           const g = generalState.get(r.source_usage_id) as { state: string; reason: string | null; revision: number } | null;
-          // Waiting: no general verdict yet, or — for a mirror that already took one — no newer revision of it. The
-          // revision is the general row's durable, monotonic verdict counter, never a clock (T25 #6).
-          const taken = r.m_src !== null && g !== null && r.m_src >= g.revision;
-          if (g && g.state !== "pending" && !taken) {
+          if (g !== null && mirrorReady(r, g)) {
             const referenced = g.state === "attributed"
               ? (general.db.prepare(
                   `SELECT display_path FROM feedback_ledger WHERE usage_id = ? AND vault = ? AND referenced_at IS NOT NULL`

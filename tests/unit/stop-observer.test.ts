@@ -45,14 +45,23 @@ describe("D3 extractObservationsResult", () => {
     if (r.status === "ok") expect(r.observations.map(o => o.title)).toEqual(["Batch writes in the ingest pipeline"]);
   });
 
-  it("empty: an empty completion or a short plain 'nothing' is a valid answer, not a failure", async () => {
+  // v0.41.4 (DESIGN-v0414.md §2.1, G1): only `<none/>` is a valid "nothing". v0.41.3 also took an empty completion and
+  // a short markup-free reply as `[]` — on the documented model that committed query-expansion lines as "nothing".
+  it("empty: exactly `<none/>` (also fenced) is a valid answer at once; an empty completion or prose is a failure, never empty", async () => {
     const { extractObservationsResult } = await obsMod();
+    for (const none of ["<none/>", "```xml\n<none/>\n```"]) {
+      const prompts = fakeLlm([none]);
+      expect((await extractObservationsResult(msgs)).status).toBe("empty");
+      expect(prompts.length).toBe(1);   // accepted at once, never retried
+    }
     let prompts = fakeLlm([""]);
-    expect((await extractObservationsResult(msgs)).status).toBe("empty");
-    expect(prompts.length).toBe(1);   // accepted at once, never retried
+    let r = await extractObservationsResult(msgs);
+    expect(r).toEqual({ status: "retryable", reason: "no parseable response: empty-reply" });
+    expect(prompts.length).toBe(3);   // the first call and its two format retries
     prompts = fakeLlm(["No significant observations."]);
-    expect((await extractObservationsResult(msgs)).status).toBe("empty");
-    expect(prompts.length).toBe(1);
+    r = await extractObservationsResult(msgs);
+    expect(r).toEqual({ status: "retryable", reason: "no parseable response: no-blocks" });
+    expect(prompts.length).toBe(3);
   });
 
   it("retryable: the model unavailable, or output that never parses, is reported as such (never as empty)", async () => {
@@ -109,9 +118,11 @@ describe("v0.41.1 the observer prompt stays inside its input bound", () => {
   // prompt fill 4,072 of 4,096 tokens and starve the reply (prod 2026-10-01). These two assert the token invariant.
   it("v0.41.2: every prompt + its reply reserve fits the context in TOKENS, and every line reaches the model exactly once", async () => {
     const { extractObservationsResult, observerReplyReserve, renderObserverLines } = await obsMod();
-    const fake = fakeBudgetLlm({ replies: [""], nCtx: 4096 });
+    const fake = fakeBudgetLlm({ replies: ["<none/>"], nCtx: 4096 });   // v0.41.4: the model's "nothing" is `<none/>`
     setDefaultLlamaCpp(fake.llm as any);
-    const batch = msgs("batch message", 40);
+    // v0.41.4: the system prompt grew, so a 4,096-token window holds fewer of these lines; 40 reached 39 lines in the six
+    // calls one invocation may make. 32 still need several windows — the subject is the fit and each line once.
+    const batch = msgs("batch message", 32);
     const r = await extractObservationsResult(batch, { context: bigContext, timeoutMs: duration(600_000) });
     expect(r.status).toBe("empty");
     const reserve = observerReplyReserve(4096);
@@ -123,7 +134,7 @@ describe("v0.41.1 the observer prompt stays inside its input bound", () => {
 
   it("v0.41.2: one invocation makes at most MAX_OBSERVER_CALLS calls; a unit past them is reported, never cut to fit", async () => {
     const { extractObservationsResult, MAX_OBSERVER_CALLS } = await obsMod();
-    const fake = fakeBudgetLlm({ replies: [""], nCtx: 4096 });
+    const fake = fakeBudgetLlm({ replies: ["<none/>"], nCtx: 4096 });
     setDefaultLlamaCpp(fake.llm as any);
     const r = await extractObservationsResult(msgs("batch message", 100), { context: bigContext, timeoutMs: duration(600_000) });
     expect(r.status).toBe("retryable");
@@ -153,11 +164,11 @@ describe("v0.41.1 the observer prompt stays inside its input bound", () => {
 
   it("v0.41.2: a format retry's prompt, its feedback included, still fits the context in tokens", async () => {
     const { extractObservationsResult, observerReplyReserve } = await obsMod();
-    const fake = fakeBudgetLlm({ replies: [UNPARSEABLE, ""], nCtx: 4096 });
+    const fake = fakeBudgetLlm({ replies: [UNPARSEABLE, "<none/>"], nCtx: 4096 });
     setDefaultLlamaCpp(fake.llm as any);
     await extractObservationsResult(msgs("batch message", 100), { context: bigContext, timeoutMs: duration(600_000) });
     const retry = fake.calls[1]!;
-    expect(retry.prompt).toContain("did not match the expected structure");
+    expect(retry.prompt).toContain("Your previous reply could not be used:");   // v0.41.4 §3.1: the observer's own feedback
     expect(feedbackOf(retry.prompt).length).toBeGreaterThan(0);
     for (const c of fake.calls) expect(c.promptTokens + observerReplyReserve(4096)).toBeLessThanOrEqual(4096);
   });
@@ -174,7 +185,7 @@ describe("v0.41.1 the observer prompt stays inside its input bound", () => {
       if (observerRenderChars([...batch, ...turn]) > OBSERVER_MAX_RENDER_CHARS - OBSERVER_BATCH_RESERVED_CHARS) break;
       batch.push(...turn);
     }
-    const prompts = fakeLlm([UNPARSEABLE, ""]);
+    const prompts = fakeLlm([UNPARSEABLE, "<none/>"]);
     await extractObservationsResult(batch, { context: bigContext });
     expect(prompts.length).toBe(2);
     for (const p of prompts) {

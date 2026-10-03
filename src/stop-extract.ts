@@ -36,6 +36,7 @@ import {
 import {
   observerRenderChars, OBSERVER_MAX_MESSAGES, OBSERVER_MAX_RENDER_CHARS, OBSERVER_BATCH_RESERVED_CHARS,
   renderObserverLines, observerLinesSha, observerContract, extractObservationsWindowed, takeObserverCallSamples, MAX_OBSERVER_CALLS,
+  takeObserverStats, validWindowBound, OBSERVER_STATS_FIELDS,
   OBSERVER_CALL_SAMPLES,
   type Observation, type WindowProgress,
 } from "./observer.ts";
@@ -49,6 +50,7 @@ import {
 import { insertStopItem, itemFingerprint, reconcileSessionDocs } from "./stop-session-docs.ts";
 import { PERSIST_RESERVE_MS, CAUSAL_MIN_BUDGET_MS } from "./causal-writer.ts";
 import type { ObservationWithDoc } from "./amem.ts";
+import { RETRY_DUE_SQL } from "./stop-due.ts";
 import {
   persistObservationDoc, insertObservationTriples, extractDecisions, extractAntipatterns, formatObservation,
 } from "./hooks/decision-extractor.ts";
@@ -407,16 +409,66 @@ function isoAfter(iso: string, ms: number): string {
   return new Date(Date.parse(iso) + ms).toISOString();
 }
 
-/** `vault_flags` as the LLM layer's template-overhead store (design §1.2). */
+/**
+ * `vault_flags` as the LLM layer's template-overhead store (design §1.2). v0.41.4: also the observer's shared records
+ * (context ceilings, grammar-off records) — each merge one immediate transaction (a savepoint when nested).
+ */
 function vaultFlagStore(db: Database): OverheadStore {
-  return {
-    get: (key) => (db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(key) as { value: string } | null)?.value ?? null,
-    set: (key, value) => {
-      db.prepare(`INSERT INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(flag) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
-        .run(key, value, isoNow());
-    },
-    delete: (key) => { db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(key); },
+  const get = (key: string) => (db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(key) as { value: string } | null)?.value ?? null;
+  const set = (key: string, value: string) => {
+    db.prepare(`INSERT INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(flag) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+      .run(key, value, isoNow());
   };
+  const del = (key: string) => { db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(key); };
+  return {
+    get, set, delete: del,
+    update: (key, fn) => db.transaction(() => {
+      const old = get(key);
+      const next = fn(old);
+      if (next === old) return;
+      if (next === null) del(key); else set(key, next);
+    }).immediate(),
+    entries: (prefix) => (db.prepare(`SELECT flag, value FROM vault_flags WHERE flag >= ? AND flag < ? ORDER BY flag`)
+      .all(prefix, `${prefix}\uffff`) as { flag: string; value: string }[]).map(r => ({ key: r.flag, value: r.value })),
+    transaction: <T>(fn: () => T): T => db.transaction(fn).immediate(),
+  };
+}
+
+/** v0.41.4 (§4.5): what the observer's replies showed, per backend key — what the doctor reports. */
+export const OBSERVER_STATS_FLAG = "observer_stats";
+/** The record keeps this many backend keys, the latest by `at`. */
+const OBSERVER_STATS_BACKENDS = 4;
+
+/**
+ * Add the observer statistics this process measured since its last take to OBSERVER_STATS_FLAG (§4.5): per backend
+ * key, counts merged as deltas inside one immediate transaction (codex T2-19), the latest 4 keys kept. Best-effort.
+ */
+export function persistObserverStats(db: Database): void {
+  const taken = takeObserverStats();
+  const deltas = Object.entries(taken.backends).filter(([, d]) => OBSERVER_STATS_FIELDS.some(f => d[f] > 0));
+  if (deltas.length === 0) return;
+  try {
+    db.transaction(() => {
+      const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(OBSERVER_STATS_FLAG) as { value: string } | null;
+      let backends: Record<string, Record<string, unknown>> = {};
+      try {
+        const v = row ? JSON.parse(row.value) as { backends?: unknown } : {};
+        if (v.backends && typeof v.backends === "object" && !Array.isArray(v.backends)) backends = v.backends as Record<string, Record<string, unknown>>;
+      } catch { /* a malformed value restarts the record */ }
+      const now = isoNow();
+      for (const [key, d] of deltas) {
+        const cur = backends[key] ?? {};
+        const merged: Record<string, unknown> = { at: now };
+        for (const f of OBSERVER_STATS_FIELDS) merged[f] = (typeof cur[f] === "number" ? cur[f] as number : 0) + d[f];
+        backends[key] = merged;
+      }
+      const kept = Object.entries(backends)
+        .sort((a, b) => (Date.parse(String(b[1].at)) || 0) - (Date.parse(String(a[1].at)) || 0))
+        .slice(0, OBSERVER_STATS_BACKENDS);
+      db.prepare(`INSERT INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(flag) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+        .run(OBSERVER_STATS_FLAG, JSON.stringify({ backends: Object.fromEntries(kept) }), now);
+    }).immediate();
+  } catch { /* best-effort: the doctor shows what was persisted before */ }
 }
 
 /**
@@ -509,7 +561,8 @@ async function observeUnit(
       const verdict = fingerprintVerdict({ fingerprint: c.fingerprint, strength: c.fingerprintStrength }, cap);
       if (verdict === "same") {
         backend = c.backend; fingerprint = c.fingerprint; strength = c.fingerprintStrength; current = c;
-        resume = { doneThroughLine: c.doneThroughLine, observations: c.observations, titles: c.titles };
+        // v0.41.4 §3.3: its window bound rides along; the observer ignores a malformed or foreign one.
+        resume = { doneThroughLine: c.doneThroughLine, observations: c.observations, titles: c.titles, windowBound: c.windowBound };
       } else if (verdict === "unverified") {
         // codex T11-3, T13-1: `/props` gave no fingerprint (no answer, an error, a body that is not llama.cpp's, or one
         // without the model, template and build) — the server may be the same one; keep the windows done and wait,
@@ -545,8 +598,17 @@ async function observeUnit(
 
   const onProgress = (prog: WindowProgress): boolean => {
     if (!current || raw === null) return false;
+    // v0.41.4 §3.3: a bound write keeps the line and only ever shrinks the stored bound; an advance drops it.
+    const { windowBound: storedBound, ...rest } = current;
+    let windowBound: ObserverCheckpoint["windowBound"];
+    if (prog.windowBound) {
+      if (prog.doneThroughLine !== current.doneThroughLine || prog.windowBound.start !== current.doneThroughLine) return false;
+      const prior = validWindowBound(storedBound, current.doneThroughLine);
+      windowBound = { start: prog.windowBound.start, maxLines: prior ? Math.min(prior.maxLines, prog.windowBound.maxLines) : prog.windowBound.maxLines };
+    }
     const next: ObserverCheckpoint = {
-      ...current, rev: current.rev + 1, doneThroughLine: prog.doneThroughLine, observations: prog.observations, titles: prog.titles, at: isoNow(),
+      ...rest, rev: current.rev + 1, doneThroughLine: prog.doneThroughLine, observations: prog.observations, titles: prog.titles, at: isoNow(),
+      ...(windowBound ? { windowBound } : {}),
     };
     const stored = swapCheckpoint(db, key, raw, next);
     if (stored === null) return false;
@@ -571,6 +633,7 @@ async function observeUnit(
     }
   }
   persistObserverCallMean(db);
+  persistObserverStats(db);
   switch (r.status) {
     case "ok": return { status: "ok", observations: r.observations };
     case "empty": return { status: "empty" };
@@ -835,7 +898,11 @@ type RetryRow = {
   from_offset: number; to_offset: number; range_key: string; range_sha: string; source_time: string | null; attempts: number;
 };
 
-export type ReplayRun = { replayed: number; unavailable: number; rescheduled: number; persisted: ObservationWithDoc[]; ranges: RangeRef[] };
+export type ReplayRun = {
+  replayed: number; unavailable: number; rescheduled: number; persisted: ObservationWithDoc[]; ranges: RangeRef[];
+  /** v0.41.4 (§7.2): rows claimed and processed, whatever the outcome — `repair stop-queue --run` counts them as progress. */
+  attempted: number; attemptedIds: number[];
+};
 
 /**
  * Replay due quarantined ranges (later Stops: at most one, inside their budget; the worker: bounded). Each is claimed
@@ -854,14 +921,14 @@ export async function replayDueRetries(
     observerMaxCalls?: number;
   },
 ): Promise<ReplayRun> {
-  const out: ReplayRun = { replayed: 0, unavailable: 0, rescheduled: 0, persisted: [], ranges: [] };
+  const out: ReplayRun = { replayed: 0, unavailable: 0, rescheduled: 0, persisted: [], ranges: [], attempted: 0, attemptedIds: [] };
   const db = store.db;
   if (!stopPipelineReady(db)) return out;
   const now0 = isoNow();
   const due = db.prepare(
     `SELECT id, session_id, transcript_key, transcript_path, anchor_epoch, from_offset, to_offset, range_key, range_sha, source_time, attempts
      FROM stop_retries WHERE hook = ?
-       AND ((state = 'queued' AND next_retry_at <= ?) OR (state = 'claimed' AND lease_expires_at < ?))
+       AND ${RETRY_DUE_SQL}
        ${opts.sessionId ? "AND session_id = ?" : ""}
        ${opts.continuationOnly ? "AND last_error LIKE 'continuation:%'" : ""}
      ORDER BY next_retry_at, id LIMIT ?`
@@ -871,10 +938,11 @@ export async function replayDueRetries(
     const claimAt = isoNow();
     db.prepare(
       `UPDATE stop_retries SET state = 'claimed', claim_token = ?, lease_expires_at = ?
-       WHERE id = ? AND ((state = 'queued' AND next_retry_at <= ?) OR (state = 'claimed' AND lease_expires_at < ?))`
+       WHERE id = ? AND ${RETRY_DUE_SQL}`
     ).run(token, new Date(Date.parse(claimAt) + LEASE_MS).toISOString(), r.id, claimAt, claimAt);
     if (lastChanges(db) !== 1) continue;   // another processor holds it
     opts.afterClaim?.();
+    const attempt = () => { out.attempted++; out.attemptedIds.push(r.id); };
     const setState = (sql: string, ...args: (string | number | null)[]) => {
       db.prepare(`UPDATE stop_retries SET ${sql} WHERE id = ? AND claim_token = ?`).run(...args, r.id, token);
       return lastChanges(db) === 1;
@@ -882,6 +950,7 @@ export async function replayDueRetries(
     // Integrity first: the range must hold exactly the bytes that failed.
     if (!existsSync(r.transcript_path) || rangeSha(r.transcript_path, r.from_offset, r.to_offset) !== r.range_sha) {
       if (setState(`state = 'unavailable', claim_token = NULL, lease_expires_at = NULL, last_error = 'range bytes changed or transcript gone'`)) out.unavailable++;
+      attempt();
       continue;
     }
     const replayRead = accumulateLines(r.transcript_path, r.from_offset, {
@@ -904,6 +973,7 @@ export async function replayDueRetries(
       if (a!.result.committedElsewhere) setState(`state = 'done', claim_token = NULL, lease_expires_at = NULL, last_error = 'committed by another processor'`);
       else setState(`state = 'queued', claim_token = NULL, lease_expires_at = NULL, next_retry_at = ?`, isoAfter(isoNow(), CONTINUATION_DELAY_MS));
       out.rescheduled++;
+      attempt();
       continue;
     }
     opts.beforePhaseB?.();
@@ -930,9 +1000,10 @@ export async function replayDueRetries(
         if (!setState(`state = 'done', claim_token = NULL, lease_expires_at = NULL`)) throw new ClaimLost();
       }).immediate();
     } catch (err) {
-      if (err instanceof ClaimLost) continue;   // the lease expired and another processor took it: nothing of ours stands
+      if (err instanceof ClaimLost) { attempt(); continue; }   // the lease expired and another processor took it: nothing of ours stands
       throw err;
     }
+    attempt();
     if (a!.result.status === "retryable" || a!.result.status === "continuation") { out.rescheduled++; continue; }
     out.replayed++;
     out.persisted.push(...persisted);

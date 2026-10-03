@@ -4,11 +4,14 @@ import type { TranscriptMessage } from "../../src/hooks.ts";
 
 // ─── parseObservationXml ────────────────────────────────────────────
 
+// v0.41.4 (DESIGN-v0414.md §2.3): a block with no usable fact is rejected (`facts-empty`) — the prompt and the grammar
+// require 1–5 facts — so blocks here that test other fields carry one valid fact.
 describe("parseObservationXml", () => {
   it("extracts type, title, and narrative", () => {
     const xml = `
       <type>decision</type>
       <title>Use PostgreSQL for primary store</title>
+      <fact>The team chose PostgreSQL as the primary store</fact>
       <narrative>We evaluated several databases and chose PostgreSQL.</narrative>
     `;
     const obs = parseObservationXml(xml);
@@ -35,7 +38,7 @@ describe("parseObservationXml", () => {
 
   it("truncates title to 80 chars", () => {
     const longTitle = "A".repeat(120);
-    const xml = `<type>bugfix</type><title>${longTitle}</title>`;
+    const xml = `<type>bugfix</type><title>${longTitle}</title><fact>The block carries one valid fact</fact>`;
     const obs = parseObservationXml(xml);
     expect(obs).toBeDefined();
     expect(obs!.title.length).toBeLessThanOrEqual(80);
@@ -58,6 +61,7 @@ describe("parseObservationXml", () => {
     const xml = `
       <type>refactor</type>
       <title>Clean up auth</title>
+      <fact>The block carries one valid fact</fact>
       <concept>how-it-works</concept>
       <concept>invalid-concept</concept>
       <concept>gotcha</concept>
@@ -73,6 +77,7 @@ describe("parseObservationXml", () => {
     const xml = `
       <type>change</type>
       <title>Updated config</title>
+      <fact>The block carries one valid fact</fact>
       <files_read><file>src/config.ts</file></files_read>
       <files_modified><file>src/config.ts</file><file>src/store.ts</file></files_modified>
     `;
@@ -90,7 +95,7 @@ describe("parseObservationXml", () => {
   it("handles all valid observation types", () => {
     const types = ["decision", "bugfix", "feature", "refactor", "discovery", "change", "preference", "milestone", "problem"] as const;
     for (const type of types) {
-      const xml = `<type>${type}</type><title>Test ${type}</title>`;
+      const xml = `<type>${type}</type><title>Test ${type}</title><fact>The block carries one valid fact</fact>`;
       const obs = parseObservationXml(xml);
       expect(obs).toBeDefined();
       expect(obs!.type).toBe(type);
@@ -290,21 +295,21 @@ describe("prepareTranscript", () => {
 
 describe("new observation types", () => {
   it("accepts 'preference' as valid type", () => {
-    const xml = `<type>preference</type><title>User prefers single PRs</title><narrative>Validated approach.</narrative>`;
+    const xml = `<type>preference</type><title>User prefers single PRs</title><fact>The block carries one valid fact</fact><narrative>Validated approach.</narrative>`;
     const obs = parseObservationXml(xml);
     expect(obs).not.toBeNull();
     expect(obs!.type).toBe("preference");
   });
 
   it("accepts 'milestone' as valid type", () => {
-    const xml = `<type>milestone</type><title>v0.5.0 released</title><narrative>Major release with conversation import.</narrative>`;
+    const xml = `<type>milestone</type><title>v0.5.0 released</title><fact>The block carries one valid fact</fact><narrative>Major release with conversation import.</narrative>`;
     const obs = parseObservationXml(xml);
     expect(obs).not.toBeNull();
     expect(obs!.type).toBe("milestone");
   });
 
   it("accepts 'problem' as valid type", () => {
-    const xml = `<type>problem</type><title>SQLite contention under load</title><narrative>Watcher locks conflict with hooks.</narrative>`;
+    const xml = `<type>problem</type><title>SQLite contention under load</title><fact>The block carries one valid fact</fact><narrative>Watcher locks conflict with hooks.</narrative>`;
     const obs = parseObservationXml(xml);
     expect(obs).not.toBeNull();
     expect(obs!.type).toBe("problem");
