@@ -3,9 +3,11 @@
  *
  * F59-2 (alignment survives a deadline-skip): two consecutive REAL handler
  * turns against ONE store, turn 1 forced across the internal deadline by a
- * synchronous vector-leg busy-wait (subprocess: HOOK_BUDGET_MS is baked at
- * module import). The deadline-skip must lose ONLY the injected-paths/tokens
- * fill-in — never the turn alignment or the prompt history:
+ * synchronous vector-leg busy-wait (subprocess: the spawner sets
+ * CLAWMEM_HOOK_BUDGET_MS, which the handler reads on every call, so both
+ * turns share one budget). The deadline-skip must lose ONLY the
+ * injected-paths/tokens fill-in — never the turn alignment or the prompt
+ * history:
  *   - distinct turn indices (0, 1) on the context_usage rows;
  *   - turn 1's prompt available to the prior-context lookback afterwards;
  *   - turn 1's row carries query_text with EMPTY injected_paths (the split).
@@ -56,11 +58,14 @@ function runAlignmentDriver(opts: { budget?: string; vectorSyncDelayTurn1Ms?: nu
 
 describe("t60 F59-2: turn alignment + prompt history survive a deadline-skip (real handler, subprocess)", () => {
   it("two consecutive turns across a deadline-skip: distinct turn indices, turn 1's prompt reaches prior lookback, only the paths fill-in is lost", () => {
-    // Budget 1000; turn 1's vector leg busy-waits 1400ms synchronously — the
+    // Budget 3000; turn 1's vector leg busy-waits 3400ms synchronously — the
     // handler is past internalDeadlineAt when the post-output boundary is
     // reached, so the bookkeeping handoff is SKIPPED. The FTS floor still
-    // injects (turn-25 contract).
-    const r = runAlignmentDriver({ budget: "1000", vectorSyncDelayTurn1Ms: 1400 });
+    // injects (turn-25 contract). Turn 2 runs under the same budget and must
+    // NOT skip: it takes ~20ms alone and ~100ms sharing one core four ways,
+    // but a loaded full-suite run once stalled it past the former 1000ms
+    // budget, so the budget leaves turn 2 that much more room.
+    const r = runAlignmentDriver({ budget: "3000", vectorSyncDelayTurn1Ms: 3400 });
 
     // Turn 1: injected, but the bookkeeping handoff was deadline-skipped.
     expect(r.turn1.outcome).toBe("injected");

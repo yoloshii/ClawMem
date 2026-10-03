@@ -4,8 +4,9 @@
  * across the internal deadline by a synchronous busy-wait in the vector leg
  * (event loop blocked — the same pathological overrun as the turn-25 tests),
  * so its post-output bookkeeping HANDOFF is deadline-skipped while the FTS
- * floor still injects. HOOK_BUDGET_MS is baked at module import, so the
- * spawner sets CLAWMEM_HOOK_BUDGET_MS before this process starts.
+ * floor still injects. The handler reads CLAWMEM_HOOK_BUDGET_MS on every call
+ * (assertHookBudgetConfig); the spawner sets it in this process's environment
+ * and nothing here changes it, so both turns share one budget.
  *
  * Emits one ALIGNDRIVER:: JSON line with, per turn: outcome,
  * postOutputSkipped / postOutputMs (RAW trace values — no coalescing, codex
