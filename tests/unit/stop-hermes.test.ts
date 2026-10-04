@@ -659,6 +659,60 @@ describe.skipIf(!PYTHON)("the Hermes plugin runs the stop pipeline the way 62.1 
     for (let k = 1; k < lines.length; k++) expect(Date.parse(lines[k].timestamp)).toBeGreaterThanOrEqual(Date.parse(lines[k - 1].timestamp));
   });
 
+  it("dates a new transcript's header by the line it opens, never later (69.14)", () => {
+    const { dir } = runPlugin([
+      `import itertools`,
+      `tick = itertools.count(1791000000000)`,
+      `m._now_ms = lambda: next(tick)`,                             // each stamp 1 ms after the one before it
+      `p.sync_turn("question for turn 1", "answer 1")`,
+    ].join("\n"));
+    const lines = transcriptLines(dir);
+    expect(lines.map(l => l.message?.role ?? l.type)).toEqual(["clawmem-transcript", "user", "assistant"]);
+    expect(lines[0].timestamp).toBe(lines[1].timestamp);
+  });
+
+  it("stamps lines in the order they are written, whichever thread writes them (69.14)", () => {
+    // The outcome thread stalls right after taking its stamp; turn 2 is synced from another thread meanwhile, and the
+    // outcome thread is released only once turn 2 has reached the transcript lock. Every wait is asserted, so a timeout
+    // is a failure, never a path through the test.
+    const { dir, out } = runPlugin([
+      `import itertools, threading`,
+      `tick = itertools.count(1791000000000)`,
+      `entered, release, contended, seen = threading.Event(), threading.Event(), threading.Event(), {}`,
+      `def clock():`,
+      `    t = next(tick)`,
+      `    if threading.current_thread().name == "outcome":`,
+      `        seen["locked"] = p._transcript_lock.locked()`,      // stamped under the write lock? (nothing else holds it)
+      `        entered.set(); seen["released"] = release.wait(5)`,
+      `    return t`,
+      `m._now_ms = clock`,
+      `p.sync_turn("question for turn 1", "answer 1")`,
+      `settle(p)`,                                                  // turn 1's Stop pass is over: the lock is free
+      `class Watched:`,                                             // notes when turn 2 reaches the transcript lock
+      `    def __init__(self, inner): self.inner = inner`,
+      `    def locked(self): return self.inner.locked()`,
+      `    def __enter__(self):`,
+      `        if threading.current_thread().name == "turn2": contended.set()`,
+      `        return self.inner.__enter__()`,
+      `    def __exit__(self, *exc): return self.inner.__exit__(*exc)`,
+      `p._transcript_lock = Watched(p._transcript_lock)`,
+      `w = threading.Thread(target=p._record_outcome, args=(p._transcript_path, 7, "dropped"), name="outcome")`,
+      `w.start()`,
+      `assert entered.wait(5)`,
+      `t2 = threading.Thread(target=p.sync_turn, args=("question for turn 2", "answer 2"), name="turn2")`,
+      `t2.start()`,
+      `assert contended.wait(5)`,                                   // turn 2 is at the lock: stamped after the outcome
+      `release.set(); w.join(5); t2.join(5)`,
+      `assert not w.is_alive() and not t2.is_alive() and seen.get("released") is True`,
+      `print("LOCKED_AT_STAMP=%s" % seen.get("locked"))`,
+    ].join("\n"));
+    expect(out).toContain("LOCKED_AT_STAMP=True");
+    const lines = transcriptLines(dir);
+    expect(lines.map(l => l.message?.role ?? l.type))
+      .toEqual(["clawmem-transcript", "user", "assistant", "clawmem-prefetch-outcome", "user", "assistant"]);
+    for (let k = 2; k < lines.length; k++) expect(Date.parse(lines[k].timestamp)).toBeGreaterThanOrEqual(Date.parse(lines[k - 1].timestamp));
+  });
+
   const outcomes = (dir: string) => transcriptLines(dir).filter(l => l.type === "clawmem-prefetch-outcome").map(l => [l.usage_id, l.outcome]);
   const records = (dir: string) => transcriptLines(dir).filter(l => l.message?.role === "user")
     .map(u => (u.clawmem_delivery === undefined ? "none" : u.clawmem_delivery.usage_id));

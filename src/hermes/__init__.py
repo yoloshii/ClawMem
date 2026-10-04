@@ -197,6 +197,16 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _first_stamp(group: bytes) -> str:
+    """The timestamp on a group's first line, "" when it has none. Every stamp comes from `_iso_ms`, whose fixed-width
+    form orders as text."""
+    try:
+        stamp = json.loads(group[:group.index(b"\n")]).get("timestamp")
+    except (ValueError, AttributeError):
+        return ""
+    return stamp if isinstance(stamp, str) else ""
+
+
 def _write_all(fd: int, data) -> tuple:
     """Write all of `data`, however many calls it takes. Returns (bytes written, whether that was all of it); a call
     that fails writes nothing, so the count is exactly what of `data` is on disk."""
@@ -363,8 +373,9 @@ class ClawMemProvider(MemoryProvider):
         # calls, "uid": id|None, "path": str, "ambiguous": bool}. See _note_delivery.
         self._pending_deliveries: Dict[str, Dict[str, Any]] = {}
 
-        # Transcript writes are serialized, and stamped with millisecond wall-clock times. A write that fails waits
-        # here, per transcript and in order, until it can be written (`_new_box`, `_write_box`).
+        # Transcript writes are serialized, and stamped with millisecond wall-clock times under the same lock, so a
+        # transcript's times follow its order in the file unless the clock is set back (`_append_transcript`). A write
+        # that fails waits here, per transcript and in order, until it can be written (`_new_box`, `_write_box`).
         self._transcript_lock = threading.Lock()
         self._outbox: Dict[str, Dict[str, Any]] = {}
         # The transcripts this process writes, held open (and locked) while it writes them (`_claim`), and those it
@@ -653,7 +664,7 @@ class ClawMemProvider(MemoryProvider):
         a failed write keeps it for the next one (`_append_transcript`)."""
         if self._agent_context != "primary" or not transcript_path:
             return
-        self._append_transcript([{"type": _OUTCOME_TYPE, "usage_id": usage_id, "outcome": outcome, "timestamp": _iso_ms(_now_ms())}],
+        self._append_transcript([{"type": _OUTCOME_TYPE, "usage_id": usage_id, "outcome": outcome, "timestamp": ""}],
                                 transcript_path)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -750,14 +761,14 @@ class ClawMemProvider(MemoryProvider):
         session_id_now, transcript_path = self._session_id, self._transcript_path
         delivery = self._take_delivery(user_content)
 
-        ts = _iso_ms(_now_ms())
+        # Both lines are stamped together, as they join the transcript's writes (`_append_transcript`).
         user_line: Dict[str, Any] = {
             "type": "message",
             "message": {
                 "role": "user",
                 "content": user_content,
             },
-            "timestamp": ts,
+            "timestamp": "",
         }
         if delivery is not None:
             user_line["clawmem_delivery"] = delivery
@@ -767,7 +778,7 @@ class ClawMemProvider(MemoryProvider):
                 "role": "assistant",
                 "content": assistant_content,
             },
-            "timestamp": ts,
+            "timestamp": "",
         }], transcript_path, session_id=session_id_now)
 
     def _append_transcript(self, entries: List[Dict[str, Any]], transcript_path: str, *, session_id: str = "") -> bool:
@@ -777,9 +788,15 @@ class ClawMemProvider(MemoryProvider):
         retry them first, after a growing pause, as the session's end, a switch and shutdown do at once
         (`_flush_locked`); `_write_box` accounts for every byte. A turn's Stop pass (`session_id`) is queued once its
         lines are on disk. Past _OUTBOX_MAX waiting writes or _OUTBOX_MAX_BYTES for one transcript — a single
-        oversized write included — the oldest is given up, with a warning, once an attempt to write it has failed."""
-        group = "".join(json.dumps(entry) + "\n" for entry in entries).encode("utf-8")
+        oversized write included — the oldest is given up, with a warning, once an attempt to write it has failed.
+
+        Each entry's `timestamp` is set here, under the lock that orders the writes, so a transcript's times never
+        decrease down the file, whichever thread writes, unless the wall clock is set back (BACKLOG 69.14)."""
         with self._transcript_lock:
+            ts = _iso_ms(_now_ms())
+            for entry in entries:
+                entry["timestamp"] = ts
+            group = "".join(json.dumps(entry) + "\n" for entry in entries).encode("utf-8")
             box = self._outbox.setdefault(transcript_path, _new_box())
             box["groups"].append(group)
             box["bytes"] += len(group)
@@ -913,8 +930,8 @@ class ClawMemProvider(MemoryProvider):
         If the transcript changed meanwhile (a writer outside this protocol, an edit), the rest of that group is given
         up with a warning — appended after someone else's lines it would join another turn. A torn tail (a crash, a
         group given up) is ended first, so it stays a line of its own, which ClawMem skips. A new file opens with a
-        small timestamped header line, so ClawMem can tell when the transcript began whatever the size of its first
-        turn."""
+        small header line, dated by the line it opens and never later, so ClawMem can tell when the transcript began
+        whatever the size of its first turn."""
         if not self._hold(path):
             return False   # another process holds it, or it cannot be opened: the writes wait
         fd = self._claims[path]
@@ -944,7 +961,10 @@ class ClawMemProvider(MemoryProvider):
         start = box["done"]
         if start == 0:
             if size == 0:
-                prefix = (json.dumps({"type": "clawmem-transcript", "host": _HOST, "timestamp": _iso_ms(_now_ms())}) + "\n").encode("utf-8")
+                # Dated by the line it opens, never later: that line was stamped when it was queued, and this write can
+                # come after a failed attempt's pause.
+                stamp, first = _iso_ms(_now_ms()), (_first_stamp(box["groups"][0]) if box["groups"] else "")
+                prefix = (json.dumps({"type": "clawmem-transcript", "host": _HOST, "timestamp": min(stamp, first or stamp)}) + "\n").encode("utf-8")
             elif _last_byte(fd, size) != b"\n":
                 prefix = b"\n"
             else:

@@ -537,15 +537,19 @@ function formatFeedback(error: string, reply: string): string {
 
 type FittedWindow = { end: number; prompt: string; count: ChatTokenCount; context: string };
 
+type FitArgs = {
+  lines: readonly ObserverLine[]; start: number; maxLines: number; n: number; contexts: readonly string[];
+  budget: number; feedback?: string; count: (prompt: string) => Promise<ChatTokenCount>; nCtx: number; source: string;
+};
+
 /**
  * Fit the next window from `start` (design §1.3–§1.4): pick the fullest CONTEXT that leaves MIN_TRANSCRIPT_TOKENS, then
  * the most whole turns whose ASSEMBLED prompt fits B (counted, never summed); a turn is cut between messages only when
- * it alone exceeds a window. `{capacity}` when even one line, or the fixed part, cannot fit.
+ * it alone exceeds a window. When the window's first line does not fit under that context, each smaller one is tried
+ * the same way, fullest first (BACKLOG 69.13). `{capacity}` when even one line under the emptiest context, or the fixed
+ * part, cannot fit.
  */
-async function fitWindow(a: {
-  lines: readonly ObserverLine[]; start: number; maxLines: number; n: number; contexts: readonly string[];
-  budget: number; feedback?: string; count: (prompt: string) => Promise<ChatTokenCount>; nCtx: number; source: string;
-}): Promise<FittedWindow | { capacity: string }> {
+async function fitWindow(a: FitArgs): Promise<FittedWindow | { capacity: string }> {
   let context: string | null = null;
   let fixed: ChatTokenCount | null = null;
   for (const c of a.contexts) {
@@ -557,11 +561,28 @@ async function fitWindow(a: {
     const need = (fixed?.tokens ?? 0) + (fixed?.margin ?? 0) + MIN_TRANSCRIPT_TOKENS;
     return { capacity: `capacity: the observer's prompt needs ${need} tokens; the context is ${a.nCtx} (${a.source})` };
   }
+  // BACKLOG 69.13: the CONTEXT helps the model read the window; the line is the work. A first line that does not fit
+  // under the chosen context is tried under each smaller one, fullest first, before it is held, so the window keeps as
+  // much context as fits. A window that fits under the chosen context is the one it always was.
+  let fitted = await fitLines(a, context, fixed);
+  const tried = new Set([context]);
+  for (const c of a.contexts.slice(a.contexts.indexOf(context) + 1)) {
+    if (!("capacity" in fitted)) break;
+    if (tried.has(c)) continue;
+    tried.add(c);
+    const f = await a.count(windowPrompt(a.n, c, [], a.feedback));
+    if (f.tokens + f.margin + MIN_TRANSCRIPT_TOKENS <= a.budget) fitted = await fitLines(a, c, f);
+  }
+  return fitted;
+}
+
+/** The window from `a.start` under one CONTEXT (`fixed` = its prompt with no lines): `{capacity}` when its first line cannot fit. */
+async function fitLines(a: FitArgs, context: string, fixed: ChatTokenCount): Promise<FittedWindow | { capacity: string }> {
   const last = Math.min(a.lines.length, a.start + Math.max(1, a.maxLines));
   const fits = (c: ChatTokenCount) => c.tokens + c.margin <= a.budget;
   const at = async (end: number): Promise<FittedWindow> => {
-    const prompt = windowPrompt(a.n, context!, a.lines.slice(a.start, end), a.feedback);
-    return { end, prompt, count: await a.count(prompt), context: context! };
+    const prompt = windowPrompt(a.n, context, a.lines.slice(a.start, end), a.feedback);
+    return { end, prompt, count: await a.count(prompt), context };
   };
   let w = await at(last);
   if (fits(w.count)) return w;

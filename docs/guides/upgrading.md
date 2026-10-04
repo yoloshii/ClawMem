@@ -62,6 +62,20 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.41.5: a window whose first message fits under a smaller CONTEXT is never held
+
+No action needed. A range held with `capacity: one message needs … tokens; a window holds …` because its message
+missed the window's fullest CONTEXT, though it fit under a smaller one, replays on its own at its next attempt;
+`clawmem repair stop-queue --retry-now held --run` retries held ranges now. A range still held with `capacity: one
+message needs … tokens; a window holds …` after the upgrade has a message larger than a window with no CONTEXT at all,
+and the reason now reports that room: raise the server's `-c` and restart it. A checkpointed range resumes where it
+stopped.
+
+**Hermes:** to take the timestamp fix, copy the plugin's contents over the installed one, then restart Hermes (the
+command is under v0.41.0 below; a symlinked install picks it up on its own). The copied plugin dates a new
+transcript's header by the line it opens, never later, and stamps each line as it joins the transcript's writes, so
+the times follow the file unless the system clock is set back. A plugin left as it was keeps working.
+
 ## v0.41.4: the observer's replies parse, and a reply that is not an answer is never "nothing"
 
 **No vault migration.** Upgrade every process that runs the Stop hooks (the hooks, `clawmem watch`, the MCP server of

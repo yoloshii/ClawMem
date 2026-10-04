@@ -4,6 +4,73 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.41.5 — a window whose first message fits under a smaller CONTEXT is never held
+
+v0.41.2 fits each observer window in tokens: it takes the fullest form of the window's CONTEXT that leaves 512 tokens
+for the transcript, then fits whole turns under it. When the window's first message did not fit under that form, the
+window was held as `capacity:` without trying a smaller form, under which the message fit. A later window's CONTEXT
+grows with the transcript's tail, the turn's opening request and the titles recorded so far, so a window
+could be held while it fit without them, again on every retry. A format retry's feedback, added to the fullest form,
+held a window the same way (`capacity: the format retry's feedback leaves no room`). The hold's reason also reported
+the room under the fullest form, not the real limit. Measured on v0.41.4 with the suite's tokenizer fake at a
+4,096-token context, a 1,006-token final answer was held with 551 tokens of room, while the form with only the turn's
+request and the titles left 1,222.
+
+### What changed
+
+- **`src/observer.ts` `fitWindow`** chooses the CONTEXT form as before. When the window's first message does not fit
+  under it, each smaller form is tried in order, fullest first, and the first that fits sends the window. For a later
+  window the forms are the tail with the turn's request (when the tail does not already show it) and the titles, then
+  the request and the titles, then the titles, then none; for window 1, the CONTEXT section, its titles alone, none. A
+  form that repeats an earlier one is tried once. A window that fits under the chosen form is unchanged, byte for byte,
+  with the same token counts in the same order. The line fitting moved, unchanged, into `fitLines`.
+- **A message that fits under no form** is still held as `capacity: one message needs N tokens; a window holds W`, and
+  W is now the room with no CONTEXT, the real limit. The reason still starts `capacity:`, so `clawmem doctor` counts it
+  as before.
+- **A format retry** re-fits the same way, so its feedback no longer holds a window that fits under a smaller form.
+- **The Hermes plugin's timestamps follow the file** (`src/hermes/__init__.py`). A line is stamped as it joins the
+  transcript's writes, under the lock that orders them, so a thread can no longer land a line stamped before another
+  thread's line after it. A new transcript's header is dated by the line it opens, never later: it was stamped at the
+  write, after the first turn's lines, and read 1 ms late about 1 run in 20 of the suite's order check (T29 in
+  `tests/unit/stop-hermes.test.ts`), or later still when the first write waited out a failed attempt's pause. The times
+  still come from the wall clock, so a clock set back can step one back.
+- **Docs:** `docs/concepts/architecture.md` (the CONTEXT forms and the fallback), `docs/guides/upgrading.md` (v0.41.5),
+  `docs/guides/hermes-plugin.md` (the transcript format).
+
+### Upgrading
+
+No action needed. Ranges held this way replay at their next attempt; `clawmem repair stop-queue --retry-now held --run`
+retries them now. A range still held with `capacity: one message needs …` after the upgrade has a message larger than a
+window with no CONTEXT; raise the server's `-c`. Hermes: to take the timestamp fix, copy the plugin's contents over the
+installed one and restart Hermes (a symlinked install picks it up on its own); a plugin left as it was keeps working. A
+checkpointed range resumes where it stopped, and the observer contract is unchanged: a checkpoint records the line
+reached, the observations, the titles and a window bound, and none of them is written or read differently. A window sent
+under a smaller form is saved like any other.
+
+### Verification
+
+Five new tests were written first and run on v0.41.4: the four that exercise the fallback failed, each for the reason
+its name gives, and the guard passed. They cover a later window sent under the request-and-titles form, one whose
+request already sits in the tail sent under the titles alone, a message that fits no form still held and reporting the
+room with no CONTEXT, a format retry sent under a smaller form, and later windows that fit keeping the fullest form.
+Each checks its geometry against the prompts the fake counted, so a later change to the prompt text fails a named check
+instead of testing nothing. Three mutants (no fallback, the emptiest form only, a stale fixed-part count) each fail at
+least one test. For the Hermes timestamps, two tests written first failed on v0.41.4: a new transcript's header dated
+after the line it opens, under a clock that moves 1 ms per reading, and a line from a second thread landing after a line
+stamped later. With either half of the fix undone, its own test fails. The suite's T29 order check
+(`tests/unit/stop-hermes.test.ts`), which failed about 1 run in 20 on v0.41.4, passed 40 runs of 40. Full suite on Bun
+1.4.2: 3,513 pass / 0 fail across 185 files. The adversarial review cleared the window fitter at its second turn, after
+3 findings, all in the notes and the tests, and the Hermes fix at its fourth, after 2 findings, a test's synchronization
+and an unqualified promise.
+
+### What didn't change
+
+The 512-token minimum, the CONTEXT forms and their order, how a window that fits is sized, the halving of a cut reply
+and its one-line `capacity:` limit (a limit on the reply's size, not the prompt's), the format-retry limit, the parser
+and the checkpoint contract. The Hermes transcript's lines keep their keys, their order and their timestamp format.
+
+---
+
 ## v0.41.4 — the observer's replies parse, and a reply that is not an answer is never "nothing"
 
 v0.41.2 made the observer's prompt fit the server's context. Its replies still failed on the documented observer
