@@ -5,9 +5,12 @@
  * Modeled after Engram's server.go — simple JSON handlers, localhost-only by default.
  *
  * Usage:
- *   clawmem serve [--port 7438] [--host 127.0.0.1]
+ *   clawmem serve [--port 7438] [--host 127.0.0.1] [--no-token]
  *
- * All endpoints require Bearer token auth when CLAWMEM_API_TOKEN is set.
+ * Every request passes the transport guard first (BACKLOG 62.4, `server-guard.ts`): a foreign Origin or Host is refused,
+ * CORS answers an allowed origin exactly, every route needs `Authorization: Bearer <token>` (the token from
+ * CLAWMEM_API_TOKEN or the generated token file), and every POST carries a JSON Content-Type. The token stops web pages;
+ * it is not authority against a same-user process, which can read it.
  */
 
 import type { Server } from "bun";
@@ -21,6 +24,20 @@ import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal } from "./causal
 import { capCausalWire } from "./causal-reader.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
+import {
+  checkRequest,
+  corsHeaders,
+  isJsonContentType,
+  preflightHeaders,
+  resolveServeGuard,
+  resolveServeToken,
+  ServeConfigError,
+  serveWarnings,
+  tokensEqual,
+  validToken,
+  type ServeGuard,
+  type ServeToken,
+} from "./server-guard.ts";
 import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
@@ -39,15 +56,17 @@ type RouteHandler = (req: Request, url: URL, store: Store) => Promise<Response> 
 // Auth
 // =============================================================================
 
-const API_TOKEN = process.env.CLAWMEM_API_TOKEN || null;
+/** True when `req` carries `Authorization: Bearer <token>` for exactly this token (compared in constant time). */
+function authorized(req: Request, token: string): boolean {
+  const m = /^Bearer +(\S+)$/i.exec(req.headers.get("authorization") ?? "");
+  return m !== null && tokensEqual(m[1]!, token);
+}
 
-function checkAuth(req: Request): Response | null {
-  if (!API_TOKEN) return null; // No token configured — open access
-  const auth = req.headers.get("authorization");
-  if (!auth || auth !== `Bearer ${API_TOKEN}`) {
-    return jsonResponse({ error: "Unauthorized" }, 401);
-  }
-  return null;
+function unauthorized(): Response {
+  return new Response(JSON.stringify({ error: "Unauthorized" }), {
+    status: 401,
+    headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="clawmem"' },
+  });
 }
 
 // =============================================================================
@@ -55,21 +74,14 @@ function checkAuth(req: Request): Response | null {
 // =============================================================================
 
 function jsonResponse(data: any, status: number = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "http://localhost:*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    },
-  });
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 }
 
 function jsonError(message: string, status: number = 400): Response {
   return jsonResponse({ error: message }, status);
 }
 
+/** The JSON body of a POST — the transport guard has already required its JSON Content-Type. */
 async function parseBody<T>(req: Request): Promise<T | null> {
   try {
     return await req.json() as T;
@@ -803,42 +815,78 @@ function matchRoute(method: string, pathname: string): RouteHandler | null {
 // Server
 // =============================================================================
 
-export function startServer(store: Store, port: number = 7438, host: string = "127.0.0.1") {
+export type ServeOptions = {
+  /**
+   * The token every request must carry: a string, or what `resolveServeToken` returned (its file feeds the startup
+   * warnings). Absent: CLAWMEM_API_TOKEN, else the token file (created on first use).
+   */
+  token?: string | ServeToken;
+  /** Serve with no token (`clawmem serve --no-token`). Refused unless the bind is loopback; the guard stays on. */
+  noToken?: boolean;
+  /** Where the token file lives; defaults to CLAWMEM_CONFIG_DIR or ~/.config/clawmem. */
+  configDir?: string;
+  /** Extra Host names (else CLAWMEM_ALLOWED_HOSTS) and browser origins (else CLAWMEM_ALLOWED_ORIGINS) to accept. */
+  allowedHosts?: string[];
+  allowedOrigins?: string[];
+  env?: Record<string, string | undefined>;
+};
+
+/**
+ * Starts the REST server. The guard and the token are resolved before it binds, so a configuration it refuses throws
+ * ServeConfigError (whose message never holds a token) instead of serving; what the configuration leaves open is
+ * logged as a warning on stderr.
+ */
+export function startServer(store: Store, port: number = 7438, host: string = "127.0.0.1", opts: ServeOptions = {}) {
+  const env = opts.env ?? process.env;
+  const guard = resolveServeGuard({ host, env, allowedHosts: opts.allowedHosts, allowedOrigins: opts.allowedOrigins });
+  if (opts.noToken && !guard.loopbackBind) {
+    throw new ServeConfigError(`--no-token is refused on a non-loopback bind (${host}): there the token is the only gate`);
+  }
+  let token: string | null = null;
+  let tokenFile: string | null = null;
+  if (!opts.noToken) {
+    const given = typeof opts.token === "string" ? { token: opts.token } : opts.token;
+    if (given !== undefined && !validToken(given.token)) throw new ServeConfigError("the token option is not a valid token");
+    const resolved: { token: string; source?: string; path?: string } = given ?? resolveServeToken({ env, configDir: opts.configDir });
+    token = resolved.token;
+    tokenFile = resolved.source === "file" ? resolved.path ?? null : null;
+  }
+  for (const w of serveWarnings({ host, guard, noToken: token === null, tokenFile })) console.warn(`[clawmem-server] warning: ${w}`);
   return Bun.serve({
     port,
     hostname: host,
-    async fetch(req) {
-      const url = new URL(req.url);
-
-      // CORS preflight
-      if (req.method === "OPTIONS") {
-        return new Response(null, {
-          status: 204,
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Max-Age": "86400",
-          },
-        });
-      }
-
-      // Auth check
-      const authError = checkAuth(req);
-      if (authError) return authError;
-
-      // Route matching
-      const handler = matchRoute(req.method, url.pathname);
-      if (!handler) {
-        return jsonError(`Not found: ${req.method} ${url.pathname}`, 404);
-      }
-
-      try {
-        return await handler(req, url, store);
-      } catch (err: any) {
-        console.error(`[clawmem-server] ${req.method} ${url.pathname} error:`, err);
-        return jsonError(`Internal error: ${err.message}`, 500);
-      }
-    },
+    fetch: (req) => handleRequest(req, store, guard, token),
   });
+}
+
+/** L1 (Origin, Host) → an OPTIONS answer (L2) → L3 (the token) → L4 (JSON bodies) → the route, with exact CORS. */
+async function handleRequest(req: Request, store: Store, guard: ServeGuard, token: string | null): Promise<Response> {
+  const verdict = checkRequest({ origin: req.headers.get("origin"), host: req.headers.get("host") }, guard);
+  if (!verdict.ok) return jsonError(`Forbidden: ${verdict.reason}`, 403);
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: verdict.origin ? preflightHeaders(verdict.origin) : {} });
+  }
+  const res = await route(req, store, token);
+  if (verdict.origin) for (const [k, v] of Object.entries(corsHeaders(verdict.origin))) res.headers.set(k, v);
+  return res;
+}
+
+async function route(req: Request, store: Store, token: string | null): Promise<Response> {
+  if (token !== null && !authorized(req, token)) return unauthorized();
+  if (req.method === "POST" && !isJsonContentType(req.headers.get("content-type"))) {
+    return jsonError("Content-Type must be application/json", 415);
+  }
+  // A request with no Host header (HTTP/1.0) arrives with a relative URL.
+  const url = new URL(req.url, "http://localhost");
+  const handler = matchRoute(req.method, url.pathname);
+  if (!handler) {
+    return jsonError(`Not found: ${req.method} ${url.pathname}`, 404);
+  }
+
+  try {
+    return await handler(req, url, store);
+  } catch (err: any) {
+    console.error(`[clawmem-server] ${req.method} ${url.pathname} error:`, err);
+    return jsonError(`Internal error: ${err.message}`, 500);
+  }
 }

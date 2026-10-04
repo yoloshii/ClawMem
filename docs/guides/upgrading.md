@@ -62,6 +62,29 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.42.0: `clawmem serve` requires a token and turns web pages away
+
+**Only REST clients are affected.** The vault, the hooks and the MCP server are unchanged.
+
+- **Restart `clawmem serve`.** On its first start it writes a token to `serve-token` in `CLAWMEM_CONFIG_DIR` (default
+  `~/.config/clawmem`), unless `CLAWMEM_API_TOKEN` is set; every request must then carry `Authorization: Bearer
+  <token>`. `clawmem serve-token` prints it. A `CLAWMEM_API_TOKEN` shorter than 32 characters, or with characters
+  outside `A–Z a–z 0–9 - . _ ~ + /` (and a trailing `=`), is refused: unset it, or set a random value
+  (`openssl rand -base64 32`) for `serve` and every client.
+- **Hermes:** copy the plugin's contents over the installed one (the command is under v0.41.0 below) and restart Hermes.
+  It sends `CLAWMEM_API_TOKEN` when set and otherwise reads the token file, so run it as the user `serve` runs as, with
+  the same `CLAWMEM_CONFIG_DIR`. A token set only in the ClawMem checkout's `.env` reaches `serve` but not the plugin.
+- **OpenClaw:** re-run `clawmem setup openclaw` (a `--link` install picks the change up on its own) and restart the
+  gateway. If a systemd unit sets `CLAWMEM_API_TOKEN`, set the same value in the gateway's environment. The plugin
+  reads the token once, when the gateway starts, so restart the gateway after a token rotation.
+- **Scripts and curl:** add `-H "Authorization: Bearer $(clawmem serve-token)"` to every request and
+  `-H "Content-Type: application/json"` to every POST — a POST without it now gets `415`.
+- **Proxies, host names, browser frontends:** a request whose `Host` is not a loopback name or the bind address gets
+  `403`; list a proxy's name, or the names clients use for a wildcard bind, in `CLAWMEM_ALLOWED_HOSTS`. A browser
+  frontend on a non-loopback origin goes in `CLAWMEM_ALLOWED_ORIGINS`; it also needs the token.
+- **No token at all:** `clawmem serve --no-token` keeps the old open behaviour on a loopback bind only. Pages from
+  other origins are still refused, but a page served from a loopback origin can call it, and so can any local program.
+
 ## v0.41.5: a window whose first message fits under a smaller CONTEXT is never held
 
 No action needed. A range held with `capacity: one message needs … tokens; a window holds …` because its message

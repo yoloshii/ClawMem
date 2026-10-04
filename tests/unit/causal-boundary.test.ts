@@ -16,6 +16,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { buildMcpServer } from "../../src/mcp.ts";
 import { startServer } from "../../src/server.ts";
+
+// The REST server needs a token on every request and a JSON Content-Type on every POST (BACKLOG 62.4).
+const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
+const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { createStore, canonicalDocId, type Store } from "../../src/store.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { hashContent } from "../../src/indexer.ts";
@@ -226,7 +230,7 @@ beforeAll(async () => {
   client = new Client({ name: "causal-boundary-tests", version: "0.0.0" });
   await client.connect(clientTransport);
 
-  restServer = startServer(seedStore, 0);
+  restServer = startServer(seedStore, 0, "127.0.0.1", { token: REST_TOKEN });
 });
 
 afterAll(() => {
@@ -570,7 +574,7 @@ describe("candidate eligibility in traversal legs", () => {
 describe("REST /retrieve causal", () => {
   const rest = async (body: Record<string, unknown>) => {
     const resp = await fetch(`http://127.0.0.1:${restServer!.port}/retrieve`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     return await resp.json() as any;
   };

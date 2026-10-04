@@ -2391,14 +2391,40 @@ async function cmdMcp() {
 async function cmdServe(args: string[]) {
   const port = parseInt(args.find((_, i, a) => a[i - 1] === "--port") || "7438", 10);
   const host = args.find((_, i, a) => a[i - 1] === "--host") || "127.0.0.1";
+  const noToken = args.includes("--no-token");
+  // Everything serve could refuse is settled before the vault opens: the guard (bind, allowlists), --no-token, the token.
+  const { resolveServeGuard, resolveServeToken, ServeConfigError } = await import("./server-guard.ts");
+  let guard, token;
+  try {
+    guard = resolveServeGuard({ host });
+    if (noToken && !guard.loopbackBind) die(`--no-token is refused on a non-loopback bind (${host}): there the token is the only gate`);
+    token = noToken ? null : resolveServeToken();
+  } catch (e) {
+    if (e instanceof ServeConfigError) die(e.message);
+    throw e;
+  }
   const s = getStore();
   const { startServer } = await import("./server.ts");
-  const server = startServer(s, port, host);
+  // startServer logs what this configuration leaves open (--no-token, Host check off, Windows file checks).
+  startServer(s, port, host, token ? { token } : { noToken: true });
   console.log(`ClawMem HTTP server listening on http://${host}:${port}`);
-  console.log(`Token auth: ${process.env.CLAWMEM_API_TOKEN ? "enabled" : "disabled (set CLAWMEM_API_TOKEN)"}`);
+  console.log(token
+    ? `Token: ${token.source === "env" ? "CLAWMEM_API_TOKEN" : token.path} (send it as Authorization: Bearer <token>; \`clawmem serve-token\` prints it)`
+    : `${c.yellow}Token: none (--no-token)${c.reset}`);
   console.log(`Press Ctrl+C to stop.`);
   // Keep alive
   await new Promise(() => {});
+}
+
+/** Prints the token `serve` would use under this environment — CLAWMEM_API_TOKEN, else the token file, created on first use. */
+async function cmdServeToken() {
+  const { resolveServeToken, ServeConfigError } = await import("./server-guard.ts");
+  try {
+    process.stdout.write(`${resolveServeToken().token}\n`);
+  } catch (e) {
+    if (e instanceof ServeConfigError) die(e.message);
+    throw e;
+  }
 }
 
 // In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
@@ -4889,6 +4915,9 @@ async function main() {
       case "serve":
         await cmdServe(subArgs);
         break;
+      case "serve-token":
+        await cmdServeToken();
+        break;
       case "setup":
         await cmdSetup(subArgs);
         break;
@@ -6056,7 +6085,8 @@ ${c.bold}Intelligence:${c.reset}
 
 ${c.bold}Integration:${c.reset}
   clawmem mcp                          Start stdio MCP server
-  clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
+  clawmem serve [--port 7438] [--host 127.0.0.1] [--no-token]  Start HTTP REST API server (token required by default)
+  clawmem serve-token                  Print the token serve uses (CLAWMEM_API_TOKEN, else the generated token file)
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
   clawmem vec-daemon-health [--db P] [--json]   Is the watcher's vector daemon Path-A authoritative? (exit 0 ONLY when live: attested DB/pid + hydrated-v1; live-raw/live-legacy = listener present but non-authoritative, exit 1)

@@ -12,7 +12,7 @@
  * - clawmem_similar: Find similar documents
  */
 
-import type { ClawMemConfig } from "./shell.js";
+import { clientServeToken, type ClawMemConfig, type ServeAuth } from "./shell.js";
 
 // =============================================================================
 // Types (matching OpenClaw's tool interface without importing it)
@@ -36,6 +36,7 @@ type Logger = {
 
 async function apiCall(
   cfg: ClawMemConfig,
+  auth: ServeAuth | undefined,
   method: string,
   path: string,
   body?: Record<string, unknown>
@@ -43,8 +44,12 @@ async function apiCall(
   const url = `http://127.0.0.1:${cfg.servePort}${path}`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
 
-  // Add auth token if configured
-  const token = cfg.env.CLAWMEM_API_TOKEN || process.env.CLAWMEM_API_TOKEN;
+  // The managed serve's token when this plugin launched one, else the effective token (env, then serve's token file).
+  const resolved = auth?.token ? { token: auth.token } : clientServeToken(cfg);
+  if (!resolved.token && resolved.problem) {
+    return { ok: false, status: 0, data: { error: `ClawMem API not called: ${resolved.problem}` } };
+  }
+  const token = resolved.token;
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
   try {
@@ -60,7 +65,8 @@ async function apiCall(
     return {
       ok: false,
       status: 0,
-      data: { error: `ClawMem API unreachable at ${url}: ${String(err)}` },
+      // Header validators quote the offending value: the token never leaves in an error.
+      data: { error: `ClawMem API unreachable at ${url}: ${token ? String(err).split(token).join("<redacted>") : String(err)}` },
     };
   }
 }
@@ -77,7 +83,7 @@ type ToolDef = {
   execute: (toolCallId: string, params: Record<string, unknown>) => Promise<ToolResult>;
 };
 
-export function createTools(cfg: ClawMemConfig, logger: Logger): ToolDef[] {
+export function createTools(cfg: ClawMemConfig, logger: Logger, auth?: ServeAuth): ToolDef[] {
   return [
     // --- Unified Search ---
     {
@@ -102,7 +108,7 @@ export function createTools(cfg: ClawMemConfig, logger: Logger): ToolDef[] {
         required: ["query"],
       },
       async execute(_id, params) {
-        const result = await apiCall(cfg, "POST", "/search", {
+        const result = await apiCall(cfg, auth, "POST", "/search", {
           query: params.query as string,
           mode: params.mode ?? "auto",
           collection: params.collection,
@@ -152,7 +158,7 @@ export function createTools(cfg: ClawMemConfig, logger: Logger): ToolDef[] {
       },
       async execute(_id, params) {
         const docid = params.docid as string;
-        const result = await apiCall(cfg, "GET", `/documents/${docid}`);
+        const result = await apiCall(cfg, auth, "GET", `/documents/${docid}`);
 
         if (!result.ok) {
           return {
@@ -185,7 +191,7 @@ export function createTools(cfg: ClawMemConfig, logger: Logger): ToolDef[] {
       },
       async execute(_id, params) {
         const limit = (params.limit as number) || 5;
-        const result = await apiCall(cfg, "GET", `/sessions?limit=${limit}`);
+        const result = await apiCall(cfg, auth, "GET", `/sessions?limit=${limit}`);
 
         if (!result.ok) {
           return {
@@ -233,7 +239,7 @@ export function createTools(cfg: ClawMemConfig, logger: Logger): ToolDef[] {
         const after = params.after ?? 5;
         const sameCol = params.same_collection ?? false;
         const qs = `before=${before}&after=${after}&same_collection=${sameCol}`;
-        const result = await apiCall(cfg, "GET", `/timeline/${docid}?${qs}`);
+        const result = await apiCall(cfg, auth, "GET", `/timeline/${docid}?${qs}`);
 
         if (!result.ok) {
           return {
@@ -277,7 +283,7 @@ export function createTools(cfg: ClawMemConfig, logger: Logger): ToolDef[] {
       async execute(_id, params) {
         const docid = params.docid as string;
         const limit = params.limit ?? 5;
-        const result = await apiCall(cfg, "GET", `/graph/similar/${docid}?limit=${limit}`);
+        const result = await apiCall(cfg, auth, "GET", `/graph/similar/${docid}?limit=${limit}`);
 
         if (!result.ok) {
           return {

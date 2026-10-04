@@ -19,6 +19,10 @@ const configDir = mkdtempSync(join(tmpdir(), "clawmem-test-config-"));
 process.env.CLAWMEM_CONFIG_DIR = configDir;
 delete process.env.CLAWMEM_VAULTS;
 delete process.env.INDEX_PATH;
+// The REST server's token and allowlists (BACKLOG 62.4): a test that serves passes its own, never the shell's.
+delete process.env.CLAWMEM_API_TOKEN;
+delete process.env.CLAWMEM_ALLOWED_HOSTS;
+delete process.env.CLAWMEM_ALLOWED_ORIGINS;
 (globalThis as { __clawmemTestConfigDir?: string }).__clawmemTestConfigDir = configDir;
 
 const keepIsolated = () => {

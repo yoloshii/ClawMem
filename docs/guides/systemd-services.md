@@ -267,7 +267,7 @@ WantedBy=default.target
 EOF
 ```
 
-For authenticated access, add `Environment=CLAWMEM_API_TOKEN=your-secret` to the `[Service]` section.
+Every request needs the server's token (v0.42.0). Without `CLAWMEM_API_TOKEN` the service generates `~/.config/clawmem/serve-token` (under `CLAWMEM_CONFIG_DIR` if set) on its first start, and clients running as the same user read it — `clawmem serve-token` prints it. To choose the token yourself, add `Environment=CLAWMEM_API_TOKEN=<32+ random characters>` to the `[Service]` section and give clients the same value. See [REST API authentication](../reference/rest-api.md#authentication-v0420).
 
 Enable alongside the other services:
 

@@ -93,7 +93,8 @@ Set in your Hermes profile's `.env` or shell environment:
 | `CLAWMEM_LLM_REASONING_EFFORT` | — | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it (for example OpenAI reasoning models). Leave unset for llama-server/vLLM unless explicitly supported. |
 | `CLAWMEM_LLM_NO_THINK` | `true` | Append `/no_think` to remote prompts; set to `false` for standard OpenAI models and other endpoints that reject or treat the Qwen-style suffix as literal prompt text |
 | `CLAWMEM_RERANK_URL` | — | GPU reranker server URL (e.g., `http://localhost:8090`) |
-| `CLAWMEM_API_TOKEN` | — | Bearer token for REST API auth (optional, must match `clawmem serve` config) |
+| `CLAWMEM_API_TOKEN` | — | REST token. Unset: the plugin reads the token file `clawmem serve` generates (below) |
+| `CLAWMEM_CONFIG_DIR` | `~/.config/clawmem` | Where `clawmem serve` keeps its token file, `serve-token` |
 
 Or configure interactively:
 ```bash
@@ -113,9 +114,17 @@ clawmem serve --port 7438 &
 
 The plugin connects to the existing server. If the server is unreachable, tools fail gracefully but hooks still work (shell-out transport).
 
+**The token (v0.42.0).** `clawmem serve` requires a token on every request. The plugin sends `CLAWMEM_API_TOKEN` when it
+is set, and otherwise reads the token file `serve` generates (`$CLAWMEM_CONFIG_DIR/serve-token`, default
+`~/.config/clawmem/serve-token`) on each call — so run the plugin and `serve` as the same user with the same
+`CLAWMEM_CONFIG_DIR`, and either set the same `CLAWMEM_API_TOKEN` for both or for neither. A `CLAWMEM_API_TOKEN` (or
+`CLAWMEM_CONFIG_DIR`) set only in the ClawMem checkout's `.env` reaches `serve` through `bin/clawmem` but not the plugin:
+set it in the plugin's environment too. A token that is not valid (32–4096 characters of `A–Z a–z 0–9 - . _ ~ + /`) is
+never sent; the plugin logs why, without the value.
+
 ### Managed
 
-The plugin starts `clawmem serve` during `initialize()` and stops it on `shutdown()`. Includes a readiness probe (5s health check loop) and early-exit detection.
+The plugin starts `clawmem serve` during `initialize()` and stops it on `shutdown()`. Includes a readiness probe (5s health check loop) and early-exit detection. Before starting it, the plugin runs `clawmem serve-token` through the same binary and environment and passes the printed token to the child explicitly, so the two ends always agree; it keeps using that token if its child loses the port to another `clawmem serve` started the same way (which then holds the same token). It reads the token once, at start: after a token rotation, restart Hermes.
 
 ```bash
 export CLAWMEM_SERVE_MODE=managed
@@ -177,8 +186,8 @@ SQLite WAL mode + `busy_timeout=5000ms` handles concurrent access. The plugin-ma
 # Plugin discovered
 hermes memory list | grep clawmem
 
-# REST API responding
-curl http://localhost:7438/health
+# REST API responding (it needs the token since v0.42.0)
+curl -H "Authorization: Bearer $(clawmem serve-token)" http://localhost:7438/health
 
 # Hooks working
 clawmem status
@@ -203,5 +212,5 @@ systemctl --user status clawmem-watcher.service
 | `on_memory_write()` | No-op | Avoids duplication with built-in memory (filesystem watcher already indexes MEMORY.md / USER.md if they live under a configured collection). |
 | `on_delegation()` | No-op | Subagent observation handled at the parent's primary context already; nothing useful to add here. |
 | `get_tool_schemas()` | 5 REST-backed tools | retrieve, get, session_log, timeline, similar |
-| `handle_tool_call()` | REST API dispatch | Bearer auth when `CLAWMEM_API_TOKEN` is set |
+| `handle_tool_call()` | REST API dispatch | Sends the token: the managed one, else `CLAWMEM_API_TOKEN`, else serve's token file |
 | `shutdown()` | Thread cleanup + managed serve stop | Joins prefetch thread, makes a last try at transcript writes still waiting (what cannot be written is logged as lost), releases the transcripts it holds, terminates managed process |

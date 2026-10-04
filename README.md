@@ -361,9 +361,9 @@ The server runs via stdio — no network port needed. The `bin/clawmem` wrapper 
 For web dashboards, non-MCP agents, cross-machine access, or programmatic use:
 
 ```bash
-./bin/clawmem serve                          # localhost:7438, no auth
+./bin/clawmem serve                          # localhost:7438; every request needs the token (below)
 ./bin/clawmem serve --port 8080              # custom port
-CLAWMEM_API_TOKEN=secret ./bin/clawmem serve # with bearer token auth
+./bin/clawmem serve-token                    # print the token serve uses
 ```
 
 **Endpoints:**
@@ -390,12 +390,13 @@ CLAWMEM_API_TOKEN=secret ./bin/clawmem serve # with bearer token auth
 | POST | `/reindex` | Trigger re-scan |
 | POST | `/graphs/build` | Rebuild temporal + semantic graphs |
 
-**Auth:** Set `CLAWMEM_API_TOKEN` env var to require `Authorization: Bearer <token>` on all requests. If unset, access is open (localhost-only by default). See `.env.example`.
+**Auth (v0.42.0):** every request needs `Authorization: Bearer <token>`: `CLAWMEM_API_TOKEN` when set (32+ characters), otherwise the token file `serve` generates at `~/.config/clawmem/serve-token`; `clawmem serve-token` prints it. Every POST needs `Content-Type: application/json`, and requests from web pages (a foreign `Origin` or `Host`) are refused. See the [REST API reference](docs/reference/rest-api.md#authentication-v0420).
 
 **Search example:**
 
 ```bash
 curl -X POST http://localhost:7438/search \
+  -H "Authorization: Bearer $(clawmem serve-token)" \
   -H 'Content-Type: application/json' \
   -d '{"query": "authentication decisions", "mode": "hybrid", "compact": true}'
 ```
@@ -531,7 +532,8 @@ clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
 clawmem setup mcp [--remove]                    Register/remove MCP server
 clawmem setup curator [--remove]                Install/remove curator maintenance agent
 clawmem mcp                                     Start stdio MCP server
-clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
+clawmem serve [--port 7438] [--host 127.0.0.1] [--no-token]  Start HTTP REST API server (token required)
+clawmem serve-token                             Print the token serve uses
 clawmem path                                    Print database path
 clawmem doctor                                  Full health check
 clawmem status                                  Quick index status

@@ -108,7 +108,9 @@ ClawMem's mutation contract.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CLAWMEM_API_TOKEN` | (none) | When set, `clawmem serve` requires `Authorization: Bearer <token>` on all requests. Unset → open (localhost-only by default). |
+| `CLAWMEM_API_TOKEN` | (none) | The token `clawmem serve` requires as `Authorization: Bearer <token>` on every request — 32–4096 characters of `A–Z a–z 0–9 - . _ ~ + /`, optional trailing `=`. Unset or empty → the token file `serve-token` in `CLAWMEM_CONFIG_DIR` (default `~/.config/clawmem`), generated on first start; never open (v0.42.0). The Hermes and OpenClaw plugins read it, else that file. `clawmem serve-token` prints the token in use. |
+| `CLAWMEM_ALLOWED_HOSTS` | (none) | Comma-separated host names or IP literals, without ports, that `clawmem serve` accepts in the `Host` header besides loopback and a named bind address — a proxy's name, or the names clients use on a wildcard bind (where, without this, Host is not checked). An unparseable or empty entry stops `serve` from starting. v0.42.0. |
+| `CLAWMEM_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`https://dash.example`) that `clawmem serve` accepts besides loopback origins; CORS answers them exactly. An unparseable or empty entry stops `serve` from starting. v0.42.0. |
 | `CLAWMEM_SERVE_PORT` | `7438` | REST API port read by the **Hermes plugin** (to launch/connect to `clawmem serve`). Manual `clawmem serve` takes `--port` instead — it does not read this env var. |
 | `CLAWMEM_SERVE_MODE` | `external` | Hermes plugin serve mode: `external` (you run `clawmem serve`) or `managed` (the plugin starts/stops `serve`). |
 | `CLAWMEM_BIN` | (auto-detect on PATH) | Path to the `clawmem` binary, for the Hermes plugin when it is not on `PATH`. |

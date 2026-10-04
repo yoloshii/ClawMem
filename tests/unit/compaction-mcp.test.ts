@@ -19,6 +19,10 @@ import { hashContent } from "../../src/indexer.ts";
 import { stalenessCheck } from "../../src/hooks/staleness-check.ts";
 import { sessionBootstrap } from "../../src/hooks/session-bootstrap.ts";
 import { startServer } from "../../src/server.ts";
+
+// The REST server needs a token on every request and a JSON Content-Type on every POST (BACKLOG 62.4).
+const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
+const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { EVOLUTION_WRITER_FLOOR_FLAG } from "../../src/compaction-state.ts";
 
 const MODEL = "quarantine-mcp-fake";
@@ -113,7 +117,7 @@ beforeAll(async () => {
   seedStore.db.exec("ALTER TABLE memory_evolution DROP COLUMN writer");
   seedStore.db.prepare("DELETE FROM vault_flags WHERE flag = ?").run(EVOLUTION_WRITER_FLOOR_FLAG);
 
-  rest = startServer(seedStore, 0);
+  rest = startServer(seedStore, 0, "127.0.0.1", { token: REST_TOKEN });
 
   const built = buildMcpServer();
   closeAllStores = built.closeAllStores;
@@ -135,10 +139,8 @@ afterAll(() => {
 const call = async (name: string, args: Record<string, unknown>): Promise<string> =>
   JSON.stringify(await client.callTool({ name, arguments: args }));
 const hookText = (out: unknown) => JSON.stringify(out);
-const restGet = async (path: string): Promise<string> => {
-  const token = process.env.CLAWMEM_API_TOKEN;
-  return (await fetch(`http://127.0.0.1:${rest.port}${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })).text();
-};
+const restGet = async (path: string): Promise<string> =>
+  (await fetch(`http://127.0.0.1:${rest.port}${path}`, { headers: AUTH })).text();
 const docid = (path: string) => docs[path]!.hash.slice(0, 6);
 
 describe("62.2 — no MCP tool or hook returns the legacy snapshot", () => {

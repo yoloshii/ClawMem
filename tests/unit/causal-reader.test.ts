@@ -15,6 +15,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { buildMcpServer } from "../../src/mcp.ts";
 import { startServer } from "../../src/server.ts";
+
+// The REST server needs a token on every request and a JSON Content-Type on every POST (BACKLOG 62.4).
+const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
+const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { createStore, findCausalLinks, CAUSAL_READER_MAX_EDGES, type Store } from "../../src/store.ts";
 import { capCausalWire, CAUSAL_READER_MAX_BYTES } from "../../src/causal-reader.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
@@ -78,7 +82,7 @@ beforeAll(async () => {
   client = new Client({ name: "causal-reader-test", version: "0.0.0" });
   await Promise.all([built.server.connect(serverTransport), client.connect(clientTransport)]);
 
-  restServer = startServer(store, 0);
+  restServer = startServer(store, 0, "127.0.0.1", { token: REST_TOKEN });
   restPort = (restServer as any).port;
 });
 
@@ -441,7 +445,7 @@ describe("MCP + REST boundaries", () => {
 
   test("REST not-found path is byte-bounded: an oversized docid comes back sliced", async () => {
     const hugeDocid = "y".repeat(8_000);
-    const res = await fetch(`http://127.0.0.1:${restPort}/graph/causal/${hugeDocid}?direction=causes`);
+    const res = await fetch(`http://127.0.0.1:${restPort}/graph/causal/${hugeDocid}?direction=causes`, { headers: AUTH });
     expect(res.status).toBe(404);
     const raw = await res.text();
     expect(Buffer.byteLength(raw, "utf8")).toBeLessThan(1_000);
@@ -475,7 +479,7 @@ describe("MCP + REST boundaries", () => {
   test("destructive REST boundary: /documents/_/forget deactivates NOTHING", async () => {
     const path = "observations/forget-victim.md";
     mkDoc(path);
-    const res = await fetch(`http://127.0.0.1:${restPort}/documents/_/forget`, { method: "POST" });
+    const res = await fetch(`http://127.0.0.1:${restPort}/documents/_/forget`, { method: "POST", headers: { ...AUTH, "Content-Type": "application/json" } });
     expect(res.status).toBe(404);
     const active = store.db.prepare(
       `SELECT active FROM documents WHERE collection = '_clawmem' AND path = ?`,
@@ -500,7 +504,7 @@ describe("MCP + REST boundaries", () => {
     edge(a, b, { weight: 0.77 });
     sighting(a, b, { so: 1, to: 2, conf: 0.77, createdAt: "2026-08-01T00:00:00.000Z", reasoning: "rest evidence" });
 
-    const res = await fetch(`http://127.0.0.1:${restPort}/graph/causal/${hashOf("observations/rest-a.md")}?direction=causes`);
+    const res = await fetch(`http://127.0.0.1:${restPort}/graph/causal/${hashOf("observations/rest-a.md")}?direction=causes`, { headers: AUTH });
     expect(res.status).toBe(200);
     const raw = await res.text();
     expect(Buffer.byteLength(raw, "utf8")).toBeLessThanOrEqual(CAUSAL_READER_MAX_BYTES);

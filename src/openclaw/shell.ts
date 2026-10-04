@@ -6,8 +6,9 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { accessSync, constants as fsConstants, existsSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { accessSync, closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ESM equivalent of CommonJS __dirname. This package declares
@@ -16,6 +17,102 @@ import { fileURLToPath } from "node:url";
 // in ESM, which is why this regression is invisible under `bun test`.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// =============================================================================
+// The REST token (BACKLOG 62.4) — mirrored from src/server-guard.ts to keep this directory self-contained
+// =============================================================================
+
+/** A managed serve's token: set by the plugin's REST service once `clawmem serve-token` answered; tools read it per call. */
+export type ServeAuth = { token: string | null };
+
+const B64TOKEN = /^[A-Za-z0-9\-._~+/]+=*$/;
+const TOKEN_RULE = "32-4096 characters of A-Z a-z 0-9 - . _ ~ + / with optional trailing =";
+export const validServeToken = (t: string): boolean => t.length >= 32 && t.length <= 4096 && B64TOKEN.test(t);
+
+/** `readSync`'s shape for one buffer slice: returns how many bytes it read, which may be fewer than asked. */
+export type ReadFn = (fd: number, buf: Buffer, offset: number, length: number, position: number) => number;
+const readFd: ReadFn = (fd, buf, offset, length, position) => readSync(fd, buf, offset, length, position);
+
+/**
+ * The token `clawmem serve` generated at `path`, under the rules serve applies: the directory is this user's and not
+ * group- or world-writable (or another user could replace the file), and the file is opened without following a
+ * symlink and checked on that descriptor. Exported for the tests, which pass a `read` that returns short counts.
+ */
+export function readServeTokenFile(path: string, read: ReadFn = readFd): string | null {
+  const uid = typeof process.geteuid === "function" ? process.geteuid() : null;
+  if (uid !== null) {
+    let dst;
+    try {
+      dst = statSync(realpathSync(dirname(path)));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new Error(`cannot read the config directory ${dirname(path)}: ${(e as NodeJS.ErrnoException).code ?? "error"}`);
+    }
+    if (!dst.isDirectory() || dst.uid !== uid || (dst.mode & 0o022) !== 0) {
+      throw new Error(`the config directory ${dirname(path)} is not this user's alone (another user could replace the token file)`);
+    }
+  }
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`cannot open the token file ${path}: ${(e as NodeJS.ErrnoException).code ?? "error"}`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 4096) throw new Error(`the token file ${path} is not a regular file of at most 4 KiB`);
+    if (uid !== null && (st.uid !== uid || (st.mode & 0o077) !== 0)) {
+      throw new Error(`the token file ${path} is not this user's alone (chmod 600 it, or remove it so serve makes another)`);
+    }
+    // A read may return fewer bytes than asked before the end of the file: read until all of it is in.
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < buf.length) {
+      const n = read(fd, buf, off, buf.length - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    const text = buf.subarray(0, off).toString("utf-8").trim();
+    if (!validServeToken(text)) throw new Error(`the token file ${path} does not hold a valid token (${TOKEN_RULE})`);
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * The REST client's token under its effective environment — `{ ...process.env, ...cfg.env }`, the overlay
+ * `spawnBackground` gives a managed serve, so `cfg.env.CLAWMEM_API_TOKEN = ""` means unset on both ends: a non-empty
+ * CLAWMEM_API_TOKEN, else serve's token file under CLAWMEM_CONFIG_DIR. A problem names what is wrong, never the value.
+ */
+export function clientServeToken(cfg: ClawMemConfig): { token: string | null; problem?: string } {
+  const env: Record<string, string | undefined> = { ...process.env, ...cfg.env };
+  const fromEnv = env.CLAWMEM_API_TOKEN ?? "";
+  if (fromEnv !== "") {
+    return validServeToken(fromEnv) ? { token: fromEnv } : { token: null, problem: `CLAWMEM_API_TOKEN is not a valid token (${TOKEN_RULE})` };
+  }
+  try {
+    return { token: readServeTokenFile(join(env.CLAWMEM_CONFIG_DIR || join(homedir(), ".config", "clawmem"), "serve-token")) };
+  } catch (e) {
+    return { token: null, problem: (e as Error).message };
+  }
+}
+
+/**
+ * The token a managed serve starts with: `clawmem serve-token` through the same binary and environment as the serve, so
+ * the checkout's .env (the wrapper applies it to unset variables only) reaches both alike.
+ */
+export function runServeToken(cfg: ClawMemConfig): Promise<{ token: string } | { problem: string }> {
+  return new Promise((done) => {
+    execFile(cfg.clawmemBin, ["serve-token"], { env: { ...process.env, ...cfg.env }, timeout: 30_000 }, (err, stdout, stderr) => {
+      const token = String(stdout ?? "").trim();
+      if (!err && validServeToken(token)) return done({ token });
+      const why = String(stderr ?? "").trim().slice(-500);
+      done({ problem: (token ? why.split(token).join("<redacted>") : why) || `exit ${(err as { code?: unknown } | null)?.code ?? "?"}` });
+    });
+  });
+}
 
 // =============================================================================
 // Types

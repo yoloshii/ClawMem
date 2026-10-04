@@ -51,6 +51,7 @@ src/
   clawmem.ts         CLI entry point
   mcp.ts             MCP server
   server.ts          REST API server
+  server-guard.ts    REST transport guard (Origin/Host checks, CORS, the token)
   store.ts           SQLite store (documents, vectors, relations)
   llm.ts             LLM abstraction (embedding, generation, reranking)
   config.ts          Vault configuration, profiles, lifecycle policy
@@ -122,7 +123,7 @@ Only `.md` files. Never add indexing for binary files, source code, or credentia
 - Never index or expose credential files (`.env`, `*secrets*`, `*credentials*`)
 - `vault_sync` validates paths against a deny-list — don't weaken it
 - Prompt injection sanitization (`promptguard.ts`) strips control sequences from injected context
-- Bearer token auth on REST API when `CLAWMEM_API_TOKEN` is set
+- `clawmem serve` requires a bearer token on every request (`CLAWMEM_API_TOKEN`, else the generated token file) and refuses foreign `Origin`/`Host` headers and non-JSON POSTs (`src/server-guard.ts`). The token stops web pages, not processes running as the same user
 
 ## License
 

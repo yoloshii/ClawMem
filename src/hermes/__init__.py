@@ -12,6 +12,9 @@ Config via environment variables:
   CLAWMEM_BIN           — Path to clawmem binary (default: auto-detect on PATH)
   CLAWMEM_SERVE_PORT    — REST API port (default: 7438)
   CLAWMEM_SERVE_MODE    — "external" (default) or "managed" (plugin starts/stops serve)
+  CLAWMEM_API_TOKEN     — REST token (default: the token file serve generates; managed mode pins the token
+                          `clawmem serve-token` prints into its serve)
+  CLAWMEM_CONFIG_DIR    — Where serve's token file lives: <dir>/serve-token (default: ~/.config/clawmem)
   CLAWMEM_PROFILE       — Retrieval profile: speed, balanced, deep (default: balanced)
   CLAWMEM_EMBED_URL     — GPU embedding server URL (optional)
   CLAWMEM_LLM_URL       — GPU LLM server URL (optional)
@@ -37,7 +40,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -118,11 +123,91 @@ def _run_hook(bin_path: str, hook_name: str, hook_input: dict,
         return None
 
 
+_TOKEN_RE = re.compile(r"[A-Za-z0-9\-._~+/]+=*")  # RFC 6750 b64token
+_TOKEN_RULE = "32-4096 characters of A-Z a-z 0-9 - . _ ~ + / with optional trailing '='"
+
+
+def _valid_token(token: str) -> bool:
+    return 32 <= len(token) <= 4096 and _TOKEN_RE.fullmatch(token) is not None
+
+
+def _read_token_file(path: str) -> Optional[str]:
+    """The token `clawmem serve` generated at path, under the same rules serve applies: the directory is this user's and
+    not group- or world-writable (or another user could replace the file), and the file is opened without following a
+    symlink and checked on that same descriptor. None when absent. Raises ValueError naming the problem, never the value."""
+    directory = os.path.dirname(path) or "."
+    if hasattr(os, "geteuid"):
+        try:
+            dst = os.stat(os.path.realpath(directory))
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise ValueError(f"cannot read the config directory {directory}: {e.strerror or 'error'}")
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.geteuid() or dst.st_mode & 0o022:
+            raise ValueError(f"the config directory {directory} is not this user's alone (another user could replace the token file)")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ValueError(f"cannot open the token file {path}: {e.strerror or 'error'}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 4096:
+            raise ValueError(f"the token file {path} is not a regular file of at most 4 KiB")
+        if hasattr(os, "geteuid") and (st.st_uid != os.geteuid() or st.st_mode & 0o077):
+            raise ValueError(f"the token file {path} is not this user's alone (chmod 600 it, or remove it so serve makes another)")
+        # A read may return fewer bytes than asked before the end of the file: read until all st_size bytes are in.
+        chunks, left = [], st.st_size
+        while left > 0:
+            chunk = os.read(fd, left)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        data = b"".join(chunks).decode("utf-8", "replace").strip()
+    finally:
+        os.close(fd)
+    if not _valid_token(data):
+        raise ValueError(f"the token file {path} does not hold a valid token ({_TOKEN_RULE})")
+    return data
+
+
+def _effective_token() -> tuple:
+    """(token, problem): CLAWMEM_API_TOKEN when set and non-empty, else the token file `clawmem serve` generates under
+    CLAWMEM_CONFIG_DIR (default ~/.config/clawmem). A problem names what is wrong and never the value; (None, None)
+    means there is no token to send."""
+    env_token = os.environ.get("CLAWMEM_API_TOKEN", "")
+    if env_token:
+        if not _valid_token(env_token):
+            return None, f"CLAWMEM_API_TOKEN is not a valid token ({_TOKEN_RULE})"
+        return env_token, None
+    config_dir = os.environ.get("CLAWMEM_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".config", "clawmem")
+    try:
+        return _read_token_file(os.path.join(config_dir, "serve-token")), None
+    except ValueError as e:
+        return None, str(e)
+
+
+def _redact(text: str, token: Optional[str]) -> str:
+    """Exception text with the token taken out: Python's and httpx's header validators quote the offending value."""
+    return text.replace(token, "<redacted>") if token else text
+
+
 def _rest_call(port: int, method: str, path: str,
-               body: Optional[dict] = None, timeout: float = _REST_TIMEOUT) -> Optional[dict]:
-    """Call the ClawMem REST API. Returns parsed JSON or None."""
+               body: Optional[dict] = None, timeout: float = _REST_TIMEOUT,
+               token: Optional[str] = None) -> Optional[dict]:
+    """Call the ClawMem REST API. Returns parsed JSON or None. ``token`` is a managed launcher's pinned token; without
+    one the effective token is sent (CLAWMEM_API_TOKEN, else serve's token file)."""
+    if token is None:
+        token, problem = _effective_token()
+        if problem:
+            logger.warning("ClawMem REST %s %s not sent: %s", method, path, problem)
+            return None
+    elif not _valid_token(token):
+        logger.warning("ClawMem REST %s %s not sent: the managed token is not a valid token", method, path)
+        return None
     headers: dict = {"Content-Type": "application/json"}
-    token = os.environ.get("CLAWMEM_API_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -143,7 +228,7 @@ def _rest_call(port: int, method: str, path: str,
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
         except (urllib.error.URLError, Exception) as e:
-            logger.debug("ClawMem REST %s %s failed: %s", method, path, e)
+            logger.debug("ClawMem REST %s %s failed: %s", method, path, _redact(str(e), token))
             return None
 
     try:
@@ -159,7 +244,7 @@ def _rest_call(port: int, method: str, path: str,
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        logger.debug("ClawMem REST %s %s failed: %s", method, path, e)
+        logger.debug("ClawMem REST %s %s failed: %s", method, path, _redact(str(e), token))
         return None
 
 
@@ -354,6 +439,8 @@ class ClawMemProvider(MemoryProvider):
         self._hermes_home: str = ""
         self._serve_mode: str = "external"
         self._serve_proc: Optional[subprocess.Popen] = None
+        # The token a managed serve was started with (`clawmem serve-token`); None in external mode.
+        self._serve_token: Optional[str] = None
         self._env_extra: dict = {}
         # Agent-context isolation. "primary" = full read+write; everything else
         # ("subagent", "cron", "flush") = reads OK, writes suppressed. See file
@@ -1195,7 +1282,7 @@ class ClawMemProvider(MemoryProvider):
         body = {"query": query, "compact": True}
         if args.get("limit"):
             body["limit"] = args["limit"]
-        data = _rest_call(self._port, "POST", "/retrieve", body)
+        data = self._rest("POST", "/retrieve", body)
         if data is None:
             return json.dumps({"error": "ClawMem REST API unreachable"})
         return json.dumps(data, ensure_ascii=False)
@@ -1204,14 +1291,14 @@ class ClawMemProvider(MemoryProvider):
         docid = args.get("docid", "")
         if not docid:
             return json.dumps({"error": "docid is required"})
-        data = _rest_call(self._port, "GET", f"/documents/{docid}")
+        data = self._rest("GET", f"/documents/{docid}")
         if data is None:
             return json.dumps({"error": f"Document not found: {docid}"})
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_session_log(self, args: dict) -> str:
         limit = args.get("limit", 5)
-        data = _rest_call(self._port, "GET", f"/sessions?limit={limit}")
+        data = self._rest("GET", f"/sessions?limit={limit}")
         if data is None:
             return json.dumps({"error": "ClawMem REST API unreachable"})
         return json.dumps(data, ensure_ascii=False)
@@ -1222,7 +1309,7 @@ class ClawMemProvider(MemoryProvider):
             return json.dumps({"error": "docid is required"})
         before = args.get("before", 5)
         after = args.get("after", 5)
-        data = _rest_call(self._port, "GET", f"/timeline/{docid}?before={before}&after={after}")
+        data = self._rest("GET", f"/timeline/{docid}?before={before}&after={after}")
         if data is None:
             return json.dumps({"error": "ClawMem REST API unreachable"})
         return json.dumps(data, ensure_ascii=False)
@@ -1232,24 +1319,41 @@ class ClawMemProvider(MemoryProvider):
         if not docid:
             return json.dumps({"error": "docid is required"})
         limit = args.get("limit", 5)
-        data = _rest_call(self._port, "GET", f"/graph/similar/{docid}?limit={limit}")
+        data = self._rest("GET", f"/graph/similar/{docid}?limit={limit}")
         if data is None:
             return json.dumps({"error": "ClawMem REST API unreachable"})
         return json.dumps(data, ensure_ascii=False)
 
+    def _rest(self, method: str, path: str, body: Optional[dict] = None,
+              timeout: float = _REST_TIMEOUT) -> Optional[dict]:
+        """A REST call with this provider's token: the managed one when it launched serve, else the effective one."""
+        return _rest_call(self._port, method, path, body, timeout, token=self._serve_token)
+
     # -- Managed serve ---------------------------------------------------------
 
     def _start_serve(self) -> None:
-        """Start clawmem serve as a managed child process with readiness probe."""
+        """Start clawmem serve as a managed child process with readiness probe.
+
+        Its token is decided first: ``clawmem serve-token`` runs through the same binary and environment, so the
+        checkout's .env (which the wrapper applies only to unset variables) reaches both alike. The printed token is
+        pinned into the child and used for every call — also when the child loses the port to another serve, which
+        then holds that same token (with no env token, the shared file's)."""
         if not self._bin:
             return
         try:
             env = {**os.environ, **self._env_extra}
+            got = subprocess.run([self._bin, "serve-token"], capture_output=True, text=True, timeout=30, env=env)
+            token = got.stdout.strip()
+            if got.returncode != 0 or not _valid_token(token):
+                logger.warning("clawmem: managed serve not started: `clawmem serve-token` failed: %s",
+                               _redact((got.stderr or "").strip()[-500:], token) or f"exit {got.returncode}")
+                return
+            self._serve_token = token
             self._serve_proc = subprocess.Popen(
                 [self._bin, "serve", "--port", str(self._port)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=env,
+                env={**env, "CLAWMEM_API_TOKEN": token},
             )
             # Readiness probe — wait up to 5s for /health to respond
             for attempt in range(10):
@@ -1260,7 +1364,7 @@ class ClawMemProvider(MemoryProvider):
                     self._serve_proc = None
                     return
                 time.sleep(0.5)
-                health = _rest_call(self._port, "GET", "/health", timeout=1.0)
+                health = self._rest("GET", "/health", timeout=1.0)
                 if health:
                     logger.info("clawmem: managed serve ready (pid=%d, port=%d)",
                                 self._serve_proc.pid, self._port)

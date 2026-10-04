@@ -131,10 +131,15 @@ OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
 ## Server
 
 ```bash
-clawmem serve                            # Start REST API (localhost:7438)
+clawmem serve                            # Start REST API (localhost:7438); every request needs the token
 clawmem serve --port 8080                # Custom port
-clawmem serve --host 0.0.0.0             # Listen on all interfaces
+clawmem serve --host 0.0.0.0             # Listen on all interfaces (Host is checked only with CLAWMEM_ALLOWED_HOSTS)
+clawmem serve --no-token                 # No token — loopback binds only; local programs and loopback-origin pages can call it
+clawmem serve-token                      # Print the token serve uses (CLAWMEM_API_TOKEN, else the generated token file)
 ```
+
+Since v0.42.0 `serve` requires `Authorization: Bearer <token>` on every request, refuses foreign `Origin` and `Host`
+headers, and takes only JSON POST bodies — see [REST API](rest-api.md#authentication-v0420).
 
 ## Hook execution (internal)
 
@@ -330,7 +335,9 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 | `CLAWMEM_RERANK_PROVIDER_ID` | — | **v0.38.0.** Declared reranker identity refinement; remote rerank caching requires an attested identity (`clawmem rerank-health`) |
 | `CLAWMEM_SURFACING_TRACE` | — | **v0.38.0.** `=1`: persist per-stage surfacing traces to `surfacing_diagnostics` (diagnostic; adds post-payload latency) |
 | `CLAWMEM_VAULTS` | — | JSON map of vault name to SQLite path |
-| `CLAWMEM_API_TOKEN` | — | Bearer token for REST API auth |
+| `CLAWMEM_API_TOKEN` | — | The REST token (32+ characters); unset or empty → the generated token file `serve-token` in the config directory |
+| `CLAWMEM_ALLOWED_HOSTS` | — | Extra `Host` names `serve` accepts (comma-separated, no ports) |
+| `CLAWMEM_ALLOWED_ORIGINS` | — | Extra browser origins `serve` accepts (comma-separated) |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction during indexing |
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background consolidation worker (light lane, 5-min interval). **v0.8.2:** every tick wraps in a `worker_leases` row (`light-consolidation` key) so dual-host (`clawmem watch` + `clawmem mcp`) is safe. Hosted by either `cmdWatch` (canonical, long-lived) or `cmdMcp` (per-session fallback). |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | `300000` | Light-lane worker interval in ms |

@@ -44,7 +44,7 @@
  */
 
 import { resolveClawMemBin, resolveHookBudgetMs, hostHookTimeoutMs } from "./shell.js";
-import type { ClawMemConfig } from "./shell.js";
+import type { ClawMemConfig, ServeAuth } from "./shell.js";
 import { createTools } from "./tools.js";
 import {
   handleAgentEnd,
@@ -100,6 +100,7 @@ const clawmemPlugin = {
     const tokenBudget = (pluginCfg.tokenBudget as number) || PROFILE_BUDGETS[profile] || 800;
     const hookBudgetMs = resolveHookBudgetMs(pluginCfg.hookBudgetMs);
 
+    const serveAuth: ServeAuth = { token: null };
     const cfg: ClawMemConfig = {
       clawmemBin: resolveClawMemBin(pluginCfg.clawmemBin as string | undefined),
       tokenBudget,
@@ -241,7 +242,7 @@ const clawmemPlugin = {
 
     // ----- Register Tools -----
     if (cfg.enableTools) {
-      const tools = createTools(cfg, logger);
+      const tools = createTools(cfg, logger, serveAuth);
       for (const tool of tools) {
         api.registerTool(
           {
@@ -265,8 +266,16 @@ const clawmemPlugin = {
     api.registerService({
       id: "clawmem-api",
       async start(svcCtx: { logger: Logger }) {
-        const { spawnBackground } = await import("./shell.js");
-        serveChild = spawnBackground(cfg, ["serve", "--port", String(cfg.servePort)], svcCtx.logger);
+        const { spawnBackground, runServeToken } = await import("./shell.js");
+        // The token is decided before the serve starts and pinned into it, so the checkout's .env cannot make the two
+        // ends disagree; the tools use it even when this serve loses the port to another one (BACKLOG 62.4).
+        const got = await runServeToken(cfg);
+        if ("problem" in got) {
+          svcCtx.logger.warn(`clawmem: REST API not started: \`clawmem serve-token\` failed: ${got.problem}`);
+          return;
+        }
+        serveAuth.token = got.token;
+        serveChild = spawnBackground({ ...cfg, env: { ...cfg.env, CLAWMEM_API_TOKEN: got.token } }, ["serve", "--port", String(cfg.servePort)], svcCtx.logger);
         svcCtx.logger.info(`clawmem: REST API spawned (pid=${serveChild.pid})`);
       },
       stop() {

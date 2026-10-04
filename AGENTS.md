@@ -220,7 +220,7 @@ Maintenance agent for Tier-3 work the main agent neglects. Install: `clawmem set
 - **Claude Code** — `clawmem setup hooks && clawmem setup mcp`. Hooks = 90% auto; 33 MCP tools = 10%.
 - **OpenClaw** — native memory plugin (`kind: memory`, v0.10.0+): `clawmem setup openclaw`. → [docs/guides/openclaw-plugin.md](docs/guides/openclaw-plugin.md).
 - **Hermes** — `MemoryProvider` plugin: copy the contents of `src/hermes/` into `$HERMES_HOME/plugins/clawmem/` (`cp -r src/hermes/. …/clawmem/`; again at every upgrade). → [docs/guides/hermes-plugin.md](docs/guides/hermes-plugin.md).
-- **REST API** — `clawmem serve [--port 7438]`. → [docs/reference/rest-api.md](docs/reference/rest-api.md).
+- **REST API** — `clawmem serve [--port 7438]`; every request needs `Authorization: Bearer <token>` (`clawmem serve-token` prints it; v0.42.0) and every POST a JSON body. → [docs/reference/rest-api.md](docs/reference/rest-api.md).
 
 All integrations share the same SQLite vault — decisions captured in one runtime surface in the others.
 

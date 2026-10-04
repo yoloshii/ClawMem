@@ -4,6 +4,100 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.42.0 — `clawmem serve` turns web pages away and requires a token
+
+`clawmem serve` binds 127.0.0.1, and through v0.41.5 that was its only defence, but a web page in your browser can
+reach a loopback port. With no token configured — the default — any page could change the vault. A `text/plain` POST,
+which a browser sends without a preflight, was parsed as JSON, so a page could archive documents (`/lifecycle/sweep`),
+restore every archived document (`/lifecycle/restore`), reindex, rebuild the graphs, or pin, snooze and forget a
+document whose docid it knew. A JSON POST got through as well: the preflight answered every origin with `*`. And with
+no Host check, DNS rebinding — a page whose host name is pointed at 127.0.0.1 after it loads — could read the whole
+vault from `/export`.
+
+### What changed
+
+- **A token, on by default.** Every request, `/health` included, needs `Authorization: Bearer <token>`, or it gets
+  `401`. The token is `CLAWMEM_API_TOKEN` when that is set and non-empty. Otherwise `serve` generates one on its first
+  start in the token file `serve-token` under `CLAWMEM_CONFIG_DIR` (default `~/.config/clawmem`): 43 random characters,
+  mode 0600, published without ever overwriting a file, so two servers starting at once agree. Every token must be
+  32–4096 characters of `A–Z a–z 0–9 - . _ ~ + /` with optional trailing `=`. `serve` refuses to start on a shorter or
+  malformed token, on a token file other users can read or that is a symlink, and on a config directory that is not
+  yours or that its group or others can write; its messages name the fix and never contain the token. An empty
+  `CLAWMEM_API_TOKEN` now means "use the file", never "open". The comparison takes constant time. The token stops web
+  pages; it is not a permission system against programs running as your user, which can read it.
+- **`clawmem serve-token`** prints the token `serve` would use under the current environment, creating the file if
+  needed: `curl -H "Authorization: Bearer $(clawmem serve-token)" …`.
+- **`clawmem serve --no-token`** serves without a token, on a loopback bind only, with a warning at every start. It is
+  refused on any other bind. Pages from other origins are still refused, but a page served from a loopback origin, or
+  from an entry of `CLAWMEM_ALLOWED_ORIGINS`, can call it, and so can any local program.
+- **Origin and Host checks** run before routing and answer `403`. A request is refused when its `Origin` names anything
+  but a loopback host or an entry of the new `CLAWMEM_ALLOWED_ORIGINS` (`Origin: null` included), or when its `Host` is
+  not a loopback host, a named bind's own address, or an entry of the new `CLAWMEM_ALLOWED_HOSTS`. On a wildcard bind
+  with no `CLAWMEM_ALLOWED_HOSTS` the legitimate Host cannot be known, so it is not checked; the startup log says so, and
+  the token alone stops a rebound page there. Both headers are parsed strictly: credentials, paths, a duplicated `Host`,
+  ports outside 1–65535 and invalid addresses are refused, and loopback is recognised in its IPv4 and IPv6 spellings
+  (127.0.0.0/8, `[::1]`, `[::ffff:127.0.0.1]`). `serve` refuses to start on an allowlist entry it cannot parse or an
+  empty one, so a stray comma cannot turn the Host check off.
+- **JSON bodies only.** Every POST, bodyless included, needs `Content-Type: application/json`, or it gets `415`, so a
+  POST from a page on another origin always needs a CORS preflight, which a foreign origin fails.
+- **Exact CORS.** A preflight from an allowed origin is answered with that origin, never `*`, and responses to it carry
+  the same `Access-Control-Allow-Origin` with `Vary: Origin`; other origins get no CORS headers. The
+  `http://localhost:*` header, which no browser matched, is gone.
+- **A request with no `Host` header** (HTTP/1.0) no longer fails with `500`: its relative request URL is resolved
+  before routing.
+- **The Hermes and OpenClaw plugins learn the token.** The Hermes plugin in external mode (its default) sends
+  `CLAWMEM_API_TOKEN` when set and otherwise reads the token file on every call. A plugin that starts its own `serve` —
+  the Hermes plugin in managed mode, and the OpenClaw plugin, whose gateway always starts one — first runs
+  `clawmem serve-token` through the same binary and environment and passes the printed token to it, so a token in the
+  ClawMem checkout's `.env` (which `bin/clawmem` applies only to unset variables) can no longer leave a plugin and its
+  `serve` disagreeing. It keeps that token when its `serve` loses the port to another one started the same way (a
+  systemd service included) and resolves it again only when its agent or gateway restarts. Neither plugin sends an
+  invalid token or puts any part of a token in an error or a log line.
+- **Tests:** a standing security suite in `tests/security/`, and the plugins' token handling in
+  `tests/unit/rest-clients-token.test.ts`.
+- **Docs:** `docs/reference/rest-api.md` (authentication, browser protection, CORS, cross-machine access),
+  `docs/reference/configuration.md`, `docs/reference/cli.md`, `docs/guides/hermes-plugin.md`,
+  `docs/guides/openclaw-plugin.md`, `docs/guides/systemd-services.md`, `docs/introduction.md`,
+  `docs/guides/upgrading.md`, AGENTS.md.
+
+### Upgrading
+
+**Every REST client must now send the token.** Restart `clawmem serve`: it generates the token file on its first start,
+or uses `CLAWMEM_API_TOKEN`. Copy the Hermes plugin's contents over the installed one, re-run `clawmem setup openclaw`
+for a copied OpenClaw plugin (a linked one picks it up), and restart the agent. Scripts add
+`-H "Authorization: Bearer $(clawmem serve-token)"` to every request and `-H "Content-Type: application/json"` to every
+POST. A `CLAWMEM_API_TOKEN` shorter than 32 characters is refused: unset it, or set a random value
+(`openssl rand -base64 32`) for `serve` and its clients alike. Behind a proxy, or with clients that reach a wildcard
+bind by host name, list those names in `CLAWMEM_ALLOWED_HOSTS`; a browser frontend on a non-loopback origin goes in
+`CLAWMEM_ALLOWED_ORIGINS`. The vault is not touched.
+
+### Verification
+
+The new tests were written first and run on v0.41.5. Of the 22 transport tests, 20 failed, each for the reason its
+name gives; the 2 that passed are controls (a JSON media type with parameters, and loopback Origins in every
+spelling). One of the failures was a defect of its own: a request with no `Host` header crashed the handler with
+`500`. The 19 guard and token-resolver tests could not run there, since the module they test does not exist; 7 more
+were added during review. Of the 9 client tests, the 3 controls passed (the plugins' external calls and OpenClaw's
+environment overlay, against a server that was open) and the 6 others failed: the managed Hermes cases, the managed
+OpenClaw token, and a header-unsafe token that both plugins sent and logged; 4 more, added during review, fail on
+client readers that skip the config-directory check or stop after one short read. Seventeen mutants each fail at least
+one test: no Origin check, no Host check, no JSON check, a port read through the URL parser (which drops `:80`), a
+token file opened through a symlink, no 32-character floor, the Hermes plugin ignoring its managed token, OpenClaw's
+environment overlay reversed, the Hermes plugin sending an invalid token, empty allowlist entries dropped, a
+token-file write that ignores a short byte count, a link-race loser returning its own token, a loser reading the
+winner's file unchecked, no startup warnings, no Windows warning, and either plugin's token-file reader stopping after
+one read. The six existing test files that start the server now send the token and keep their route-level assertions.
+Full suite on Bun 1.4.2: 3,574 pass / 0 fail across 188 files. The adversarial review (one session) cleared the design
+at its fourth turn, after 12 findings, and this implementation at its fourth, after 9: 1 noted by a turn that the
+reviewer's server ended before its verdict, then 7 and 1.
+
+### What didn't change
+
+The routes, their parameters and their responses; the MCP server (stdio, not HTTP); the hooks; `serve`'s default
+address and port.
+
+---
+
 ## v0.41.5 — a window whose first message fits under a smaller CONTEXT is never held
 
 v0.41.2 fits each observer window in tokens: it takes the fullest form of the window's CONTEXT that leaves 512 tokens

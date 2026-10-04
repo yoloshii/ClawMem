@@ -19,6 +19,10 @@ import { indexCollection, hashContent } from "../../src/indexer.ts";
 import { storeMemoryNote } from "../../src/amem.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { startServer } from "../../src/server.ts";
+
+// The REST server needs a token on every request and a JSON Content-Type on every POST (BACKLOG 62.4).
+const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
+const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { updateProfile } from "../../src/profile.ts";
 import { runConsolidationTick } from "../../src/consolidation.ts";
 import { buildMcpServer } from "../../src/mcp.ts";
@@ -122,9 +126,9 @@ describe("D9: a reindex must not undo forget or archival", () => {
     const docid = (store.db.prepare("SELECT substr(hash,1,8) AS d FROM documents WHERE path = 'rest.md'")
       .get() as { d: string }).d;
 
-    const server = startServer(store, 7439 + (process.pid % 200), "127.0.0.1");
+    const server = startServer(store, 7439 + (process.pid % 200), "127.0.0.1", { token: REST_TOKEN });
     try {
-      const res = await fetch(`http://127.0.0.1:${server.port}/documents/${docid}/forget`, { method: "POST" });
+      const res = await fetch(`http://127.0.0.1:${server.port}/documents/${docid}/forget`, { method: "POST", headers: { ...AUTH, "Content-Type": "application/json" } });
       expect(res.status).toBe(200);
       expect((await res.json() as { forgotten: boolean }).forgotten).toBe(true);
     } finally {
@@ -605,11 +609,11 @@ describe("issue-24 note counters", () => {
     process.env.CLAWMEM_CONFIG_DIR = CONF;
 
     writeDoc("rest-counters.md", "# R\n\nrho\n");
-    const server = startServer(store, 7439 + ((process.pid + 17) % 200), "127.0.0.1");
+    const server = startServer(store, 7439 + ((process.pid + 17) % 200), "127.0.0.1", { token: REST_TOKEN });
     try {
       const resp = await fetch(`http://127.0.0.1:${server.port}/reindex`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ collection: "docs" }),
       });
       expect(resp.status).toBe(200);

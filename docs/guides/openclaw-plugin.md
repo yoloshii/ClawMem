@@ -282,7 +282,7 @@ For cross-machine setups where one runtime is on a different host:
 
 | Method | How | Latency | Full feature set |
 |--------|-----|---------|-----------------|
-| **REST API** | Run `clawmem serve --port 7438` on the vault host. Remote agents call HTTP endpoints. | ~5-20ms per call | Search, retrieval, lifecycle, graph traversal. No hooks (hooks are local-only). |
+| **REST API** | Run `clawmem serve --host <address>` on the vault host; remote HTTP clients send its token (`clawmem serve-token` on that host prints it) — see [cross-machine access](../reference/rest-api.md#cross-machine-access). This plugin's own tools call `127.0.0.1` only. | ~5-20ms per call | Search, retrieval, lifecycle, graph traversal. No hooks (hooks are local-only). |
 | **MCP over SSE** | Run the MCP server as an SSE transport instead of stdio. Configure the remote MCP client (Claude Code, OpenClaw, etc.) to connect via SSE URL. | ~5-20ms per call | All 33 MCP tools. No hooks. |
 
 In both cases, hooks (context-surfacing, decision-extractor, etc.) only run on the machine where the vault lives. Remote agents get tool access but not automatic context injection.
@@ -297,9 +297,9 @@ The plugin spawns `clawmem hook <name>` as Bun subprocesses (Phase 1 transport).
 
 The 5 agent tools (search, get, session_log, timeline, similar) are served via ClawMem's HTTP REST API. The plugin manages this in one of two ways:
 
-**Auto-managed (default):** The plugin launches `clawmem serve` via `spawnBackground()` on init and sends SIGTERM on stop. This works for development but the process may not survive plugin crashes or OpenClaw restarts.
+**Auto-managed (default):** The plugin launches `clawmem serve` via `spawnBackground()` on init and sends SIGTERM on stop. This works for development but the process may not survive plugin crashes or OpenClaw restarts. Since v0.42.0 `serve` requires a token on every request: before launching it the plugin runs `clawmem serve-token` with the same binary and environment, passes the printed token to the child, and its tools send that token — also when the port is already held by another `clawmem serve` using the same token.
 
-**Systemd-managed (recommended for production):** Run `clawmem serve` as a persistent systemd service. The plugin connects to the existing server. See the [REST API reference](../reference/rest-api.md#running-as-a-systemd-service) for the service unit.
+**Systemd-managed (recommended for production):** Run `clawmem serve` as a persistent systemd service. The plugin still starts its own `serve` when the gateway starts; that child exits at once because the port is taken, and the tools call the systemd server. See the [REST API reference](../reference/rest-api.md#running-as-a-systemd-service) for the service unit. The tools send the token `clawmem serve-token` printed at gateway start (run through `clawmemBin` in the gateway's environment), so run the unit as the agent's user — both ends then read the same token file (`~/.config/clawmem/serve-token`, or under `CLAWMEM_CONFIG_DIR`) — and if the unit sets `CLAWMEM_API_TOKEN`, set the same value in the gateway's environment; the plugin has no token setting of its own. The token is read once, at gateway start: after a token rotation, restart the gateway.
 
 If the REST API is unreachable, agent tools fail silently — the agent won't get search results but hooks (context-surfacing, decision-extractor, etc.) continue working since they use shell-out transport, not REST.
 
@@ -341,8 +341,8 @@ journalctl -u openclaw-gateway.service -n 50 --no-pager | grep -E "(ready|\bclaw
 # runtime because another plugin owns plugins.slots.memory. See Troubleshooting.
 journalctl -u openclaw-gateway.service -n 200 --no-pager | grep -c "not selected for the memory slot"
 
-# REST API responding
-curl http://localhost:7438/health
+# REST API responding (it needs the token since v0.42.0)
+curl -H "Authorization: Bearer $(clawmem serve-token)" http://localhost:7438/health
 
 # Hooks working (check vault for recent context)
 clawmem status

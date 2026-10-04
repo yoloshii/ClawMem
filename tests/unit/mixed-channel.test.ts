@@ -19,6 +19,10 @@ import { describe, it, expect, beforeEach, afterAll } from "bun:test";
 import { createStore, insertContent, insertDocument, canonicalDocId, type Store } from "../../src/store.ts";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { startServer } from "../../src/server.ts";
+
+// The REST server needs a token on every request and a JSON Content-Type on every POST (BACKLOG 62.4).
+const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
+const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 
 const MODEL = "mixed-fake";
@@ -146,11 +150,11 @@ describe("REST hybrid max-score merge (S49.1 U5)", () => {
       F_VEC);
     addDoc("g-doc.md", "vortalgold reference for the adjacent subsystem with concise structure.", G_VEC);
 
-    const server = startServer(store, 0);
+    const server = startServer(store, 0, "127.0.0.1", { token: REST_TOKEN });
     try {
       const resp = await fetch(`http://127.0.0.1:${server.port}/search`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ query: "vortalfair calibration", mode: "hybrid", compact: true }),
       });
       expect(resp.ok).toBe(true);
