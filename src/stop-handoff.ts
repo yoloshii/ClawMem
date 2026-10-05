@@ -9,6 +9,8 @@
  *    which the same Phase B increments, so a `seq` is never reused and follows transcript order across generations.
  *    Rows are never modified: a turn that grew since its digest (a provisional one) has that row deleted and its full
  *    digest inserted with a new `seq`. The Phase B marks the handoff doc `render_needed` and advances the cursor.
+ *    72.4: a turn opens at a human line or at an opening notice; a notice turn's request is the notice's label, and a
+ *    digest carries `derivRev`, so a re-planned digest derived under an older classifier is derived again.
  *  - Summary step (model, throttled). The watermark `summary_through` is the `seq` of the last digest a summary
  *    covered. It runs when a digest lies past it AND (3 do, or 30 minutes passed since `last_output_at`, or no summary
  *    exists yet), over ordered batches (the previous summary + the next digests in `seq` order, within the observer's
@@ -44,7 +46,7 @@ import {
 } from "./observer.ts";
 import { insertStopItem, markSessionDocRenderNeeded, readSessionDoc, upsertSessionDoc, type SessionDocWrite } from "./stop-session-docs.ts";
 import { CAUSAL_MIN_BUDGET_MS, PERSIST_RESERVE_MS } from "./causal-writer.ts";
-import type { TranscriptMessage } from "./hooks.ts";
+import { cutUnits, opensTurn, TRANSCRIPT_CLASSIFIER_REVISION, type TranscriptMessage } from "./hooks.ts";
 
 export const HANDOFF_HOOK = "handoff-generator";
 /** SessionEnd opens the vault with this busy timeout and works under this deadline, inside Claude Code's 1.5 s cap. */
@@ -63,12 +65,19 @@ const SUMMARY_MIN_INTERVAL_MS = 30 * 60_000;
 /** Digests a summary batch is packed from, per reload (a batch holds ~15 of them). */
 const SUMMARY_PAGE = 200;
 const HANDOFF_MIN_MESSAGES = 4;
+/**
+ * How a turn digest is derived from its range (72.4 §4). A stored digest is reused only when its range end, raw-byte
+ * SHA AND derivation revision match; only re-planned ranges (provisional ones, at or after the cursor) are re-derived.
+ */
+export const DIGEST_DERIV_REV = TRANSCRIPT_CLASSIFIER_REVISION;
 
 export type TurnDigest = TurnDigestText & {
-  /** The turn's human entry time (ISO), else its first timestamped entry's. */
+  /** The turn's opening entry time (ISO), else its first timestamped entry's. */
   at: string | null;
   /** The observer messages the turn holds (the four-message floor). */
   messages: number;
+  /** DIGEST_DERIV_REV when derived (absent on digests written before v0.43.0). */
+  derivRev?: number;
 };
 
 export type HandoffSummaryItem = { summary: SessionSummary; files: string[]; through: number };
@@ -80,7 +89,7 @@ class WatermarkMoved extends Error {}
 
 function clip(text: string, max: number): string {
   const t = text.replace(/\s+/g, " ").trim();
-  return t.length <= max ? t : t.slice(0, max - 1).trimEnd() + "…";
+  return t.length <= max ? t : cutUnits(t, max - 1).trimEnd() + "…";
 }
 
 function mergeFiles(into: readonly string[], add: readonly string[], max: number): string[] {
@@ -92,16 +101,21 @@ function mergeFiles(into: readonly string[], add: readonly string[], max: number
   return out;
 }
 
-/** A digest from an accumulated turn (the same fields however the turn was read). */
+/**
+ * A digest from an accumulated turn (the same fields however the turn was read). The request is the turn's opening
+ * text: the typed request, or a notice's label (72.4).
+ */
 export function digestOfAccumulator(host: StopHost, acc: LineAccumulator): TurnDigest {
   const paragraphs = acc.lastAssistantText.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-  const ts = acc.humanTs ?? acc.firstTs;
+  const ts = acc.openTs ?? acc.firstTs;
+  const request = acc.openText === null ? "" : acc.openStart === acc.humanStart ? hostText(host, acc.openText) : acc.openText;
   return {
-    request: acc.humanText !== null ? clip(hostText(host, acc.humanText), DIGEST_REQUEST_CHARS) : "",
+    request: clip(request, DIGEST_REQUEST_CHARS),
     outcome: clip(paragraphs.at(-1) ?? "", DIGEST_OUTCOME_CHARS),
     files: acc.files.slice(0, DIGEST_FILES_MAX),
     at: ts !== null ? new Date(ts).toISOString() : null,
     messages: acc.messageCount,
+    derivRev: DIGEST_DERIV_REV,
   };
 }
 
@@ -112,7 +126,17 @@ export function digestOf(host: StopHost, lines: readonly TranscriptLine[]): Turn
   return digestOfAccumulator(host, acc);
 }
 
-/** A turn worth a digest: a request, assistant text or an edit (pure metadata is passed over). */
+/** A stored digest's derivation revision (undefined: written before v0.43.0, or unreadable). */
+function derivRevOf(payload: string): number | undefined {
+  try {
+    const v = (JSON.parse(payload) as { derivRev?: unknown }).derivRev;
+    return typeof v === "number" ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A turn worth a digest: a request, assistant text or an edit (pure metadata is passed over; a notice alone is not one). */
 function substantive(seg: TurnSegment): boolean {
   return seg.lines.some(l => l.kind === "human" || (l.kind === "assistant" && (l.text.trim().length > 0 || (l.toolUses?.length ?? 0) > 0)));
 }
@@ -153,7 +177,7 @@ export type DigestArgs = {
   transcriptPath: string;
   host?: string;
   sessionKey?: string;
-  /** A Stop: every turn from the cursor is complete. The worker: only turns followed by a later human entry are. */
+  /** A Stop: every turn from the cursor is complete. The worker: only turns followed by a later opening entry are. */
   atStop: boolean;
   /** Test seam: runs before the Phase B. */
   beforePhaseB?: () => void;
@@ -205,19 +229,20 @@ export function runHandoffDigests(store: Store, args: DigestArgs): DigestRun {
   const segs = segmentTurns(read.lines, { trailingComplete: args.atStop && read.eof });
   if (!segs.some(s => s.complete) && read.bounded) {
     // One turn larger than a read (T24 #1): streamed in bounded reads into ONE digest — complete once its end is seen
-    // (the next human entry; at a Stop, the end of the file), provisional while it runs (the cursor stays at its start).
-    const big = accumulateLines(path, start.start, { stopAtNextHuman: true, maxBytes: args.readMaxBytes, deadline: args.deadline });
+    // (the next opening entry; at a Stop, the end of the file), provisional while it runs (the cursor stays at its
+    // start). It is planned under the normal path's test (`substantive`), so both paths agree, short replies included.
+    const big = accumulateLines(path, start.start, { stopAtNextOpening: true, maxBytes: args.readMaxBytes, deadline: args.deadline });
     if (big.stream.expired || big.acc.lines === 0) return run;   // redone from the same cursor
     const acc = big.acc;
-    const done = big.reachedHuman || (args.atStop && big.stream.eof) || (big.stream.eof && acc.stopMarked);
-    if (!done && acc.humanStart === null) return run;
-    planned = acc.humanStart !== null || acc.admits ? [{
+    const done = big.reachedOpening || (args.atStop && big.stream.eof) || (big.stream.eof && acc.stopMarked);
+    if (!done && acc.openStart === null) return run;
+    planned = acc.substantive ? [{
       fp: `${start.anchorEpoch}:${acc.start}`, from: acc.start, to: acc.end, sha: rangeSha(path, acc.start, acc.end)!,
       digest: digestOfAccumulator(host, acc), provisional: !done,
     }] : [];
     offset = done ? acc.end : acc.start;
     tailSha = done ? acc.lastLineSha! : tailAt(offset, []);
-    turnStartOffset = done ? acc.humanStart ?? start.cursor?.turnStartOffset ?? null : acc.start;
+    turnStartOffset = done ? acc.openStart ?? start.cursor?.turnStartOffset ?? null : acc.start;
     humans = done && acc.humanStart !== null ? 1 : 0;
   } else {
     // A trailing turn a stop marker closed is complete for the worker too (T25 #1: its Stop fired).
@@ -230,7 +255,7 @@ export function runHandoffDigests(store: Store, args: DigestArgs): DigestRun {
     const trailing = !args.atStop ? segs.find(s => !s.complete) : undefined;
     planned = [
       ...complete.map(seg => ({ seg, provisional: false })),
-      ...(trailing && trailing.humanIndex !== null ? [{ seg: trailing, provisional: true }] : []),
+      ...(trailing && trailing.openIndex !== null ? [{ seg: trailing, provisional: true }] : []),
     ].filter(p => substantive(p.seg)).map(p => ({
       fp: `${start.anchorEpoch}:${p.seg.start}`, from: p.seg.start, to: p.seg.end, sha: rangeSha(path, p.seg.start, p.seg.end)!,
       digest: digestOf(host, p.seg.lines), provisional: p.provisional,
@@ -240,7 +265,8 @@ export function runHandoffDigests(store: Store, args: DigestArgs): DigestRun {
     offset = trailing ? trailing.start : lastComplete ? lastComplete.end : start.start;
     tailSha = tailAt(offset, read.lines);
     const completeHumans = complete.flatMap(s => s.lines.filter(l => l.kind === "human"));
-    turnStartOffset = trailing ? trailing.start : completeHumans.at(-1)?.start ?? start.cursor?.turnStartOffset ?? null;
+    const completeOpenings = complete.flatMap(s => s.lines.filter(opensTurn));
+    turnStartOffset = trailing ? trailing.start : completeOpenings.at(-1)?.start ?? start.cursor?.turnStartOffset ?? null;
     humans = completeHumans.length;
   }
   if (planned.length === 0 && offset === start.start && start.reason === "cursor") return run;
@@ -256,9 +282,10 @@ export function runHandoffDigests(store: Store, args: DigestArgs): DigestRun {
       let changed = false;
       for (const p of planned) {
         const existing = db.prepare(
-          `SELECT range_to, range_sha FROM stop_items WHERE session_id = ? AND transcript_key = ? AND kind = 'turn-digest' AND fp = ?`
-        ).get(args.sessionId, key, p.fp) as { range_to: number; range_sha: string } | null;
-        if (existing && existing.range_to === p.to && existing.range_sha === p.sha) continue;   // unchanged: it stands
+          `SELECT range_to, range_sha, payload FROM stop_items WHERE session_id = ? AND transcript_key = ? AND kind = 'turn-digest' AND fp = ?`
+        ).get(args.sessionId, key, p.fp) as { range_to: number; range_sha: string; payload: string } | null;
+        // Unchanged — the same range, bytes and derivation — it stands.
+        if (existing && existing.range_to === p.to && existing.range_sha === p.sha && derivRevOf(existing.payload) === DIGEST_DERIV_REV) continue;
         if (existing) {
           db.prepare(`DELETE FROM stop_items WHERE session_id = ? AND transcript_key = ? AND kind = 'turn-digest' AND fp = ?`)
             .run(args.sessionId, key, p.fp);
@@ -397,7 +424,7 @@ function recentTurnText(path: string | null, batch: readonly StoredDigest[], bud
       continue;
     }
     // Bounded whatever the turn's size (T24): its accumulated messages, never its raw bytes at once.
-    const turnRead = accumulateLines(path, d.rangeFrom, { stopAtNextHuman: false, to: d.rangeTo, releaseTrailingCommand: true });
+    const turnRead = accumulateLines(path, d.rangeFrom, { stopAtNextOpening: false, to: d.rangeTo, releaseTrailingCommand: true });
     const next = [...accumulatedMessages(turnRead.acc), ...msgs];
     if (observerRenderChars(next) > budget) break;
     msgs = next;

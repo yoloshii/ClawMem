@@ -12,6 +12,10 @@
  * candidates leave the row unattributed — never guessed. When a timestamp the rule needs is missing, only the hash
  * decides, and it must then be unique among the rows and the turns given.
  *
+ * 72.4: an opening notice (a task's notice, a peer's message) opens a turn too. It is a candidate when its identity —
+ * the hash of the text the surfacing hook received for it, computed by the classifier — equals the row's hash, and
+ * every window closes at the next opening, human or notice.
+ *
  * Pure: callers pass one transcript's entries and that transcript's pending rows (a row without a transcript key is
  * never passed — it waits until it is bound, D1 rev 14).
  */
@@ -61,7 +65,14 @@ export function hostText(host: StopHost, humanText: string): string {
   return host === "openclaw" ? cleanPromptForSearch(humanText) : humanText;
 }
 
-export type PairingEntry = { kind: string; text: string; ts: number | null };
+/**
+ * `human`: a human entry (its text is hashed); `notice`: an opening notice (its `identitySha` is the hash); any other
+ * kind (OpenClaw's `prev`) only bounds a window.
+ */
+export type PairingEntry = { kind: string; text: string; ts: number | null; identitySha?: string };
+
+/** An entry that opens a turn: a human entry or an opening notice. */
+export const opensPairingTurn = (e: PairingEntry) => e.kind === "human" || e.kind === "notice";
 export type PairingRow = { id: number; promptSha: string | null; ts: number | null };
 
 type Window = { lo: number; hi: number; hiInclusive: boolean } | null;   // null: undecidable, the hash alone decides
@@ -75,7 +86,7 @@ function windowOf(host: StopHost, entries: readonly PairingEntry[], i: number): 
     return prev.ts === null ? null : { lo: prev.ts, hi: h.ts, hiInclusive: true };
   }
   for (let j = i + 1; j < entries.length; j++) {
-    if (entries[j]!.kind !== "human") continue;
+    if (!opensPairingTurn(entries[j]!)) continue;
     const next = entries[j]!.ts;
     return next === null ? null : { lo: h.ts, hi: next, hiInclusive: false };
   }
@@ -100,13 +111,14 @@ function inWindow(w: Window, ts: number | null): boolean {
 }
 
 /**
- * Pair usage rows with the human turns of ONE transcript. Returns row id → index (into `entries`) of its human entry,
- * for the rows that pair uniquely in both directions; every other row is unattributed.
+ * Pair usage rows with the turns of ONE transcript. Returns row id → index (into `entries`) of its human entry or
+ * opening notice, for the rows that pair uniquely in both directions; every other row is unattributed.
  */
 export function pairTurns(host: StopHost, entries: readonly PairingEntry[], rows: readonly PairingRow[]): Map<number, number> {
   const turns: { index: number; sha: string; window: Window }[] = [];
   entries.forEach((e, i) => {
     if (e.kind === "human") turns.push({ index: i, sha: promptSha(hostText(host, e.text)), window: windowOf(host, entries, i) });
+    else if (e.kind === "notice" && e.identitySha) turns.push({ index: i, sha: e.identitySha, window: windowOf(host, entries, i) });
   });
   const byRow = new Map<number, number[]>();    // row id → candidate turn indexes
   const byTurn = new Map<number, number[]>();   // turn index → candidate row ids

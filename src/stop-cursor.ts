@@ -13,15 +13,19 @@
  *
  * The local-command rule of `readTranscriptTurns` holds across batches: a built-in command's record is followed by its
  * local output, so a command record whose successor has not been read yet is held back — the read ends before it.
+ * 72.4: a turn opens at a human line or at an opening notice (`opensTurn`), and a command record its writer marked as
+ * opening a turn (`turnOrigin: "human"`) is a prompt command, never held back.
  */
 
 import { closeSync, fstatSync, openSync, readSync, statSync } from "fs";
 import { createHash, type Hash } from "crypto";
 import type { Database } from "bun:sqlite";
 import {
-  classifyTranscriptEntry,
+  classifyTranscriptRow,
+  opensTurn,
   renderTranscriptContent,
   LOCAL_COMMAND_OUTPUT_RE,
+  type TranscriptNotice,
   type TranscriptTurnKind,
 } from "./hooks.ts";
 import { parseEntryTime, type StopHost } from "./stop-pairing.ts";
@@ -50,17 +54,29 @@ export type TranscriptLine = {
   /** The entry's timestamp in epoch ms (the line's own, else its message's); null when it carries none. */
   ts: number | null;
   kind: TranscriptTurnKind;
-  /** Human: the typed text (a prompt command's task); assistant: its text blocks. */
+  /** Human: the typed text (a prompt command's task, "/name" without arguments); assistant: its text blocks; notice: its label. */
   text: string;
-  /** The message content rendered as text (tool calls and results included). */
+  /** The message content rendered as text (tool calls and results included); a notice: its label only. */
   rendered: string;
-  /** A slash-command record carrying a task (whether it is a turn depends on its successor). */
+  /** A slash-command record, with or without arguments (whether it is a turn depends on its successor). */
   command?: true;
+  /** A slash command without arguments ("/name"): it opens a turn but holds no request content (72.4). */
+  bareCommand?: true;
+  /**
+   * A command record its writer marked as opening a turn (`turnOrigin: "human"`): a prompt command, so it is never held
+   * back waiting for its successor (72.4). Local output after it still demotes it.
+   */
+  promptCommand?: true;
+  /** Input the user did not type as a turn-opening prompt (72.4): a task's notice, a peer's message, queued input. */
+  notice?: TranscriptNotice;
   /** Assistant tool calls (name + input), for digests (files touched). */
   toolUses?: TranscriptToolUse[];
   /** A line larger than one read's bound, passed over unparsed so the cursor can advance. */
   oversized?: true;
-  /** An oversized line whose kept prefix shows local-command output (T26 #3): it classifies a preceding command record. */
+  /**
+   * Local-command output that classifies a preceding command record: an oversized line whose kept prefix shows it
+   * (T26 #3), or a `system`/`local_command` row (newer writers, 72.4).
+   */
   localOutput?: true;
   /**
    * Claude Code's record that a turn ended: the Stop hooks' summary (a `stop_hook_summary` WITHOUT a `hookLabel` —
@@ -100,6 +116,89 @@ type RawLine = { start: number; end: number; bytes: Buffer | null; sha: string; 
 const OVERSIZED_PREFIX_BYTES = 64 * 1024;
 /** Local-command output at the start of a message's content, in raw JSON (whitespace escaped or not). */
 const LOCAL_OUTPUT_JSON_RE = /"(?:content|text)"\s*:\s*"(?:\\[nrt]|\s)*<local-command-(?:stdout|stderr)>/;
+
+/**
+ * The TOP-LEVEL string fields named in `keys`, read from the first bytes of a JSON object (an oversized line's prefix)
+ * as far as they reach: nested values are skipped whole, and a field the prefix cuts off is not read. Keys and values
+ * are decoded as JSON strings (`"sys\u0074em"` reads `system`, as the parsed classifier sees it — codex CODE T2-1); a
+ * token that does not decode ends the scan.
+ */
+function topLevelStringFields(json: string, keys: readonly string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const n = json.length;
+  let i = 0;
+  const ws = () => { while (i < n && /\s/.test(json[i]!)) i++; };
+  /** Move `i` past the string whose opening quote is at `i`; false when the prefix ends inside it. */
+  const pass = (): boolean => {
+    i++;
+    while (i < n) {
+      const c = json[i]!;
+      if (c === "\\") { i += 2; continue; }
+      i++;
+      if (c === '"') return true;
+    }
+    return false;
+  };
+  /** The decoded string whose opening quote is at `i`, leaving `i` past it; null when it is cut off or does not decode. */
+  const str = (): string | null => {
+    const from = i;
+    if (!pass()) return null;
+    try {
+      const v: unknown = JSON.parse(json.slice(from, i));
+      return typeof v === "string" ? v : null;
+    } catch {
+      return null;
+    }
+  };
+  /** Skip the value at `i`; false when the prefix ends inside it. */
+  const skip = (): boolean => {
+    if (json[i] === '"') return pass();
+    if (json[i] === "{" || json[i] === "[") {
+      let depth = 0;
+      while (i < n) {
+        const c = json[i]!;
+        if (c === '"') { if (!pass()) return false; continue; }
+        i++;
+        if (c === "{" || c === "[") depth++;
+        else if ((c === "}" || c === "]") && --depth === 0) return true;
+      }
+      return false;
+    }
+    while (i < n && !/[,}\]\s]/.test(json[i]!)) i++;
+    return i < n;
+  };
+  ws();
+  if (json[i] !== "{") return out;
+  i++;
+  while (true) {
+    ws();
+    if (json[i] !== '"') return out;
+    const key = str();
+    ws();
+    if (key === null || json[i] !== ":") return out;
+    i++;
+    ws();
+    if (json[i] === '"' && keys.includes(key)) {
+      const value = str();
+      if (value === null) return out;
+      out.set(key, value);
+    } else if (!skip()) return out;
+    ws();
+    if (json[i] !== ",") return out;
+    i++;
+  }
+}
+
+/**
+ * An oversized line's prefix shows a built-in command's output: a user row whose content starts with
+ * `<local-command-stdout|stderr>`, or a top-level `system`/`local_command` envelope whatever its content (codex CODE
+ * T1-2; P18: Claude Code writes `type` and `subtype` before `content`, and 22 of 60 such rows are unwrapped).
+ */
+function prefixShowsLocalOutput(prefix: string): boolean {
+  if (LOCAL_OUTPUT_JSON_RE.test(prefix)) return true;
+  const f = topLevelStringFields(prefix, ["type", "subtype"]);
+  return f.get("type") === "system" && f.get("subtype") === "local_command";
+}
 
 function scanRawLines(fd: number, from: number, limit: number, maxBytes: number): { lines: RawLine[]; next: number; eof: boolean } {
   const lines: RawLine[] = [];
@@ -154,7 +253,7 @@ function scanRawLines(fd: number, from: number, limit: number, maxBytes: number)
 function classifyRawLine(raw: RawLine): TranscriptLine {
   const base = { start: raw.start, end: raw.end, sha: raw.sha };
   if (!raw.bytes) {
-    const local = raw.prefix !== undefined && LOCAL_OUTPUT_JSON_RE.test(raw.prefix.toString("utf8"));
+    const local = raw.prefix !== undefined && prefixShowsLocalOutput(raw.prefix.toString("utf8"));
     return { ...base, ts: null, kind: "meta", text: "", rendered: "", oversized: true, ...(local ? { localOutput: true as const } : {}) };
   }
   let entry: any;
@@ -177,10 +276,17 @@ function classifyRawLine(raw: RawLine): TranscriptLine {
     if (Number.isInteger(id) && id > 0 && outcome) line.prefetchOutcome = { usageId: id, outcome };
     return line;
   }
-  if (!msg || typeof msg !== "object" || !msg.role || !msg.content) return { ...base, ts, kind: "meta", text: "", rendered: "" };
-  const { kind, text, command } = classifyTranscriptEntry(entry, msg);
-  const line: TranscriptLine = { ...base, ts, kind, text, rendered: renderTranscriptContent(msg.content) };
-  if (command) line.command = true;
+  const c = classifyTranscriptRow(entry);
+  if (!c) return { ...base, ts, kind: "meta", text: "", rendered: "" };
+  const { kind, text } = c;
+  // A notice is rendered as its label only (72.4 §3.3): no consumer sees a peer's body or a task's output.
+  const rendered = kind === "notice" ? text : c.localOutput ? "" : renderTranscriptContent(msg.content);
+  const line: TranscriptLine = { ...base, ts, kind, text, rendered };
+  if (c.command) line.command = true;
+  if (c.bareCommand) line.bareCommand = true;
+  if (c.promptCommand) line.promptCommand = true;
+  if (c.notice) line.notice = c.notice;
+  if (c.localOutput) line.localOutput = true;
   const d = entry?.clawmem_delivery;
   if (kind === "human" && d && typeof d === "object") {
     const id = d.usage_id;
@@ -195,11 +301,23 @@ function classifyRawLine(raw: RawLine): TranscriptLine {
   return line;
 }
 
+/** A command record whose successor shows local-command output is a built-in's: a setting change, not a turn. */
+function demoteCommand(l: TranscriptLine): void {
+  l.kind = "meta";
+  l.text = "";
+  delete l.command;
+  delete l.bareCommand;
+}
+
+const showsLocalOutput = (next: TranscriptLine) => LOCAL_COMMAND_OUTPUT_RE.test(next.rendered) || next.localOutput === true;
+
 /**
  * Read the complete lines of a transcript from `from` (a line start), classified, at most `maxBytes` of them, and not
  * past `to` when given. A command record followed by local-command output is meta (a setting change, not a task); a
  * command record whose successor is not read yet is held back (`next` stops before it) unless
- * `releaseTrailingCommand` says its turn is known to be over.
+ * `releaseTrailingCommand` says its turn is known to be over. A read that stopped at its byte bound right after a
+ * command record peeks at its successor whatever `releaseTrailingCommand` says (72.4 (e)). A prompt command its writer
+ * marked as opening a turn is never held back (no successor needed); local output after it still demotes it.
  */
 export function readLines(
   path: string,
@@ -214,27 +332,23 @@ export function readLines(
     const lines = scanned.lines.map(classifyRawLine);
     for (let i = 0; i < lines.length - 1; i++) {
       const l = lines[i]!;
-      if (l.command && (LOCAL_COMMAND_OUTPUT_RE.test(lines[i + 1]!.rendered) || lines[i + 1]!.localOutput)) {
-        l.kind = "meta";
-        l.text = "";
-        delete l.command;
-      }
+      if (l.command && showsLocalOutput(lines[i + 1]!)) demoteCommand(l);
     }
     const last = lines.at(-1);
-    if (last?.command && !opts?.releaseTrailingCommand) {
+    if (last?.command) {
       if (scanned.eof) {
-        lines.pop();   // its successor is not written yet: held back until it is
-        return { lines, next: last.start, eof: false, bounded: false };
-      }
-      // The read stopped at its byte bound right after the command record: classify it by peeking at its successor
-      // (as the first line of a read, an oversized successor is passed over as metadata) instead of holding it back —
-      // holding it would leave `next` where the read started, and a stream would read the same bytes for ever (T25 #5).
-      const raw = scanRawLines(fd, last.end, limit, opts?.maxBytes ?? STOP_READ_MAX_BYTES).lines[0];
-      const peek = raw ? classifyRawLine(raw) : null;
-      if (peek && (LOCAL_COMMAND_OUTPUT_RE.test(peek.rendered) || peek.localOutput)) {
-        last.kind = "meta";
-        last.text = "";
-        delete last.command;
+        if (!opts?.releaseTrailingCommand && !last.promptCommand) {
+          lines.pop();   // its successor is not written yet: held back until it is
+          return { lines, next: last.start, eof: false, bounded: false };
+        }
+      } else {
+        // The read stopped at its byte bound right after the command record: classify it by peeking at its successor
+        // (as the first line of a read, an oversized successor is passed over as metadata) instead of holding it back —
+        // holding it would leave `next` where the read started, and a stream would read the same bytes for ever (T25 #5).
+        // Whatever `releaseTrailingCommand` says: the successor exists, so the record is classified, not released (72.4 (e)).
+        const raw = scanRawLines(fd, last.end, limit, opts?.maxBytes ?? STOP_READ_MAX_BYTES).lines[0];
+        const peek = raw ? classifyRawLine(raw) : null;
+        if (peek && showsLocalOutput(peek)) demoteCommand(last);
       }
     }
     return { lines, next: scanned.next, eof: scanned.eof, bounded: !scanned.eof };
@@ -244,23 +358,29 @@ export function readLines(
 }
 
 export type TurnSegment = {
-  /** Index (into the lines read) of the turn's human line; null = the lines continue a turn whose human line precedes the read. */
+  /** Index (into the lines read) of the turn's opening line when it is a human line (typed); null otherwise. */
   humanIndex: number | null;
+  /**
+   * Index of the line that opened the turn — a human line or an opening notice (72.4); null = the lines continue a
+   * turn whose opener precedes the read.
+   */
+  openIndex: number | null;
   start: number;
   end: number;
   lines: TranscriptLine[];
-  /** True when a later human line follows it in the read, or it is the trailing turn and the caller knows it is over (a Stop). */
+  /** True when a later opening line follows it in the read, or it is the trailing turn and the caller knows it is over (a Stop). */
   complete: boolean;
 };
 
-/** Split lines into turns at human lines. */
+/** Split lines into turns at opening lines: human lines and opening notices (72.4). */
 export function segmentTurns(lines: TranscriptLine[], opts: { trailingComplete: boolean }): TurnSegment[] {
   const segs: TurnSegment[] = [];
   let cur: TurnSegment | null = null;
   lines.forEach((l, i) => {
-    if (l.kind === "human" || cur === null) {
+    const opens = opensTurn(l);
+    if (opens || cur === null) {
       if (cur) cur.complete = true;
-      cur = { humanIndex: l.kind === "human" ? i : null, start: l.start, end: l.end, lines: [], complete: false };
+      cur = { humanIndex: l.kind === "human" ? i : null, openIndex: opens ? i : null, start: l.start, end: l.end, lines: [], complete: false };
       segs.push(cur);
     }
     cur.lines.push(l);
@@ -447,11 +567,18 @@ function lastLineWhere(path: string, pred: (l: TranscriptLine) => boolean, relea
 }
 
 /**
- * The start of the current turn: the last human line (the local-command rule applied). A transcript with no human
- * line anchors after its last complete line — nothing before the anchor is processed.
+ * The start of the current turn: the last human line (the local-command rule applied), or the last opening notice that
+ * an assistant line follows — an opener nothing has answered yet never moves the anchor past the last answered turn
+ * (72.4 F1). A transcript with neither anchors after its last complete line — nothing before the anchor is processed.
  */
 export function currentTurnStart(path: string): number {
-  const r = lastLineWhere(path, l => l.kind === "human", false);
+  let answered = false;   // the scan runs backwards: an assistant line has been seen after the line in hand
+  const r = lastLineWhere(path, l => {
+    if (l.kind === "human") return true;
+    if (answered && opensTurn(l)) return true;
+    if (l.kind === "assistant") answered = true;
+    return false;
+  }, false);
   return r.line ? r.line.start : r.tailNext;
 }
 

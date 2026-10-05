@@ -180,6 +180,11 @@ The Stop-event hooks do not deduplicate by content window (through v0.40.3 they 
 
 ## What the Stop hooks write
 
+- **Turns (v0.43.0).** A background task's notice, a message from another Claude Code session and a
+  prompt command without arguments each open a turn of their own; input received while the assistant
+  was working never opens one. These hooks and PreCompact see a notice only as a label (its sender, or
+  the task's status and summary), never a message's body or a task's output — see
+  [Turns](../concepts/architecture.md#turns).
 - **`decision-extractor`** sends the turns after its cursor to the observer in batches, with the two
   turns before them and the session's recorded observation titles as context (at most 2,000
   characters of the observer's 8,000-character input, v0.41.1). Since v0.41.2 each prompt is fitted
@@ -204,8 +209,8 @@ The Stop-event hooks do not deduplicate by content window (through v0.40.3 they 
   handoff once it holds four messages.
 - **`feedback-loop`** credits a surfaced note when the turn it was injected into names it: its path,
   its file name as a whole token, or its title as it was rendered. Each note is credited once per
-  turn, when the turn is over (a later prompt, a Stop, the summary entry Claude Code writes after
-  each Stop, or the session's end), and never by the turn's position.
+  turn, when the turn is over (the next turn's start, a Stop, the summary entry Claude Code writes
+  after each Stop, or the session's end), and never by the turn's position.
 
 `decision-extractor` does more than persist observations: when a contradiction **judge** is
 configured (`CLAWMEM_JUDGE_*`, v0.29.0 — disabled otherwise), it classifies each session's new

@@ -316,8 +316,13 @@ describe("62.2 D5 (codex T1 #8 + suggestion) — the Stop hooks' reader is byte-
 
   it("extractFilePaths still reads exactly readTranscript's rendering (ids included)", () => {
     const path = writeTranscript(projectDir, "sess-fp", TAIL);
-    const viaTurns = readTranscriptTurns(path, 200).map(t => ({ role: t.role, content: t.rendered }));
-    expect(viaTurns).toEqual(readTranscript(path, 200) as any);
+    const turns = readTranscriptTurns(path, 200);
+    // 72.4 §3.3 changed one thing on purpose: a notice (here the task notification) renders as its label, never as the
+    // raw record. Every other row — the assistant rows file paths are read from included — renders as before.
+    const viaTurns = turns.filter(t => t.kind !== "notice").map(t => ({ role: t.role, content: t.rendered }));
+    const raw = readTranscript(path, 200).filter(m => !m.content.includes("<task-notification>"));
+    expect(viaTurns).toEqual(raw as any);
     expect(viaTurns.some(m => m.content.includes('[tool_use name="Write" id="toolu_1"]'))).toBe(true);
+    expect(turns.filter(t => t.kind === "notice").map(t => t.rendered)).toEqual(["[background task completed] background job finished CANARY-TASK"]);
   });
 });

@@ -257,6 +257,9 @@ builders operate on — so archiving documents legitimately lowers the total.
 **A session's handoff lacks its last turns**
 - The handoff document renders at the summary step, at SessionEnd and in the watcher. Without the SessionEnd hook (`clawmem setup hooks` installs it since v0.41.0), or when the flush found the vault busy, the watcher renders it once the session has ended or its digests have been quiet for 10 minutes. `clawmem repair stop-queue --run` renders it at once.
 
+**A handoff turn's request reads `[background task …]` or `[message from …]` (v0.43.0)**
+- Expected. Since v0.43.0 a background task's notice and another Claude Code session's message open a turn of their own, and the Stop hooks and PreCompact see them only as labels: the request is the label, never the task's output or the message's text. See [Turns](concepts/architecture.md#turns).
+
 **Hermes sessions keep only their last turn and write no handoff (v0.41.0)**
 - The Hermes plugin copied before v0.41.0 runs the Stop hooks only at session end, and a transcript's first Stop starts at its current turn. Copy the plugin's contents over it and restart Hermes: `cp -r /path/to/ClawMem/src/hermes/. "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem/"` (with the trailing `/.` — `cp -r src/hermes` into an existing directory nests a copy inside it and leaves the old plugin running). The v0.41 plugin runs them after every synced turn.
 

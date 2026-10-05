@@ -20,7 +20,8 @@ import type { Database } from "bun:sqlite";
 import type { Store } from "./store.ts";
 import { isoNow, type MonoDeadline } from "./clock.ts";
 import { freshStamp, lastChanges, stopPipelineReady } from "./stop-schema.ts";
-import { pairWindowClosed, pairTurns, parseEntryTime, stopHostOf, transcriptKey, type PairingEntry } from "./stop-pairing.ts";
+import { opensPairingTurn, pairWindowClosed, pairTurns, parseEntryTime, stopHostOf, transcriptKey, type PairingEntry } from "./stop-pairing.ts";
+import { opensTurn } from "./hooks.ts";
 import { bindKeylessUsageRows, locatorPath, registerTranscript } from "./stop-identity.ts";
 import { humanLineAtOrBefore, streamLines } from "./stop-cursor.ts";
 import { dropHermesMarks, hermesGeneration, hermesMark, scanHermesTranscript, stillHermesFile, type HermesScan } from "./stop-hermes-scan.ts";
@@ -210,13 +211,17 @@ type PendingRow = { id: number; prompt_sha: string | null; timestamp: string | n
 /** A row that still owes a verdict: pending, or attributed provisionally (the worker, on a quiet transcript). */
 const OPEN_ROW = FEEDBACK_OPEN_ROW_SQL;
 
-/** A human entry as pairing sees it, with the offsets of its line (compact: pairing needs no other line). */
+/**
+ * An opening entry as pairing sees it — a human entry, or an opening notice with its identity (72.4) — with the
+ * offsets of its line (compact: pairing needs no other line).
+ */
 type HumanEntry = PairingEntry & { start: number; end: number };
 
 /**
  * Attribute the open general-vault rows of ONE transcript (session id + transcript key). First registers the
  * transcript and binds this session key's keyless rows to it (D1 rev 14). A row's verdict is FINAL once its turn is
- * over: a later human entry follows it, or `atStop` (a Stop, `agent_end`, an ended session) says the trailing turn is.
+ * over: a later opening entry follows it — a human entry or, since 72.4, an opening notice — or `atStop` (a Stop,
+ * `agent_end`, an ended session) says the trailing turn is.
  * Claude Code's stop marker after the turn (a `stop_hook_summary` / `turn_duration` entry) proves the same as a Stop:
  * the turn ended, even when the Stop hook itself died (T25 #1). `provisional` (the worker, on a transcript quiet for
  * 10 minutes) credits a trailing turn's references written so far and leaves the row open (`attributed`/
@@ -290,17 +295,20 @@ export function attributeTranscript(
     attributeHermes(db, args, path, key, scan, candidates, toAttribute, toConclude, run);
   } else if (candidates.length > 0) {
     const minTs = Math.min(...candidates.map(c => c.ts));
-    // Stream 1: the human entries (and, before each, the entry that precedes it) and the latest assistant time.
+    // Stream 1: the opening entries — human entries and opening notices (72.4) — (and, before each, the entry that
+    // precedes it) and the latest assistant time.
     const entries: HumanEntry[] = [];
-    const endMarked = new Set<number>();   // human entries whose turn a stop marker closed
+    const endMarked = new Set<number>();   // opening entries whose turn a stop marker closed
     let prev: { ts: number | null } | null = null;
     let lastAssistantTs = -Infinity;
     let lastMarkerTs = -Infinity;
-    let answered = false;   // an assistant line since the last human entry: a stop marker closes only an answered turn
+    let answered = false;   // an assistant line since the last opening entry: a stop marker closes only an answered turn
     const s1 = streamLines(path, humanLineAtOrBefore(path, minTs), l => {
-      if (l.kind === "human") {
+      if (opensTurn(l)) {
         if (prev) entries.push({ kind: "prev", text: "", ts: prev.ts, start: -1, end: -1 });
-        entries.push({ kind: "human", text: l.text, ts: l.ts, start: l.start, end: l.end });
+        entries.push(l.kind === "human"
+          ? { kind: "human", text: l.text, ts: l.ts, start: l.start, end: l.end }
+          : { kind: "notice", text: "", ts: l.ts, start: l.start, end: l.end, identitySha: l.notice?.identitySha });
         answered = false;
       } else if (l.kind === "assistant") {
         answered = true;
@@ -313,16 +321,16 @@ export function attributeTranscript(
     }, { maxBytes: args.readMaxBytes, deadline: args.deadline });
     const eof = s1.eof;
     const pairs = pairTurns(host, entries, candidates);
-    const humanAt = entries.map((e, i) => (e.kind === "human" ? i : -1)).filter(i => i >= 0);
-    const nextHuman = (i: number) => humanAt.find(h => h > i) ?? -1;
-    const turnOver = (i: number) => nextHuman(i) >= 0 || endMarked.has(i) || (args.atStop && eof);
+    const openAt = entries.map((e, i) => (opensPairingTurn(e) ? i : -1)).filter(i => i >= 0);
+    const nextOpening = (i: number) => openAt.find(h => h > i) ?? -1;
+    const turnOver = (i: number) => nextOpening(i) >= 0 || endMarked.has(i) || (args.atStop && eof);
     for (const c of candidates) {
       const paired = pairs.get(c.id);
       if (paired !== undefined) {
         const over = turnOver(paired);
         // Provisional credit only where no later entry can change the pairing: a closed pairing window.
         if (!over && !(args.provisional && eof && pairWindowClosed(host, entries, paired))) { run.pending++; continue; }
-        const nh = nextHuman(paired);
+        const nh = nextOpening(paired);
         const r = turnReferences(db, path, c.id, entries[paired]!.end, nh >= 0 ? entries[nh]!.start : null, args);
         if (r.expired) { run.pending++; continue; }
         toAttribute.push({ id: c.id, keys: r.keys, final: over });
@@ -330,8 +338,8 @@ export function attributeTranscript(
       }
       // Unpaired: concluded only when the transcript proves the row's turn is over and readable.
       const concluded = host === "openclaw"
-        ? entries.some((e, i) => e.kind === "human" && e.ts !== null && e.ts >= c.ts && turnOver(i))
-        : entries.some(e => e.kind === "human" && e.ts !== null && e.ts > c.ts)
+        ? entries.some((e, i) => opensPairingTurn(e) && e.ts !== null && e.ts >= c.ts && turnOver(i))
+        : entries.some(e => opensPairingTurn(e) && e.ts !== null && e.ts > c.ts)
           || ((args.atStop && eof) || lastMarkerTs > c.ts) && lastAssistantTs > c.ts;
       if (concluded) toConclude.push({ id: c.id, reason: "no-unique-pair" });
       else run.pending++;

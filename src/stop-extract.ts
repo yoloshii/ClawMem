@@ -17,7 +17,7 @@ import { closeSync, existsSync, openSync, readSync } from "fs";
 import { createHash, randomUUID } from "crypto";
 import type { Database } from "bun:sqlite";
 import type { Store } from "./store.ts";
-import type { TranscriptMessage } from "./hooks.ts";
+import { cutUnits, opensTurn, type TranscriptMessage } from "./hooks.ts";
 import { isoNow } from "./clock.ts";
 import {
   monoNow, deadlineAfter, deadlineBefore, remainingForTimeout, shorterThan, duration,
@@ -77,14 +77,16 @@ export { RETRY_BACKOFF_MS };
 /**
  * A transcript's lines as the observer's messages: human → user, assistant and tool results as rendered. v0.41.2: each
  * message carries its turn (a human entry after the first message starts the next) and `opening` on the human entry.
+ * 72.4: a notice is a user-role message carrying its label (never a peer's body); an opening notice starts a turn.
  */
 export function toObserverMessages(lines: readonly TranscriptLine[]): TranscriptMessage[] {
   const out: TranscriptMessage[] = [];
   let turn = 0;
   for (const l of lines) {
-    if (l.kind === "human") {
-      if (out.length > 0) turn++;
-      out.push({ role: "user", content: l.text, turn, opening: true });
+    if (l.kind === "human" || l.kind === "notice") {
+      const opening = opensTurn(l);
+      if (opening && out.length > 0) turn++;
+      out.push({ role: "user", content: l.text, turn, opening });
     }
     else if (l.kind === "assistant") out.push({ role: "assistant", content: l.rendered, turn });
     else if (l.kind === "tool_result") out.push({ role: "user", content: l.rendered, turn });
@@ -99,7 +101,8 @@ export function admitsBatch(lines: readonly TranscriptLine[]): boolean {
 
 /**
  * T24 #1/#5: what the Stop consumers need from lines streamed past one read's bound, kept bounded whatever the length
- * streamed: the first human entry, the last OBSERVER_MAX_MESSAGES observer messages (each capped — the observer
+ * streamed: the first human entry, the first opening entry (72.4: a human line or an opening notice), the last
+ * OBSERVER_MAX_MESSAGES observer messages (each capped — the observer
  * renders at most 1,000 characters of one, and only its last 100 messages), admission, the last assistant text, the
  * files the edit tools touched, and the regex decisions/antipatterns (each found in its full message, with the
  * preceding user message as context, as the batch extractors do).
@@ -110,9 +113,17 @@ export type LineAccumulator = {
   lines: number;
   /** v0.41.2: the turn the next message belongs to (a human entry after the first message starts the next). */
   turn: number;
+  /** The stretch's first human line: the user's typed request. */
   humanText: string | null;
   humanTs: number | null;
   humanStart: number | null;
+  /** The stretch's first opening line (72.4): its text — the typed request, or a notice's label — start and time. */
+  openText: string | null;
+  openStart: number | null;
+  openTs: number | null;
+  /** That line's observer message as kept (its own turn), and its ordinal among the stretch's messages (CODE T1-3). */
+  openMessage: TranscriptMessage | null;
+  openOrdinal: number | null;
   firstTs: number | null;
   messages: TranscriptMessage[];
   messageCount: number;
@@ -126,6 +137,8 @@ export type LineAccumulator = {
   stopMarked: boolean;
   /** The stretch holds an assistant line. */
   answered: boolean;
+  /** The stretch holds a human line, assistant text or a tool call: a turn worth a handoff digest (72.4 F4). */
+  substantive: boolean;
   /** Keys of the kept regex items (dedup across the stream), and whether the safety bound was reached. */
   itemKeys: Set<string>;
   itemsCapped: boolean;
@@ -133,9 +146,9 @@ export type LineAccumulator = {
 
 export function newAccumulator(start: number): LineAccumulator {
   return {
-    start, end: start, lines: 0, turn: 0, humanText: null, humanTs: null, humanStart: null, firstTs: null, messages: [],
-    messageCount: 0, admits: false, lastAssistantText: "", files: [], decisions: [], antipatterns: [], lastLineSha: null,
-    stopMarked: false, answered: false, itemKeys: new Set(), itemsCapped: false,
+    start, end: start, lines: 0, turn: 0, humanText: null, humanTs: null, humanStart: null, openText: null, openStart: null,
+    openTs: null, openMessage: null, openOrdinal: null, firstTs: null, messages: [], messageCount: 0, admits: false, lastAssistantText: "", files: [], decisions: [],
+    antipatterns: [], lastLineSha: null, stopMarked: false, answered: false, substantive: false, itemKeys: new Set(), itemsCapped: false,
   };
 }
 
@@ -157,6 +170,8 @@ function pushUnique(acc: LineAccumulator, kind: "d" | "a", items: { text: string
 export function accumulateLine(acc: LineAccumulator, l: TranscriptLine): void {
   if (acc.lines === 0) acc.start = l.start;
   if (l.kind === "human" && acc.humanStart === null) { acc.humanText = l.text; acc.humanTs = l.ts; acc.humanStart = l.start; }
+  if (opensTurn(l) && acc.openStart === null) { acc.openText = l.text; acc.openTs = l.ts; acc.openStart = l.start; }
+  if (l.kind === "human" || (l.kind === "assistant" && (l.text.trim().length > 0 || (l.toolUses?.length ?? 0) > 0))) acc.substantive = true;
   if (acc.firstTs === null && l.ts !== null) acc.firstTs = l.ts;
   for (const raw of toObserverMessages([l])) {
     if (raw.opening && acc.messageCount > 0) acc.turn++;
@@ -166,7 +181,9 @@ export function accumulateLine(acc: LineAccumulator, l: TranscriptLine): void {
       pushUnique(acc, "d", extractDecisions(recent).map(d => ({ text: d.text, context: d.context })));
       pushUnique(acc, "a", extractAntipatterns([m]));
     }
-    acc.messages.push(m.content.length > ACCUMULATED_MESSAGE_CHARS ? { ...m, content: m.content.slice(0, ACCUMULATED_MESSAGE_CHARS) } : m);
+    const kept = m.content.length > ACCUMULATED_MESSAGE_CHARS ? { ...m, content: cutUnits(m.content, ACCUMULATED_MESSAGE_CHARS) } : m;
+    if (m.opening && acc.openOrdinal === null) { acc.openMessage = kept; acc.openOrdinal = acc.messageCount; }
+    acc.messages.push(kept);
     if (acc.messages.length > OBSERVER_MAX_MESSAGES) acc.messages.shift();
     acc.messageCount++;
   }
@@ -187,10 +204,13 @@ export function accumulateLine(acc: LineAccumulator, l: TranscriptLine): void {
   acc.lines++;
 }
 
-/** The observer's messages of an accumulated stretch: its human request first even when the kept tail dropped it. */
+/**
+ * The observer's messages of an accumulated stretch: its opening line first — the typed request, or a notice's label
+ * (72.4 F3) — even when the kept tail dropped it. Restored only when it was dropped, with its own turn (CODE T1-3).
+ */
 export function accumulatedMessages(acc: LineAccumulator): TranscriptMessage[] {
-  if (acc.humanText !== null && acc.messageCount > acc.messages.length) {
-    return [{ role: "user", content: acc.humanText, turn: 0, opening: true }, ...acc.messages.slice(1)];
+  if (acc.openMessage !== null && acc.openOrdinal !== null && acc.openOrdinal < accumulatorDropped(acc)) {
+    return [acc.openMessage, ...acc.messages.slice(1)];
   }
   return acc.messages;
 }
@@ -201,22 +221,22 @@ export function accumulatorDropped(acc: LineAccumulator): number {
 }
 
 /**
- * Stream lines from `from` into an accumulator — through `to`, or (stopAtNextHuman) until the next human entry after
- * the first line: one turn, however large, read once in bounded reads and processed as ONE turn (T24 #1). `reachedHuman`:
- * the turn's end was seen.
+ * Stream lines from `from` into an accumulator — through `to`, or (stopAtNextOpening) until the next opening entry — a
+ * human line or an opening notice (72.4) — after the first line: one turn, however large, read once in bounded reads
+ * and processed as ONE turn (T24 #1). `reachedOpening`: the turn's end was seen.
  */
 export function accumulateLines(
   path: string,
   from: number,
-  opts: { stopAtNextHuman: boolean; to?: number; maxBytes?: number; deadline?: MonoDeadline; releaseTrailingCommand?: boolean },
-): { acc: LineAccumulator; stream: StreamEnd; reachedHuman: boolean } {
+  opts: { stopAtNextOpening: boolean; to?: number; maxBytes?: number; deadline?: MonoDeadline; releaseTrailingCommand?: boolean },
+): { acc: LineAccumulator; stream: StreamEnd; reachedOpening: boolean } {
   const acc = newAccumulator(from);
-  let reachedHuman = false;
+  let reachedOpening = false;
   const stream = streamLines(path, from, l => {
-    if (opts.stopAtNextHuman && acc.lines > 0 && l.kind === "human") { reachedHuman = true; return false; }
+    if (opts.stopAtNextOpening && acc.lines > 0 && opensTurn(l)) { reachedOpening = true; return false; }
     accumulateLine(acc, l);
   }, { maxBytes: opts.maxBytes, to: opts.to, deadline: opts.deadline, releaseTrailingCommand: opts.releaseTrailingCommand });
-  return { acc, stream, reachedHuman };
+  return { acc, stream, reachedOpening };
 }
 
 /** Pack complete turns, in order, into batches within the observer's bounds; at least one turn per batch. */
@@ -249,8 +269,8 @@ function lastTurnsBefore(path: string, offset: number, n: number): TranscriptLin
   const from = offset <= CONTEXT_MAX_BYTES ? 0 : alignToLineStart(path, offset - CONTEXT_MAX_BYTES);
   if (from >= offset) return [];
   const read = readLines(path, from, { to: offset, maxBytes: offset - from, releaseTrailingCommand: true });
-  const humans = read.lines.map((l, i) => (l.kind === "human" ? i : -1)).filter(i => i >= 0);
-  return read.lines.slice(humans.length >= n ? humans[humans.length - n]! : 0);
+  const openings = read.lines.map((l, i) => (opensTurn(l) ? i : -1)).filter(i => i >= 0);
+  return read.lines.slice(openings.length >= n ? openings[openings.length - n]! : 0);
 }
 
 /** The first line start at or after `pos` (the byte after the first '\n' at or after pos - 1). */
@@ -291,7 +311,7 @@ function rangeRefOf(path: string, epoch: number, lines: readonly TranscriptLine[
   const from = lines[0]!.start;
   const to = lines.at(-1)!.end;
   const sha = rangeSha(path, from, to)!;
-  const first = lines.find(l => l.kind === "human" && l.ts !== null) ?? lines.find(l => l.ts !== null);
+  const first = lines.find(l => opensTurn(l) && l.ts !== null) ?? lines.find(l => l.ts !== null);
   return {
     anchorEpoch: epoch, from, to, sha, key: `${epoch}-${from}-${to}-${sha.slice(0, 16)}`,
     sourceTime: first?.ts != null ? new Date(first.ts).toISOString() : null,
@@ -766,7 +786,9 @@ type Unit = {
   admits: boolean;
   regex: RegexItems;
   tailSha: string;
-  lastHumanStart: number | null;
+  /** The start of the unit's last opening line (the cursor's `turn_start_offset`). */
+  lastOpenStart: number | null;
+  /** The unit's human lines (the cursor's `human_turns` count). */
   humans: number;
   /** The CONTEXT lines the NEXT unit sees (this unit's last turns). */
   tailLines: TranscriptLine[];
@@ -780,14 +802,14 @@ function unitOfBatch(path: string, epoch: number, batch: Turn[]): Unit {
   const humans = lines.filter(l => l.kind === "human");
   return {
     range: rangeRefOf(path, epoch, lines), messages, admits: admitsBatch(lines), regex: regexItemsOf(messages),
-    tailSha: lines.at(-1)!.sha, lastHumanStart: humans.at(-1)?.start ?? null, humans: humans.length,
+    tailSha: lines.at(-1)!.sha, lastOpenStart: lines.filter(opensTurn).at(-1)?.start ?? null, humans: humans.length,
     tailLines: batch.slice(-CONTEXT_PRIOR_TURNS).flatMap(t => t.lines),
   };
 }
 
 function rangeOfAccumulator(path: string, epoch: number, acc: LineAccumulator): RangeRef {
   const sha = rangeSha(path, acc.start, acc.end)!;
-  const ts = acc.humanTs ?? acc.firstTs;
+  const ts = acc.openTs ?? acc.firstTs;
   return {
     anchorEpoch: epoch, from: acc.start, to: acc.end, sha, key: `${epoch}-${acc.start}-${acc.end}-${sha.slice(0, 16)}`,
     sourceTime: ts !== null ? new Date(ts).toISOString() : null,
@@ -813,14 +835,14 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
   let units: Unit[];
   if (segs.length === 0 && read.bounded) {
     // One turn larger than a read (T24 #1): streamed to its end in bounded reads, processed as ONE turn — never as
-    // pieces, so its inference sees the turn's end. At a Stop the turn is over at the next human entry or at the end.
-    const big = accumulateLines(path, start.start, { stopAtNextHuman: true, maxBytes: args.readMaxBytes, deadline });
-    if (big.stream.expired || !(big.reachedHuman || big.stream.eof) || big.acc.lines === 0) return run;   // redone next Stop
+    // pieces, so its inference sees the turn's end. At a Stop the turn is over at the next opening entry or at the end.
+    const big = accumulateLines(path, start.start, { stopAtNextOpening: true, maxBytes: args.readMaxBytes, deadline });
+    if (big.stream.expired || !(big.reachedOpening || big.stream.eof) || big.acc.lines === 0) return run;   // redone next Stop
     const acc = big.acc;
     units = [{
       range: rangeOfAccumulator(path, start.anchorEpoch, acc), messages: accumulatedMessages(acc), admits: acc.admits,
       regex: { decisions: acc.decisions, antipatterns: acc.antipatterns }, tailSha: acc.lastLineSha!,
-      lastHumanStart: acc.humanStart, humans: acc.humanStart !== null ? 1 : 0, tailLines: [], dropped: accumulatorDropped(acc),
+      lastOpenStart: acc.openStart, humans: acc.humanStart !== null ? 1 : 0, tailLines: [], dropped: accumulatorDropped(acc),
     }];
   } else {
     const turns: Turn[] = segs.map(s => ({ lines: s.lines, messages: toObserverMessages(s.lines), start: s.start, end: s.end }));
@@ -864,7 +886,7 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
         }
         const moved = !casAdvanceCursor(db, args.sessionId, DECISION_HOOK, key, cursor, {
           transcriptPath: path, file: start.file, anchorEpoch: start.anchorEpoch, byteOffset: range.to,
-          tailSha: u.tailSha, turnStartOffset: u.lastHumanStart ?? cursor?.turnStartOffset ?? null,
+          tailSha: u.tailSha, turnStartOffset: u.lastOpenStart ?? cursor?.turnStartOffset ?? null,
           humanTurns: (cursor?.humanTurns ?? 0) + u.humans,
         });
         if (moved) throw new CursorMoved();
@@ -954,7 +976,7 @@ export async function replayDueRetries(
       continue;
     }
     const replayRead = accumulateLines(r.transcript_path, r.from_offset, {
-      stopAtNextHuman: false, to: r.to_offset, maxBytes: STOP_READ_MAX_BYTES, deadline: opts.deadline, releaseTrailingCommand: true,
+      stopAtNextOpening: false, to: r.to_offset, maxBytes: STOP_READ_MAX_BYTES, deadline: opts.deadline, releaseTrailingCommand: true,
     });
     if (replayRead.stream.expired) {
       setState(`state = 'queued', claim_token = NULL, lease_expires_at = NULL`);   // out of budget: due again at once

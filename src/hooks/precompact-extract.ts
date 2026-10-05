@@ -17,6 +17,7 @@ import {
   type HookInput,
   type HookOutput,
   type TranscriptTurn,
+  cutUnits,
   makeEmptyOutput,
   readTranscriptTurns,
   validateTranscriptPath,
@@ -67,13 +68,28 @@ function extractFilePaths(messages: { role: string; content: string }[]): string
 // Last human request
 // ---------------------------------------------------------------------------
 
-/** The last thing the user TYPED (over 10 chars) — never a tool result, meta entry or harness wrapper. */
+/** A slash command without arguments, as typed (`/pre-compact`). */
+const BARE_SLASH_COMMAND_RE = /^\/\S+$/;
+
+/**
+ * The words the user typed in a turn: a human line's text, or a prompt typed while the assistant worked (72.4 F2) —
+ * never a bare command such as `/pre-compact`, either way. Never a notice's label: a task's or a peer's text is not a
+ * request.
+ */
+function typedWords(t: TranscriptTurn): string {
+  if (t.kind === "human") return t.bareCommand ? "" : t.text;
+  if (t.kind === "notice" && t.notice?.source === "queued-prompt") {
+    const typed = (t.notice.typedText ?? "").trim();
+    return BARE_SLASH_COMMAND_RE.test(typed) ? "" : typed;
+  }
+  return "";
+}
+
+/** The last thing the user TYPED (10 or more chars of typed text) — never a tool result, meta entry, harness wrapper or label. */
 function getLastHumanRequest(turns: TranscriptTurn[]): string {
   for (let i = turns.length - 1; i >= 0; i--) {
-    const t = turns[i]!;
-    if (t.kind === "human" && t.text.trim().length > 10) {
-      return t.text.trim().slice(0, 500);
-    }
+    const typed = typedWords(turns[i]!).trim();
+    if (typed.length >= 10) return cutUnits(typed, 500);
   }
   return "";
 }
@@ -182,18 +198,24 @@ export async function precompactExtract(
   const turns = readTranscriptTurns(transcriptPath, REQUEST_SEARCH_TURNS);
   const recent = turns.slice(-RECENT_TURNS);
 
-  // Decisions and open questions: human prompts and assistant PROSE only — tool input and tool
-  // output are never mined (CM-03). A decision's context is the preceding human turn.
+  // Decisions: human prompts, notice labels and assistant PROSE only — tool input and tool output are
+  // never mined (CM-03). A decision's context is the preceding user message: the typed prompt, or the
+  // label of the notice that started the turn (72.4 F5), never an earlier prompt across that boundary.
   const prose = recent
-    .filter(t => t.kind === "human" || t.kind === "assistant")
-    .map(t => ({ role: t.kind === "human" ? "user" : "assistant", content: t.text }));
+    .filter(t => t.kind === "human" || t.kind === "notice" || t.kind === "assistant")
+    .map(t => ({ role: t.kind === "assistant" ? "assistant" : "user", content: t.text }));
+  // Open questions: the user's own words and assistant prose — never a notice's label.
+  const questionProse = recent.flatMap(t =>
+    t.kind === "assistant" ? [{ role: "assistant", content: t.text }]
+    : typedWords(t) ? [{ role: "user", content: typedWords(t) }]
+    : []);
   // File paths keep reading the inline rendering, where tool calls carry their file_path.
   const rendered = recent.map(t => ({ role: t.role, content: t.rendered }));
 
   const lastRequest = getLastHumanRequest(turns);
   const decisions = rankDecisionsByRelevance(extractDecisions(prose), lastRequest);
   const filePaths = extractFilePaths(rendered);
-  const openQuestions = extractOpenQuestions(prose);
+  const openQuestions = extractOpenQuestions(questionProse);
 
   // Nothing extracted: the attempt stays without a payload, so there is nothing to take.
   if (decisions.length === 0 && !lastRequest && filePaths.length === 0) {

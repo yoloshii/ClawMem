@@ -9,6 +9,7 @@ import type { Store } from "./store.ts";
 import { isoNow, toDate, epochNow } from "./clock.ts";
 import { createHash } from "node:crypto";
 import type { UsageIdentity } from "./stop-identity.ts";
+import { promptSha } from "./stop-pairing.ts";
 
 // =============================================================================
 // Types
@@ -410,23 +411,61 @@ export function readTranscript(
 /**
  * What an entry IS, as opposed to its role. Claude Code writes tool results, skill expansions,
  * slash-command records, local-command output, task notifications and compact summaries as
- * user-ROLE entries; only `human` is something the user typed.
+ * user-ROLE entries; only `human` is something the user typed. 72.4: `notice` is input the user did not type as a
+ * turn-opening prompt — a background task's notice, another session's message, input received while the model worked.
  */
-export type TranscriptTurnKind = "human" | "assistant" | "tool_result" | "meta";
+export type TranscriptTurnKind = "human" | "assistant" | "tool_result" | "meta" | "notice";
+
+/** Where a notice came from (72.4). */
+export type NoticeSource = "task" | "peer" | "other" | "queued-prompt" | "queued-unknown";
+
+export type TranscriptNotice = {
+  source: NoticeSource;
+  /**
+   * Whether the notice opens a turn: a row on a writer that records openers by its `turnOrigin`, a row on an older
+   * writer by its shape. Input queued while the model worked never opens one.
+   */
+  opens: boolean;
+  /** `queued-prompt` only: the user's own words (the prompt's text blocks, bounded). */
+  typedText?: string;
+  /**
+   * An opening notice ROW only: `promptSha` of the text the prompt hook receives for it — for pairing usage rows with
+   * the turn (72.4 F7). Never stored, rendered or logged.
+   */
+  identitySha?: string;
+};
+
+/**
+ * Bump with any change to how a transcript row is classified — its kind, whether it opens a turn, its rendering. The
+ * observer checkpoint contract and the handoff turn digests carry it, so state derived under an older classifier is
+ * re-derived (72.4 §4). v0.43.0: 2.
+ */
+export const TRANSCRIPT_CLASSIFIER_REVISION = 2;
 
 export type TranscriptTurn = {
   role: string;
   kind: TranscriptTurnKind;
   /**
    * Assistant: text blocks only (no tool_use rendering). Human: the typed text with host-injected
-   * context blocks stripped, or "/name args" for a slash command that carries a task. Others: "".
+   * context blocks stripped, or "/name args" ("/name" without arguments) for a slash command. Notice: its label.
+   * Others: "".
    */
   text: string;
-  /** The same entry as `readTranscript` renders it. */
+  /** The same entry as `readTranscript` renders it (a notice: its label). */
   rendered: string;
-  /** Set on a human turn that is a slash command's task ("/name args"). */
+  /** Set on a slash command's record (with or without arguments); whether it is a turn depends on its successor. */
   command?: true;
+  /** A slash command without arguments ("/name"): it opens a turn but holds no request content. */
+  bareCommand?: true;
+  notice?: TranscriptNotice;
+  /** A `system`/`local_command` row: a built-in command's output, as newer writers record it. */
+  localOutput?: true;
 };
+
+/** A turn opens at a human line or at an opening notice (72.4). */
+export function opensTurn(l: { kind: TranscriptTurnKind; notice?: TranscriptNotice }): boolean {
+  return l.kind === "human" || (l.kind === "notice" && l.notice?.opens === true);
+}
 
 /**
  * The top-level blocks of `text` when it is nothing but one or more complete tag-wrapped blocks
@@ -467,15 +506,15 @@ export const HOST_RECORD_TAGS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A slash-command record's task: "/name args". `null` = a command record without a task (no
- * arguments, or `/compact`, whose arguments are compaction instructions). Only TOP-LEVEL
- * `command-name` / `command-args` blocks count.
+ * A slash-command record's task: "/name args", or "/name" (bare) for a record without arguments (72.4). `null` = a
+ * record without a name, or `/compact`, whose arguments are compaction instructions. Only TOP-LEVEL `command-name` /
+ * `command-args` blocks count.
  */
-function commandTask(blocks: { tag: string; inner: string }[]): string | null {
+function commandTask(blocks: { tag: string; inner: string }[]): { text: string; bare: boolean } | null {
   const name = blocks.find(b => b.tag === "command-name")?.inner.trim();
   if (!name || name === "/compact") return null;
   const args = blocks.find(b => b.tag === "command-args")?.inner.trim() ?? "";
-  return args ? `${name} ${args}` : null;
+  return args ? { text: `${name} ${args}`, bare: false } : { text: name, bare: true };
 }
 
 /** Context blocks a host may prepend to the user's prompt (ClawMem's own, and system reminders). */
@@ -490,24 +529,212 @@ function transcriptTextBlocks(content: any): string {
     .join("\n");
 }
 
-/** The entry's kind, and for human turns the typed text (injected context blocks stripped). Shared with the 62.1 cursor reader. */
-export function classifyTranscriptEntry(entry: any, msg: any): { kind: TranscriptTurnKind; text: string; command?: true } {
-  if (msg.role === "assistant") return { kind: "assistant", text: transcriptTextBlocks(msg.content) };
-  if (msg.role === "toolResult" || msg.role === "tool") return { kind: "tool_result", text: "" }; // OpenClaw / generic
-  if (msg.role !== "user") return { kind: "meta", text: "" };
-  if (entry.isMeta || entry.isCompactSummary || entry.isVisibleInTranscriptOnly) return { kind: "meta", text: "" };
-  if (entry.toolUseResult !== undefined) return { kind: "tool_result", text: "" };
-  if (Array.isArray(msg.content) && msg.content.some((b: any) => b && b.type === "tool_result")) {
-    return { kind: "tool_result", text: "" };
+/** What a classifier decided about one transcript row. */
+export type EntryClass = {
+  kind: TranscriptTurnKind;
+  /** Human: the typed text or the command's task; assistant: its text blocks; notice: its label; others: "". */
+  text: string;
+  command?: true;
+  bareCommand?: true;
+  /**
+   * A command record its writer marked as opening a turn (`turnOrigin: "human"`): a prompt command, never held back
+   * waiting for its successor. Local output after it still demotes it.
+   */
+  promptCommand?: true;
+  notice?: TranscriptNotice;
+  localOutput?: true;
+};
+
+/** Claude Code records which row opens a turn (`turnOrigin`) from this version on (72.4 §1 P3). */
+const OPENER_RECORDING_VERSION = [2, 1, 278] as const;
+const TURN_ORIGIN_RE = /^[a-z_]{1,40}$/;
+/** The fixed text Claude Code puts before another session's `<cross-session-message>` element. */
+const PEER_PREAMBLE = "Another Claude session sent a message:";
+const PEER_OPEN = "<cross-session-message";
+const PEER_CLOSE = "</cross-session-message>";
+const TASK_LABEL_CHARS = 300;
+const PEER_NAME_CHARS = 80;
+const TYPED_TEXT_CHARS = 2_000;
+
+function writerRecordsOpeners(version: unknown): boolean {
+  const m = typeof version === "string" ? /^(\d+)\.(\d+)\.(\d+)/.exec(version) : null;
+  if (!m) return false;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  for (let i = 0; i < 3; i++) if (v[i] !== OPENER_RECORDING_VERSION[i]) return v[i]! > OPENER_RECORDING_VERSION[i]!;
+  return true;
+}
+
+function originOf(entry: any): Record<string, any> | null {
+  const o = entry?.origin;
+  return o && typeof o === "object" && !Array.isArray(o) ? o : null;
+}
+
+/** At most `max` UTF-16 units of `text`, one fewer when the cut would leave half of a surrogate pair. */
+export function cutUnits(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = text.slice(0, max);
+  return /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
+}
+
+/** Whitespace runs collapsed, at most `max` characters, never ending on half of a surrogate pair. */
+function cutText(text: string, max: number): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length <= max ? t : cutUnits(t, max - 1) + "…";
+}
+
+/** The `<cross-session-message>` element, opening tag through closing tag: what the prompt hook receives for a peer (§1 P11). */
+function peerElement(text: string): string | null {
+  const i = text.indexOf(PEER_OPEN);
+  if (i < 0 || !/[\s>]/.test(text[i + PEER_OPEN.length] ?? "")) return null;
+  const j = text.indexOf(PEER_CLOSE, i);
+  return j < 0 ? null : text.slice(i, j + PEER_CLOSE.length);
+}
+
+const TASK_OPEN = "<task-notification>";
+/** The children a `<task-notification>` element opens with, before any task output (P20: 1,909 of 1,909 elements). */
+const TASK_HEADER_TAGS: ReadonlySet<string> = new Set(["task-id", "tool-use-id", "output-file", "status", "summary"]);
+
+/**
+ * A task notice's label: the `<status>` and `<summary>` among the element's LEADING header children, never the task's
+ * result, event or other output (codex CODE T1-1). The element's inner text must be a sequence of child blocks (P17:
+ * every surveyed element is); the first child of any other kind ends the header; a child counts only when it occurs
+ * once there. Otherwise it is left out (fail closed).
+ */
+function taskLabel(text: string): string {
+  const start = text.indexOf(TASK_OPEN);
+  const end = start < 0 ? -1 : text.indexOf("</task-notification>", start);
+  const children = end < 0 ? null : topLevelBlocks(text.slice(start + TASK_OPEN.length, end));
+  const header: { tag: string; inner: string }[] = [];
+  for (const b of children ?? []) {
+    if (!TASK_HEADER_TAGS.has(b.tag)) break;
+    header.push(b);
   }
+  const child = (tag: string) => {
+    const found = header.filter(b => b.tag === tag);
+    return found.length === 1 ? found[0]!.inner.replace(/\s+/g, " ").trim() : "";
+  };
+  const status = cutText(child("status"), 40);
+  const summary = child("summary");
+  const head = status ? `[background task ${status}]` : "[background task]";
+  return cutText(summary ? `${head} ${summary}` : head, TASK_LABEL_CHARS);
+}
+
+/** A peer notice's label: who sent it, never the message body, never its socket path. */
+function peerLabel(origin: Record<string, any> | null): string {
+  if (origin?.handback) return "[message from a background agent]";
+  const name = typeof origin?.name === "string" ? cutText(origin.name, PEER_NAME_CHARS) : "";
+  return `[message from ${name || "another session"}]`;
+}
+
+const noticeClass = (notice: TranscriptNotice, label: string): EntryClass => ({ kind: "notice", text: label, notice });
+
+/**
+ * A `queued_command` attachment: input received while the model worked (§3.2 step 5). Never human, never opening. Only
+ * an attachment WITHOUT `origin` falls back to `commandMode`; an origin without a valid kind is queued-unknown (CODE T1-6).
+ */
+function queuedNotice(att: any): EntryClass {
+  const origin = originOf(att);
+  const kind = typeof origin?.kind === "string" ? origin.kind : null;
+  const prompt = att.prompt;
+  const text = typeof prompt === "string" ? prompt : Array.isArray(prompt) ? transcriptTextBlocks(prompt) : "";
+  if (kind === "task-notification" || (att.origin === undefined && att.commandMode === "task-notification")) {
+    return noticeClass({ source: "task", opens: false }, taskLabel(text));
+  }
+  if (kind === "peer") return noticeClass({ source: "peer", opens: false }, peerLabel(origin));
+  if (kind === "human") {
+    const typedText = text.trim().length > TYPED_TEXT_CHARS ? cutText(text, TYPED_TEXT_CHARS) : text.trim();
+    const label = `[typed while the assistant was working] ${typedText}`.trimEnd();
+    return noticeClass({ source: "queued-prompt", opens: false, typedText }, label);
+  }
+  return noticeClass({ source: "queued-unknown", opens: false }, "[input received while the assistant was working]");
+}
+
+/** A row's notice shape without `turnOrigin` (§3.2 steps 3–4), or null. The preamble form needs NO `origin` at all. */
+function noticeShape(entry: any, text: string): "task" | "peer" | null {
+  const origin = originOf(entry);
+  if (origin?.kind === "peer") return "peer";
+  if (origin?.kind === "task-notification") return "task";
+  if (entry.origin === undefined && entry.isMeta && text.trimStart().startsWith(PEER_PREAMBLE) && peerElement(text) !== null) return "peer";
+  const blocks = topLevelBlocks(text);
+  if (blocks && blocks.every(b => b.tag === "task-notification")) return "task";
+  return null;
+}
+
+/** An opening or non-opening notice row: its label, and for an opening row its identity (§3.1). */
+function noticeRow(entry: any, text: string, source: "task" | "peer" | "other", opens: boolean, turnOrigin: string | null): EntryClass {
+  const label = source === "task" ? taskLabel(text) : source === "peer" ? peerLabel(originOf(entry)) : `[turn started by ${turnOrigin}]`;
+  const notice: TranscriptNotice = { source, opens };
+  if (opens) notice.identitySha = promptSha((source === "peer" ? peerElement(text) : null) ?? text);
+  return noticeClass(notice, label);
+}
+
+/**
+ * The entry's kind, and its text: for human turns the typed text (injected context blocks stripped), for notices the
+ * label. Shared with the 62.1 cursor reader. One executable order, first match wins (72.4 §3.2 step 0):
+ *  1. assistant; a tool result (role toolResult/tool, or a user row with `toolUseResult` or tool_result blocks);
+ *  2. any other role than user → meta, whatever `turnOrigin` says;
+ *  3. hard exclusions → meta: compact summaries, transcript-only rows, plugin rows (ysk notes), an interrupt;
+ *  4. a valid `turnOrigin` other than "human" → an opening notice (it overrides the generic `isMeta` gate);
+ *  5. no `turnOrigin` at all (a present but invalid one is not absent), notice-shaped → a notice, opening only on a
+ *     writer that does not record openers;
+ *  6. generic `isMeta` → meta;
+ *  7. host records and typed text: a command record → human ("/name args", or bare "/name"), other records → meta.
+ */
+export function classifyTranscriptEntry(entry: any, msg: any): EntryClass {
+  const first = assistantOrToolResult(entry, msg);
+  if (first) return first;
+  if (msg.role !== "user") return { kind: "meta", text: "" };
   const text = transcriptTextBlocks(msg.content);
+  if (entry.isCompactSummary || entry.isVisibleInTranscriptOnly || originOf(entry)?.kind === "plugin") return { kind: "meta", text: "" };
   if (text.trimStart().startsWith("[Request interrupted by user")) return { kind: "meta", text: "" };
+  const turnOrigin = typeof entry.turnOrigin === "string" && TURN_ORIGIN_RE.test(entry.turnOrigin) ? entry.turnOrigin : null;
+  if (turnOrigin !== null && turnOrigin !== "human") {
+    const source = turnOrigin === "task_notification" ? "task" : turnOrigin === "peer" ? "peer" : "other";
+    return noticeRow(entry, text, source, true, turnOrigin);
+  }
+  if (entry.turnOrigin === undefined) {
+    const shape = noticeShape(entry, text);
+    // A writer that records openers recorded none for this row: it opened no turn (§1 P6b).
+    if (shape) return noticeRow(entry, text, shape, !writerRecordsOpeners(entry.version), null);
+  }
+  if (entry.isMeta) return { kind: "meta", text: "" };
   const blocks = topLevelBlocks(text);
   if (blocks && blocks.every(b => HOST_RECORD_TAGS.has(b.tag))) {
     const task = blocks.some(b => b.tag === "command-name") ? commandTask(blocks) : null;
-    return typeof task === "string" ? { kind: "human", text: task, command: true } : { kind: "meta", text: "" };
+    if (!task) return { kind: "meta", text: "" };
+    const out: EntryClass = { kind: "human", text: task.text, command: true };
+    if (task.bare) out.bareCommand = true;
+    if (turnOrigin === "human") out.promptCommand = true;
+    return out;
   }
   return { kind: "human", text: text.replace(INJECTED_BLOCK_RE, "").trim() };
+}
+
+/** §3.2 step 0.1: an assistant message, or a tool result (role toolResult/tool, or a user row carrying one); else null. */
+function assistantOrToolResult(entry: any, msg: any): EntryClass | null {
+  if (msg.role === "assistant") return { kind: "assistant", text: transcriptTextBlocks(msg.content) };
+  if (msg.role === "toolResult" || msg.role === "tool") return { kind: "tool_result", text: "" }; // OpenClaw / generic
+  if (msg.role !== "user") return null;
+  if (entry.toolUseResult !== undefined) return { kind: "tool_result", text: "" };
+  if (Array.isArray(msg.content) && msg.content.some((b: any) => b && b.type === "tool_result")) return { kind: "tool_result", text: "" };
+  return null;
+}
+
+/**
+ * Classify a parsed transcript row, including the rows without a message the readers used to skip (72.4): a
+ * `queued_command` attachment, and a `system`/`local_command` row (a built-in command's output). Step 0.1 comes first
+ * whatever the envelope (codex CODE T1-5). Null: a row without a role and content that is neither.
+ */
+export function classifyTranscriptRow(entry: any): EntryClass | null {
+  if (!entry || typeof entry !== "object") return null;
+  const msg = entry.message ?? entry;
+  const hasMessage = !!msg && typeof msg === "object" && !!msg.role && !!msg.content;
+  const first = hasMessage ? assistantOrToolResult(entry, msg) : null;
+  if (first) return first;
+  if (entry.type === "attachment" && entry.attachment && typeof entry.attachment === "object"
+    && entry.attachment.type === "queued_command") return queuedNotice(entry.attachment);
+  if (entry.type === "system" && entry.subtype === "local_command") return { kind: "meta", text: "", localOutput: true };
+  return hasMessage ? classifyTranscriptEntry(entry, msg) : null;
 }
 
 /** Claude Code follows a LOCAL (built-in) command's record with its output; a prompt command expands instead. */
@@ -515,19 +742,26 @@ export const LOCAL_COMMAND_OUTPUT_RE = /^\s*<local-command-(stdout|stderr)>/;
 
 /**
  * Read a transcript as classified turns (62.2, CM-03). The window matches `readTranscript`'s
- * (the last N parsed entries); entries without a role or content are skipped, as there.
+ * (the last N parsed entries); entries without a role or content are skipped, as there — except, since 72.4, queued
+ * input (a notice) and a built-in command's `system`/`local_command` output row (kept as the record's successor).
  */
 export function readTranscriptTurns(transcriptPath: string, lastN: number = 200): TranscriptTurn[] {
   try {
-    const turns: TranscriptTurn[] = [];
+    const turns: (TranscriptTurn & { promptCommand?: true })[] = [];
     for (const line of readTranscriptTailLines(transcriptPath, lastN)) {
       try {
         const entry = JSON.parse(line);
+        const c = classifyTranscriptRow(entry);
+        if (!c) continue;
         const msg = entry.message ?? entry;
-        if (!msg.role || !msg.content) continue;
-        const { kind, text, command } = classifyTranscriptEntry(entry, msg);
-        const turn: TranscriptTurn = { role: String(msg.role), kind, text, rendered: renderTranscriptContent(msg.content) };
-        if (command) turn.command = true;
+        const role = c.kind === "notice" ? "user" : c.localOutput ? "system" : String(msg.role);
+        const rendered = c.kind === "notice" ? c.text : c.localOutput ? "" : renderTranscriptContent(msg.content);
+        const turn: TranscriptTurn & { promptCommand?: true } = { role, kind: c.kind, text: c.text, rendered };
+        if (c.command) turn.command = true;
+        if (c.bareCommand) turn.bareCommand = true;
+        if (c.promptCommand) turn.promptCommand = true;
+        if (c.notice) turn.notice = c.notice;
+        if (c.localOutput) turn.localOutput = true;
         turns.push(turn);
       } catch {
         // Skip malformed lines
@@ -537,12 +771,15 @@ export function readTranscriptTurns(transcriptPath: string, lastN: number = 200)
     // local-command output. Only prompt commands (skills, custom commands) keep their arguments as a task.
     for (let i = 0; i < turns.length - 1; i++) {
       const t = turns[i]!;
-      if (t.command && LOCAL_COMMAND_OUTPUT_RE.test(turns[i + 1]!.rendered)) {
+      const next = turns[i + 1]!;
+      if (t.command && (LOCAL_COMMAND_OUTPUT_RE.test(next.rendered) || next.localOutput)) {
         t.kind = "meta";
         t.text = "";
         delete t.command;
+        delete t.bareCommand;
       }
     }
+    for (const t of turns) delete t.promptCommand;
     return turns.slice(-lastN);
   } catch {
     return [];

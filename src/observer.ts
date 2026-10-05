@@ -7,7 +7,7 @@
  */
 
 import { createHash } from "crypto";
-import type { TranscriptMessage } from "./hooks.ts";
+import { TRANSCRIPT_CLASSIFIER_REVISION, type TranscriptMessage } from "./hooks.ts";
 import {
   monoNow, deadlineAfter, duration, remainingForTimeout, evidenceMs, elapsed, timeoutSignal, epochNow, epochMs,
   type DurationMs, type MonoDeadline,
@@ -345,11 +345,14 @@ export function observationSystemPrompt(n: number): string {
 /**
  * What the contract hashes (design §1.4): every static string the windows assemble — the system prompt, the CONTEXT /
  * EARLIER / ALREADY RECORDED sections and markers, the format-retry feedback — and every window-policy constant,
- * the CONTEXT's sizes included. v0.41.4 (§1.5): the observer's own feedback strings and the grammar too.
+ * the CONTEXT's sizes included. v0.41.4 (§1.5): the observer's own feedback strings and the grammar too. 72.4 (§4): the
+ * transcript classifier's revision — the rendered lines' hash does not cover where turns open, so a checkpoint taken
+ * under another classifier restarts its range.
  */
 export function observerContractInputs(): Record<string, unknown> {
   return {
-    contract: OBSERVER_CONTRACT_VERSION, parser: OBSERVER_PARSER_VERSION, system: OBSERVATION_SYSTEM_PROMPT,
+    contract: OBSERVER_CONTRACT_VERSION, parser: OBSERVER_PARSER_VERSION, classifier: TRANSCRIPT_CLASSIFIER_REVISION,
+    system: OBSERVATION_SYSTEM_PROMPT,
     sections: [EARLIER_HEADER, RECORDED_HEADER, CONTEXT_END, TRANSCRIPT_OPEN, TRANSCRIPT_CLOSE, "--- CONTEXT (already recorded — do not extract) ---", "Already recorded observations:"],
     feedback: OBSERVATION_FEEDBACK_TEXT,
     grammar: { version: OBSERVER_GRAMMAR_VERSION, text: [1, 2, 3, 4, 5].map(observerGrammar) },

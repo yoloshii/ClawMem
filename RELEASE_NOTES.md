@@ -4,6 +4,101 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.0 — a turn started by a task's notice, another session or a bare command is its own turn
+
+The Stop hooks and the PreCompact hook start a turn at each typed prompt. Through v0.42.0 nothing else started one: a
+prompt command run without arguments (`/review`), a background task's `<task-notification>` and a message from another
+Claude Code session were metadata, so the assistant's reply to any of them was recorded as part of the previous typed
+prompt's turn. The observer read that reply as an answer to the earlier prompt, the handoff merged the two turns into
+one digest, `feedback-loop` credited a note the reply named to the earlier prompt's surfacing, and the reason the turn
+happened was dropped. Input received while the assistant was working (a `queued_command` attachment) was read by
+nothing, the user's own mid-turn prompts included.
+
+### What changed
+
+- **What opens a turn.** A typed prompt or a prompt command, now with or without arguments (`/name`); a built-in
+  command is still recognised by the output that follows it, now also in the `system`/`local_command` row newer Claude
+  Code versions write. A background task's notice and another session's message open a turn too: on Claude Code
+  2.1.278 and later by the row's `turnOrigin`, which marks exactly the rows that open a turn (a notice row without it
+  opens none); on older versions and other hosts by the row's shape. Input received while the assistant was working
+  never opens a turn.
+- **A notice is a label, never a message body.** The observer, the handoff and PreCompact see a notice as
+  `[background task <status>] <summary>` (at most 300 characters, never the task's output), `[message from <session
+  name>]` (never the message's text or its sender's socket path), `[message from a background agent]`, or `[turn
+  started by <origin>]`. A prompt typed while the assistant worked keeps the user's words
+  (`[typed while the assistant was working] …`, at most 2,000 characters); queued input of unknown origin is labelled
+  without its text. The assistant's reply to a notice is recorded as before, and it may restate the notice.
+- **Each consumer follows.** The observer numbers turns at every opening and restores a long turn's opening line —
+  the typed request or the label — when its 100-message window drops it. A handoff digest's request is the turn's
+  opening text, and the streamed path for a turn larger than one read now digests exactly what the normal path does,
+  short replies included. `feedback-loop` closes every turn at the next opening, and pairs a surfacing row with a
+  notice's turn when the row's prompt hash equals the hash of the text the hook received for that notice (for another
+  session's message, its `<cross-session-message>` element); a row with no such match is concluded unattributable,
+  never credited to a neighbouring turn. PreCompact's last request is the last text of ten or more characters the user
+  typed (through v0.42.0, more than ten) — a mid-turn prompt included, a bare command (`/pre-compact`) never — and a
+  decision's stored context after a notice is the notice's label, not the earlier prompt.
+- **A bounded read** that ends right after a built-in command with arguments (`/model sonnet`) now looks at the next
+  line before classifying it, whatever the caller asked about the read's end; through v0.42.0 such a record could read
+  as a turn start. A next line larger than the read is judged from its first 64 KiB, which now also recognises a
+  `system`/`local_command` row by its own `type` and `subtype`, whatever its content.
+- **Migration, automatic.** The observer's checkpoint contract now carries the transcript classifier's revision, so a
+  checkpoint written by v0.42.0 or earlier restarts its range when it is next processed. A handoff digest records how
+  it was derived (`derivRev`); a provisional digest (a turn still in progress) written by an older version is derived
+  again when it is re-planned, while settled digests are left as they are.
+- **Known limits.** A hand-back from a background agent is paired by its row's raw text, because the form the
+  surfacing hook receives for it is unmeasured; it normally does not match, so its turn is normally concluded
+  unattributable. The `context-surfacing` hook is unchanged: it still stores the prompt it receives, a task's notice
+  or another session's message included, as its prior-query input. A next line larger than the read is still judged
+  from its first 64 KiB without being parsed: escaped characters, a quote inside a key, a nested field, a host's
+  marker row shaped like command output, or invalid JSON, inside that prefix or past it, can make it misjudge whether
+  the command before it was a built-in, as in v0.42.0. The check of the row's own `type` and `subtype` that this
+  version adds can be misled by the last of these, and it takes a `system`/`local_command` row that carries an
+  assistant message for command output, where the full parse reads the assistant's reply.
+- **Tests:** `tests/unit/turn-starters.test.ts`.
+- **Docs:** `docs/concepts/architecture.md` (Stop pipeline: turns; the surfacing hook's stored prompts),
+  `docs/guides/upgrading.md`, `docs/guides/setup-hooks.md`, `docs/troubleshooting.md`, `AGENTS.md`.
+
+### Upgrading
+
+No action needed beyond upgrading every process that shares the vault: the hooks take the new version at their next
+run; restart `clawmem watch`, whose worker runs the same readers. Neither plugin's own files changed, so a copied
+OpenClaw or Hermes plugin need not be copied again. When a range is next processed, an observer checkpoint written by
+an older version restarts it from its first window (the range is not lost), and the digest of a turn still in progress
+is derived again; settled work is not redone. See [upgrading](docs/guides/upgrading.md).
+
+### Verification
+
+Run on v0.42.0, 61 of the 95 new tests fail and 31 pass; the 31 guard behaviour the change must keep (metadata stays
+metadata, the hard exclusions, what is never a last request, the trailing command a bounded read holds back, local
+output that is not over-matched), and four of those are cases a first draft of this change broke: an assistant message
+or a tool result inside another envelope, and metadata that is present but invalid. The other 3 are `todo`: the limits
+above of the check of a line larger than the read. One existing test changed: the PreCompact reader's rendering
+contract (`tests/unit/compaction-transcript.test.ts`) now expects a task's notice as its label; every other row
+renders as before. Thirty-four mutants, each undoing one part of the change, each fail at least one new test: an
+opening notice that opens nothing; no fallback by shape for older writers; a task's label read from anywhere in the
+element or past its header; a peer's body as its label, or its raw row as its identity; an envelope that outranks an
+assistant message; invalid metadata read as absent; cuts that split a surrogate pair; a mid-turn prompt that opens a
+turn; a bare prompt command as metadata; no recognition of a `system`/`local_command` row, in a next line or in the 64
+KiB prefix; no look past a read's end; a prompt command held back at the end of a read; a first cursor that skips an
+answered notice; a long turn's opening line not restored; turn numbers, digest requests and streamed reads that take
+only typed prompts as openings; a digest never derived again, or given to a turn with nothing in it; PreCompact's
+ten-character rule, bare and queued commands as a last request, and a mid-turn prompt never one; a notice's label in
+the open questions; a checkpoint contract without the classifier's revision; a notice's turn never paired, or never
+closing the turn before it. Full suite on Bun 1.4.2: 3,666 pass / 0 fail across 189 files (3 todo); tsc unchanged. The
+adversarial review (one session) cleared the design at its fourth turn, after 15 findings, one of which (the surfacing
+hook storing what it receives) is outside this change, as Known limits says. It cleared the implementation at its
+fifth, after 13: 9 fixed, 2 in code this change dropped, and 2 accepted as the limits above of the check of a line
+larger than the read. Six more turns cleared the docs and these notes, after 4 findings.
+
+### What didn't change
+
+A typed prompt is read as before, and a built-in command whose output follows it is still a setting change. The read
+bound (64 MB; 4 MB for the turns read as context) and v0.42.0's check of a next line larger than the read are kept.
+The observer's instructions, parser and grammar, the vault's schema, the `context-surfacing` hook and `clawmem mine`
+are unchanged.
+
+---
+
 ## v0.42.0 — `clawmem serve` turns web pages away and requires a token
 
 `clawmem serve` binds 127.0.0.1, and through v0.41.5 that was its only defence, but a web page in your browser can

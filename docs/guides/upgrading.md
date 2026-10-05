@@ -62,6 +62,16 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.43.0: a turn started by a task's notice, another session or a bare command is its own turn
+
+No action needed beyond the usual upgrade of every process that shares the vault (hooks, the watcher, MCP servers,
+plugins): hooks take the new code at their next run, and `clawmem watch`, whose worker runs the same readers, needs a
+restart. Neither plugin's own files changed, so a copied OpenClaw or Hermes plugin need not be copied again. The first
+processing after the upgrade restarts each observer checkpoint written by an older version from its range's first
+window (its range is not lost), and re-derives the handoff digest of a turn still in progress; settled digests stay as
+they are. Settled work (ranges already processed, digests behind the cursor) is not redone; a range still queued for
+retry is read under the new rules when it runs.
+
 ## v0.42.0: `clawmem serve` requires a token and turns web pages away
 
 **Only REST clients are affected.** The vault, the hooks and the MCP server are unchanged.
