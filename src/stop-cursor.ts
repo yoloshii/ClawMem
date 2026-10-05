@@ -22,7 +22,9 @@ import { createHash, type Hash } from "crypto";
 import type { Database } from "bun:sqlite";
 import {
   classifyTranscriptRow,
+  commandSuccessor,
   opensTurn,
+  readPastForOutput,
   renderTranscriptContent,
   LOCAL_COMMAND_OUTPUT_RE,
   type TranscriptNotice,
@@ -200,7 +202,7 @@ function prefixShowsLocalOutput(prefix: string): boolean {
   return f.get("type") === "system" && f.get("subtype") === "local_command";
 }
 
-function scanRawLines(fd: number, from: number, limit: number, maxBytes: number): { lines: RawLine[]; next: number; eof: boolean } {
+function scanRawLines(fd: number, from: number, limit: number, maxBytes: number, maxLines = Infinity): { lines: RawLine[]; next: number; eof: boolean } {
   const lines: RawLine[] = [];
   const buf = Buffer.allocUnsafe(CHUNK);
   // The line being assembled: its parts, or — once it outgrows one read's bound — only a running hash of it.
@@ -243,7 +245,7 @@ function scanRawLines(fd: number, from: number, limit: number, maxBytes: number)
       cur.big = null;
       cur.prefix = undefined;
       i += rel + 1;
-      if (total >= maxBytes) return { lines, next: cur.start, eof: cur.start >= limit };
+      if (total >= maxBytes || lines.length >= maxLines) return { lines, next: cur.start, eof: cur.start >= limit };
     }
     pos += n;
   }
@@ -312,17 +314,38 @@ function demoteCommand(l: TranscriptLine): void {
 const showsLocalOutput = (next: TranscriptLine) => LOCAL_COMMAND_OUTPUT_RE.test(next.rendered) || next.localOutput === true;
 
 /**
+ * The successor the local-command rule reads for a command record whose successor lies past the lines read (72.4 (e)):
+ * the first complete line from `pos` that the rule does not read past (72.9), classified; null when none comes before
+ * `limit`. One line at a time, so a long run of queued input costs one line of memory (codex 72.9 T1-2). As the first
+ * line of a scan, a line larger than `maxBytes` is passed over as metadata judged from its prefix; with no bound
+ * (`Infinity`) each line is read whole.
+ */
+function peekSuccessor(fd: number, pos: number, limit: number, maxBytes: number): TranscriptLine | null {
+  while (pos < limit) {
+    const raw = scanRawLines(fd, pos, limit, maxBytes, 1).lines[0];
+    if (!raw) return null;   // no complete line before `limit`: the successor is not written yet
+    const l = classifyRawLine(raw);
+    if (!readPastForOutput(l)) return l;
+    pos = raw.end;
+  }
+  return null;
+}
+
+/**
  * Read the complete lines of a transcript from `from` (a line start), classified, at most `maxBytes` of them, and not
- * past `to` when given. A command record followed by local-command output is meta (a setting change, not a task); a
- * command record whose successor is not read yet is held back (`next` stops before it) unless
- * `releaseTrailingCommand` says its turn is known to be over. A read that stopped at its byte bound right after a
- * command record peeks at its successor whatever `releaseTrailingCommand` says (72.4 (e)). A prompt command its writer
- * marked as opening a turn is never held back (no successor needed); local output after it still demotes it.
+ * past `to` when given. A command record followed by local-command output is meta (a setting change, not a task); its
+ * successor is the next line that is not input received while the model worked (72.9). A command record whose
+ * successor is not read yet is held back (`next` stops before it, and before the lines after it) unless
+ * `releaseTrailingCommand` says its turn is known to be over. A read that stopped at its byte bound before the
+ * successor peeks at it whatever `releaseTrailingCommand` says (72.4 (e)), and holds the record back only when none is
+ * written yet. `lookPastTo` (a step of a backward scan): a record whose successor lies past `to` is classified by it the
+ * same way, each line past `to` read whole, as the scan's lookahead line always was (codex 72.9 T2-1). A prompt command
+ * its writer marked as opening a turn is never held back (no successor needed); local output after it still demotes it.
  */
 export function readLines(
   path: string,
   from: number,
-  opts?: { maxBytes?: number; to?: number; releaseTrailingCommand?: boolean },
+  opts?: { maxBytes?: number; to?: number; releaseTrailingCommand?: boolean; lookPastTo?: boolean },
 ): LineRead {
   const fd = openSync(path, "r");
   try {
@@ -330,25 +353,27 @@ export function readLines(
     const limit = Math.min(size, opts?.to ?? size);
     const scanned = scanRawLines(fd, from, limit, opts?.maxBytes ?? STOP_READ_MAX_BYTES);
     const lines = scanned.lines.map(classifyRawLine);
-    for (let i = 0; i < lines.length - 1; i++) {
-      const l = lines[i]!;
-      if (l.command && showsLocalOutput(lines[i + 1]!)) demoteCommand(l);
+    for (let i = 0; i < lines.length; i++) {
+      const j = lines[i]!.command ? commandSuccessor(lines, i) : -1;
+      if (j >= 0 && showsLocalOutput(lines[j]!)) demoteCommand(lines[i]!);
     }
-    const last = lines.at(-1);
+    // The one record whose successor is not in the read: the last line, or the last before lines it reads past (72.9).
+    let k = lines.length - 1;
+    while (k >= 0 && readPastForOutput(lines[k]!)) k--;
+    const last = k >= 0 ? lines[k]! : undefined;
     if (last?.command) {
-      if (scanned.eof) {
-        if (!opts?.releaseTrailingCommand && !last.promptCommand) {
-          lines.pop();   // its successor is not written yet: held back until it is
-          return { lines, next: last.start, eof: false, bounded: false };
-        }
-      } else {
-        // The read stopped at its byte bound right after the command record: classify it by peeking at its successor
-        // (as the first line of a read, an oversized successor is passed over as metadata) instead of holding it back —
-        // holding it would leave `next` where the read started, and a stream would read the same bytes for ever (T25 #5).
-        // Whatever `releaseTrailingCommand` says: the successor exists, so the record is classified, not released (72.4 (e)).
-        const raw = scanRawLines(fd, last.end, limit, opts?.maxBytes ?? STOP_READ_MAX_BYTES).lines[0];
-        const peek = raw ? classifyRawLine(raw) : null;
-        if (peek && showsLocalOutput(peek)) demoteCommand(last);
+      // A read that stopped at its byte bound classifies the record by peeking at its successor instead of holding it
+      // back — holding it when the successor exists would leave `next` where the read started, and a stream would read
+      // the same bytes for ever (T25 #5). Whatever `releaseTrailingCommand` says: a successor that exists classifies the
+      // record, it is not released (72.4 (e)).
+      const lookLimit = opts?.lookPastTo ? size : limit;
+      const lookBytes = opts?.lookPastTo ? Infinity : opts?.maxBytes ?? STOP_READ_MAX_BYTES;
+      const peek = !scanned.eof || lookLimit > limit ? peekSuccessor(fd, scanned.next, lookLimit, lookBytes) : null;
+      if (peek) {
+        if (showsLocalOutput(peek)) demoteCommand(last);
+      } else if (!opts?.releaseTrailingCommand && !last.promptCommand) {
+        lines.length = k;   // its successor is not written yet: held back, with the lines after it, until it is
+        return { lines, next: last.start, eof: false, bounded: false };
       }
     }
     return { lines, next: scanned.next, eof: scanned.eof, bounded: !scanned.eof };
@@ -535,7 +560,10 @@ export function streamLines(
   }
 }
 
-/** Bytes a backward scan reads per step (plus the one line past it that classifies a command record at its end). */
+/**
+ * Bytes a backward scan reads per step. A command record at a step's end is classified by a look at its successor past
+ * the step, one whole line at a time (72.9; codex 72.9 T1-2, T2-1).
+ */
 const BACK_CHUNK = 16 * 1024 * 1024;
 
 /**
@@ -552,12 +580,13 @@ function lastLineWhere(path: string, pred: (l: TranscriptLine) => boolean, relea
     // strictly decreases.
     const lo = hi > BACK_CHUNK ? Math.min(nextLineStart(path, hi - BACK_CHUNK), prevLineStart(path, hi)) : 0;
     if (lo >= hi) throw new Error(`transcript scan made no progress at offset ${hi}`);
-    const to = hi >= size ? size : nextLineStart(path, hi);
-    const read = readLines(path, lo, { to, maxBytes: STOP_READ_MAX_BYTES + (to - lo), releaseTrailingCommand: hi >= size ? releaseTrailingCommand : true });
-    if (tailNext < 0) tailNext = read.next;
+    // The step's last record is classified by its successor past `hi`; with none written yet (only queued input or an
+    // incomplete line follow it) it is the file's last record, and the caller's rule for a trailing record applies.
+    const read = readLines(path, lo, { to: hi, maxBytes: STOP_READ_MAX_BYTES + (hi - lo), releaseTrailingCommand, lookPastTo: true });
+    // A record held back is where a forward read of the tail stops, whichever step met it (codex 72.9 T1-1).
+    if (tailNext < 0 || (!read.eof && !read.bounded)) tailNext = read.next;
     for (let i = read.lines.length - 1; i >= 0; i--) {
       const l = read.lines[i]!;
-      if (l.start >= hi) continue;   // the lookahead line: it only classifies the step's last line
       if (pred(l)) return { line: l, tailNext };
     }
     if (lo === 0) break;

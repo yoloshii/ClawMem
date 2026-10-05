@@ -12,6 +12,12 @@
  * first draft of this change broke and v0.42.0 already had right). 3 are `todo`: limits of the oversized-line check
  * that v0.42.0 already had and this change keeps (BACKLOG 72.8).
  *
+ * BACKLOG 72.9 (v0.43.1): 17 more tests at the end. 11 fail on v0.43.0; 6 guard behaviour the fix must keep (an opening
+ * notice ends the look for a built-in's output, a prompt command's expansion after queued input, a record released by
+ * its caller or a prompt command is not held back, and — codex 72.9 T1-1 — a record the backward scan holds back with
+ * no earlier opener anchors the current turn at it, and — T2-1 — the backward scan still reads a complete successor
+ * larger than a read whole).
+ *
  * Fixture text is synthetic; the row shapes are the ones the 72.4 survey counted (DESIGN §1).
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
@@ -30,7 +36,7 @@ import { feedbackLoop } from "../../src/hooks/feedback-loop.ts";
 import { applySurfacingBookkeeping, type SurfacingBookkeepingJob } from "../../src/hooks/surfacing-bookkeeping.ts";
 import { precompactExtract } from "../../src/hooks/precompact-extract.ts";
 import { promptSha, transcriptKey } from "../../src/stop-pairing.ts";
-import { iso, human, assistant, command, localStdout, meta, writeTranscriptFile, lineStarts, type Entry } from "./stop-fixtures.ts";
+import { iso, human, assistant, command, localStdout, meta, writeTranscriptFile, appendEntries, lineStarts, type Entry } from "./stop-fixtures.ts";
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -984,5 +990,199 @@ describe("CODE T1-6: metadata that is present but invalid is not absent", () => 
       expect(notice(l)).toMatchObject({ source: "queued-unknown", opens: false });
       expect(l.text).toBe("[input received while the assistant was working]");
     }
+  });
+});
+
+// ─── BACKLOG 72.9 (v0.43.1) ─────────────────────────────────────────────────────────────────────────────────────────
+/**
+ * Input received while the model worked (a non-opening notice: a `queued_command` attachment) written between a
+ * built-in command's record and its output. v0.43.0 read only the record's immediate successor, so the record stayed a
+ * request — in the PreCompact reader, in the Stop reader's in-read rule, at the read-end peek and in the backward scan's
+ * one-line lookahead. Found in review; no surveyed transcript holds the shape (each of 4,076 built-in records had its output
+ * as the very next row). Without queued input, two more cases change: a bounded read, or a backward scan's
+ * step, that ends at a record whose next line is still being written now holds the record back, as the end of the file
+ * does, instead of releasing it.
+ */
+describe("72.9: queued input between a built-in command and its output", () => {
+  const Q = {
+    typed: (t: number) => queued("also check the retry path", t, { origin: { kind: "human" } }),
+    peer: (t: number) => queued(`${PEER_PREAMBLE}${PEER_EL("BODY-SECRET")}`, t, { origin: { kind: "peer", name: "lane-b", body: "BODY-SECRET", from: "/tmp/PEER-SOCKET.sock" } }),
+    task: (t: number) => queued(TASK_XML("tests passed"), t, { commandMode: "task-notification", origin: { kind: "task-notification" } }),
+    unknown: (t: number) => queued("UNKNOWN-SOURCE-TEXT", t),
+  };
+  const humans = (ls: { kind: string; text: string }[]) => ls.filter(l => l.kind === "human").map(l => l.text);
+  const kinds = (ls: { kind: string }[]) => ls.map(l => l.kind);
+
+  it("the command is meta in both readers, whatever the queued input and the output row", () => {
+    for (const args of ["", "sonnet"]) for (const output of [localStdout, localCommandRow])
+      for (const between of [[Q.typed], [Q.peer], [Q.task], [Q.unknown], [Q.typed, Q.task]]) {
+        const entries = [typed("first question here", 0), assistant("answer", 1), command("/model", args, 2),
+          ...between.map((q, i) => q(3 + i)), output("Set model to sonnet", 10), assistant("a reply after the switch", 11)];
+        expect(linesOf(entries)[2]!.kind).toBe("meta");
+        expect(humans(linesOf(entries))).toEqual(["first question here"]);
+        expect(humans(turnsOf(entries))).toEqual(["first question here"]);
+      }
+  });
+
+  it("an opening notice after a command record is its successor: the command stays a turn (guard; an unobserved shape)", () => {
+    const entries = [typed("first question here", 0), assistant("answer", 1), command("/review", "the diff", 2), taskRow("done", 3),
+      localStdout("stray output", 4)];
+    expect(linesOf(entries)[2]).toMatchObject({ kind: "human", text: "/review the diff" });
+    expect(turnsOf(entries)[2]).toMatchObject({ kind: "human", text: "/review the diff" });
+  });
+
+  it("a prompt command followed by queued input and then its expansion stays a turn (guard)", () => {
+    const entries = [typed("first question here", 0), assistant("answer", 1), command("/review", "the diff", 2), Q.typed(3),
+      meta("expansion of the prompt command", 4), assistant("Reviewed.", 5)];
+    expect(humans(linesOf(entries))).toEqual(["first question here", "/review the diff"]);
+    expect(humans(turnsOf(entries))).toEqual(["first question here", "/review the diff"]);
+  });
+
+  it("Stop reader: a command record followed only by queued input is held back until its output is written", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), Q.typed(3), Q.peer(4)]);
+    const r = cursor.readLines(path, 0);   // releaseTrailingCommand off
+    expect(kinds(r.lines)).toEqual(["human", "assistant"]);
+    expect(r.next).toBe(lineStarts(path)[2]!);
+    expect(r.eof).toBe(false);
+    expect(cursor.currentTurnStart(path)).toBe(0);
+    appendEntries(path, [localStdout("Set model to sonnet", 5), assistant("a reply after the switch", 6)]);
+    expect(kinds(cursor.readLines(path, r.next).lines)).toEqual(["meta", "notice", "notice", "meta", "assistant"]);
+  });
+
+  it("Stop reader: released, or a prompt command, it is not held back (guard)", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), Q.typed(3)]);
+    expect(kinds(cursor.readLines(path, 0, { releaseTrailingCommand: true }).lines)).toEqual(["human", "assistant", "human", "notice"]);
+    const p2 = write([typed("first question here", 0), assistant("answer", 1), promptCommand("/review", "the diff", 2), Q.typed(3)]);
+    const r = cursor.readLines(p2, 0);
+    expect(kinds(r.lines)).toEqual(["human", "assistant", "human", "notice"]);
+    expect(r.next).toBe(readFileSync(p2).length);
+  });
+
+  for (const release of [false, true]) {
+    it(`Stop reader, a bounded read (releaseTrailingCommand ${release}) ending at the record or inside the queued input: meta`, () => {
+      const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), Q.typed(3), Q.task(4),
+        localStdout("Set model to sonnet", 5), typed("second question here", 6)]);
+      for (const end of [3, 4, 5]) {
+        const r = cursor.readLines(path, 0, { maxBytes: lineStarts(path)[end]!, releaseTrailingCommand: release });
+        expect(r.bounded).toBe(true);
+        expect(r.lines.length).toBe(end);
+        expect(r.lines[2]!.kind).toBe("meta");
+      }
+    });
+  }
+
+  it("Stop reader, a bounded read whose record has only queued input after it: held back like at the end, or released", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), Q.typed(3), Q.task(4)]);
+    const held = cursor.readLines(path, 0, { maxBytes: lineStarts(path)[3]! });
+    expect(kinds(held.lines)).toEqual(["human", "assistant"]);
+    expect(held.next).toBe(lineStarts(path)[2]!);
+    expect(held.bounded).toBe(false);
+    const released = cursor.readLines(path, 0, { maxBytes: lineStarts(path)[3]!, releaseTrailingCommand: true });
+    expect(kinds(released.lines)).toEqual(["human", "assistant", "human"]);
+    expect(released.bounded).toBe(true);
+  });
+
+  it("Stop reader, a bounded read ending at a record whose next line is still being written: held back (no queued input)", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2)]);
+    const complete = readFileSync(path).length;
+    const recordStart = lineStarts(path)[2]!;
+    const out = JSON.stringify(localStdout("Set model to sonnet", 3)) + "\n";
+    writeFileSync(path, readFileSync(path, "utf-8") + out.slice(0, 25));   // its output, not complete yet
+    const held = cursor.readLines(path, 0, { maxBytes: complete });
+    expect(kinds(held.lines)).toEqual(["human", "assistant"]);
+    expect(held.next).toBe(recordStart);
+    expect(held.bounded).toBe(false);
+    expect(kinds(cursor.readLines(path, 0, { maxBytes: complete, releaseTrailingCommand: true }).lines)).toEqual(["human", "assistant", "human"]);
+    writeFileSync(path, readFileSync(path, "utf-8").slice(0, complete) + out);   // the line completes
+    expect(kinds(cursor.readLines(path, 0, { maxBytes: complete }).lines)).toEqual(["human", "assistant", "meta"]);
+  });
+
+  it("a stream in reads of any size agrees with one whole read", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), Q.typed(3), Q.peer(4),
+      localCommandRow("Set model to sonnet", 5), assistant("a reply after the switch", 6), typed("second question here", 7), assistant("ok", 8)]);
+    const starts = lineStarts(path);
+    const size = readFileSync(path).length;
+    const longest = Math.max(...starts.map((s, i) => (starts[i + 1] ?? size) - s));
+    for (const release of [false, true]) {
+      const whole = cursor.readLines(path, 0, { releaseTrailingCommand: release }).lines.map(l => `${l.kind}:${l.text}`);
+      expect(whole[2]).toBe("meta:");
+      for (let maxBytes = longest; maxBytes <= size; maxBytes += 7) {
+        const seen: string[] = [];
+        const end = cursor.streamLines(path, 0, l => { seen.push(`${l.kind}:${l.text}`); }, { maxBytes, releaseTrailingCommand: release });
+        expect(end.eof).toBe(true);
+        expect(seen).toEqual(whole);
+      }
+    }
+  });
+
+  /** stop-cursor's BACK_CHUNK: a backward scan step. A tail of STEP - 1 bytes after the record ends a step right after it. */
+  const STEP = 16 * 1024 * 1024;
+  const lineBytes = (e: Entry) => Buffer.byteLength(JSON.stringify(e)) + 1;
+
+  it("the backward scan reads past queued input after a record at a step's end (currentTurnStart, humanLineAtOrBefore)", () => {
+    const q = Q.typed(3);
+    const out = localStdout("Set model to sonnet", 4);
+    const reply = assistant("reply ", 5) as any;
+    const pad = STEP - 1 - lineBytes(q) - lineBytes(out) - lineBytes(reply);
+    reply.message.content[0].text += "r".repeat(pad);
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), q, out, reply]);
+    expect(readFileSync(path).length - lineStarts(path)[3]!).toBe(STEP - 1);
+    expect(cursor.currentTurnStart(path)).toBe(0);
+    expect(cursor.humanLineAtOrBefore(path, Date.parse(iso(5)))).toBe(0);
+  }, 30_000);
+
+  it("the backward scan: queued input from a record at a step's end to the end of the file is the end of the file (held back)", () => {
+    const q = Q.typed(3) as any;
+    q.attachment.prompt += "q".repeat(STEP - 1 - lineBytes(q));
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2), q]);
+    expect(readFileSync(path).length - lineStarts(path)[3]!).toBe(STEP - 1);
+    expect(cursor.currentTurnStart(path)).toBe(0);
+  }, 30_000);
+
+  it("the backward scan: a record at a step's end before a last line still being written, longer than a step: held back (no queued input)", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2)]);
+    const partial = JSON.stringify(assistant("x".repeat(STEP), 3)).slice(0, STEP + 100);   // no newline yet
+    writeFileSync(path, readFileSync(path, "utf-8") + partial);
+    expect(cursor.currentTurnStart(path)).toBe(0);
+  }, 30_000);
+
+  it("the backward scan, no earlier opener: a record held back in a later step anchors the turn at it (queued input)", () => {
+    const rec = command("/review", "the diff", 0);
+    const qs: Entry[] = [];
+    let tail = STEP - 1;
+    while (tail > 0) {
+      const q = Q.typed(1) as any;
+      const room = tail - lineBytes(q);
+      if (room < 0) throw new Error("fixture: a queued line does not fit");
+      q.attachment.prompt += "q".repeat(Math.min(room, 4 * 1024 * 1024));
+      qs.push(q);
+      tail -= lineBytes(q);
+    }
+    const path = write([rec, ...qs]);
+    expect(readFileSync(path).length - lineStarts(path)[1]!).toBe(STEP - 1);
+    expect(cursor.currentTurnStart(path)).toBe(0);
+    appendEntries(path, [meta("expansion of the prompt command", 2), assistant("Reviewed.", 3)]);
+    expect(cursor.currentTurnStart(path)).toBe(0);
+  }, 30_000);
+
+  it("the backward scan, no earlier opener: a record before a last line still being written, longer than a step, anchors the turn at it", () => {
+    const path = write([command("/review", "the diff", 0)]);
+    writeFileSync(path, readFileSync(path, "utf-8") + JSON.stringify(assistant("x".repeat(STEP), 1)).slice(0, STEP + 100));
+    expect(cursor.currentTurnStart(path)).toBe(0);
+  }, 30_000);
+
+  it("the backward scan reads a complete successor larger than a read whole, as v0.43.0 did (guard; codex 72.9 T2-1)", () => {
+    const path = write([typed("first question here", 0), assistant("answer", 1), command("/model", "sonnet", 2)]);
+    // A complete local-output row of 70 MiB whose first "<" is the JSON escape \u003c: only a full parse sees the output.
+    const row = JSON.stringify(localStdout("x".repeat(70 * 1024 * 1024), 3)).replace("<local-command-stdout>", "\\u003clocal-command-stdout>");
+    expect(row.includes("<local-command-stdout>")).toBe(false);
+    writeFileSync(path, readFileSync(path, "utf-8") + row + "\n");
+    expect(cursor.currentTurnStart(path)).toBe(0);
+    expect(cursor.humanLineAtOrBefore(path, Date.parse(iso(3)))).toBe(0);
+  }, 60_000);
+
+  it("the classifier revision is 3: state derived under revision 2 is derived again", () => {
+    expect(hooks.TRANSCRIPT_CLASSIFIER_REVISION).toBe(3);
+    expect((observerContractInputs() as Record<string, unknown>).classifier).toBe(3);
   });
 });

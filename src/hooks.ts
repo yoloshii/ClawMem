@@ -438,9 +438,10 @@ export type TranscriptNotice = {
 /**
  * Bump with any change to how a transcript row is classified — its kind, whether it opens a turn, its rendering. The
  * observer checkpoint contract and the handoff turn digests carry it, so state derived under an older classifier is
- * re-derived (72.4 §4). v0.43.0: 2.
+ * re-derived (72.4 §4). v0.43.0: 2. v0.43.1: 3 — the local-command rule reads past input received while the model
+ * worked (72.9).
  */
-export const TRANSCRIPT_CLASSIFIER_REVISION = 2;
+export const TRANSCRIPT_CLASSIFIER_REVISION = 3;
 
 export type TranscriptTurn = {
   role: string;
@@ -741,6 +742,21 @@ export function classifyTranscriptRow(entry: any): EntryClass | null {
 export const LOCAL_COMMAND_OUTPUT_RE = /^\s*<local-command-(stdout|stderr)>/;
 
 /**
+ * A line the local-command rule reads past when it looks for a command record's successor (72.9): input received while
+ * the model worked — a notice that opens no turn — which can be written between a built-in's record and its output.
+ */
+export function readPastForOutput(l: { kind: TranscriptTurnKind; notice?: TranscriptNotice }): boolean {
+  return l.kind === "notice" && l.notice?.opens !== true;
+}
+
+/** The index of the successor the local-command rule reads for the command record at `i`; -1 when none follows. */
+export function commandSuccessor(lines: readonly { kind: TranscriptTurnKind; notice?: TranscriptNotice }[], i: number): number {
+  let j = i + 1;
+  while (j < lines.length && readPastForOutput(lines[j]!)) j++;
+  return j < lines.length ? j : -1;
+}
+
+/**
  * Read a transcript as classified turns (62.2, CM-03). The window matches `readTranscript`'s
  * (the last N parsed entries); entries without a role or content are skipped, as there — except, since 72.4, queued
  * input (a notice) and a built-in command's `system`/`local_command` output row (kept as the record's successor).
@@ -768,11 +784,13 @@ export function readTranscriptTurns(transcriptPath: string, lastN: number = 200)
       }
     }
     // A built-in command (`/model sonnet`) is a setting change, not a task: its record is followed by
-    // local-command output. Only prompt commands (skills, custom commands) keep their arguments as a task.
-    for (let i = 0; i < turns.length - 1; i++) {
+    // local-command output, after any input received while the model worked (72.9). Only prompt commands (skills,
+    // custom commands) keep their arguments as a task.
+    for (let i = 0; i < turns.length; i++) {
       const t = turns[i]!;
-      const next = turns[i + 1]!;
-      if (t.command && (LOCAL_COMMAND_OUTPUT_RE.test(next.rendered) || next.localOutput)) {
+      const j = t.command ? commandSuccessor(turns, i) : -1;
+      const next = j >= 0 ? turns[j]! : null;
+      if (next && (LOCAL_COMMAND_OUTPUT_RE.test(next.rendered) || next.localOutput)) {
         t.kind = "meta";
         t.text = "";
         delete t.command;

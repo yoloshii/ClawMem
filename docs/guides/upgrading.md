@@ -62,6 +62,13 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.43.1: input queued between a built-in command and its output no longer makes the command a request
+
+No action needed beyond the usual upgrade of every process that shares the vault; restart `clawmem watch`. The
+transcript classifier's revision moves to 3, so, as after v0.43.0, the first processing restarts each observer
+checkpoint written by an older version, v0.43.0 included, from its range's first window (its range is not lost) and
+re-derives the handoff digest of a turn still in progress; settled work is not redone.
+
 ## v0.43.0: a turn started by a task's notice, another session or a bare command is its own turn
 
 No action needed beyond the usual upgrade of every process that shares the vault (hooks, the watcher, MCP servers,

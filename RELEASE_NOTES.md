@@ -4,6 +4,73 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.1 — input queued between a built-in command and its output no longer makes the command a request
+
+A built-in command (`/model sonnet`) is a setting change, recognised by the output that follows its record, and the
+readers looked for that output in the record's very next row. v0.43.0 began classifying input received while the
+assistant was working (a `queued_command` attachment) as a notice that opens no turn, and the PreCompact reader, which
+used to skip such rows, began reading them. When such input was written between a built-in command's record and its
+output, both readers took the command for a typed request: PreCompact could save `/model sonnet` as the last request, a
+handoff digest could take it as a turn's opening text, and the observer counted an extra turn. The Stop hooks' reader
+had read such a row as the record's successor before v0.43.0 too. In the transcripts surveyed for this fix every
+built-in command's output was the row right after its record (4,076 records), so the shape is rare.
+
+### What changed
+
+- **The local-command rule reads past queued input.** A command record's successor is the next row that is not a notice
+  opening no turn: in the PreCompact reader, and in the Stop hooks' reader within a read, at a bounded read's end and in
+  the backward scan that finds the current turn. A notice that opens a turn still ends the look, so a record it follows
+  stays a turn.
+- **A record whose successor is not written yet is held back** — the read's `next` stops before it and the queued input
+  after it — until a successor arrives, unless the caller knows the turn is over or the record is a prompt command, as a
+  record at the end of a transcript already was. This also holds where a bounded read, or a step of the backward scan
+  that finds the current turn, ends at such a record: through v0.43.0 a record whose next line was still being written
+  could be read there as a request.
+- **The transcript classifier's revision is 3**, so the observer's checkpoints and the digests of turns still in
+  progress that v0.43.0 wrote are derived again once (see Upgrading).
+- **Tests:** `tests/unit/turn-starters.test.ts`.
+- **Docs:** `docs/concepts/architecture.md` (Stop pipeline: turns), `docs/guides/upgrading.md`.
+
+### Upgrading
+
+As for v0.43.0: no action needed beyond upgrading every process that shares the vault; restart `clawmem watch`. When a
+range is next processed, an observer checkpoint written by an older version, v0.43.0 included, restarts it from its
+first window (the range is not lost), and the digest of a turn still in progress is derived again; settled work is not
+redone. See [upgrading](docs/guides/upgrading.md).
+
+### Verification
+
+Twelve new tests were written before the fix and five while it was revised; all 17 were run on v0.43.0: 11 fail, each
+for the reason its name gives, and 6 pass. The 6 guard behaviour the fix must keep: a notice that opens a turn ends the
+look for a built-in's output, a prompt command's expansion after queued input keeps the command a turn, and a record
+released by its caller or a prompt command is not held back. Three of them cover cases that earlier drafts of this fix
+got wrong, and each fails on its draft: a record that the backward scan holds back with no turn opener before it anchors
+the current turn at itself (two tests), and a complete next line larger than a read is still read whole by the backward
+scan. Sixteen mutants, each undoing one part of the fix or of the v0.43.0 behaviour it rewrote, each fail at least one
+test: the rule reading past nothing, or past a notice that opens a turn; either reader taking only the very next row;
+the trailing record taken as the read's last line only; a look that takes the first line whatever it is, or that stops
+at the first queued input; a bounded read that never holds a record back, or that keeps the input after a held-back
+record; a backward scan that does not look past a step's end, whose inner steps always release, that keeps its first
+step's anchor after a later step holds a record back, or that judges a complete next line from its first 64 KiB; the
+classifier's revision left at 2; a look that never demotes; a prompt command held back at a read's end. A seventeenth
+mutant only raises memory — the look reading a whole read's lines at a time instead of one — and passes every test, as
+expected; that bound is measured instead: on a transcript ending in 96 queued inputs of 1 MiB each, finding the current
+turn held at most 15 MiB of lines at a time (v0.43.0: 16 MiB; the first draft of this fix: 96 MiB). Full suite on Bun
+1.4.2: 3,683 pass / 0 fail across 189 files (3 todo); tsc unchanged. An earlier full run of this fix failed one timing
+test of the eval vector daemon's client deadline (`tests/hooks/eval-vector-daemon.integration.test.ts`), which this
+release does not touch; it passed 5 runs of 5 alone and in every later full run. The adversarial review cleared the fix
+at its third turn, after 3 findings, all in the backward scan that finds the current turn: two fixed and pinned by
+tests, one (its memory bound) fixed and measured as above. A fourth turn cleared these notes.
+
+### What didn't change
+
+A record followed directly by its output, a prompt command and its expansion, what opens a turn, the labels, the read
+bound and the check of a next line larger than the read. Other rows without a message (an attachment of another kind, a
+bookkeeping row) between a record and its output are still read as its successor by the Stop hooks' reader, while the
+PreCompact reader skips them; the surveyed transcripts hold none there.
+
+---
+
 ## v0.43.0 — a turn started by a task's notice, another session or a bare command is its own turn
 
 The Stop hooks and the PreCompact hook start a turn at each typed prompt. Through v0.42.0 nothing else started one: a
