@@ -817,7 +817,8 @@ A surfaced note gets `access_count + 1` when a turn it was injected into names i
 | `CLAWMEM_JUDGE_API_KEY` | (none) | **v0.29.0.** Bearer / `x-api-key` for the judge endpoint. On `anthropic`, falls back to `ANTHROPIC_API_KEY`. |
 | `CLAWMEM_JUDGE_NO_THINK` | `false` | **v0.29.0.** Append `/no_think` on the judge lane (only useful for a local Qwen-family judge on the `openai` lane). |
 | `CLAWMEM_JUDGE_STRUCTURED` | lane-specific | **v0.29.0.** Schema-constrained judge output. Default `false` on `openai` (endpoint support varies), `true` on `anthropic`/`claude-cli`. Set explicitly to override. |
-| `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
+| `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). The server must expose `/v1/rerank` (llama-server `--reranking`, oMLX, vLLM, TEI); Ollama has none, and a non-2xx reply is now logged once. |
+| `CLAWMEM_RERANK_MODEL` | (none) | Model name sent in rerank requests. Required by multi-model servers (oMLX, vLLM routers, Jina-compatible gateways); single-model llama-server ignores it. Also part of the rerank cache namespace. |
 | `CLAWMEM_RERANK_API_KEY` | (none) | Bearer token for an authenticated remote reranker endpoint. Independent of the embed and LLM keys. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
 | `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` | (superseded) | **No effect since v0.22.0** — the direct-pipeline eval this knob was gated on measured tuned weights at 1/19 hit@1; the direct vector routes rank by raw cosine instead. Still parsed for backward compatibility; setting it logs a once-per-process warning. |
