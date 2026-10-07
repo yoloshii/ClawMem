@@ -799,7 +799,7 @@ A surfaced note gets `access_count + 1` when a turn it was injected into names i
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction + link generation during indexing |
 | `CLAWMEM_ENABLE_CONSOLIDATION` | disabled | Background worker for backlog A-MEM enrichment |
 | `CLAWMEM_CONSOLIDATION_INTERVAL` | 300000 | Worker interval in ms (min 15000) |
-| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Uses llama-server (GPU or CPU) or cloud API. Falls back to in-process `node-llama-cpp` if unset. |
+| `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL (server root; a pasted `…/v1/embeddings` or `…/v1` suffix is stripped). Uses llama-server (GPU or CPU), Ollama, oMLX or a cloud API. Falls back to in-process `node-llama-cpp` if unset. `clawmem doctor` runs a live embedding round trip against it. The same suffix stripping applies to `CLAWMEM_RERANK_URL`. |
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
