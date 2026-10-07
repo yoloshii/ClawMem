@@ -396,7 +396,7 @@ This is the recommended entry point for ALL memory queries.`,
       // served — the FTS fallback's scores are not cosine, so it keeps composite scoring.
       let vectorLegServed = false;
       if (effectiveMode === "keyword") {
-        results = store.searchFTS(query, lim, undefined, undefined, undefined, excl);
+        results = store.searchFTS(query, lim, undefined, undefined, undefined, excl, { anyTermFallback: true });
       } else if (effectiveMode === "semantic" || effectiveMode === "discovery") {
         try {
           const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, lim, { excludeCollections: excl });
@@ -406,7 +406,7 @@ This is the recommended entry point for ALL memory queries.`,
         } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim, undefined, undefined, undefined, excl); }
       } else {
         // Hybrid: BM25 + vector + RRF
-        const bm25 = store.searchFTS(query, 30, undefined, undefined, undefined, excl);
+        const bm25 = store.searchFTS(query, 30, undefined, undefined, undefined, excl, { anyTermFallback: true });
         let vec: SearchResult[] = [];
         try {
           const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 30, { excludeCollections: excl });
@@ -542,7 +542,7 @@ This is the recommended entry point for ALL memory queries.`,
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
-      const results = store.searchFTS(query, limit || 10, undefined, collections, undefined, excl);
+      const results = store.searchFTS(query, limit || 10, undefined, collections, undefined, excl, { anyTermFallback: true });
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
@@ -708,7 +708,7 @@ This is the recommended entry point for ALL memory queries.`,
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
-      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl);
+      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl, { anyTermFallback: true });
       // When intent is provided, disable strong-signal bypass — the obvious BM25
       // match may not be what the caller wants (e.g. "performance" with intent "web page load times")
       const hasStrongSignal = !intent && ftsBypassEnabled() && hasStrongFtsSignal(initialFts);

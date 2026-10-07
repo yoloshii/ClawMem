@@ -1724,7 +1724,7 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean; anyTermFallback?: boolean }) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => Promise<SearchResult[]>;
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
@@ -1925,7 +1925,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean; anyTermFallback?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
     searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadline),
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
@@ -4143,12 +4143,19 @@ export function tokenizeForFTS5(query: string): string[] {
   return query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0);
 }
 
-function buildFTS5Query(query: string): string | null {
+function buildFTS5Query(query: string, joiner: "AND" | "OR" = "AND"): string | null {
   const terms = tokenizeForFTS5(query);
   if (terms.length === 0) return null;
   if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  return terms.map(t => `"${t}"*`).join(` ${joiner} `);
 }
+
+/**
+ * Weight of an any-term (OR) match relative to an every-term (AND) match. Below 1 so every
+ * AND hit outranks the OR hits it is padded with, and ≤ 0.5 so an OR-only hit can never
+ * reach the 0.85 strong-signal bar (ftsScoreFromBm25 < 1) and skip query expansion.
+ */
+const FTS_ANY_TERM_WEIGHT = 0.5;
 
 /**
  * Convert an FTS5 bm25() value into a stable [0,1) relevance score where higher is better.
@@ -4164,8 +4171,27 @@ export function ftsScoreFromBm25(bm25Score: number): number {
   return m / (1 + m);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
+/**
+ * Keyword search: every-term (AND) matches. With `opts.anyTermFallback`, when those are fewer
+ * than `limit` the rest is filled with any-term (OR) matches at FTS_ANY_TERM_WEIGHT. AND alone
+ * returns nothing for a natural-language query containing one word absent from the target,
+ * which also empties the BM25 leg of hybrid retrieval. Opt-in so causal, graph and lane
+ * candidate pools keep their every-term contract.
+ */
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean; anyTermFallback?: boolean }): SearchResult[] {
+  const everyTerm = buildFTS5Query(query, "AND");
+  const exact = searchFTSMatch(db, everyTerm, limit, collectionId, collections, dateRange, excludeCollections, opts);
+  if (!opts?.anyTermFallback || exact.length >= limit) return exact;
+  const anyTerm = buildFTS5Query(query, "OR");
+  if (!anyTerm || anyTerm === everyTerm) return exact;
+  const seen = new Set(exact.map(r => r.filepath));
+  const padding = searchFTSMatch(db, anyTerm, limit, collectionId, collections, dateRange, excludeCollections, opts)
+    .filter(r => !seen.has(r.filepath))
+    .map(r => ({ ...r, score: r.score * FTS_ANY_TERM_WEIGHT }));
+  return [...exact, ...padding].slice(0, limit);
+}
+
+function searchFTSMatch(db: Database, ftsQuery: string | null, limit: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean; anyTermFallback?: boolean }): SearchResult[] {
   if (!ftsQuery) return [];
 
   let sql = `
