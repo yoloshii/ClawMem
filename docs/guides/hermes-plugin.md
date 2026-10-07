@@ -10,12 +10,18 @@ Hermes scans two directories for memory provider plugins (since Hermes #10529, i
 2. **Bundled plugins** at `hermes-agent/plugins/memory/<name>/` — always supported. Bundled-first precedence on name collisions.
 
 ```bash
-# Preferred — user-plugin path. Copies the directory's CONTENTS, so the same command installs and upgrades
+# Recommended — one command, links $HERMES_HOME/plugins/clawmem to this install's src/hermes, so every later
+# ClawMem upgrade (npm/bun global or source checkout) reaches Hermes on its next restart with no copy step.
+# An existing copied install is moved aside (clawmem.bak-<timestamp>), never deleted.
+clawmem setup hermes            # --copy for a copied install, --remove to uninstall, --hermes-home DIR to override
+# `clawmem doctor` reports a stale copied plugin or a broken link.
+
+# Manual equivalent — user-plugin path. Copies the directory's CONTENTS, so the same command installs and upgrades
 # (`cp -r src/hermes <existing dir>` would nest a hermes/ inside it and leave the old plugin running).
 mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem"
 cp -r /path/to/ClawMem/src/hermes/. "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem/"
 
-# Or symlink for development (either path; an upgrade then needs no copy)
+# Or symlink (either path; an upgrade then needs no copy)
 ln -s /path/to/ClawMem/src/hermes "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem"
 
 # Bundled-style — only when working in the hermes-agent source tree

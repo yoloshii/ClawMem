@@ -9,6 +9,7 @@ import { tmpdir } from "os";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
+import { setupHermesPlugin, hermesPluginState } from "./hermes-setup.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
 import {
   createStore,
@@ -2452,7 +2453,8 @@ async function cmdSetup(args: string[]) {
     case "mcp": await cmdSetupMcp(args.slice(1)); break;
     case "curator": await cmdSetupCurator(args.slice(1)); break;
     case "openclaw": await cmdSetupOpenClaw(args.slice(1)); break;
-    default: die("Usage: clawmem setup <hooks|mcp|curator|openclaw> [--remove]");
+    case "hermes": await cmdSetupHermes(args.slice(1)); break;
+    default: die("Usage: clawmem setup <hooks|mcp|curator|openclaw|hermes> [--remove]");
   }
 }
 
@@ -2600,6 +2602,20 @@ async function cmdSetupMcp(args: string[]) {
 
   const { writeFileSync: wfs } = await import("fs");
   wfs(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
+}
+
+async function cmdSetupHermes(args: string[]) {
+  const homeIdx = args.indexOf("--hermes-home");
+  const result = setupHermesPlugin({
+    mode: args.includes("--remove") ? "remove" : args.includes("--copy") ? "copy" : "link",
+    hermesHome: homeIdx >= 0 ? args[homeIdx + 1] : undefined,
+    sourceDir: pathResolve(import.meta.dir, "hermes"),
+  });
+  for (const line of result.messages) console.log(line);
+  if (result.action !== "removed") {
+    console.log(`${c.dim}Activate with memory.provider: clawmem in ${result.hermesHome}/config.yaml (or 'hermes memory setup'), then restart Hermes.${c.reset}`);
+    if (result.mode === "link") console.log(`${c.dim}Linked install: future ClawMem upgrades reach Hermes on its next restart — no copy needed.${c.reset}`);
+  }
 }
 
 async function cmdSetupCurator(args: string[]) {
@@ -4244,6 +4260,18 @@ async function cmdDoctor() {
     }
   } catch {
     // openclaw CLI unavailable — skip silently
+  }
+
+  // 8b. Hermes plugin: a copied install goes stale on every ClawMem upgrade.
+  try {
+    const st = hermesPluginState(pathResolve(import.meta.dir, "hermes"));
+    if (st.kind === "linked" && st.current) console.log(`${c.green}✓${c.reset} Hermes plugin: linked to this install (${st.linkTo})`);
+    else if (st.kind === "linked") { console.log(`${c.yellow}!${c.reset} Hermes plugin: linked to a different ClawMem (${st.linkTo}) — run 'clawmem setup hermes' to point it at this one`); }
+    else if (st.kind === "broken-link") { console.log(`${c.red}✗${c.reset} Hermes plugin: broken symlink ${st.target} → ${st.linkTo} — run 'clawmem setup hermes'`); issues++; }
+    else if (st.kind === "copy" && st.current) console.log(`${c.green}✓${c.reset} Hermes plugin: copy matches this version (run 'clawmem setup hermes' to switch to a link that follows upgrades)`);
+    else if (st.kind === "copy") { console.log(`${c.red}✗${c.reset} Hermes plugin: copy at ${st.target} differs from this version — Hermes runs an older plugin. Run 'clawmem setup hermes' (links it so upgrades follow automatically)`); issues++; }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Hermes plugin: could not check (${(err as Error).message})`);
   }
 
   // 9. Reranker discrimination (active probe — asserts the reranker DISCRIMINATES, not just
