@@ -803,6 +803,7 @@ A surfaced note gets `access_count + 1` when a turn it was injected into names i
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
+| `CLAWMEM_EMBED_FORMAT` | `gemma` | Prompt wrapping before embedding: `gemma` (EmbeddingGemma task prefixes), `qwen3` (Qwen3-Embedding: instruction on queries, raw passages), `plain` (BGE-M3 and most BERT-family models). Changing it changes the vector geometry — run `clawmem embed --force`. |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM and the Stop hooks' observer. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_LLM_API_KEY` | (none) | Bearer token for an authenticated remote LLM endpoint. Independent of the embed and rerank keys. |

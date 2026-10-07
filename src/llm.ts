@@ -33,11 +33,29 @@ import { timeoutSignal, type MonoDeadline, epochNow, epochMs, monoNow, deadlineA
 // =============================================================================
 
 /**
+ * Prompt format applied around queries and documents before embedding (`CLAWMEM_EMBED_FORMAT`):
+ *   gemma (default) — EmbeddingGemma task prefixes (`task: search result | query: …`, `title: … | text: …`)
+ *   qwen3          — Qwen3-Embedding: instruction on the query side only, raw passage text
+ *   plain          — no wrapping (BGE-M3, most BERT-family models)
+ * Changing it changes the vector geometry: run `clawmem embed --force` afterwards.
+ */
+export type EmbedFormat = "gemma" | "qwen3" | "plain";
+export function embedFormat(): EmbedFormat {
+  const v = (process.env.CLAWMEM_EMBED_FORMAT || "").trim().toLowerCase();
+  return v === "qwen3" || v === "plain" ? v : "gemma";
+}
+const QWEN3_QUERY_INSTRUCTION = "Given a search query, retrieve relevant notes and passages that answer the query";
+
+/**
  * Format a query for embedding.
  * Uses task prefix format for embedding models.
  */
 export function formatQueryForEmbedding(query: string): string {
-  return `task: search result | query: ${query}`;
+  switch (embedFormat()) {
+    case "qwen3": return `Instruct: ${QWEN3_QUERY_INSTRUCTION}\nQuery: ${query}`;
+    case "plain": return query;
+    default: return `task: search result | query: ${query}`;
+  }
 }
 
 /**
@@ -45,7 +63,11 @@ export function formatQueryForEmbedding(query: string): string {
  * Uses title + text format for embedding models.
  */
 export function formatDocForEmbedding(text: string, title?: string): string {
-  return `title: ${title || "none"} | text: ${text}`;
+  switch (embedFormat()) {
+    case "qwen3":
+    case "plain": return title && title !== "none" ? `${title}\n${text}` : text;
+    default: return `title: ${title || "none"} | text: ${text}`;
+  }
 }
 
 // =============================================================================
