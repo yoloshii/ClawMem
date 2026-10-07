@@ -6,6 +6,7 @@
 import { parseArgs } from "util";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, mkdtempSync, cpSync, rmSync } from "fs";
 import { tmpdir } from "os";
+import { normalizeEndpointEnv, endpointEnvNotes } from "./endpoint-env.ts";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
@@ -4043,6 +4044,47 @@ async function cmdDoctor() {
     console.log(`${c.yellow}!${c.reset} Vector index: could not check (${(err as Error).message})`);
   }
 
+  // 3b. Endpoint configuration and a live embedding round trip. A reachable server answering the
+  //     wrong path (a URL pasted with its /v1/embeddings suffix, a port owned by another service, a
+  //     model name the server does not know) used to leave documents unembedded while every index
+  //     run reported success; the backlog line above stayed green.
+  for (const note of endpointEnvNotes) console.log(`${c.yellow}!${c.reset} Endpoint URL: ${note}`);
+  try {
+    const embedRoot = process.env.CLAWMEM_EMBED_URL?.trim();
+    const backlog = getStore().getHashesNeedingEmbedding();
+    if (!embedRoot) {
+      const local = process.env.CLAWMEM_NO_LOCAL_MODELS === "true" ? "blocked by CLAWMEM_NO_LOCAL_MODELS=true — nothing can embed" : "in-process node-llama-cpp";
+      console.log(`${process.env.CLAWMEM_NO_LOCAL_MODELS === "true" && backlog > 0 ? c.red + "✗" : c.dim + "-"}${c.reset} Embedding endpoint: CLAWMEM_EMBED_URL unset (${local})`);
+      if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true" && backlog > 0) issues++;
+    } else {
+      const model = process.env.CLAWMEM_EMBED_MODEL?.trim() || "embedding";
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (process.env.CLAWMEM_EMBED_API_KEY) headers["Authorization"] = `Bearer ${process.env.CLAWMEM_EMBED_API_KEY}`;
+      const url = `${embedRoot}/v1/embeddings`;
+      let verdict: { ok: true; dim: number } | { ok: false; why: string };
+      try {
+        const resp = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model, input: ["clawmem doctor probe"] }), signal: AbortSignal.timeout(8000) });
+        const text = await resp.text();
+        if (!resp.ok) verdict = { ok: false, why: `HTTP ${resp.status}: ${text.replace(/\s+/g, " ").slice(0, 160)}` };
+        else {
+          const dim = (JSON.parse(text) as { data?: { embedding?: unknown[] }[] }).data?.[0]?.embedding?.length ?? 0;
+          verdict = dim > 0 ? { ok: true, dim } : { ok: false, why: "200 without data[0].embedding" };
+        }
+      } catch (e) {
+        verdict = { ok: false, why: (e as Error).message };
+      }
+      if (verdict.ok) {
+        console.log(`${c.green}✓${c.reset} Embedding endpoint: ${url} model=${model} → ${verdict.dim} dims${backlog > 0 ? ` (${backlog} pending — 'clawmem embed')` : ""}`);
+      } else {
+        console.log(`${c.red}✗${c.reset} Embedding endpoint: ${url} model=${model} failed — ${verdict.why}${backlog > 0 ? `; ${backlog} document(s) cannot be embedded until this answers` : ""}`);
+        console.log(`   ${c.dim}Set CLAWMEM_EMBED_URL to the server root (http://host:port) and CLAWMEM_EMBED_MODEL to a model the server lists at /v1/models.${c.reset}`);
+        issues++;
+      }
+    }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Embedding endpoint: could not check (${(err as Error).message})`);
+  }
+
   // 4. Content types
   try {
     const s = getStore();
@@ -4847,6 +4889,8 @@ async function cmdFocus(args: string[]) {
 // =============================================================================
 
 async function main() {
+  // Endpoint roots before any module reads them (embed / rerank URLs pasted with their /v1/... path).
+  normalizeEndpointEnv();
   const args = process.argv.slice(2);
   const command = args[0];
   const subArgs = args.slice(1);
