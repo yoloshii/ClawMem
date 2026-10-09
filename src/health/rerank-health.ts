@@ -29,6 +29,23 @@ import { duration } from "../clock.ts";
 // 2.5x below the live min margin (0.64) so healthy never trips, far above the degenerate ~0.
 export const RERANK_CALIB_FLOOR = 0.05; // band: best relevant-doc score across pairs must clear this
 export const RERANK_DISCRIM_MARGIN = 0.25; // per-pair: score(relevant) - score(hardNegative) >= this
+
+/**
+ * Per-pair margin actually applied by the probe: `CLAWMEM_RERANK_DISCRIM_MARGIN` (a number in (0, 1)) or
+ * the zerank-2 default above. The default is calibrated to zerank-2's spread; rerankers that saturate
+ * scores toward the ends (Qwen3-Reranker, bge-reranker) rank correctly but can land a hard negative at
+ * 0.86 beside a relevant doc at 1.00 — a margin of 0.14 that is still a correct ordering. A lower margin
+ * keeps the guard against the degenerate regimes (inverted order, constant output, collapse to ~0) because
+ * those sit at or below zero margin. Invalid values fall back to the default and are never silent about it.
+ */
+export function rerankDiscrimMargin(raw: string | undefined = Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN): number {
+  const t = raw?.trim();
+  if (!t) return RERANK_DISCRIM_MARGIN;
+  const v = Number(t);
+  if (Number.isFinite(v) && v > 0 && v < 1) return v;
+  console.error(`[clawmem] ignoring CLAWMEM_RERANK_DISCRIM_MARGIN=${JSON.stringify(t)} (need a number in (0, 1)); using ${RERANK_DISCRIM_MARGIN}`);
+  return RERANK_DISCRIM_MARGIN;
+}
 /**
  * Per-REQUEST spread floor (BUILD-3d) — the probe margin adapted to an
  * unlabeled candidate set. The probe separates labeled relevant/hard-negative
@@ -219,7 +236,7 @@ export async function probeRerankHealth(
   } = {},
 ): Promise<RerankHealthResult> {
   const calibFloor = opts.thresholds?.calibFloor ?? RERANK_CALIB_FLOOR;
-  const discrimMargin = opts.thresholds?.discrimMargin ?? RERANK_DISCRIM_MARGIN;
+  const discrimMargin = opts.thresholds?.discrimMargin ?? rerankDiscrimMargin();
   const timeoutMs = duration(opts.timeoutMs ?? RERANK_PROBE_TIMEOUT_MS); // O1: a validated construction, not an assertion
   const model = opts.model ?? DEFAULT_RERANK_MODEL;
   const triples = opts.triples ?? loadGoldenSet();
