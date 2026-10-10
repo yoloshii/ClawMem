@@ -50,7 +50,7 @@ import {
   startHeavyMaintenanceWorker,
 } from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
-import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
+import { getEntityGraphNeighbors, searchEntities, resolveEntityQuery, CANONICAL_ENTITY_ID_RE } from "./entity.ts";
 
 // =============================================================================
 // Reranker fallback telemetry
@@ -2309,7 +2309,7 @@ This is the recommended entry point for ALL memory queries.`,
     "kg_query",
     {
       title: "Knowledge Graph Query",
-      description: "Query the knowledge graph for an entity's relationships. Returns structured facts with temporal validity (valid_from/valid_to). Use for 'what does X relate to?', 'what was true about X on date Y?', 'who/what is connected to X?'. Accepts an entity name (e.g. 'ClawMem') OR a canonical entity ID in the form 'vault:type:slug' (e.g. 'default:service:clawmem').",
+      description: "Query the knowledge graph for an entity's relationships. Returns structured facts with temporal validity (valid_from/valid_to). Use for 'what does X relate to?', 'what was true about X on date Y?', 'who/what is connected to X?'. Accepts an entity name (e.g. 'ClawMem') OR a canonical entity ID in the form 'vault:type:slug' (e.g. 'default:service:clawmem'). An exact name wins over a partial match, and when several entities share the name each one's facts are listed under its ID.",
       inputSchema: {
         entity: z.string().describe("Entity name or canonical ID ('vault:type:slug') to query"),
         as_of: z.string().optional().describe("Date filter (YYYY-MM-DD) — only facts valid at this date"),
@@ -2320,51 +2320,67 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ entity, as_of, direction, vault }) => {
       const store = getStore(vault);
 
-      // Canonical IDs look like `vault:type:slug` — accept them directly so callers
-      // that already resolved an entity can round-trip its ID without losing it to
-      // a name-search fallback that would never match.
-      const CANONICAL_ID_RE = /^[a-z][a-z0-9-]*:[a-z_]+:[a-z0-9_]+$/;
-
-      const entityResults = store.searchEntities(entity, 1);
-      let entityId: string;
-      if (entityResults.length > 0) {
-        entityId = entityResults[0]!.entity_id;
-      } else if (CANONICAL_ID_RE.test(entity)) {
-        entityId = entity; // caller passed a canonical ID directly
-      } else {
+      // 76.2: an existing canonical ID, then every entity with exactly this name, then the
+      // name search (never for an ID-shaped argument, never onto a name whose numbers differ).
+      // An ID-shaped argument that names no entity is used as given, so an ID known only from
+      // triples still round-trips.
+      const resolution = resolveEntityQuery(store.db, entity);
+      const asGiven = entity.trim();
+      const targets: { entity_id: string; name: string; type: string }[] = resolution.matches.length > 0
+        ? resolution.matches
+        : CANONICAL_ENTITY_ID_RE.test(asGiven) ? [{ entity_id: asGiven, name: asGiven, type: "" }] : [];
+      if (targets.length === 0) {
         const stats = store.getTripleStats();
         return {
           content: [{ type: "text", text: `No entity found matching "${entity}". The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current). Try a shorter/broader name, or pass a canonical ID in the form 'vault:type:slug'.` }],
         };
       }
 
-      const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction, includeProvenance: true, provenanceLimit: 5 });
+      const groups = targets.map(target => ({
+        target,
+        triples: store.queryEntityTriples(target.entity_id, { asOf: as_of, direction, includeProvenance: true, provenanceLimit: 5 }),
+      }));
       const stats = store.getTripleStats();
+      const total = groups.reduce((n, g) => n + g.triples.length, 0);
+      const plural = (n: number) => `${n} fact${n === 1 ? '' : 's'}`;
 
-      if (triples.length === 0) {
+      if (total === 0) {
         return {
-          content: [{ type: "text", text: `No knowledge graph facts found for "${entity}" (resolved to ${entityId}). The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current).` }],
+          content: [{ type: "text", text: `No knowledge graph facts found for "${entity}" (resolved to ${targets.map(t => t.entity_id).join(", ")}). The KG has ${stats.totalTriples} total triples (${stats.currentFacts} current).` }],
         };
       }
 
-      const lines = [`Knowledge graph for "${entity}" (${triples.length} fact${triples.length === 1 ? '' : 's'}):\n`];
+      const lines: string[] = [];
+      if (groups.length > 1) {
+        lines.push(`Knowledge graph for "${entity}": ${groups.length} entities share this name (${plural(total)}):`);
+      } else if (resolution.via === "name-word" || resolution.via === "name-prefix") {
+        const how = resolution.via === "name-word"
+          ? `the most-mentioned entity with a word of "${entity}" in its name`
+          : `the most-mentioned entity with a name word starting with a word of "${entity}"`;
+        lines.push(`Knowledge graph for "${entity}": no entity has that exact name, so this is "${targets[0]!.name}" [${targets[0]!.entity_id}], ${how} (${plural(total)}):\n`);
+      } else {
+        lines.push(`Knowledge graph for "${entity}" [${targets[0]!.entity_id}] (${plural(total)}):\n`);
+      }
 
-      for (const t of triples) {
-        const validity = t.current ? "current" : `ended ${t.validTo}`;
-        const from = t.validFrom ? ` (since ${t.validFrom})` : "";
-        const conf = Math.round(t.confidence * 100);
-        // Evidence summary (v0.32.0): count of UNIQUE evidence sources plus a bounded source
-        // list. Evidence with no source document renders as `unattributed`, never null/null.
-        let evidence = "";
-        const count = t.evidenceCount ?? 0;
-        if (count > 0 && t.sources && t.sources.length > 0) {
-          // Repeated paths stay repeated (same doc, different facts): the `+M more` remainder is
-          // computed from the rows actually shown, so deduping the display would misreport it.
-          const shown = t.sources.map(s => (s.docId != null && s.collection && s.path) ? `${s.collection}/${s.path}` : "unattributed");
-          const more = count - t.sources.length;
-          evidence = ` [evidence ×${count}; sources: ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}]`;
+      for (const { target, triples } of groups) {
+        if (groups.length > 1) lines.push(`\n${target.entity_id} (${target.type}, ${plural(triples.length)}):`);
+        for (const t of triples) {
+          const validity = t.current ? "current" : `ended ${t.validTo}`;
+          const from = t.validFrom ? ` (since ${t.validFrom})` : "";
+          const conf = Math.round(t.confidence * 100);
+          // Evidence summary (v0.32.0): count of UNIQUE evidence sources plus a bounded source
+          // list. Evidence with no source document renders as `unattributed`, never null/null.
+          let evidence = "";
+          const count = t.evidenceCount ?? 0;
+          if (count > 0 && t.sources && t.sources.length > 0) {
+            // Repeated paths stay repeated (same doc, different facts): the `+M more` remainder is
+            // computed from the rows actually shown, so deduping the display would misreport it.
+            const shown = t.sources.map(s => (s.docId != null && s.collection && s.path) ? `${s.collection}/${s.path}` : "unattributed");
+            const more = count - t.sources.length;
+            evidence = ` [evidence ×${count}; sources: ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}]`;
+          }
+          lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]${evidence}`);
         }
-        lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]${evidence}`);
       }
 
       return {
@@ -2373,7 +2389,13 @@ This is the recommended entry point for ALL memory queries.`,
           entity,
           direction,
           as_of: as_of ?? null,
-          facts: triples,
+          // 76.2: which step resolved the argument, and to which entities. An ID-shaped
+          // argument used as given has via "id-as-given" and an empty type.
+          resolution: {
+            via: resolution.via ?? "id-as-given",
+            entities: groups.map(g => ({ entityId: g.target.entity_id, name: g.target.name, type: g.target.type, facts: g.triples.length })),
+          },
+          facts: groups.flatMap(g => g.triples.map(t => ({ ...t, entityId: g.target.entity_id }))),
           stats,
         },
       };

@@ -80,6 +80,107 @@ function similarityRatio(a: string, b: string): number {
   return 1 - levenshtein(a, b) / maxLen;
 }
 
+/**
+ * The runs of digits in a name, in order: "Node 200" → ["200"], "v0.43.1" → ["0", "43", "1"].
+ */
+function digitRuns(name: string): string[] {
+  return name.match(/\d+/g) ?? [];
+}
+
+/**
+ * True when two names carry the same digit runs in the same order (76.1). A number in a name
+ * is usually what tells two entities apart — a VM, a port, a version, a date, a model size —
+ * and one changed digit costs a short name little similarity ("node 200" vs "node 202" = 0.875),
+ * so a fuzzy match must never join two names whose numbers differ.
+ */
+function sameDigitRuns(a: string, b: string): boolean {
+  const ra = digitRuns(a);
+  const rb = digitRuns(b);
+  return ra.length === rb.length && ra.every((run, i) => run === rb[i]);
+}
+
+/**
+ * True when every digit run of `query` appears in `name`, in order — so a partial-name lookup
+ * ("Opus 4" → "Claude Opus 4") never lands on a name with a different number ("Node 207" →
+ * "Node 202"). A query with no digits accepts any name.
+ */
+function containsDigitRuns(name: string, query: string): boolean {
+  const wanted = digitRuns(query);
+  const have = digitRuns(name);
+  let at = 0;
+  for (const run of have) {
+    if (at < wanted.length && run === wanted[at]) at++;
+  }
+  return at === wanted.length;
+}
+
+interface ExactNameRow {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+  mention_count: number | null;
+  rid: number;
+}
+
+/**
+ * Every entity named exactly `name`, ignoring case as JS folds it (76.1): an entity whose own
+ * name, trimmed and JS-lowercased, equals the argument's. SQLite's LOWER() folds ASCII letters
+ * only, so the indexed LOWER(name) lookup alone misses "Élan" for "élan", "İstanbul" for
+ * "i̇stanbul", "ⒶⒷ" for "ⓐⓑ", and "Kelvin" written with the Kelvin sign for ASCII "kelvin".
+ * Every row found below is kept only when the entity's own name, trimmed and JS-lowercased,
+ * equals the argument (writers store names untrimmed; an FTS row can hold another name that
+ * slugs to the same ID).
+ * - An argument that is not ASCII once lowercased, or holds no ASCII letter or digit, is
+ *   compared with every entity name in JS. FTS5 cannot narrow these reliably: its tokenizer
+ *   splits or drops characters JS keeps ("i̇stanbul" is one word to it, "ⓐⓑ" and "+++" none).
+ *   Such names are rare, and the prompt hook's proper nouns are ASCII words, so this scan
+ *   never runs on that path.
+ * - Any other ASCII argument: the indexed LOWER(name) lookup (an unpadded name equal up to
+ *   ASCII case), plus entities_fts asked for the argument as ONE phrase. FTS5 tokenizes ASCII
+ *   as JS does and entities_fts stores names JS-lowercased, so the phrase reaches every name
+ *   that equals the argument once trimmed and lowercased — padded, or holding the Kelvin sign.
+ * `vault` null = every vault. `rid` = the entity_nodes rowid (insertion order).
+ */
+function exactNameRows(db: Database, name: string, vault: string | null): ExactNameRow[] {
+  const trimmed = name.trim();
+  if (!trimmed) return [];
+  const lower = trimmed.toLowerCase();
+  const inVault = vault === null ? [] : [vault];
+  const rows = new Map<string, ExactNameRow>();
+  const keep = (row: ExactNameRow) => {
+    if (row.name != null && row.name.trim().toLowerCase() === lower) rows.set(row.entity_id, row);
+  };
+  for (const row of db.prepare(`
+    SELECT entity_id, name, entity_type, mention_count, rowid AS rid
+    FROM entity_nodes
+    WHERE LOWER(name) = LOWER(?)${vault === null ? "" : " AND vault = ?"}
+  `).all(trimmed, ...inVault) as ExactNameRow[]) {
+    keep(row);
+  }
+  if (/[^\x00-\x7f]/.test(lower) || !/[a-z0-9]/.test(lower)) {
+    for (const row of db.prepare(`
+      SELECT entity_id, name, entity_type, mention_count, rowid AS rid
+      FROM entity_nodes${vault === null ? "" : " WHERE vault = ?"}
+    `).all(...inVault) as ExactNameRow[]) {
+      keep(row);
+    }
+    return [...rows.values()];
+  }
+  try {
+    for (const row of db.prepare(`
+      SELECT e.entity_id, e.name, e.entity_type, e.mention_count, e.rowid AS rid
+      FROM entities_fts f
+      JOIN entity_nodes e ON e.entity_id = f.entity_id
+      WHERE entities_fts MATCH ?${vault === null ? "" : " AND e.vault = ?"}
+    `).all(`name : "${lower.replace(/"/g, '""')}"`, ...inVault) as ExactNameRow[]) {
+      keep(row);
+    }
+  } catch {
+    // no FTS table: the LOWER(name) lookup above is the whole answer
+  }
+  return [...rows.values()];
+}
+
 // =============================================================================
 // Quality Filters
 // =============================================================================
@@ -332,7 +433,8 @@ function gatherEntityFTSCandidates<T extends { entity_id: string }>(
 
 /**
  * Resolve an entity name to its canonical form.
- * Uses FTS5 candidate lookup + Levenshtein fuzzy matching.
+ * An entity with exactly this name wins first; otherwise FTS5 candidate lookup +
+ * Levenshtein fuzzy matching, where two names whose digit runs differ never match (76.1).
  *
  * Type-agnostic within compatibility buckets:
  * - person: only merges with person
@@ -356,6 +458,17 @@ export function resolveEntityCanonical(
 
   // Use lower threshold for person names (enables "Andre (Dre) Konrad" ↔ "Dre Konrad")
   const effectiveThreshold = inputBucket === 'person' ? 0.65 : threshold;
+
+  // Step 0 (76.1): an entity with exactly this name in the bucket wins outright. The FTS
+  // pass below applies its LIMIT before ranking, so a token many names share ("node" in every
+  // "Node …") can fill the pool and leave the exact row out of it. Among several exact rows in
+  // the bucket the oldest wins — a fixed choice (the old code took whichever row its unordered
+  // FTS query returned first, in practice the oldest), so every caller feeds the same row,
+  // whatever type it asks for, and a duplicate stops growing.
+  const exactInBucket = exactNameRows(db, name, vault)
+    .sort((a, b) => a.rid - b.rid)
+    .find(row => getEntityBucket(row.entity_type) === inputBucket);
+  if (exactInBucket) return exactInBucket.entity_id;
 
   // Step 1: FTS5 candidate lookup — type-agnostic, vault-scoped
   let candidates: { entity_id: string; name: string; entity_type: string }[] = [];
@@ -386,7 +499,11 @@ export function resolveEntityCanonical(
     // Reject cross-bucket matches (e.g., don't merge "Andrea" person with "Andrea" project)
     if (getEntityBucket(candidate.entity_type) !== inputBucket) continue;
 
-    const score = similarityRatio(normalizedName, candidate.name.toLowerCase());
+    const candidateName = candidate.name.toLowerCase();
+    // Reject a candidate whose numbers differ ("Node 200" is not "Node 202") — 76.1
+    if (!sameDigitRuns(normalizedName, candidateName)) continue;
+
+    const score = similarityRatio(normalizedName, candidateName);
     if (score >= effectiveThreshold && (!bestMatch || score > bestMatch.score)) {
       bestMatch = { entity_id: candidate.entity_id, score };
     }
@@ -994,4 +1111,81 @@ export function searchEntities(
       cooccurrence_count: coCount.total,
     };
   });
+}
+
+/** A canonical entity ID as `makeEntityId` writes it: `vault:type:slug`. */
+export const CANONICAL_ENTITY_ID_RE = /^[a-z][a-z0-9-]*:[a-z_]+:[a-z0-9_]+$/;
+
+export interface EntityQueryMatch {
+  entity_id: string;
+  name: string;
+  type: string;
+  mention_count: number;
+}
+
+/**
+ * Resolve an entity name or canonical ID, as `kg_query` receives it, to the entities it
+ * names (76.2). Most specific first:
+ *  1. an existing canonical ID. An ID-shaped argument that names no entity stops here with no
+ *     match — its tokens ("default", "project") would find unrelated entities, and a slug is
+ *     lossy ("C++" and "C#" both slug to `c`), so no other entity stands in for it;
+ *  2. every entity whose name equals the argument, ignoring case as JS folds it, at any
+ *     mention count — a rarely mentioned "Node 200" is never answered with a much-mentioned
+ *     "Node 202", and entities that share a name (a project and a location "Node 202") are all
+ *     returned, most mentioned first;
+ *  3. the most-mentioned entity with a word of the argument in its NAME ("name-word"); failing
+ *     that, with a name word starting with one of them ("name-prefix"). Either way a candidate
+ *     must carry the argument's digit runs, checked before any cut so a crowded pool cannot
+ *     hide the answer. Only the name column is searched: entities_fts also indexes the ID
+ *     and the type, where "default" or "project" match every entity of that vault or type.
+ * `via` names the step that answered; it is null, with no matches, when none did.
+ */
+export function resolveEntityQuery(
+  db: Database,
+  query: string
+): { via: "canonical-id" | "exact-name" | "name-word" | "name-prefix" | null; matches: EntityQueryMatch[] } {
+  type Row = { entity_id: string; name: string; entity_type: string; mention_count: number | null };
+  const toMatch = (r: Row): EntityQueryMatch =>
+    ({ entity_id: r.entity_id, name: r.name, type: r.entity_type, mention_count: r.mention_count ?? 0 });
+  const arg = query.trim();
+  if (!arg) return { via: null, matches: [] };
+
+  const byId = db.prepare(`
+    SELECT entity_id, name, entity_type, mention_count FROM entity_nodes WHERE entity_id = ?
+  `).get(arg) as Row | null;
+  if (byId) return { via: "canonical-id", matches: [toMatch(byId)] };
+  if (CANONICAL_ENTITY_ID_RE.test(arg)) return { via: null, matches: [] };
+
+  const exact = exactNameRows(db, arg, null).sort((a, b) =>
+    (b.mention_count ?? 0) - (a.mention_count ?? 0) || (a.entity_id < b.entity_id ? -1 : a.entity_id > b.entity_id ? 1 : 0));
+  if (exact.length > 0) return { via: "exact-name", matches: exact.map(toMatch) };
+
+  const argLower = arg.toLowerCase();
+  const tokens = tokenizeForFTS5(argLower);
+  if (tokens.length === 0) return { via: null, matches: [] };
+  // With no digits to check, the first row is the answer; with digits, every match is read so
+  // that the check runs before any cut.
+  const limit = digitRuns(argLower).length > 0 ? "" : "LIMIT 1";
+  const passes: { via: "name-word" | "name-prefix"; expr: string }[] = [
+    { via: "name-word", expr: tokens.map(t => `"${t}"`).join(" OR ") },
+    { via: "name-prefix", expr: tokens.map(t => `"${t}"*`).join(" OR ") },
+  ];
+  for (const pass of passes) {
+    let rows: Row[] = [];
+    try {
+      rows = db.prepare(`
+        SELECT e.entity_id, e.name, e.entity_type, e.mention_count
+        FROM entities_fts f
+        JOIN entity_nodes e ON e.entity_id = f.entity_id
+        WHERE entities_fts MATCH ?
+        ORDER BY e.mention_count DESC, e.entity_id
+        ${limit}
+      `).all(`name : (${pass.expr})`) as Row[];
+    } catch {
+      // no FTS table, or an expression FTS5 rejects: this pass has no answer
+    }
+    const hit = rows.find(r => containsDigitRuns(r.name.toLowerCase(), argLower));
+    if (hit) return { via: pass.via, matches: [toMatch(hit)] };
+  }
+  return { via: null, matches: [] };
 }

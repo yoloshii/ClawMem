@@ -36,7 +36,7 @@ Separate from `memory_relations`, the `entity_triples` table stores structured S
 
 **Provenance**: each triple's `source_doc_id` points at the persisted observation document it was extracted from. Triples for observations whose doc insert failed are naturally skipped because the extractor iterates the `ObservationWithDoc` array.
 
-Query via the `kg_query(entity)` MCP tool — accepts either an entity name (resolved via `searchEntities`) or a canonical ID in `vault:type:slug` form. This is not used by `adaptiveTraversal()` — it serves a different purpose (structured entity lookup vs document graph traversal).
+Query via the `kg_query(entity)` MCP tool — accepts either an entity name or a canonical ID in `vault:type:slug` form (resolution order: [kg_query](../reference/mcp-tools.md#kg_query)). This is not used by `adaptiveTraversal()` — it serves a different purpose (structured entity lookup vs document graph traversal).
 
 ### Edge collision
 

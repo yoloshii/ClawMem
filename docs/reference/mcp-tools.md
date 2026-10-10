@@ -396,7 +396,13 @@ Query the SPO knowledge graph for an entity's temporal relationships.
 | `direction` | enum | `both` | `outgoing`, `incoming`, or `both` |
 | `vault` | string | — | Named vault |
 
-Uses entity resolution (FTS search) first, falls back to slug normalization. Returns triples with subject, predicate, object, valid_from, valid_to, confidence, and current status.
+**Resolution (v0.43.2):** `entity` resolves through the first of these steps that finds an entity:
+
+1. **An existing canonical ID** (`vault:type:slug`). An argument shaped like an ID is never name-searched: when no entity has that ID, the argument itself is the lookup key, and any facts recorded under it are returned.
+2. **An exact name.** Every entity whose name equals the argument, ignoring letter case (non-ASCII letters included) and leading or trailing spaces. When several entities share the name, each one's facts are listed under its own ID, the most-mentioned entity first.
+3. **A name search** over entity names only, never IDs or types: the most-mentioned entity with a word of the argument in its name, failing that the most-mentioned one with a name word that starts with a word of the argument. A candidate must contain the argument's numbers in the same order, so `Node 207` never resolves to `Node 202`.
+
+Returns triples with subject, predicate, object, valid_from, valid_to, confidence, and current status. The text header names the resolved entity ID (`Knowledge graph for "X" [vault:type:slug] (N facts):`); after a name search it names the entity chosen and the step that chose it. `structuredContent.resolution` holds `via` (`canonical-id`, `exact-name`, `name-word`, `name-prefix`, or `id-as-given`) and `entities` (`entityId`, `name`, `type` and `facts` for each resolved entity; `type` is empty for an ID used as given), and every fact carries the `entityId` it is listed under.
 
 **Evidence (v0.32.0):** each fact carries `evidenceCount` — the number of UNIQUE evidence sources (distinct `(source document, source fact)` pairs; identical re-sightings collapse) — plus up to 5 `sources` of `{ docId, collection, path, fact, at }` ordered most-recent-first. Evidence with no source document renders as `unattributed`. Text output appends `[evidence ×N; sources: …]` when evidence exists.
 

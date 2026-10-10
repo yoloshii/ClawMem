@@ -162,11 +162,11 @@ Database schema migrates automatically on next startup (new tables and columns a
 After **major version updates** (e.g. 0.1.x → 0.2.0) that add new enrichment pipelines, run a full enrichment pass to backfill existing documents:
 
 ```bash
-clawmem reindex --enrich  # Full enrichment: entity extraction + links + evolution for all docs
+clawmem reindex --enrich  # Full enrichment: entity extraction (backfill) + links + evolution for all docs
 clawmem embed             # Re-embed if upgrading embedding models (not needed for most updates)
 ```
 
-`--enrich` forces the complete A-MEM pipeline (entity extraction, link generation, memory evolution) on all documents, not just new ones. Without it, reindex only refreshes metadata for existing docs.
+`--enrich` runs the complete A-MEM pipeline (entity extraction, link generation, memory evolution) on all documents, not just new ones; entity extraction inside it skips a document unchanged since its last extraction ([enrichment lifecycle](docs/internals/entity-resolution.md#enrichment-lifecycle)). Without it, reindex only refreshes metadata for existing docs.
 
 Routine patch updates (e.g. 0.2.0 → 0.2.1) do not require reindexing.
 
@@ -578,7 +578,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 |---|---|
 | `build_graphs` | Build temporal and/or semantic graphs from document corpus |
 | `find_causal_links` | Trace decision chains: "what led to X", "how we got from A to B". Follow up `intent_search` with this tool on a top result to walk the full causal chain. Traverses causes / caused_by / both up to N hops with depth-annotated reasoning. |
-| `kg_query` | Query the SPO knowledge graph: "what does X relate to?", "what was true about X when?". Returns temporal entity-relationship triples with validity windows. Accepts entity name (resolved via `searchEntities`) or canonical ID in `vault:type:slug` form. Triples are populated by the decision-extractor hook from observer-emitted `<triples>` blocks. |
+| `kg_query` | Query the SPO knowledge graph: "what does X relate to?", "what was true about X when?". Returns temporal entity-relationship triples with validity windows. Accepts an entity name or a canonical ID in `vault:type:slug` form; an exact name wins over a partial match, and entities that share the name are listed separately ([resolution](docs/reference/mcp-tools.md#kg_query)). Triples are populated by the decision-extractor hook from observer-emitted `<triples>` blocks. |
 | `memory_evolution_status` | Show how a document's A-MEM metadata evolved over time |
 | `timeline` | Show the temporal neighborhood around a document — what was created/modified before and after it. Progressive disclosure: search → timeline (context) → get (full content). Supports same-collection scoping and session correlation. |
 

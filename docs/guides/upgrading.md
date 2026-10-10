@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.41.4**.
+Guide for upgrading between released versions. Current: **v0.43.2**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -61,6 +61,31 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
 
 ---
+
+## v0.43.2: names that differ only in a number stay separate entities, and kg_query returns the named entity's facts
+
+No action needed beyond the usual upgrade of every process that shares the vault: restart `clawmem watch` (its
+stop-pipeline worker stores triples too, from the observer ranges it resumes or replays) and reconnect open agent
+sessions (`/mcp` in Claude Code) so that their MCP server's `kg_query` runs the new code. Nothing migrates.
+
+- **Links made before the upgrade stay.** A mention or a triple that an earlier version attached to an entity whose name
+  differs only in a number (facts about `Node 200` stored on `Node 202`) keeps that entity; v0.43.2 stops new ones. A
+  mention is resolved again only when its document's entities are extracted again, which `clawmem reindex --enrich` does
+  only for a document whose content changed since its last extraction ([enrichment
+  lifecycle](../internals/entity-resolution.md#enrichment-lifecycle)); triples keep the entity they were stored with. No
+  repair command ships yet.
+- **Earlier `kg_query` answers may belong to another entity.** Before v0.43.2, `kg_query` looked every argument up by
+  its words, canonical IDs included, and kept the entity with the most mentions. `default` and `project` in
+  `default:project:node_200` occur in the ID or type of almost every entity, so an ID lookup typically answered with the
+  entity mentioned most in the whole vault; a name could likewise answer with a more-mentioned entity that shared one of
+  its words.
+- **Name variants that differ in a number are now separate entities** (`Driver 590` and `Driver 590.44`), so facts about
+  one thing can sit on two entities; `kg_query` finds each by its own name.
+- **`kg_query`'s output changed** ([kg_query](../reference/mcp-tools.md#kg_query)): the header names the resolved entity
+  ID; entities that share the exact name are listed separately, each under its ID; after a name search the header says
+  which entity was chosen and how; `structuredContent` gains `resolution` and a per-fact `entityId`; and an argument
+  shaped like a canonical ID is never name-searched (with no entity of that ID, the argument is the lookup key). A
+  client that parses the header line needs updating.
 
 ## v0.43.1: input queued between a built-in command and its output no longer makes the command a request
 
@@ -1056,7 +1081,7 @@ The troubleshooting guide has the full set of diagnostic queries and the symptom
 
 **No.** v0.8.5 does not introduce new enrichment stages, so `--enrich` is not required to benefit from the fix. New Stop-hook activity from v0.8.5 onward is the cleanest source of triples.
 
-Running `--enrich` anyway is harmless but unnecessary — it will re-extract entities against the same entity cap as v0.8.3, not re-fire the decision-extractor hook. Past observation transcripts are gone (they were consumed by the Stop hook on their original session), so re-enrichment on already-persisted `_clawmem/observations/*.md` files cannot recover observations lost to the pre-v0.8.5 path-collision bug — those are permanently gone. Only future sessions generate new triples.
+Running `--enrich` anyway is harmless but unnecessary — it re-extracts entities only for documents whose content changed since their last extraction, and never re-fires the decision-extractor hook. Past observation transcripts are gone (they were consumed by the Stop hook on their original session), so re-enrichment on already-persisted `_clawmem/observations/*.md` files cannot recover observations lost to the pre-v0.8.5 path-collision bug — those are permanently gone. Only future sessions generate new triples.
 
 ### Confirming the fix is live
 
@@ -1102,14 +1127,7 @@ systemctl --user restart clawmem-watcher.service
 
 ### Do I need to re-run `clawmem reindex --enrich` to pick up the new entity cap?
 
-Only if you want previously-enriched long-form documents to re-extract entities against the new cap. A-MEM enrichment is tied to an `input_hash` of (title + body), so re-enrichment is skipped when the document content is unchanged. To force re-extraction against the new cap on already-indexed docs:
-
-```bash
-# Re-enrich all documents (LLM call per doc — expect latency on large vaults)
-clawmem reindex --enrich
-```
-
-This is purely opt-in. New and modified documents pick up the new cap automatically on their next enrichment pass — no manual step needed for those.
+No, and it cannot apply the cap to unchanged documents. Entity extraction is tied to an `input_hash` of (title + body) and is skipped while the document content is unchanged, and `clawmem reindex --enrich` honours that skip. New documents get the new cap when first indexed; a modified document gets it the next time `clawmem reindex --enrich` runs, since a content change alone refreshes only its A-MEM note ([enrichment lifecycle](../internals/entity-resolution.md#enrichment-lifecycle)).
 
 ### Do I need to rebuild graphs?
 

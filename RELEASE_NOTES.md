@@ -4,6 +4,83 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.2 — names that differ only in a number stay separate entities, and kg_query returns the named entity's facts
+
+The entity resolver joins a new name to an existing entity when the two are similar enough: a Levenshtein ratio of 0.75
+(0.65 for people). One changed digit costs a short name little — `node 200` and `node 202` score 0.875 — so a new host,
+port, version or date merged into whichever entity carrying a neighbouring number existed first, and what was later
+said about it landed there too: document mentions, and the subjects and objects of the triples `decision-extractor`
+stores. An exact name could lose as well: the FTS5 lookup that gathers the fuzzy candidates applies its 20-row limit
+before any ranking, so where many names share a word (`node` in every `Node …`) the entity carrying exactly the new name
+could be missing from the pool. The prompt hook resolves the proper nouns it finds through the same resolver, so a
+prompt naming `Node 200` could surface the facts of `Node 202`.
+
+`kg_query` resolved its argument with a word search over entity IDs, names and types, ranked by mention count and cut to
+one row. A name could answer with a more-mentioned entity that shared one word with it (`Node 200` with `Node 202`). A
+canonical ID fared worse: `default` and `project` in `default:project:node_200` occur in the ID or type of almost every
+entity, so an ID lookup typically answered with the entity mentioned most in the whole vault.
+
+### What changed
+
+- **An exact name wins first** (`resolveEntityCanonical`, `src/entity.ts`). An entity in the same bucket whose name
+  equals the new one, ignoring letter case and leading or trailing spaces, is the match before any fuzzy step; among
+  several, the oldest wins, the row the old lookup in practice chose. Case is folded as JavaScript lowercases it, and
+  SQLite's `LOWER()` folds ASCII letters only: a name that is ASCII once trimmed and lowercased and holds a letter or
+  digit is found through the `LOWER(name)` index plus one FTS5 phrase lookup, and any other name (`İstanbul`, `ⓐⓑ`,
+  `+++`) is compared with every entity name in JavaScript, since FTS5 splits or drops such characters.
+- **A fuzzy match keeps its numbers.** A candidate must hold the same runs of digits, in the same order, as the new
+  name. A variant that adds or drops a number (`Driver 590` vs `Driver 590.44`) now becomes its own entity: the rule
+  can split one thing in two, but never joins two.
+- **`kg_query` resolves the most specific way first** (`resolveEntityQuery` in `src/entity.ts`, `src/mcp.ts`): an
+  existing canonical ID; then every entity with exactly the argument's name, each listed under its own ID when several
+  share it; then a search of entity names only, by whole word and then by word start, most-mentioned first, whose answer
+  must contain the argument's numbers in order. An argument shaped like a canonical ID is never name-searched: when no
+  entity has that ID, the argument itself is the lookup key, and any facts recorded under it are returned. The text
+  header names the resolved entity ID and, after a name search, says which entity was chosen and how;
+  `structuredContent` gains `resolution` (`via` and the resolved `entities`) and a per-fact `entityId`. The tool's
+  description says that an exact name wins and that entities sharing a name are listed separately.
+- **Tests:** `tests/unit/entity.test.ts`, `tests/unit/kg-query.test.ts` (new), `tests/unit/spo-extraction.test.ts`,
+  `tests/unit/vault-facts.test.ts`.
+- **Docs:** `docs/reference/mcp-tools.md` (kg_query), `docs/internals/entity-resolution.md`,
+  `docs/internals/graph-traversal.md`, `docs/guides/upgrading.md`, `docs/troubleshooting.md`, `README.md`. Corrected on
+  the way: `reindex --enrich` was described as re-extracting every document's entities, but extraction skips a document
+  whose title and body are unchanged since its last extraction, so `--enrich` backfills new or changed documents only
+  (`docs/internals/entity-resolution.md` § Enrichment lifecycle, `README.md`, `docs/reference/cli.md`,
+  `docs/guides/inference-services.md`, `docs/guides/upgrading.md`, `docs/troubleshooting.md`).
+
+### Upgrading
+
+No action needed beyond upgrading every process that shares the vault: restart `clawmem watch` and reconnect open agent
+sessions so that their MCP servers run the new `kg_query`. Nothing migrates. Mentions and triples that an earlier
+version attached to the wrong entity keep it; no repair command ships yet. A client that parses `kg_query`'s header line
+needs updating. See [upgrading](docs/guides/upgrading.md).
+
+### Verification
+
+The fix adds 34 tests, all run on v0.43.1 with the new `resolveEntityQuery` stubbed to throw so that the files load: 31
+fail and 3 pass. 7 fail on the entity that the resolver, the triple path or the prompt hook picks, and 3 pass, guarding
+behaviour the fix keeps: names whose numbers match still resolve fuzzily, the oldest of several exact names wins, and an
+exact name in another bucket does not answer. Of the 11 that query through the MCP tool, 9 fail on the entity they
+answer with; 2, a partial name and an ordinary one, get the same facts as before and fail only on the new output (the
+header that names the chosen entity, the per-fact `entityId`). The other 13 call `resolveEntityQuery` first. Full suite:
+3,717 pass / 0 fail across 190 files (3 todo) on Bun 1.3.14 and on Bun 1.4.2; tsc unchanged. The cross-model adversarial
+pass (codex) cleared the fix at its fifth turn, after 7 findings, 4 at the first turn and 1 at each of the next three:
+the name search checked numbers only after cutting its candidate list; names that differ only in non-ASCII case missed
+the exact step (fixed over three rounds: JavaScript case folding, one FTS5 phrase, then a JavaScript comparison for
+names FTS5 tokenizes differently); a header overstated how the name search ranks; a stand-in by slug for an unknown ID
+was removed; and padded names lost the exact step. Three more turns cleared these notes and the docs, after 4 findings
+(3, then 1): the docs said that `reindex --enrich` re-extracts every document (corrected wherever it was said), an
+example merge that the candidate lookup never proposes, and an inexact summary of the exact-name lookup.
+
+### What didn't change
+
+The buckets, the 0.75 and 0.65 thresholds, entity IDs (`vault:type:slug`), the schema, and `kg_query`'s parameters, date
+and direction filters and evidence summaries. Fuzzy matching is otherwise unchanged: two names whose numbers agree still
+merge when the candidate lookup finds the existing one through a shared word and their ratio clears the bar (`Atlas API`
+and `Atlis API` score 0.889). Mentions and triples already stored keep the entity they were given (see Upgrading).
+
+---
+
 ## v0.43.1 — input queued between a built-in command and its output no longer makes the command a request
 
 A built-in command (`/model sonnet`) is a setting change, recognised by the output that follows its record, and the
@@ -3416,7 +3493,7 @@ v0.8.5 is **safe to drop in** — the fix is additive across the board and nothi
 - **Config / env vars** — zero changes.
 - **Hooks** — no `clawmem setup hooks` re-run needed. Claude Code invokes `${binPath} hook ${name}` at runtime, so upgrading the ClawMem binary alone propagates the new decision-extractor behavior.
 - **Data cleanup** — *optional*. Dead `entity_nodes.entity_type='auto'` rows and placeholder `source_fact` strings from pre-v0.8.5 runs are harmless (they never resolve via `kg_query`), but can be deleted if you want a clean slate. See the "kg_query returns empty for every entity" entry in `docs/troubleshooting.md` for the exact `sqlite3` cleanup commands and diagnostic symptoms.
-- **Retroactive re-enrichment** — *optional*. v0.8.5 does not introduce new enrichment stages, so `clawmem reindex --enrich` is NOT required. Only run it if you specifically want triple extraction to re-fire across your existing observation history — but note that past observation transcripts are gone, so re-enrichment on already-persisted `_clawmem/observations/*.md` files will not recover lost same-type-collision observations. New Stop-hook activity from v0.8.5 onward is the cleanest source of triples.
+- **Retroactive re-enrichment** — *optional*. v0.8.5 does not introduce new enrichment stages, so `clawmem reindex --enrich` is NOT required. Only run it if you specifically want triple extraction to re-fire across your existing observation history — but note that past observation transcripts are gone, so re-enrichment on already-persisted `_clawmem/observations/*.md` files will not recover lost same-type-collision observations. New Stop-hook activity from v0.8.5 onward is the cleanest source of triples. *(Correction, v0.43.2: `reindex --enrich` never runs triple extraction, and it re-extracts entities only for documents that are new or changed since their last extraction; see [enrichment lifecycle](docs/internals/entity-resolution.md#enrichment-lifecycle).)*
 
 **Confirming the fix is live** — after a real Claude Code Stop-hook-firing session, `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT source_fact FROM entity_triples ORDER BY created_at DESC LIMIT 5"` should show human-readable `subject predicate object` strings (e.g. `"ClawMem depends_on Bun"`), not JSON blobs or schema-placeholder echoes.
 

@@ -28,7 +28,7 @@ import {
   resolveEntityTypeExact,
   upsertEntity,
 } from "../../src/entity.ts";
-import { persistObservationDoc } from "../../src/hooks/decision-extractor.ts";
+import { persistObservationDoc, insertObservationTriples } from "../../src/hooks/decision-extractor.ts";
 import type { Observation } from "../../src/observer.ts";
 
 let store: Store;
@@ -623,5 +623,33 @@ describe("persistObservationDoc — multi-observation same-type collision", () =
     const obs = makeObservation({ title: "Empty", facts: [] });
     const wit = persistObservationDoc(store, obs, sessionId, dateStr, timestamp);
     expect(wit).toBeNull();
+  });
+});
+
+// =============================================================================
+// Source 76.1 — the observer's triple writer keeps names whose numbers differ apart
+// =============================================================================
+
+describe("insertObservationTriples keeps number-bearing names apart (76.1)", () => {
+  // Bug-first: a "Node 200 runs_on Driver 580" fact was stored with Node 202 as its subject and
+  // "Driver 590+" as its object (one changed digit = similarity 0.875 / 0.82).
+  it("a Node 200 fact does not land on Node 202, nor a driver 580 fact on driver 590+", () => {
+    const [docId] = seedDocuments(store, [
+      { path: "observations/node200.md", title: "Node 200 obs", body: "Node 200 runs on Driver 580" },
+    ]);
+    upsertEntity(store.db, "Node 202", "project", "default");
+    upsertEntity(store.db, "Driver 590+", "concept", "default");
+
+    insertObservationTriples(store, [], [{
+      docId: docId!,
+      facts: ["Node 200 runs on Driver 580"],
+      obsType: "decision",
+      triples: [{ subject: "Node 200", predicate: "runs_on", object: "Driver 580" }],
+    }]);
+
+    const rows = store.db.prepare(
+      `SELECT subject_entity_id, object_entity_id FROM entity_triples`
+    ).all() as { subject_entity_id: string; object_entity_id: string }[];
+    expect(rows).toEqual([{ subject_entity_id: "default:concept:node_200", object_entity_id: "default:concept:driver_580" }]);
   });
 });

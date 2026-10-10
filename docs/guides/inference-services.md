@@ -143,7 +143,7 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
   --port 8089 --host 0.0.0.0 -ngl 99 -c 8192 --batch-size 512
 ```
 
-For better entity-extraction quality during `reindex --enrich`, point `CLAWMEM_LLM_URL` at a 7B+ model or cloud API (see [../internals/entity-resolution.md](../internals/entity-resolution.md)).
+For better entity-extraction quality, point `CLAWMEM_LLM_URL` at a 7B+ model or cloud API before documents are first indexed: `reindex --enrich` does not re-extract unchanged documents (see [../internals/entity-resolution.md](../internals/entity-resolution.md#enrichment-lifecycle)).
 
 ## Contradiction judge
 

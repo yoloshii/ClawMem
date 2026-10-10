@@ -38,7 +38,7 @@ clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill
                                                # stored confidence, and embeddings are never touched)
 clawmem reindex                                # Re-scan all collections
 clawmem reindex --force                        # Re-read every file, bypassing the content-hash skip
-clawmem reindex --enrich                       # Full A-MEM pipeline on all documents
+clawmem reindex --enrich                       # Full A-MEM pipeline on all documents (entity extraction skips unchanged ones)
 clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first; since v0.41.2 a run that stores no vector never sets the geometry taint, and still exits 1 when unverified)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
 clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild (since v0.41.2 only a --force rebuild whose preflight PASSES clears the taint)

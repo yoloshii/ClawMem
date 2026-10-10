@@ -15,7 +15,9 @@ import { createMockLLM } from "../helpers/mock-llm.ts";
 import type { Store } from "../../src/store.ts";
 import {
   upsertEntity,
+  ensureEntityCanonical,
   resolveEntityCanonical,
+  resolveEntityQuery,
   recordEntityMention,
   trackCoOccurrences,
   enrichDocumentEntities,
@@ -884,5 +886,227 @@ describe("extractEntities retry-with-error-feedback (§13.1)", () => {
 
     expect(result).toEqual([]);
     expect(llm.generate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// =============================================================================
+// Source 76: names that differ only in a number, and kg_query's lookup
+// =============================================================================
+
+/** An entity row written directly (entity_nodes + entities_fts), bypassing the resolver. */
+function insertEntityRow(entityId: string, name: string, type: string, mentions: number): void {
+  store.db.prepare(
+    `INSERT INTO entity_nodes (entity_id, entity_type, name, description, created_at, mention_count, last_seen, vault)
+     VALUES (?, ?, ?, NULL, datetime('now'), ?, datetime('now'), 'default')`
+  ).run(entityId, type, name, mentions);
+  store.db.prepare(`INSERT INTO entities_fts (entity_id, name, entity_type) VALUES (?, ?, ?)`)
+    .run(entityId, name.toLowerCase(), type);
+}
+
+describe("names that differ only in a number (76.1)", () => {
+  // Bug-first: the 0.75 Levenshtein bar let one changed digit through ("node 200" vs "node 202"
+  // = 0.875), so a new VM, port, version or date merged silently into whichever entity
+  // carrying a neighbouring number existed first.
+  it("Node 200 and Node 205 do not resolve to Node 202; the triple path mints their own entities", () => {
+    const node202 = upsertEntity(store.db, "Node 202", "project", "default");
+    expect(resolveEntityCanonical(store.db, "Node 200", "project", "default")).toBeNull();
+    expect(resolveEntityCanonical(store.db, "Node 205", "concept", "default")).toBeNull();
+    const node200 = ensureEntityCanonical(store.db, "Node 200", "concept", "default");
+    expect(node200).toBe("default:concept:node_200");
+    expect(node200).not.toBe(node202);
+  });
+
+  it("a version, a port or a date never joins the entity with a neighbouring number", () => {
+    upsertEntity(store.db, "Driver 590+", "concept", "default");
+    upsertEntity(store.db, "localhost:5020", "service", "default");
+    upsertEntity(store.db, "2026-04-22", "concept", "default");
+    expect(resolveEntityCanonical(store.db, "Driver 580", "concept", "default")).toBeNull();
+    expect(resolveEntityCanonical(store.db, "localhost:5080", "service", "default")).toBeNull();
+    expect(resolveEntityCanonical(store.db, "2026-04-13", "concept", "default")).toBeNull();
+  });
+
+  it("a name whose numbers match still resolves fuzzily (spacing, punctuation)", () => {
+    const vm = upsertEntity(store.db, "Node 202", "project", "default");
+    expect(resolveEntityCanonical(store.db, "Node-202", "project", "default")).toBe(vm);
+    const cm = upsertEntity(store.db, "ClawMem", "project", "default");
+    expect(resolveEntityCanonical(store.db, "Claw Mem", "project", "default")).toBe(cm);
+  });
+
+  it("an exact name past the 20th FTS row wins over a fuzzy neighbour, whatever type the caller asks", () => {
+    // 25 "Node 1xx" rows fill the exact-token pool ("node" OR "200", LIMIT 20) before "Node 200" is
+    // reached; the old code then merged "Node 200" into "Node 100" (0.875).
+    for (let i = 0; i < 25; i++) insertEntityRow(`default:project:node_${100 + i}`, `Node ${100 + i}`, "project", 3);
+    insertEntityRow("default:project:node_200", "Node 200", "project", 0);
+    expect(resolveEntityCanonical(store.db, "Node 200", "concept", "default")).toBe("default:project:node_200");
+    // the triple path asks for "concept": it must reuse the project row, not mint a concept twin
+    expect(ensureEntityCanonical(store.db, "Node 200", "concept", "default")).toBe("default:project:node_200");
+    expect((store.db.prepare(`SELECT COUNT(*) AS n FROM entity_nodes WHERE LOWER(name) = 'node 200'`).get() as { n: number }).n).toBe(1);
+  });
+
+  it("an exact name that differs only in non-ASCII case wins past the 20th FTS row", () => {
+    // SQLite's LOWER() folds ASCII only, so "Élan" is not LOWER-equal to "élan" (Codex T1-2)
+    for (let i = 0; i < 25; i++) {
+      insertEntityRow(`default:tool:lan_part_${i}`, `Élan part ${"abcdefghijklmnopqrstuvwxy"[i]}`, "tool", 3);
+    }
+    insertEntityRow("default:tool:lan", "Élan", "tool", 0);
+    expect(resolveEntityCanonical(store.db, "élan", "concept", "default")).toBe("default:tool:lan");
+    expect(ensureEntityCanonical(store.db, "ÉLAN", "concept", "default")).toBe("default:tool:lan");
+  });
+
+  it("JS case folding past the FTS cutoff: İstanbul (a combining dot) and the Kelvin sign", () => {
+    // Codex T2: a JS tokenization split "i̇stanbul" at its combining dot (FTS5 indexes one word),
+    // and an ASCII argument skipped the lookup although "Kelvin" lowercases to ASCII
+    for (let i = 0; i < 25; i++) {
+      const s = "abcdefghijklmnopqrstuvwxy"[i];
+      insertEntityRow(`default:tool:stanbul_part_${i}`, `İstanbul part ${s}`, "tool", 3);
+      insertEntityRow(`default:tool:kelvin_part_${i}`, `kelvin part ${s}`, "tool", 3);
+    }
+    insertEntityRow("default:tool:i_stanbul", "İstanbul", "tool", 0);
+    insertEntityRow("default:tool:elvin", "Kelvin", "tool", 0);
+    expect(resolveEntityCanonical(store.db, "i̇stanbul", "concept", "default")).toBe("default:tool:i_stanbul");
+    expect(resolveEntityCanonical(store.db, "kelvin", "concept", "default")).toBe("default:tool:elvin");
+  });
+
+  it("padding never hides an exact name: ASCII spaces, Unicode spaces, a name with no letters", () => {
+    // Codex T4: names compare trimmed (writers store them untrimmed), so every lookup must reach
+    // a padded stored name before that comparison
+    insertEntityRow("default:service:postgres", " Postgres ", "service", 0);
+    insertEntityRow("default:tool:postgres_toolkit", "Postgres toolkit", "tool", 100);
+    insertEntityRow("default:tool:lan", " Élan　", "tool", 0);
+    insertEntityRow("default:concept:plusplus", " +++ ", "concept", 0);
+    expect(resolveEntityQuery(store.db, "Postgres").matches.map(m => m.entity_id)).toEqual(["default:service:postgres"]);
+    expect(resolveEntityQuery(store.db, "  postgres ").via).toBe("exact-name");
+    expect(resolveEntityQuery(store.db, "élan").matches.map(m => m.entity_id)).toEqual(["default:tool:lan"]);
+    expect(resolveEntityQuery(store.db, "+++").matches.map(m => m.entity_id)).toEqual(["default:concept:plusplus"]);
+    expect(resolveEntityCanonical(store.db, "postgres", "project", "default")).toBe("default:service:postgres");
+  });
+
+  it("among several exact names in the bucket, the oldest wins for every caller, as before", () => {
+    // what the old code did when both rows reached the pool: every path keeps feeding one row
+    insertEntityRow("default:concept:node_202", "Node 202", "concept", 0);
+    insertEntityRow("default:project:node_202", "Node 202", "project", 116);
+    expect(resolveEntityCanonical(store.db, "Node 202", "concept", "default")).toBe("default:concept:node_202");
+    expect(resolveEntityCanonical(store.db, "Node 202", "project", "default")).toBe("default:concept:node_202");
+    expect(resolveEntityCanonical(store.db, "node 202", "service", "default")).toBe("default:concept:node_202");
+  });
+
+  it("an exact name in another bucket does not answer", () => {
+    insertEntityRow("default:location:node_202", "Node 202", "location", 1);
+    expect(resolveEntityCanonical(store.db, "Node 202", "project", "default")).toBeNull();
+  });
+});
+
+describe("resolveEntityQuery (76.2)", () => {
+  beforeEach(() => {
+    insertEntityRow("default:service:clawmem", "ClawMem", "service", 500);
+    insertEntityRow("default:project:node_202", "Node 202", "project", 116);
+    insertEntityRow("default:location:node_202", "Node 202", "location", 1);
+    insertEntityRow("default:project:node_200", "Node 200", "project", 0);
+    insertEntityRow("default:concept:report_9_two_axes", "Report 9 two axes", "concept", 5);
+    insertEntityRow("default:concept:atlas_two", "Atlas Two", "concept", 0);
+  });
+
+  it("an exact name beats a much-mentioned entity sharing a token, at any mention count", () => {
+    expect(resolveEntityQuery(store.db, "Node 200")).toEqual({
+      via: "exact-name",
+      matches: [{ entity_id: "default:project:node_200", name: "Node 200", type: "project", mention_count: 0 }],
+    });
+    expect(resolveEntityQuery(store.db, "atlas two").matches.map(m => m.entity_id)).toEqual(["default:concept:atlas_two"]);
+  });
+
+  it("returns every entity that shares the exact name, most mentioned first", () => {
+    const r = resolveEntityQuery(store.db, "Node 202");
+    expect(r.via).toBe("exact-name");
+    expect(r.matches.map(m => m.entity_id)).toEqual(["default:project:node_202", "default:location:node_202"]);
+  });
+
+  it("a canonical ID resolves to itself; an unknown ID-shaped argument never reaches the name search", () => {
+    expect(resolveEntityQuery(store.db, "default:project:node_200").via).toBe("canonical-id");
+    expect(resolveEntityQuery(store.db, "default:project:node_200").matches[0]!.entity_id).toBe("default:project:node_200");
+    // its tokens ("default", "project", "node") would match ClawMem and the VMs
+    expect(resolveEntityQuery(store.db, "default:project:node_999")).toEqual({ via: null, matches: [] });
+    expect(resolveEntityQuery(store.db, "default:tool:bnu")).toEqual({ via: null, matches: [] });
+  });
+
+  it("an unknown ID is never answered by another entity that shares its slug", () => {
+    // a slug is lossy ("C++" and "C#" both slug to "c"): it does not establish identity (Codex T1-4)
+    expect(resolveEntityQuery(store.db, "default:concept:node_200")).toEqual({ via: null, matches: [] });
+    expect(resolveEntityQuery(store.db, "default:tool:node_202")).toEqual({ via: null, matches: [] });
+  });
+
+  it("an exact name that differs only in non-ASCII case beats a more-mentioned partial match", () => {
+    insertEntityRow("default:tool:lan", "Élan", "tool", 0);
+    insertEntityRow("default:tool:lan_toolkit", "Élan toolkit", "tool", 100);
+    const r = resolveEntityQuery(store.db, "élan");
+    expect(r.via).toBe("exact-name");
+    expect(r.matches.map(m => m.entity_id)).toEqual(["default:tool:lan"]);
+  });
+
+  it("JS case folding in the exact step: İstanbul beats a more-mentioned word match; the Kelvin sign answers an ASCII query", () => {
+    // Codex T2's two cases: before, "I toolkit" and "Kelvin toolkit" (100 mentions) answered
+    insertEntityRow("default:tool:i_stanbul", "İstanbul", "tool", 0);
+    insertEntityRow("default:tool:i_toolkit", "I toolkit", "tool", 100);
+    insertEntityRow("default:tool:elvin", "Kelvin", "tool", 0);
+    insertEntityRow("default:tool:kelvin_toolkit", "Kelvin toolkit", "tool", 100);
+    expect(resolveEntityQuery(store.db, "i̇stanbul")).toEqual({
+      via: "exact-name",
+      matches: [{ entity_id: "default:tool:i_stanbul", name: "İstanbul", type: "tool", mention_count: 0 }],
+    });
+    expect(resolveEntityQuery(store.db, "kelvin")).toEqual({
+      via: "exact-name",
+      matches: [{ entity_id: "default:tool:elvin", name: "Kelvin", type: "tool", mention_count: 0 }],
+    });
+  });
+
+  it("a name FTS5 makes no token of still matches exactly: circled letters fold case in JS only", () => {
+    // Codex T3: "ⒶⒷ" lowercases to "ⓐⓑ" in JS; SQLite LOWER() leaves it, and unicode61 tokenizes neither
+    insertEntityRow("default:concept:circled", "ⒶⒷ", "concept", 0);
+    expect(resolveEntityQuery(store.db, "ⓐⓑ")).toEqual({
+      via: "exact-name",
+      matches: [{ entity_id: "default:concept:circled", name: "ⒶⒷ", type: "concept", mention_count: 0 }],
+    });
+    expect(resolveEntityCanonical(store.db, "ⓐⓑ", "concept", "default")).toBe("default:concept:circled");
+  });
+
+  it("an FTS row holding another name for the same ID is not an exact name", () => {
+    // makeEntityId slugs "Élan" and "Lan" alike, so a second name's FTS row can join the first entity
+    insertEntityRow("default:tool:lan", "Lan", "tool", 5);
+    store.db.prepare(`INSERT INTO entities_fts (entity_id, name, entity_type) VALUES (?, ?, ?)`)
+      .run("default:tool:lan", "élan", "tool");
+    expect(resolveEntityQuery(store.db, "élan").via).not.toBe("exact-name");
+  });
+
+  it("the number check runs before any cut: a crowd of wrong numbers cannot hide the answer", () => {
+    // Codex T1-1: ten or more much-mentioned "Node 1xx" filled the old 10-row pool first
+    for (let i = 0; i < 12; i++) insertEntityRow(`default:project:node_${100 + i}`, `Node ${100 + i}`, "project", 50);
+    insertEntityRow("default:project:node_207_host", "Node 207 host", "project", 0);
+    const r = resolveEntityQuery(store.db, "Node 207");
+    expect(r.via).toBe("name-word");
+    expect(r.matches.map(m => m.entity_id)).toEqual(["default:project:node_207_host"]);
+  });
+
+  it("a whole-word match comes before a more-mentioned word-start match; each says which it is", () => {
+    // Codex T1-3: the search prefers whole words, so its label must say so
+    insertEntityRow("default:concept:atlasware", "Atlasware", "concept", 100);
+    const word = resolveEntityQuery(store.db, "Atlas missing");
+    expect(word.via).toBe("name-word");
+    expect(word.matches.map(m => m.entity_id)).toEqual(["default:concept:atlas_two"]);
+    const prefix = resolveEntityQuery(store.db, "Atla");
+    expect(prefix.via).toBe("name-prefix");
+    expect(prefix.matches.map(m => m.entity_id)).toEqual(["default:concept:atlasware"]);
+  });
+
+  it("the search fallback finds a partial name but never a name with a different number", () => {
+    const atlas = resolveEntityQuery(store.db, "Atlas");
+    expect(atlas.via).toBe("name-word");
+    expect(atlas.matches.map(m => m.entity_id)).toEqual(["default:concept:atlas_two"]);
+    expect(resolveEntityQuery(store.db, "Node 207")).toEqual({ via: null, matches: [] });
+    expect(resolveEntityQuery(store.db, "   ")).toEqual({ via: null, matches: [] });
+  });
+
+  it("the search reads entity names only, never the indexed ID or type columns", () => {
+    expect(resolveEntityQuery(store.db, "project")).toEqual({ via: null, matches: [] });
+    expect(resolveEntityQuery(store.db, "default")).toEqual({ via: null, matches: [] });
+    expect(resolveEntityQuery(store.db, "clawme").matches.map(m => m.entity_id)).toEqual(["default:service:clawmem"]);
   });
 });

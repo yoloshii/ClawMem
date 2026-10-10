@@ -676,3 +676,26 @@ describe("buildVaultFactsBlock", () => {
     expect(out!.split(" uses ").length - 1).toBe(1);
   });
 });
+
+// =============================================================================
+// Source 76.1 — path (b)'s ensureEntityCanonical with a starved exact row
+// =============================================================================
+
+describe("extractPromptEntities path (b) with the exact row past the FTS pool (76.1)", () => {
+  // Bug-first: path (b) confirms an exact name, then resolves it through ensureEntityCanonical,
+  // whose FTS pool (LIMIT 20) can miss the exact row; a fuzzy neighbour then answered instead.
+  it("an exact proper noun is not answered by a fuzzy neighbour that shares its token", () => {
+    const store = createTestStore();
+    // "ClawMem X" (0.78 to "clawmem") and 24 fillers fill the exact-token pool before the
+    // exact row, which is written last.
+    seedEntity(store, "default:project:clawmem_x", "ClawMem X", "project");
+    for (let i = 0; i < 24; i++) {
+      seedEntity(store, `default:project:clawmem_part_${i}`, `ClawMem Part ${"abcdefghijklmnopqrstuvwx"[i]}`, "project");
+    }
+    seedEntity(store, "default:project:clawmem", "ClawMem", "project");
+
+    const ids = extractPromptEntities("please check ClawMem status", store.db).map(e => e.entityId);
+    expect(ids).toContain("default:project:clawmem");
+    expect(ids).not.toContain("default:project:clawmem_x");
+  });
+});
