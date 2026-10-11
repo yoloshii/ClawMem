@@ -5249,7 +5249,8 @@ export function rerankIdentityState(kind: "remote" | "local", model: string, db?
     const ns = `local:${model}#score-rev${LOCAL_RERANK_SCORE_REV}`;
     return { namespace: ns, token: ns };
   }
-  const url = Bun.env.CLAWMEM_RERANK_URL?.trim() || "unset";
+  const servedModel = Bun.env.CLAWMEM_RERANK_MODEL?.trim();
+  const url = (Bun.env.CLAWMEM_RERANK_URL?.trim() || "unset") + (servedModel ? `#model=${servedModel}` : "");
   if (!db) return { namespace: null, token: `no-db:${url}` };
   // ONE SNAPSHOT (codex turn-38): generation, tombstone and fingerprint are
   // read by a SINGLE query. Reading them separately left a window in which a
@@ -5507,6 +5508,23 @@ export class RerankMalformedResponseError extends Error {
   }
 }
 
+const _rerankHttpWarned = new Set<string>();
+/**
+ * Name a non-2xx reranker reply once per process instead of falling back silently. A 404/405 almost
+ * always means the server has no rerank route at all — Ollama, for one, serves no /v1/rerank.
+ */
+function warnRerankHttpOnce(url: string, status: number): void {
+  const key = `${url}#${status}`;
+  if (_rerankHttpWarned.has(key)) return;
+  _rerankHttpWarned.add(key);
+  const hint = status === 404 || status === 405
+    ? " — this server has no rerank route (Ollama serves none); point CLAWMEM_RERANK_URL at llama-server --reranking, oMLX, vLLM or TEI"
+    : status === 400 || status === 422
+      ? " — the server rejected the request; a multi-model server needs CLAWMEM_RERANK_MODEL"
+      : "";
+  console.error(`[clawmem] reranker ${url}/v1/rerank answered HTTP ${status}${hint}; falling back to the local reranker`);
+}
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, options?: RerankProbeOptions): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
@@ -5608,6 +5626,9 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocs.length > 0) {
     const rerankUrl = Bun.env.CLAWMEM_RERANK_URL;
     const rerankApiKey = Bun.env.CLAWMEM_RERANK_API_KEY;
+    // Multi-model servers (oMLX, vLLM, TEI routers, Jina-compatible gateways) need the model named
+    // in the request; single-model llama-server ignores the field.
+    const rerankModelName = Bun.env.CLAWMEM_RERANK_MODEL?.trim();
     let scored = false;
 
     // Try remote GPU reranker first
@@ -5630,6 +5651,7 @@ export async function rerank(query: string, documents: { file: string; text: str
             method: "POST",
             headers: rerankHeaders,
             body: JSON.stringify({
+              ...(rerankModelName ? { model: rerankModelName } : {}),
               query: rerankQuery,
               documents: batch.map(d => rerankTransmittedText(d.text)),
             }),
@@ -5685,6 +5707,7 @@ export async function rerank(query: string, documents: { file: string; text: str
               for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
             }
           } else {
+            warnRerankHttpOnce(rerankUrl, resp.status);
             break; // Remote failed mid-batch, fall through to local
           }
         }
