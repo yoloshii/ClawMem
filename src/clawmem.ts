@@ -5884,6 +5884,7 @@ async function stopPipelineVaults(): Promise<{ name: string; store: StoreType; g
 async function cmdRepair(args: string[]) {
   const sub = args[0];
   const rest = args.slice(1);
+  if (sub === "entities") return cmdRepairEntities(rest);
   if (sub === "counters") {
     const { values } = parseArgs({
       args: rest,
@@ -5991,7 +5992,172 @@ async function cmdRepair(args: string[]) {
     console.log(`quarantined ranges ${h.stopRetries.count} (unavailable ${h.unavailableRanges}) · feedback pending ${h.feedbackPending.count} (keyless ${h.keylessPending}), provisional ${h.feedbackProvisional.count} · judge deferred ${h.judgeDeferred.count} · handoff renders ${h.handoffRenders.count} · causal runnable ${h.causalRunnable}, waiting on mode off ${h.causalWaitingOff}`);
     return;
   }
-  die("Usage: clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]\n       clawmem repair stop-queue [--retry-now <id[,id…]|held> [--limit N]] [--run] [--dismiss <id>] [--dismiss-causal]");
+  die("Usage: clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]\n       clawmem repair stop-queue [--retry-now <id[,id…]|held> [--limit N]] [--run] [--dismiss <id>] [--dismiss-causal]\n       clawmem repair entities [--vault <name>] [--apply [--expect <digest>]] [--restore <op>] [--json]");
+}
+
+// 76.3: `clawmem repair entities` — entity links written before the v0.43.2 resolver fix. Every vault is opened as a raw
+// SQLite handle (no store init: no schema work, no backfill); the dry run opens each one readonly.
+async function cmdRepairEntities(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: { vault: { type: "string" }, apply: { type: "boolean" }, expect: { type: "string" }, restore: { type: "string" }, json: { type: "boolean" } },
+    allowPositionals: false,
+  });
+  if ((values.apply || values.restore) && !values.vault) die("--apply and --restore act on one vault: add --vault <name> (the dry run lists each vault's name)");
+  if (values.apply && values.restore) die("--apply and --restore cannot be combined");
+  if (values.expect !== undefined && !values.apply) die("--expect goes with --apply");
+  const { Database } = await import("bun:sqlite");
+  const { realpathSync } = await import("fs");
+  const { listVaults, getVaultPath } = await import("./config.ts");
+  const repair = await import("./entity-repair.ts");
+  // One entry per database file: a configured name for a file already listed is an alias of that entry. A configured
+  // name always reaches its own file, as resolveStore does: the default index is "general" unless a configured vault on
+  // another file has that name, and then "default-index" (or the first such name no configured vault takes).
+  const fileOf = (p: string) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return pathResolve(p);
+    }
+  };
+  const defaultPath = getDefaultDbPath();
+  const configured = listVaults().flatMap(name => {
+    const path = getVaultPath(name);
+    return path ? [{ name, path }] : [];
+  });
+  const elsewhere = new Set(configured.filter(v => fileOf(v.path) !== fileOf(defaultPath)).map(v => v.name));
+  let defaultName = "general";
+  if (elsewhere.has(defaultName)) {
+    defaultName = "default-index";
+    for (let n = 2; elsewhere.has(defaultName); n++) defaultName = `default-index-${n}`;
+  }
+  const vaults: { name: string; aliases: string[]; path: string }[] = [{ name: defaultName, aliases: [], path: defaultPath }];
+  for (const { name, path } of configured) {
+    const listed = vaults.find(v => fileOf(v.path) === fileOf(path));
+    if (listed) {
+      if (name !== listed.name) listed.aliases.push(name);
+      continue;
+    }
+    vaults.push({ name, aliases: [], path });
+  }
+  const chosen = values.vault === undefined ? vaults : vaults.filter(v => v.name === values.vault || v.aliases.includes(values.vault!));
+  if (chosen.length === 0) die(`Unknown vault: "${values.vault}" (known: ${vaults.flatMap(v => [v.name, ...v.aliases]).join(", ")})`);
+  const refused = (name: string, err: unknown) => {
+    if (!(err instanceof repair.EntityRepairRefusal)) throw err;
+    if (values.json) console.log(JSON.stringify({ vault: name, refused: err.message }));
+    else console.log(`${c.red}✗${c.reset} ${name}: refused — ${err.message}`);
+    process.exitCode = 1;
+  };
+
+  if (values.restore !== undefined || values.apply) {
+    const v = chosen[0]!;
+    if (!existsSync(v.path)) die(`vault ${v.name}: no database at ${v.path}`);
+    const db = new Database(v.path, { readwrite: true, create: false });
+    try {
+      if (values.restore !== undefined) {
+        const r = repair.restoreEntityRepair(db, values.restore);
+        if (values.json) console.log(JSON.stringify({ vault: v.name, ...r }));
+        else {
+          console.log(`${v.name}: op ${r.opId} — restored ${r.restored.length} component(s), kept ${r.kept.length}; minted entities removed ${r.mintsDeleted.length}, kept ${r.mintsKept.length} (still referenced); added links left in place ${r.edgesKept}`);
+          for (const k of r.kept) console.log(`  ${c.yellow}kept${c.reset} ${k.comp}: ${k.why}`);
+        }
+        if (r.kept.length > 0) process.exitCode = 1;
+        return;
+      }
+      const r = repair.applyEntityRepair(db, { expect: values.expect });
+      if (values.json) console.log(JSON.stringify({ vault: v.name, opId: r.opId, written: r.written, newTriples: r.newTriples, plan: entityPlanJson(r.plan) }));
+      else {
+        printEntityPlan(v.name, r.plan, "applied", r.newTriples);
+        const w = r.written;
+        console.log(`${v.name}: applied op ${r.opId} — ${w.mints} entities minted; triples ${w.triplesUpdated} updated, ${w.triplesInserted} added, ${w.triplesDeleted} removed; evidence ${w.evidenceMoved} moved, ${w.evidenceDeleted} collapsed; ${w.mentionsMoved} mentions moved; ${w.edgesAdded} links added`);
+        console.log(`${c.dim}Undo: clawmem repair entities --restore ${r.opId} --vault ${v.name}${c.reset}`);
+      }
+    } catch (err) {
+      refused(v.name, err);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  const json: unknown[] = [];
+  for (const v of chosen) {
+    if (!existsSync(v.path)) {
+      if (values.json) json.push({ vault: v.name, missing: true });
+      else console.log(`${c.dim}${v.name}: no database at ${v.path} — skipped${c.reset}`);
+      continue;
+    }
+    try {
+      const plan = repair.dryRunEntityRepair(v.path);
+      if (values.json) json.push({ vault: v.name, ...(v.aliases.length > 0 ? { aliases: v.aliases } : {}), plan: entityPlanJson(plan) });
+      else printEntityPlan(v.name, plan, "planned");
+    } catch (err) {
+      if (values.json && err instanceof repair.EntityRepairRefusal) {
+        json.push({ vault: v.name, refused: err.message });
+        process.exitCode = 1;
+      } else refused(v.name, err);
+    }
+  }
+  if (values.json) console.log(JSON.stringify({ vaults: json }));
+  else console.log(`${c.dim}Dry run: nothing written. Apply one vault with --apply --vault <name> --expect <digest>; undo an apply with --restore <op> --vault <name>.${c.reset}`);
+}
+
+function entityPlanJson(p: import("./entity-repair.ts").EntityRepairPlan) {
+  return {
+    digest: p.digest,
+    runs: p.runs,
+    counts: p.counts,
+    holds: p.holds.map(([owner, reason]) => ({ owner, reason })),
+    answers: p.answers.map(a => ({ key: a.item.key, surface: a.item.surface, class: a.item.cls, from: a.item.linked, to: a.to, minted: a.minted, fuzzy: a.fuzzy })),
+    mints: p.mints,
+    triples: p.groups.map(g => ({ action: g.action, survivor: g.survivor, members: g.members, origins: g.origins, key: g.key, evidence: g.evidence })),
+    deletedTriples: p.deletedTriples.map(d => d.id),
+    mentions: p.mentionDocs.map(d => ({ doc: d.doc, moves: d.moves, mayAlsoMention: d.mayAlsoMention })),
+    edges: p.edges,
+    staleEdges: p.staleEdges,
+  };
+}
+
+function printEntityPlan(
+  name: string,
+  p: import("./entity-repair.ts").EntityRepairPlan,
+  verb: "planned" | "applied",
+  newTriples: { group: number; id: number }[] = [],
+) {
+  const k = p.counts;
+  const left = k.r3 === null ? "" : `; left alone: R3 ${k.r3} (same-name duplicates), R4 ${k.r4} (type drift and other)`;
+  console.log(`${c.bold}${name}${c.reset}: links acted on R1 ${k.r1} (digits differ), R2 ${k.r2} (another exact name), held ${k.held}${left}; triples touched ${k.triplesTouched}; unparseable facts ${k.unparseable}`);
+  const holdCounts = new Map<string, number>();
+  for (const [, why] of p.holds) holdCounts.set(why, (holdCounts.get(why) ?? 0) + 1);
+  if (holdCounts.size > 0) console.log(`  held: ${[...holdCounts].map(([why, n]) => `${why} ${n}`).join(", ")}`);
+  for (const [owner, why] of p.holds) {
+    const what = owner.startsWith("T") ? `triple #${owner.slice(1)}` : `doc ${owner.slice(1, owner.indexOf(":"))}: mention ${owner.slice(owner.indexOf(":") + 1)}`;
+    console.log(`  ${c.dim}held ${what} — ${why}${c.reset}`);
+  }
+  console.log(`  digest ${p.digest}`);
+  for (const m of p.mints) console.log(`  ${verb === "planned" ? "mint" : "minted"} ${m.id} ("${m.name}", ${m.type})`);
+  p.groups.forEach((g, i) => {
+    const fresh = newTriples.find(n => n.group === i)?.id;
+    const what = g.action === "keep" ? `keep #${g.survivor}` : g.action === "repoint" ? `re-point #${g.survivor}` : g.action === "merge" ? `merge into #${g.survivor}` : fresh !== undefined ? `new #${fresh}` : "new";
+    const from = g.members.filter(id => id !== g.survivor);
+    const collapsed = g.evidence.filter(e => !e.keep).length;
+    // each moving triple's endpoints, old → new (a merge carrier keeps its own)
+    const ends = g.origins.filter(o => g.action !== "merge" || o.id !== g.survivor).map(o => {
+      const subject = o.subject === g.key[0] ? `subject ${o.subject}` : `subject ${o.subject} → ${g.key[0]}`;
+      const object = g.key[2] === null ? `literal ${JSON.stringify(g.key[3])}` : o.object === g.key[2] ? `object ${o.object}` : `object ${o.object} → ${g.key[2]}`;
+      return `#${o.id} ${subject}, ${object}`;
+    });
+    console.log(`  triple ${what}${from.length > 0 ? ` from #${from.join(", #")}` : ""} (${g.key[1]}): ${ends.join("; ")}${collapsed > 0 ? ` (${collapsed} equal evidence row(s) collapsed)` : ""}`);
+  });
+  for (const d of p.deletedTriples) console.log(`  triple #${d.id} removed (all its evidence moved)`);
+  for (const d of p.mentionDocs) {
+    for (const m of d.moves) console.log(`  doc ${d.doc}: mention ${m.from} → ${m.to}${m.toMint ? " (new entity)" : ""}${m.fuzzy ? " (fuzzy)" : ""}`);
+    for (const e of d.mayAlsoMention) console.log(`  ${c.dim}doc ${d.doc} may also mention ${e} (its text still names it; the mention moved anyway)${c.reset}`);
+  }
+  for (const e of p.edges) console.log(`  link ${e.source} → ${e.target} via ${e.entity} (weight ${e.weight.toFixed(3)}${verb === "planned" ? " as of now" : ""})`);
+  for (const s of p.staleEdges) {
+    console.log(`  ${c.dim}stale link ${s.source} → ${s.target} (records ${s.entity}): ${s.stillShared.length > 0 ? `the documents still share ${s.stillShared.join(", ")}` : "no remaining shared entity"} — kept${c.reset}`);
+  }
 }
 
 async function cmdRecover(args: string[]) {
@@ -6067,6 +6233,10 @@ ${c.bold}Lifecycle:${c.reset}
   clawmem lifecycle restore --query Q  Restore archived docs by keyword
   clawmem lifecycle restore --collection N  Restore by collection
   clawmem lifecycle restore --all      Restore all archived docs
+
+${c.bold}Repair:${c.reset}
+  clawmem repair entities [--vault <name>] [--apply [--expect <digest>]] [--restore <op>] [--json]
+                                       Fix entity links written before v0.43.2's resolver fix (dry run without --apply)
 
 ${c.bold}Stop pipeline:${c.reset}
   clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]

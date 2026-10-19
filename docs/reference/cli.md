@@ -192,6 +192,32 @@ on any path** (v0.30.0) — `purge_after_days` is inert, and a sweep that sees i
 says so. To reclaim disk space, act on the SQLite file out-of-band; that is deliberately
 outside ClawMem's mutation contract.
 
+## Entity repair (v0.43.4)
+
+```bash
+clawmem repair entities                                      # Dry run: per vault, what would change (nothing written)
+clawmem repair entities --vault <name> --json                # One vault, as one JSON object
+clawmem repair entities --vault <name> --apply --expect <digest>   # Write the plan whose digest you reviewed
+clawmem repair entities --vault <name> --restore <op>        # Undo an apply's groups that nothing changed since
+```
+
+Moves the mentions and triple endpoints that a resolver before v0.43.2 attached to the wrong entity: a name whose
+numbers differ from the linked entity's (R1), or that names another entity exactly (R2). Same-name duplicates (R3) and
+other differences (R4) are counted and left. The dry run lists the links acted on per class, how many triples and
+mentions are held, every planned change (each triple's endpoints, old → new), the held links with their reasons, and a
+plan digest. `--apply` plans again under the write lock; with `--expect <digest>` it writes only when the vault still
+plans to that digest (edge weights are not in it), and without it, whatever it plans then. It prints the changes it
+wrote with the id each new triple got (the R3 and R4 counts only in the dry run), and records every change in
+`entity_repair_log` under the op id it prints. `--apply` and `--restore` need `--vault`.
+The vaults are the default index and each configured vault, one per database file; another name configured for a
+file already listed selects that vault. The default index is named `general`, or `default-index` when a configured
+vault on another file has that name (`default-index-2` and up when that name is configured for another file too), so
+`--vault general` reaches the vault your config calls `general`. The command opens vault files directly and
+initializes no store. Exit 1 when an apply or restore is refused, or a restore keeps a group because something
+changed it since or undoing it would put back a second open triple on one subject, predicate and object.
+Details: [Repairing links made before
+v0.43.2](../internals/entity-resolution.md#repairing-links-made-before-v0432).
+
 ## Stop pipeline (v0.41.0)
 
 ```bash

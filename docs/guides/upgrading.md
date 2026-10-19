@@ -62,6 +62,29 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.43.4: `clawmem repair entities` moves the entity links made before v0.43.2
+
+No action is needed to upgrade: nothing migrates, and the new command changes a vault only when you run it with
+`--apply` or `--restore`. Restart `clawmem watch` and reconnect open agent sessions as usual.
+
+To repair the links an earlier resolver attached to the wrong entity (see the v0.43.2 entry below):
+
+1. `clawmem repair entities` — a dry run over every vault. Read each vault's planned changes and holds, and note its
+   plan digest. Nothing is written.
+2. `clawmem repair entities --vault <name> --apply --expect <digest>` — one vault at a time. If the vault no longer plans
+   to that digest (new facts about the same entities, a document naming a newly shared entity), nothing is written;
+   run the dry run again.
+3. Keep the op id it prints. `clawmem repair entities --vault <name> --restore <op>` reverses each group of the apply
+   whose logged triples and evidence rows, or whose document's whole set of mentions, still match the apply, unless
+   undoing it would put back a second open triple on one subject, predicate and object. Counts reverse by their
+   difference; edges the repair added, and created entities still in use, stay.
+
+The command names the default index `general`, or `default-index` when your config names a vault `general` on another
+database file (`default-index-2` and up when that name is configured for another file too); the dry run prints each
+vault's name. The first apply creates the `entity_repair_log` table in that
+vault. Details: [Repairing links made before
+v0.43.2](../internals/entity-resolution.md#repairing-links-made-before-v0432).
+
 ## v0.43.3: an index pass waits for the write lock instead of failing with `database is locked`
 
 No action needed beyond the usual upgrade of every process that indexes the vault: restart `clawmem watch` and any
@@ -90,8 +113,8 @@ sessions (`/mcp` in Claude Code) so that their MCP server's `kg_query` runs the 
   differs only in a number (facts about `Node 200` stored on `Node 202`) keeps that entity; v0.43.2 stops new ones. A
   mention is resolved again only when its document's entities are extracted again, which `clawmem reindex --enrich` does
   only for a document whose content changed since its last extraction ([enrichment
-  lifecycle](../internals/entity-resolution.md#enrichment-lifecycle)); triples keep the entity they were stored with. No
-  repair command ships yet.
+  lifecycle](../internals/entity-resolution.md#enrichment-lifecycle)); triples keep the entity they were stored with.
+  v0.43.4 adds the repair: [`clawmem repair entities`](#v0434-clawmem-repair-entities-moves-the-entity-links-made-before-v0432).
 - **Earlier `kg_query` answers may belong to another entity.** Before v0.43.2, `kg_query` looked every argument up by
   its words, canonical IDs included, and kept the entity with the most mentions. `default` and `project` in
   `default:project:node_200` occur in the ID or type of almost every entity, so an ID lookup typically answered with the

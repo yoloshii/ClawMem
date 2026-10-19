@@ -74,7 +74,7 @@ function levenshtein(a: string, b: string): number {
  * Normalized similarity ratio (0.0 = no match, 1.0 = exact match).
  * Equivalent to Python's SequenceMatcher.ratio().
  */
-function similarityRatio(a: string, b: string): number {
+export function similarityRatio(a: string, b: string): number {
   const maxLen = Math.max(a.length, b.length);
   if (maxLen === 0) return 1.0;
   return 1 - levenshtein(a, b) / maxLen;
@@ -83,7 +83,7 @@ function similarityRatio(a: string, b: string): number {
 /**
  * The runs of digits in a name, in order: "Node 200" → ["200"], "v0.43.1" → ["0", "43", "1"].
  */
-function digitRuns(name: string): string[] {
+export function digitRuns(name: string): string[] {
   return name.match(/\d+/g) ?? [];
 }
 
@@ -93,7 +93,7 @@ function digitRuns(name: string): string[] {
  * and one changed digit costs a short name little similarity ("node 200" vs "node 202" = 0.875),
  * so a fuzzy match must never join two names whose numbers differ.
  */
-function sameDigitRuns(a: string, b: string): boolean {
+export function sameDigitRuns(a: string, b: string): boolean {
   const ra = digitRuns(a);
   const rb = digitRuns(b);
   return ra.length === rb.length && ra.every((run, i) => run === rb[i]);
@@ -114,7 +114,7 @@ function containsDigitRuns(name: string, query: string): boolean {
   return at === wanted.length;
 }
 
-interface ExactNameRow {
+export interface ExactNameRow {
   entity_id: string;
   name: string;
   entity_type: string;
@@ -141,7 +141,7 @@ interface ExactNameRow {
  *   that equals the argument once trimmed and lowercased — padded, or holding the Kelvin sign.
  * `vault` null = every vault. `rid` = the entity_nodes rowid (insertion order).
  */
-function exactNameRows(db: Database, name: string, vault: string | null): ExactNameRow[] {
+export function exactNameRows(db: Database, name: string, vault: string | null): ExactNameRow[] {
   const trimmed = name.trim();
   if (!trimmed) return [];
   const lower = trimmed.toLowerCase();
@@ -248,7 +248,7 @@ const ENTITY_BUCKETS: Record<string, string> = {
   concept: 'tech',
 };
 
-function getEntityBucket(type: string): string {
+export function getEntityBucket(type: string): string {
   return ENTITY_BUCKETS[type] ?? type; // unknown types form their own bucket
 }
 
@@ -260,7 +260,7 @@ function getEntityBucket(type: string): string {
  * Generate a stable entity ID from name, type, and vault.
  * Vault-qualified to prevent cross-vault entity merges.
  */
-function makeEntityId(name: string, type: string, vault: string = 'default'): string {
+export function makeEntityId(name: string, type: string, vault: string = 'default'): string {
   const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
   return `${vault}:${type}:${normalized}`;
 }
@@ -870,63 +870,8 @@ export async function enrichDocumentEntities(
       const uniqueResolvedIds = [...new Set(resolvedIds)];
       trackCoOccurrences(db, uniqueResolvedIds);
 
-      // Step 5: Create entity edges with IDF-based specificity scoring
-      // Rare entities justify edges; ubiquitous entities alone cannot
-      const totalDocs = (db.prepare(`SELECT COUNT(*) as cnt FROM documents WHERE active = 1`).get() as { cnt: number }).cnt;
-
-      // Collect candidate target docs and their shared entities.
-      // BL-001 residual: candidates are ACTIVE docs only — edges must never
-      // target archived documents.
-      const targetEntityMap = new Map<number, string[]>(); // docId → [entityIds]
-      for (const entityId of resolvedIds) {
-        const otherDocs = db.prepare(`
-          SELECT em.doc_id FROM entity_mentions em
-          JOIN documents d ON d.id = em.doc_id
-          WHERE em.entity_id = ? AND em.doc_id != ? AND d.active = 1 AND ${notLegacyArtifactSql("d")}
-          LIMIT 20
-        `).all(entityId, docId) as { doc_id: number }[];
-
-        for (const other of otherDocs) {
-          const existing = targetEntityMap.get(other.doc_id) || [];
-          existing.push(entityId);
-          targetEntityMap.set(other.doc_id, existing);
-        }
-      }
-
-      // Compute IDF per entity (cache for this enrichment).
-      // BL-001 residual: totalDocs above is active-only, so doc_freq must be
-      // active-only too — an all-docs denominator lets archived history deflate
-      // specificity (IDF can even go negative), suppressing edges for entities
-      // that are specific among the LIVE corpus.
-      const entityIdf = new Map<string, number>();
-      for (const entityId of resolvedIds) {
-        if (!entityIdf.has(entityId)) {
-          const docFreq = (db.prepare(
-            `SELECT COUNT(DISTINCT em.doc_id) as cnt FROM entity_mentions em
-             JOIN documents d ON d.id = em.doc_id
-             WHERE em.entity_id = ? AND d.active = 1`
-          ).get(entityId) as { cnt: number }).cnt;
-          entityIdf.set(entityId, Math.log((totalDocs + 1) / (docFreq + 1)));
-        }
-      }
-
-      // Create edges only when max entity IDF exceeds threshold
-      for (const [targetDocId, sharedEntities] of targetEntityMap) {
-        const maxIdf = Math.max(...sharedEntities.map(eid => entityIdf.get(eid) || 0));
-        if (maxIdf < ENTITY_IDF_SPECIFICITY_THRESHOLD) continue; // Skip — only ubiquitous entities shared
-
-        // Weight: IDF specificity + shared-count bonus (multi-entity overlap outranks single)
-        const sharedBonus = Math.min(0.15, 0.05 * (sharedEntities.length - 1));
-        const weight = Math.min(1.0, 0.3 + 0.12 * maxIdf + sharedBonus);
-        const bestEntity = sharedEntities.reduce((best, eid) =>
-          (entityIdf.get(eid) || 0) > (entityIdf.get(best) || 0) ? eid : best
-        );
-
-        db.prepare(`
-          INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
-          VALUES (?, ?, 'entity', ?, ?, datetime('now'))
-        `).run(docId, targetDocId, weight, JSON.stringify({ entity: bestEntity, shared: sharedEntities.length }));
-      }
+      // Step 5: Create entity edges with IDF-based specificity scoring (computeEntityEdges)
+      for (const edge of computeEntityEdges(db, docId, resolvedIds)) writeEntityEdge(db, docId, edge);
 
       // Persist enrichment state LAST — only after all derived data written
       db.prepare(`
@@ -948,6 +893,89 @@ export async function enrichDocumentEntities(
 }
 
 // =============================================================================
+// Entity edges (enrichment Step 5)
+// =============================================================================
+
+/** One `entity` edge as enrichment computes it for a source document. */
+export interface EntityEdge {
+  targetDocId: number;
+  /** The source's entities whose candidates reached the target, in the source's entity order. */
+  sharedEntities: string[];
+  /** IDF over active documents, per shared entity. */
+  idf: Map<string, number>;
+  weight: number;
+  bestEntity: string;
+}
+
+/**
+ * The `entity` edges enrichment gives a document with these entities, in the order it writes them. Reads only; every
+ * read happens before the caller writes anything. Rare entities justify edges; ubiquitous entities alone cannot.
+ */
+export function computeEntityEdges(db: Database, docId: number, entityIds: string[]): EntityEdge[] {
+  const totalDocs = (db.prepare(`SELECT COUNT(*) as cnt FROM documents WHERE active = 1`).get() as { cnt: number }).cnt;
+
+  // Collect candidate target docs and their shared entities.
+  // BL-001 residual: candidates are ACTIVE docs only — edges must never
+  // target archived documents.
+  const targetEntityMap = new Map<number, string[]>(); // docId → [entityIds]
+  for (const entityId of entityIds) {
+    const otherDocs = db.prepare(`
+      SELECT em.doc_id FROM entity_mentions em
+      JOIN documents d ON d.id = em.doc_id
+      WHERE em.entity_id = ? AND em.doc_id != ? AND d.active = 1 AND ${notLegacyArtifactSql("d")}
+      LIMIT 20
+    `).all(entityId, docId) as { doc_id: number }[];
+
+    for (const other of otherDocs) {
+      const existing = targetEntityMap.get(other.doc_id) || [];
+      existing.push(entityId);
+      targetEntityMap.set(other.doc_id, existing);
+    }
+  }
+
+  // Compute IDF per entity (cache for this enrichment).
+  // BL-001 residual: totalDocs above is active-only, so doc_freq must be
+  // active-only too — an all-docs denominator lets archived history deflate
+  // specificity (IDF can even go negative), suppressing edges for entities
+  // that are specific among the LIVE corpus.
+  const entityIdf = new Map<string, number>();
+  for (const entityId of entityIds) {
+    if (!entityIdf.has(entityId)) {
+      const docFreq = (db.prepare(
+        `SELECT COUNT(DISTINCT em.doc_id) as cnt FROM entity_mentions em
+         JOIN documents d ON d.id = em.doc_id
+         WHERE em.entity_id = ? AND d.active = 1`
+      ).get(entityId) as { cnt: number }).cnt;
+      entityIdf.set(entityId, Math.log((totalDocs + 1) / (docFreq + 1)));
+    }
+  }
+
+  // Edges only when max entity IDF exceeds threshold
+  const edges: EntityEdge[] = [];
+  for (const [targetDocId, sharedEntities] of targetEntityMap) {
+    const maxIdf = Math.max(...sharedEntities.map(eid => entityIdf.get(eid) || 0));
+    if (maxIdf < ENTITY_IDF_SPECIFICITY_THRESHOLD) continue; // Skip — only ubiquitous entities shared
+
+    // Weight: IDF specificity + shared-count bonus (multi-entity overlap outranks single)
+    const sharedBonus = Math.min(0.15, 0.05 * (sharedEntities.length - 1));
+    const weight = Math.min(1.0, 0.3 + 0.12 * maxIdf + sharedBonus);
+    const bestEntity = sharedEntities.reduce((best, eid) =>
+      (entityIdf.get(eid) || 0) > (entityIdf.get(best) || 0) ? eid : best
+    );
+    edges.push({ targetDocId, sharedEntities, idf: entityIdf, weight, bestEntity });
+  }
+  return edges;
+}
+
+/** Write one computed edge as enrichment does (`INSERT OR IGNORE`: an existing row is never touched). Returns rows written. */
+export function writeEntityEdge(db: Database, docId: number, edge: EntityEdge): number {
+  return db.prepare(`
+    INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
+    VALUES (?, ?, 'entity', ?, ?, datetime('now'))
+  `).run(docId, edge.targetDocId, edge.weight, JSON.stringify({ entity: edge.bestEntity, shared: edge.sharedEntities.length })).changes;
+}
+
+// =============================================================================
 // Entity Graph Traversal (for intent_search ENTITY queries)
 // =============================================================================
 
@@ -957,7 +985,7 @@ export async function enrichDocumentEntities(
  * creation (gate) and neighbor ranking (BL-001 specificity blend) so the two
  * hub-suppression paths cannot drift apart.
  */
-const ENTITY_IDF_SPECIFICITY_THRESHOLD = 3.0;
+export const ENTITY_IDF_SPECIFICITY_THRESHOLD = 3.0;
 
 /**
  * Get entity co-occurrence neighbors for a set of seed entities.

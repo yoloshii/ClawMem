@@ -4,6 +4,104 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.4 — `clawmem repair entities` moves the entity links made before v0.43.2's resolver fix
+
+v0.43.2 stopped the entity resolver from joining names whose numbers differ (`Node 200` into `Node 202`) and made an
+entity with the exact name win over fuzzy candidates. The links written before then stay as they were: a mention or a
+triple endpoint attached to the wrong entity keeps it, because nothing resolves them again. An unchanged document's
+entities are never extracted again, and triples are never resolved again.
+
+### What changed
+
+- **New command: `clawmem repair entities`** (`src/entity-repair.ts`, `src/clawmem.ts`). It moves a mention or a triple
+  endpoint only when its own stored text proves the link wrong under the fixed rule: the text's numbers differ from the
+  linked entity's name's (R1), or the text names another entity in the same bucket exactly (R2). It resolves those
+  links again, one at a time in the order they were seen, with the real resolver, on an in-memory copy of the vault's
+  entity tables, and creates an entity where today's resolver would. Same-name duplicates (R3) and other differences,
+  such as types assigned inconsistently (R4), are counted and left alone. Links whose case is ambiguous are held and
+  listed with their reason: a predicate that occurs twice in the fact, a name of another bucket, a match through
+  another name's search row, an ID taken by another name, among others.
+  - **Triples** are regrouped by their repaired key: a triple keeps its id when its key stays, merges into an untouched
+    triple with the same key, is re-pointed, or splits; equal evidence rows collapse to the earliest.
+  - **Mentions** move within each document; two that meet at one entity collapse to one. `mention_count` and the
+    co-occurrence counts change by the difference.
+  - **Entity edges:** an edge is added only where the repair makes two documents share an entity that clears
+    enrichment's specificity threshold and nothing they shared before does. Existing edges are never changed or
+    removed; those whose recorded entity the two documents no longer share are listed as stale.
+  - **Dry run by default**, on a read-only handle in one read snapshot: it prints every planned change and a plan
+    digest. `--apply --vault <name>` plans again under the write lock; with `--expect <digest>` it writes only when the
+    new plan's digest is the one given (edge weights are not in the digest), and without it, whatever it plans then. It
+    checks every answer and the added edges against the vault before committing, and logs every change in
+    `entity_repair_log`. `--restore <op> --vault <name>` reverses each group of changes whose logged triples and
+    evidence rows, or whose document's whole set of mentions, are still as the apply left them, unless undoing it would
+    put a triple back beside an open triple that took its subject, predicate and object meanwhile. Counts are reversed
+    by their difference; added edges, and created entities still in use, stay. The command opens vault files directly
+    and never initializes a store. It lists each database file once: another configured name for a file already listed
+    selects that vault, and when a configured vault on another file is named `general`, the default index is listed as
+    `default-index` (or `default-index-2` and up, when that name is configured for another file too).
+- **Enrichment's edge step is a helper** (`computeEntityEdges` and `writeEntityEdge` in `src/entity.ts`), which the
+  repair shares; enrichment writes the same edges as before. Seven resolver helpers are exported. No behaviour changes.
+- **Tests:** `tests/unit/entity-repair.test.ts` and `tests/unit/entity-repair-cli.test.ts` (new).
+- **Docs:** `docs/internals/entity-resolution.md` (Repairing links made before v0.43.2), `docs/reference/cli.md`,
+  `docs/guides/upgrading.md`, `docs/troubleshooting.md`.
+
+### Upgrading
+
+No action needed: nothing migrates, and the command changes a vault only with `--apply` or `--restore`. To repair a
+vault, run the dry run, review it, then apply each vault with `--expect` and the digest it printed; keep the op id for
+`--restore`. See
+[upgrading](docs/guides/upgrading.md#v0434-clawmem-repair-entities-moves-the-entity-links-made-before-v0432).
+
+### Verification
+
+88 new tests: 82 in `tests/unit/entity-repair.test.ts`, 6 in `tests/unit/entity-repair-cli.test.ts`. The command was
+written before its tests. The changes for the review below were written test-first: each change's new tests ran on the
+code before it, where those aimed at the change failed and some that guard kept behaviour passed. For the first turn's
+findings, which assertion each test failed on was checked afterwards, on a copy of the earlier code rebuilt from its
+text; there a restore-order test failed inside apply, and in restore once the old restore ran after the fixed apply.
+Full suite on Bun 1.3.14: 3,802 pass / 5 fail across 193 files (3 todo). All 5 failures are in
+`tests/integration/cmdwatch-workers.integration.test.ts`, which this release does not change: each test hit Bun's 5 s
+default before its helper, which allows the watcher up to 8 s to print anything, had finished; those five tests set no
+timeout of their own (the file's sixth allows 90 s). Run alone, the file passes 6 of 6, twice with this release and once
+on v0.43.3, and v0.43.3's full run on Bun 1.3.14 (below) passed it. On Bun 1.4.2: 3,806 pass / 1 fail across 193 files
+(3 todo). The failure is `tests/integration/store-concurrent-init.test.ts` with `database is locked`, the
+timing-dependent failure noted under v0.43.3; run alone 15 times, it failed once with this release and once on v0.43.3.
+tsc unchanged.
+
+On a copy of a working vault (3.44 GB), the dry run plans to move 41 links under R1 and 3 under R2, holds 2 (a name of
+another bucket, a predicate that occurs twice) and counts 112 same-name duplicates and 150 other differences. Apply
+creates 34 entities, updates 31 triples and inserts 2, moves 3 evidence rows and 9 mentions, adds no edge and lists 14
+as stale. A second process that asked for the write lock every 5 ms without waiting found it taken for one stretch of
+841 ms during apply (1.04 s in all) and of 203 ms during restore (0.43 s); both are shorter than the default 5 s
+`busy_timeout`. On an in-memory copy of the same vault, apply makes the same writes and leaves no foreign-key violation,
+no triple without evidence and no open key held twice; planning again finds nothing to move and 2 holds; restore
+reverses all 42 groups and deletes the 34 entities, and the entities, their search rows, the mentions, the triples and
+their evidence, the co-occurrences and the document links then compare equal to before (entities by id, type, name,
+mention count, canonical id and vault; mentions by content, since a moved mention gets a new row id). That comparison
+was made on the in-memory copy, not on the disk copy.
+
+The cross-model adversarial pass (codex) reviewed the design over nine turns, and cleared the code at its third turn,
+after 9 findings (8, then 1): evidence rows of two moved triples could collide on the evidence table's unique index, in
+apply and in restore; restore could reopen a fact closed after the apply, because a carrying triple the repair left
+unchanged was not logged in its final state; the command read `general` as the default index even where a configured
+vault has that name; after apply removed and re-created a co-occurrence pair, restore left it with the apply's time, and
+after the first fix still did when the pair's stored time was NULL; the plan digest left out the order times and the
+original endpoints; the alias check trimmed a name that the resolver compares untrimmed; the report lacked the endpoints
+and the held count; and three tests could pass on wrong code. The first turn also confirmed two gaps named to it: cases
+of the design with no test, and a restore that could leave two open triples with one key (restore now keeps such a
+group). On the review's advice, apply holds a group that would give a key a second open triple (`open-key-taken`). Four
+more turns cleared these notes, the docs and the commit message, after 11 findings: 9 closed at the second turn, 1 at
+the third and the last at the fourth.
+
+### What didn't change
+
+The resolver, its buckets and thresholds, enrichment and the edges it writes, and every other command. No existing
+table changes; the first `--apply` creates `entity_repair_log`. The repair never deletes an edge, never merges
+same-name duplicates (R3), and never moves a link that its own stored text does not prove wrong: a merge of two names
+whose numbers agree stays unless the text names another entity in the bucket exactly.
+
+---
+
 ## v0.43.3 — an index pass waits for the write lock instead of failing with `database is locked`
 
 `indexCollection` (`src/indexer.ts`) runs each index pass in one transaction, opened with a plain `BEGIN`. SQLite starts
