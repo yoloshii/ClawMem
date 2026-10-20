@@ -9,6 +9,7 @@ import { tmpdir } from "os";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
+import { readinessWaitApplies, parseWaitFlag, resolveEmbedWaitOptions, waitForRemoteEmbed, formatNotReadyMessage, formatInstantTripMessage } from "./embed-readiness.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
 import {
   createStore,
@@ -627,9 +628,26 @@ async function cmdEmbed(args: string[]) {
       // Explicit baseline replacement (T8-M3): baselines are first-healthy calibrations
       // and never roll on their own — this is the intentional recalibration operation.
       "recalibrate-canary": { type: "boolean", default: false },
+      // v0.43.5 (77.1): seconds to wait for a self-hosted embed server with local fallback off (0 = one probe).
+      wait: { type: "string" },
     },
     allowPositionals: false,
   });
+
+  // Usage errors stop before the lease. `--wait` is checked on every run; the env knobs only where the wait applies,
+  // so a mistyped knob never stops a run that does not wait.
+  const waitSec = parseWaitFlag(values.wait);
+  if (typeof waitSec === "object") {
+    console.error(`${c.red}${waitSec.error}${c.reset}`);
+    process.exitCode = 1;
+    return;
+  }
+  const waitOptions = readinessWaitApplies() ? resolveEmbedWaitOptions(waitSec) : null;
+  if (waitOptions && "error" in waitOptions) {
+    console.error(`${c.red}${waitOptions.error}${c.reset}`);
+    process.exitCode = 1;
+    return;
+  }
 
   const s = getStore();
   // Embed runs race live hook/watcher writers. Set the operational busy timeout on the
@@ -699,6 +717,25 @@ async function cmdEmbed(args: string[]) {
       process.exitCode = 1;
       return;
     }
+
+    // v0.43.5 (BACKLOG 77.1): a self-hosted server with local fallback off is waited for BEFORE the canary, the stale
+    // cleanup and any document attempt. Through v0.43.4 a run started while the server was down tripped the 60 s
+    // cooldown on its first request, charged every pending document an attempt and wrote nothing. Not ready in time →
+    // the embedding is skipped, exit 1. Ready → the run goes on exactly as before.
+    if (waitOptions) {
+      const ready = await waitForRemoteEmbed(llm, { ...waitOptions, shouldAbort: () => leaseLost });
+      if (ready.status === "aborted") throw new EmbedLeaseLostError();
+      if (ready.status !== "ready") {
+        const message = ready.status === "instant-trip"
+          ? formatInstantTripMessage(embedUrl!, ready.last.status ?? 0)
+          : formatNotReadyMessage(embedUrl!, waitOptions.budgetMs, ready.last);
+        console.error(`${c.red}${message}${c.reset}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (ready.probes > 1) console.log(`Embed server ready after ${ready.probes} probes`);
+    }
+
     let canaryState: CanaryCheckResult | null = null;
     {
       const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key), { ignoreBaseline: recalibrate });
@@ -727,7 +764,7 @@ async function cmdEmbed(args: string[]) {
     // v0.41.2 (BACKLOG 68.3): run scope, so the finalization (the no-work path included) knows what this run stored.
     let totalFragments = 0;
     let removedStale = 0;
-    const finalizeCanary = async (failedFragmentsCount: number) => {
+    const verifyEndOfRun = async (failedFragmentsCount: number) => {
       const setTaint = (reason: string) =>
         markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
       // A NON-destructive run (no --force clear) that stored no vectors cannot have mixed a second geometry into the
@@ -783,6 +820,15 @@ async function cmdEmbed(args: string[]) {
         }
       }
     };
+    // v0.43.5 (BACKLOG 77.1 (c)): a run that scheduled work and wrote no vector failed, whatever the canary said —
+    // through v0.43.4 a verified end let it exit 0. A no-work run (scheduledDocs 0) keeps the finalization above.
+    const finalizeCanary = async (failedFragmentsCount: number, scheduledDocs: number) => {
+      await verifyEndOfRun(failedFragmentsCount);
+      if (scheduledDocs > 0 && totalFragments === 0) {
+        console.error(`${c.red}No documents were embedded: ${scheduledDocs} scheduled, 0 vectors written.${c.reset}`);
+        process.exitCode = 1;
+      }
+    };
 
     // Probe the live model's output dimension (+ model name). Returns null on ANY
     // failure so a down/flaky endpoint can NEVER trigger a destructive clear.
@@ -806,6 +852,7 @@ async function cmdEmbed(args: string[]) {
       const probe = await probeEmbed();
       if (!probe) {
         console.error(`${c.red}Force re-embed aborted: could not reach the embedding endpoint. Nothing was cleared.${c.reset}`);
+        process.exitCode = 1;
         return;
       }
       console.log(`${c.yellow}Force mode: clearing all embeddings (rebuilding at dim ${probe.dim})${c.reset}`);
@@ -821,6 +868,7 @@ async function cmdEmbed(args: string[]) {
         const probe = await probeEmbed();
         if (probe && probe.dim !== existingDim) {
           console.error(`${c.red}Embedding dimension changed (${existingDim} → ${probe.dim}). Run 'clawmem embed --force' to clear and rebuild the full vault.${c.reset}`);
+          process.exitCode = 1;
           return;
         }
         // Same dimension but a DIFFERENT model still mixes the vector space (cosine
@@ -829,14 +877,20 @@ async function cmdEmbed(args: string[]) {
         const existingModels = s.getVecModels();
         if (existingModels.length > 1) {
           console.error(`${c.red}Vault already contains mixed embedding models: ${existingModels.join(", ")}. Run 'clawmem embed --force' to rebuild with a single model.${c.reset}`);
+          process.exitCode = 1;
           return;
         }
         if (probe && probe.model && existingModels.length === 1 && existingModels[0] !== probe.model) {
           console.error(`${c.red}Embedding model changed (${existingModels[0]} → ${probe.model}) at the same dimension. Mixing models in one vector space breaks similarity. Run 'clawmem embed --force' to rebuild with the current model.${c.reset}`);
+          process.exitCode = 1;
           return;
         }
         expectedDim = existingDim;
-        if (probe && probe.model) expectedModel = probe.model;
+        // v0.43.5 (BACKLOG 77.1 (b)): bind the vault's one stored model whether or not the probe answered. Through
+        // v0.43.4 a probe that failed left the model unbound, so a same-dimension vector from another model (the
+        // in-process fallback, or a server that came back with a different model) was stored unchecked.
+        if (existingModels.length === 1) expectedModel = existingModels[0]!;
+        else if (probe && probe.model) expectedModel = probe.model;
       }
     }
 
@@ -867,7 +921,7 @@ async function cmdEmbed(args: string[]) {
       // it must not skip end verification, silently exit zero on an unvalidated
       // endpoint, or persist/recalibrate a baseline without a verified end.
       console.log(`${c.green}All documents already embedded${c.reset}`);
-      await finalizeCanary(0);
+      await finalizeCanary(0, 0);
       return;
     }
 
@@ -1092,7 +1146,7 @@ async function cmdEmbed(args: string[]) {
     console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
 
     // End-of-run verification — shared finalization (T9-H1 + T10-M1); see finalizeCanary.
-    await finalizeCanary(failedFragments);
+    await finalizeCanary(failedFragments, hashes.length);
   } catch (err) {
     // Fatal aborts must NOT exit 0 — otherwise the embed timer / `update --embed`
     // cannot tell the run was incomplete. Set a nonzero exit code (cleanup still

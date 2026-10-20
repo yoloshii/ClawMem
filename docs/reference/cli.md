@@ -43,7 +43,27 @@ clawmem embed                   # Embed all un-embedded fragments (geometry-cana
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
 clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild (since v0.41.2 only a --force rebuild whose preflight PASSES clears the taint)
 clawmem embed --force --recalibrate-canary    # v0.21.0: replace the stored canary baseline after a deliberate model/server change (requires --force)
+clawmem embed --wait 300        # v0.43.5: wait up to 300 s for the embedding server (self-hosted, local fallback off only; 0 = one probe)
 ```
+
+**Waiting for the embedding server (v0.43.5).** When `CLAWMEM_EMBED_URL` is set, `CLAWMEM_EMBED_API_KEY` is not, and
+`CLAWMEM_NO_LOCAL_MODELS=true`, `clawmem embed` first probes the server, before the geometry canary, the stale-vector
+cleanup and any document. It probes at once, then every `CLAWMEM_EMBED_WAIT_INTERVAL_MS` (default 5000) until the
+server answers an embedding, for up to `--wait <seconds>`, else `CLAWMEM_EMBED_WAIT_SEC`, else 120 s; each probe gives
+up after `CLAWMEM_EMBED_PROBE_TIMEOUT_MS` (default 15000) or the time left. `--wait 0` sends one probe. A server that
+answers HTTP 405 or 501 (another service on the port) stops the wait at once. When the server is not ready, the run
+prints `Embed server <url> did not become ready within <N> s (last: <kind>[, HTTP <status>])`, skips the embedding with
+no document charged an attempt, and exits 1. Other setups (local fallback allowed, a cloud API key, which includes a
+self-hosted server that takes a key, or no URL) do not wait. The budget covers startup only: a server that goes away
+after it answered meets the usual per-request timeouts and the 60 s cooldown. `update --embed` reads the env knobs.
+`--wait` must be a whole number of seconds; the env knobs are checked only where the wait applies (the interval and the
+probe timeout must be greater than 0).
+
+**Exit codes (v0.43.5).** `clawmem embed` exits 1 when it stops for an embedding dimension or model change, for a
+vault with mixed models, or because `--force` could not reach the endpoint, and when it scheduled documents but wrote no
+vector (`No documents were embedded: N scheduled, 0 vectors written.`). Through v0.43.4 these exited 0. A run with
+nothing to embed whose end check passes still exits 0. A non-force run on a vault with one stored model now refuses a
+vector from any other model, as a run with a reachable endpoint already did.
 
 ### Conversation Import
 

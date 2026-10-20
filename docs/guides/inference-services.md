@@ -48,7 +48,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
 
-On CPU, omit `-ngl 99`. If the LLM endpoint (self-hosted or cloud) or the self-hosted embedding server is unreachable (ECONNREFUSED/ETIMEDOUT), or keeps answering HTTP errors (405 or 501 at once; any other non-2xx except 429 after three in a row, since v0.37.0), ClawMem pauses that endpoint for 60 seconds and uses in-process inference meanwhile, except with `CLAWMEM_NO_LOCAL_MODELS=true` and for a query-path embedding or expansion that carries its own deadline. A user-cancelled request does not start a pause, and the reranker has no such pause.
+On CPU, omit `-ngl 99`. If the LLM endpoint (self-hosted or cloud) or the self-hosted embedding server is unreachable (ECONNREFUSED/ETIMEDOUT), or keeps answering HTTP errors (405 or 501 at once; any other non-2xx except 429 after three in a row, since v0.37.0), ClawMem pauses that endpoint for 60 seconds and uses in-process inference meanwhile, except with `CLAWMEM_NO_LOCAL_MODELS=true` and for a query-path embedding or expansion that carries its own deadline. A user-cancelled request does not start a pause, and the reranker has no such pause. Since v0.43.5, with `CLAWMEM_NO_LOCAL_MODELS=true` and no embedding API key, `clawmem embed` first waits for the embedding server to answer (120 s by default, `CLAWMEM_EMBED_WAIT_SEC`) and skips the run's embedding when it does not, rather than failing every document during the pause.
 
 ## SOTA stack — z models (16 GB+ GPU, Apache-2.0)
 

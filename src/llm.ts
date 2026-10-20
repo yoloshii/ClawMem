@@ -586,6 +586,14 @@ export function budgetLayerOf(llm: LlamaCpp): BudgetLlm {
   };
 }
 
+/**
+ * v0.43.5 (BACKLOG 77.1): one readiness probe of the remote embed endpoint (`LlamaCpp.probeRemoteEmbed`).
+ * `instant-trip` = a status a correctly-routed embeddings endpoint never returns (405/501: a squatted port).
+ */
+export type RemoteEmbedProbeResult =
+  | { kind: "ok"; dim: number; model: string }
+  | { kind: "transport" | "timeout" | "http" | "instant-trip" | "malformed"; status?: number; detail?: string };
+
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -1149,6 +1157,15 @@ export class LlamaCpp implements LLM {
   }
 
   /**
+   * v0.43.5 (BACKLOG 77.1): `clawmem embed`'s startup readiness wait accepted a probe — clear the cooldown and the
+   * HTTP-error streak so the run's next calls go to the server. The notify-once state is left as it is.
+   */
+  markRemoteEmbedReady(): void {
+    this.remoteEmbedDownUntil = 0;
+    this.remoteEmbedHttpErrorStreak = 0;
+  }
+
+  /**
    * HTTP-level (non-2xx) failure accounting for the self-hosted remote lanes
    * (issue #24). One HTTP error is a reachable server misbehaving — never a
    * reason to abandon the GPU lane. But a port squatted by an unrelated
@@ -1357,6 +1374,60 @@ export class LlamaCpp implements LLM {
       }, ms);
       signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  /** The fixed text the readiness probe embeds. */
+  static readonly READINESS_PROBE_TEXT = "clawmem readiness probe";
+
+  /**
+   * v0.43.5 (BACKLOG 77.1): ONE POST to `/v1/embeddings`, classified, for `clawmem embed`'s startup readiness wait.
+   * Written on its own rather than through `embedRemote`, which checks the cooldown, moves the HTTP-error streak,
+   * retries 429s and marks transport failures down: this has NO side effects on the instance — it sends during an
+   * active cooldown and leaves the cooldown, the streak and the notify-once fields as they were. The caller's signal
+   * bounds the request and the body read; an abort is `timeout`.
+   */
+  async probeRemoteEmbed(opts: { signal?: AbortSignal } = {}): Promise<RemoteEmbedProbeResult> {
+    const { signal } = opts;
+    if (!this.remoteEmbedUrl) return { kind: "transport", detail: "no embed URL configured" };
+    const failed = (error: unknown): RemoteEmbedProbeResult =>
+      signal?.aborted || this.isAbortError(error)
+        ? { kind: "timeout" }
+        : { kind: "transport", detail: String((error as Error)?.message ?? error) };
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
+        method: "POST",
+        headers: this.getEmbedHeaders(),
+        body: JSON.stringify({ input: LlamaCpp.READINESS_PROBE_TEXT, model: this.remoteEmbedModel }),
+        signal,
+      });
+    } catch (error) {
+      return failed(error);
+    }
+    if (!resp.ok) {
+      await resp.body?.cancel().catch(() => {});
+      return LlamaCpp.REMOTE_HTTP_INSTANT_TRIP.has(resp.status)
+        ? { kind: "instant-trip", status: resp.status }
+        : { kind: "http", status: resp.status };
+    }
+    let text: string;
+    try {
+      text = await resp.text();
+    } catch (error) {
+      return failed(error);
+    }
+    let data: { data?: { embedding?: unknown }[]; model?: unknown } | null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return { kind: "malformed", status: resp.status, detail: "the body is not JSON" };
+    }
+    const embedding = Array.isArray(data?.data) ? data.data[0]?.embedding : undefined;
+    if (!Array.isArray(embedding) || embedding.length === 0 || !embedding.every(x => typeof x === "number" && Number.isFinite(x))) {
+      return { kind: "malformed", status: resp.status, detail: "no numeric data[0].embedding" };
+    }
+    const model = typeof data?.model === "string" && data.model ? data.model : this.remoteEmbedUrl;
+    return { kind: "ok", dim: embedding.length, model };
   }
 
   private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5, signal?: AbortSignal): Promise<EmbeddingResult | null> {

@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.43.3**.
+Guide for upgrading between released versions. Current: **v0.43.5**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -61,6 +61,24 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
 
 ---
+
+## v0.43.5: `clawmem embed` waits for a self-hosted server that is not up yet, and its failed stops exit 1
+
+Nothing migrates. Two things can change what a scheduler or script sees:
+
+- **Exit codes.** `clawmem embed` now exits 1 when it stops for an embedding dimension or model change, for a vault
+  with mixed models, or because `--force` could not reach the endpoint, and when it scheduled documents but wrote no
+  vector. These exited 0 through v0.43.4. A systemd `OnFailure=` hook, or a `set -e` script that runs `clawmem embed`,
+  now fires or stops on them.
+- **A startup wait.** With `CLAWMEM_EMBED_URL` set, no `CLAWMEM_EMBED_API_KEY` and `CLAWMEM_NO_LOCAL_MODELS=true`,
+  `clawmem embed` waits up to 120 s for the server before the geometry canary, the stale-vector cleanup and any
+  document. A server that needs longer after a reboot: set `CLAWMEM_EMBED_WAIT_SEC` in the embed unit, or pass
+  `--wait <seconds>`. If you added a wait of your own in front of the embed unit (an `ExecStartPre` that polls the
+  server's `/health`), it can stay or go; the command now does the same for itself.
+
+A non-force run on a vault with one stored model now refuses a vector from any other model even when its start probe
+failed; through v0.43.4 such a vector could be stored. Run `clawmem doctor` if you suspect a vault already mixes models.
+Details: [CLI reference](../reference/cli.md), [troubleshooting](../troubleshooting.md).
 
 ## v0.43.4: `clawmem repair entities` moves the entity links made before v0.43.2
 

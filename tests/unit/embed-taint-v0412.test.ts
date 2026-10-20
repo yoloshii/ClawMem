@@ -15,6 +15,8 @@ import { createHash } from "crypto";
 import { createStore, canonicalDocId } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { canaryProbeInputs } from "../../src/canary.ts";
+import { startEmbedFixture } from "../helpers/embed-readiness-fixture.ts";
+import { LlamaCpp } from "../../src/llm.ts";
 
 const ROOT = join(import.meta.dir, "../..");
 const TAINT = "embed_geometry_taint";
@@ -46,8 +48,11 @@ beforeEach(() => {
       const list = Array.isArray(body.input) ? body.input : [body.input];
       const isProbe = list.some(t => PROBES.has(t));
       const isDim = list.some(t => t === "clawmem dimension probe");
+      // v0.43.5 (77.1): a fallback-off run first waits for the server to answer a readiness probe. These cases model a
+      // server that is up and misbehaving, so it answers that probe (undefined, so never matched, on older code).
+      const isReady = list.some(t => t === LlamaCpp.READINESS_PROBE_TEXT);
       if (isProbe && mode.canary === "unavailable") return new Response("down", { status: 500 });
-      if (!isProbe && !isDim && mode.fragments === "fail") return new Response("down", { status: 500 });
+      if (!isProbe && !isDim && !isReady && mode.fragments === "fail") return new Response("down", { status: 500 });
       // A FAILED canary: every text embeds to the same vector — no separation at all, perfectly stable.
       const embed = (t: string) => (isProbe && mode.canary === "fail" ? new Array(64).fill(1) : bow(t));
       return Response.json({ data: list.map((t, index) => ({ embedding: embed(t), index })), model: "bow-embed" });
@@ -108,13 +113,21 @@ const vectors = () => {
 };
 
 describe("v0.41.2 (BACKLOG 68.3) an embed run that wrote nothing leaves the taint alone", () => {
-  it("work pending, the endpoint unreachable: every fragment fails, 0 written → exit 1, NO taint, stale removals reported", async () => {
+  // v0.43.5 (77.1): through v0.43.4 this used a closed port. A fallback-off run now waits for a server that is down at
+  // the start and stops before cleanup (embed-cooldown-cli.test.ts), so here the endpoint answers its first request —
+  // the readiness probe, or on older code the first canary probe — and drops every later one: the path after a
+  // passed readiness check, which this release leaves as it was.
+  it("work pending, the endpoint goes away after its first answer: every fragment fails, 0 written → exit 1, NO taint, stale removals reported", async () => {
     seed({ stale: true });
-    const r = await embed(`http://127.0.0.1:${deadPort}`);
-    expect(r.code).not.toBe(0);
-    expect(r.out).toContain("wrote 0 vectors");
-    expect(r.out).toContain("removed 1 stale");
-    expect(taintOf()).toBeNull();
+    const fx = startEmbedFixture({ fragmentMark: "ingest pipeline", resetRequest: n => n >= 2 });
+    try {
+      const r = await embed(fx.url);
+      expect(fx.front.resets).toBeGreaterThan(0);
+      expect(r.code).not.toBe(0);
+      expect(r.out).toContain("wrote 0 vectors");
+      expect(r.out).toContain("removed 1 stale");
+      expect(taintOf()).toBeNull();
+    } finally { fx.stop(); }
   }, 60_000);
 
   it("the canary unavailable but fragments embed: ≥ 1 vector stored unvalidated → taint (today's rule)", async () => {

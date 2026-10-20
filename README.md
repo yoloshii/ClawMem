@@ -803,6 +803,9 @@ A surfaced note gets `access_count + 1` when a turn it was injected into names i
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding. Enables cloud mode: batch embedding, provider-specific params, TPM-aware pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
+| `CLAWMEM_EMBED_WAIT_SEC` | `120` | v0.43.5: how long `clawmem embed` waits for a self-hosted embedding server at start (URL set, no API key, `CLAWMEM_NO_LOCAL_MODELS=true`). Not ready in time → the embedding is skipped, exit 1. `embed --wait` overrides it. |
+| `CLAWMEM_EMBED_WAIT_INTERVAL_MS` | `5000` | v0.43.5: time between that wait's probes. |
+| `CLAWMEM_EMBED_PROBE_TIMEOUT_MS` | `15000` | v0.43.5: how long one probe of that wait may take. |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM and the Stop hooks' observer. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_LLM_API_KEY` | (none) | Bearer token for an authenticated remote LLM endpoint. Independent of the embed and rerank keys. |
@@ -819,7 +822,7 @@ A surfaced note gets `access_count + 1` when a turn it was injected into names i
 | `CLAWMEM_JUDGE_STRUCTURED` | lane-specific | **v0.29.0.** Schema-constrained judge output. Default `false` on `openai` (endpoint support varies), `true` on `anthropic`/`claude-cli`. Set explicitly to override. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_RERANK_API_KEY` | (none) | Bearer token for an authenticated remote reranker endpoint. Independent of the embed and LLM keys. |
-| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
+| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. Since v0.43.5 `clawmem embed` first waits for a self-hosted embedding server under this setting (`CLAWMEM_EMBED_WAIT_SEC`). |
 | `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` | (superseded) | **No effect since v0.22.0** — the direct-pipeline eval this knob was gated on measured tuned weights at 1/19 hit@1; the direct vector routes rank by raw cosine instead. Still parsed for backward compatibility; setting it logs a once-per-process warning. |
 | `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 consolidation merge-safety threshold when candidate and existing anchors align. Merges above this normalized 3-gram cosine score are allowed. |
 | `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold — fallback when anchor sets are ambiguous. |

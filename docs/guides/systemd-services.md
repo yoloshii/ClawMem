@@ -69,6 +69,15 @@ WantedBy=timers.target
 EOF
 ```
 
+When the unit runs against a self-hosted embedding server with the in-process fallback off (`CLAWMEM_EMBED_URL` set, no
+`CLAWMEM_EMBED_API_KEY`, `CLAWMEM_NO_LOCAL_MODELS=true`), `clawmem embed` waits up to 120 s for the server to answer
+before the geometry canary, the stale-vector cleanup and any document (v0.43.5). A server that is not ready by then —
+still loading a model after a reboot, or down — skips that run's embedding with no document charged an attempt, and
+the unit exits 1; the next run tries again. For a server that needs longer to start, add
+`Environment=CLAWMEM_EMBED_WAIT_SEC=300`. A server that takes an API key counts as cloud and is not waited for. Through
+v0.43.4 such a run charged every pending document an attempt and wrote nothing, and three such runs in a row left a
+document unembedded until its content changed. Details: [CLI reference](../reference/cli.md).
+
 ## Enable and start
 
 ```bash

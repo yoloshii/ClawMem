@@ -23,7 +23,7 @@ See also: [../guides/inference-services.md](../guides/inference-services.md) (st
 | `CLAWMEM_OBSERVER_GRAMMAR` | `auto` | **v0.41.4.** `auto`: the Stop hooks' observer sends a GBNF grammar that admits only well-formed `<observation>` blocks or `<none/>` to an LLM server whose `/props` names its model, chat template and build (llama-server), and to the in-process model. `off`: never. A server that refuses one (HTTP 400, or in process a grammar that does not compile) gets none for 24 hours and until a grammarless request reaches it (`clawmem doctor` shows it). Enforcement is not verified in advance: the doctor counts completed replies to grammar requests that fail structurally. |
 | `CLAWMEM_LLM_REASONING_EFFORT` | (none) | Top-level `reasoning_effort` for Chat Completions endpoints that support it (e.g. a remote reasoning model). Optional. |
 | `CLAWMEM_LLM_NO_THINK` | enabled | Appends `/no_think` to remote LLM prompts (Qwen3 emits thinking tokens by default). Set `false` for standard OpenAI-compatible models that would treat `/no_think` as literal text. |
-| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUFs. Set `true` for remote-only setups to fail fast on unreachable endpoints. With it set, a tripped or unreachable endpoint returns null instead of falling back — watch the `✎stored/attempted notes` counter in index-run summaries. |
+| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUFs. Set `true` for remote-only setups to fail fast on unreachable endpoints. With it set, a tripped or unreachable endpoint returns null instead of falling back — watch the `✎stored/attempted notes` counter in index-run summaries. Since v0.43.5 it also makes `clawmem embed` wait for a self-hosted embedding server at start (`CLAWMEM_EMBED_WAIT_SEC`). |
 
 ## Cloud embedding
 
@@ -35,6 +35,9 @@ Full provider matrix and behavior: [../guides/cloud-embedding.md](../guides/clou
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input (local only; fits EmbeddingGemma's 2048 tokens). Set `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud pacing. Match your tier (e.g. Jina Free 100000, Paid 2000000, Premium 50000000). |
+| `CLAWMEM_EMBED_WAIT_SEC` | `120` | **v0.43.5.** How long `clawmem embed` waits at start for a self-hosted embedding server to answer (before the geometry canary, the stale-vector cleanup and any document; the lease is already taken), when `CLAWMEM_EMBED_URL` is set, `CLAWMEM_EMBED_API_KEY` is not and `CLAWMEM_NO_LOCAL_MODELS=true`. Whole seconds; `0` = one probe. Not ready in time → the embedding is skipped with no document charged an attempt, exit 1. `embed --wait <seconds>` overrides it. See [embed in the CLI reference](cli.md). |
+| `CLAWMEM_EMBED_WAIT_INTERVAL_MS` | `5000` | **v0.43.5.** Time between the readiness probes of that wait. Whole milliseconds, greater than 0. |
+| `CLAWMEM_EMBED_PROBE_TIMEOUT_MS` | `15000` | **v0.43.5.** How long one readiness probe may take (never longer than the time left). Whole milliseconds, greater than 0. |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). Sent only when the URL contains `openai.com`. |
 
 ## Retrieval profile

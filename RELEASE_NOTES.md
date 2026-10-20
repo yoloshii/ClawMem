@@ -4,6 +4,85 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.5 — `clawmem embed` waits for a self-hosted server that is not up yet, and its failed stops exit 1
+
+A scheduled `clawmem embed` that started while its self-hosted embedding server was still down, with the in-process
+fallback off, put the server into the 60 s cooldown on its first failed request. Every later request failed at once,
+the run charged every pending document an attempt, and it wrote no vector. After three such runs in a row a document was
+skipped until its content changed. Several stops also exited 0, so a scheduler saw nothing wrong.
+
+### What changed
+
+- **Startup readiness wait** (`src/embed-readiness.ts` new, `src/llm.ts`, `src/clawmem.ts`). When `CLAWMEM_EMBED_URL`
+  is set, `CLAWMEM_EMBED_API_KEY` is not, and `CLAWMEM_NO_LOCAL_MODELS=true`, `clawmem embed` probes the server before
+  the geometry canary, the stale-vector cleanup and any document attempt: at once, then every 5 s, for up to 120 s
+  (`embed --wait <seconds>`, `CLAWMEM_EMBED_WAIT_SEC`, `CLAWMEM_EMBED_WAIT_INTERVAL_MS`,
+  `CLAWMEM_EMBED_PROBE_TIMEOUT_MS`; `--wait 0` sends one probe). One deadline bounds every probe and every pause. When
+  the server answers an embedding, the cooldown and the HTTP-error count are cleared and the run goes on as before.
+  When it does not, the run prints `Embed server <url> did not become ready within <N> s (last: <kind>[, HTTP
+  <status>])`, skips the embedding, and exits 1, with no document charged and no stale vector removed. A server that
+  answers HTTP 405 or 501 (another service on the port) stops the wait at once. Under `update --embed` the indexing has
+  finished by then; only the embedding is skipped. The probe (`LlamaCpp.probeRemoteEmbed`) sends one request and
+  changes no state of its own; `LlamaCpp.markRemoteEmbedReady` does the clearing.
+- **Every other setup is unchanged in its routing**: local fallback allowed (the stock launcher's default), a cloud key
+  (including a self-hosted server that takes a key), or no URL. The env knobs are read only where the wait applies,
+  so a mistyped one cannot stop those runs; `--wait` is checked on every run.
+- **The vault's stored model is bound on every non-force run.** On a vault with one stored model, every vector is now
+  checked against it. Through v0.43.4 the model was bound only from a start probe that answered, so when that probe
+  failed, a vector of the same dimension from another model was stored: from the in-process fallback during a
+  cooldown, or from a server that came back serving another model. Such a run now stops with `Embedding model changed
+  mid-run` and stores nothing of the other model. `--force` still binds the model the server reports, so migrations
+  and repairs by `--force` work as before.
+- **Exit codes.** The stops for an embedding dimension change, a model change, a vault with mixed models and a
+  `--force` run that cannot reach the endpoint now exit 1. A run that scheduled documents and wrote no vector prints
+  `No documents were embedded: N scheduled, 0 vectors written.` and exits 1, whatever its geometry checks said. A run
+  with nothing to embed whose end check passes still exits 0.
+- **Tests:** `tests/unit/embed-cooldown-cli.test.ts` and `tests/unit/embed-cooldown-probe.test.ts` (new), with a shared
+  fixture in `tests/helpers/embed-readiness-fixture.ts`: a scripted `/v1/embeddings` server and a TCP front that resets
+  chosen requests. Three existing tests used a closed port, or a server that refused every non-canary request, with the
+  fallback off; they now model a server that answers its first request and then goes away, or answer the readiness
+  probe, so they keep testing what they tested: `tests/unit/embed-taint-v0412.test.ts` (two cases) and
+  `tests/unit/canary-validation.test.ts` (the no-work case).
+- **Docs:** `docs/reference/cli.md`, `docs/reference/configuration.md`, `docs/troubleshooting.md`,
+  `docs/guides/systemd-services.md`, `docs/guides/inference-services.md`, `docs/guides/upgrading.md`.
+
+### Upgrading
+
+Nothing migrates. A systemd `OnFailure=` hook or a `set -e` script around `clawmem embed` now fires or stops on the
+exits listed above. A server that needs more than 120 s to start: set `CLAWMEM_EMBED_WAIT_SEC`. See
+[upgrading](docs/guides/upgrading.md#v0435-clawmem-embed-waits-for-a-self-hosted-server-that-is-not-up-yet-and-its-failed-stops-exit-1).
+
+### Known limits
+
+- A server that goes away after the wait behaves as before. Before the canary, a non-force run warns and goes on, and a
+  `--force` run refuses at the canary. During the sweep, the remaining requests fail at once for 60 s, and each
+  document whose fragments fail is charged an attempt (a document that completes resets its count). Three such runs in
+  a row still skip a document without a report. Recovery mid-run and the report are BACKLOG 77.3 and 77.4.
+- With the in-process fallback allowed, a server that is down still meets the fallback; the new model check refuses
+  its vectors only where they differ from a vault's one stored model. A fresh vault, and a vault whose stored model is
+  the in-process one, still embed locally. One backend per run is BACKLOG 77.2.
+- A cloud setup can still fall back to the in-process model after a transport error (BACKLOG 77.2).
+
+### Verification
+
+New tests, written first and run on v0.43.4's code before the change: in `embed-cooldown-cli.test.ts`, 10 cases failed
+there on the fields the change is about (attempts charged, stale vector removed, the readiness message, the exit code,
+the other model stored), and 2 guards passed. Each case that scripts a server failure (a reset, an HTTP status) also
+checks that the failure happened, and those checks held on both versions. The same held on Bun 1.3.14 and 1.4.2. The 19
+cases of `embed-cooldown-probe.test.ts` cover the new functions and could not run on v0.43.4. The three changed
+existing tests pass on v0.43.4 and on this release.
+
+Full suite: 3,838 pass / 0 fail across 195 files (3 todo) on Bun 1.3.14 and the same on Bun 1.4.2. tsc reports the same
+85 errors as on v0.43.4, none in the files this release adds; the O1 seam audit passes.
+
+The cross-model adversarial pass (codex) reviewed the design over five turns (11, 9, 4, 1 and 0 findings), which
+narrowed it to this release and moved the rest to BACKLOG 77.2–77.4. Its first code turn found 3: the wait accepted a
+ready answer after the embed lease was lost during the probe, the test server's TCP front counted requests by the first
+bytes of a socket read (a request line split across reads went uncounted), and four docs said the wait came before
+anything the run does. Each code fix got a test that failed on the code before it. The second code turn cleared the
+fixes with no finding. Two more turns cleared these notes and the commit message after one finding: the commit message
+credited all three code-review findings with a test that failed first, where one of them was a docs fix.
+
 ## v0.43.4 — `clawmem repair entities` moves the entity links made before v0.43.2's resolver fix
 
 v0.43.2 stopped the entity resolver from joining names whose numbers differ (`Node 200` into `Node 202`) and made an

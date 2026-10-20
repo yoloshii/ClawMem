@@ -27,6 +27,7 @@ import { createStore, canonicalDocId, EmbedLeaseLostError, type Store } from "..
 import { acquireWorkerLease } from "../../src/worker-lease.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { formatDocForEmbedding } from "../../src/llm.ts";
+import { startEmbedFixture } from "../helpers/embed-readiness-fixture.ts";
 import { createHash } from "crypto";
 
 // ---------------------------------------------------------------------------
@@ -342,19 +343,29 @@ describe("no-work run end verification (T10-M1)", () => {
     store.insertEmbedding(hash, 0, 0, textEmbed("x"), "m", new Date().toISOString(), "full", undefined, canonicalDocId("user", "a.md"));
     store.close();
 
-    // Run the REAL CLI with an unreachable embed endpoint and local fallback disabled:
-    // canary unavailable → non-force warn → no work → shared finalization: exit 1, no taint (0 vectors written).
-    const proc = Bun.spawnSync(["bun", "src/clawmem.ts", "embed"], {
-      cwd: `${import.meta.dir}/../..`,
-      env: {
-        ...process.env,
-        INDEX_PATH: dbPath,
-        CLAWMEM_EMBED_URL: "http://127.0.0.1:9",
-        CLAWMEM_NO_LOCAL_MODELS: "true",
-      },
-    });
-    expect(proc.exitCode).not.toBe(0);
-    expect(proc.stderr.toString()).toContain("wrote 0 vectors");
+    // Run the REAL CLI with local fallback disabled against an endpoint that answers its first request and then goes
+    // away: canary unavailable → non-force warn → no work → shared finalization: exit 1, no taint (0 vectors written).
+    // v0.43.5 (77.1): through v0.43.4 this used a closed port; a fallback-off run now waits for a server that is down
+    // at the start and stops before the canary (embed-cooldown-cli.test.ts), so the endpoint answers the first
+    // request — the readiness probe, or on older code the first canary probe — and drops every later one. The
+    // spawn is async: a synchronous one would block the in-process fixture.
+    const fx = startEmbedFixture({ fragmentMark: "fully embedded doc", resetRequest: n => n >= 2 });
+    try {
+      const proc = Bun.spawn(["bun", "src/clawmem.ts", "embed"], {
+        cwd: `${import.meta.dir}/../..`,
+        env: {
+          ...process.env,
+          INDEX_PATH: dbPath,
+          CLAWMEM_EMBED_URL: fx.url,
+          CLAWMEM_NO_LOCAL_MODELS: "true",
+        },
+        stdout: "pipe", stderr: "pipe",
+      });
+      const [, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      expect(await proc.exited).not.toBe(0);
+      expect(fx.front.resets).toBeGreaterThan(0);
+      expect(stderr).toContain("wrote 0 vectors");
+    } finally { fx.stop(); }
 
     const check = createStore(dbPath);
     expect(check.getVaultFlag("embed_geometry_taint")).toBeNull();
