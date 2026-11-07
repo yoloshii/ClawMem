@@ -542,6 +542,25 @@ builders operate on — so archiving documents legitimately lowers the total.
 - Fixed in v0.4.2: `parseDocument()` runtime-checks all frontmatter string fields. Defense-in-depth guards in `insertDocument()`, `updateDocument()`, and `reactivateDocument()`.
 - If on an older version: quote YAML values as strings (`title: "2023-09-27"`) as a workaround.
 
+**A file is indexed as plain text — no title, no tags — although it has frontmatter (v0.43.6 or later)**
+- Only `yaml`/`yml` (any case) and `json` frontmatter is read. A first line of `---js`, `---javascript`, `---toml` or
+  `---coffee` makes the whole file the body: before v0.43.6 the `js` spellings RAN the block as code in the indexing
+  process; now none of them is read as frontmatter.
+- YAML that defines an anchor (`&name`, so also every `*alias`), uses `!!omap`, nests deeper than 32 levels, has more
+  than 4,096 nodes, or whose block exceeds 64 KiB or 1,024 lines (any line ending) is read as plain text. A `<<` merge
+  key no longer merges: it is an ordinary key named `<<`.
+- `tags` keeps string, number and boolean entries only, each up to 256 characters, at most 64; a nested list or object
+  entry is dropped.
+- Fix the file (plain YAML, no anchors, under the caps) and save it; the watcher re-indexes it, or run `clawmem update`.
+
+**`clawmem doctor` prints `✗ Frontmatter guard: self-test FAILED`**
+- The bounded YAML engine checks at its first parse that the installed YAML parser reports every node, in order, with
+  its depth, and exposes anchors. A parser that does not would drop the limits silently, so the guard fails closed:
+  every YAML frontmatter block reads as plain text, and one line went to stderr at that first parse (Hermes discards
+  it; the doctor line is the signal there).
+- Cause: a dependency not at the pinned version (`gray-matter` 4.0.3, `js-yaml` 3.14.x). Fix: `bun install
+  --frozen-lockfile` in the ClawMem checkout, restart the long-lived processes, run `clawmem doctor` again.
+
 ## General
 
 **"Unknown vault" error**

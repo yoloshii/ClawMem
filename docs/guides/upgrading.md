@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.43.5**.
+Guide for upgrading between released versions. Current: **v0.43.6**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -61,6 +61,31 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
 
 ---
+
+## v0.43.6: frontmatter can no longer run code or blow up memory while it is indexed
+
+Nothing migrates. Two things to do, one thing that may change what you see:
+
+- **Restart every long-lived ClawMem process.** The fix is in the indexer module, which `clawmem watch`, every
+  `clawmem mcp` server (one per Claude Code session; their `reindex` and `vault_sync` tools index) and `clawmem serve`
+  (REST `/reindex`) load once at start and keep until they exit — including servers OpenClaw or Hermes run as child
+  processes. One-shot commands (`update`, `embed`, `mine`, `curate`, `doctor`) pick up the fix on their next run; one
+  already running keeps the old code until it exits. Find them: `ps -eo pid,lstart,args | grep -E 'clawmem (watch|mcp|serve)'`.
+  A Claude Code MCP server restarts on `/mcp` → reconnect `clawmem`, or with the session.
+- **Run `clawmem doctor` once.** A ✓ `Frontmatter guard` line means the bounded YAML engine's self-test passed. A ✗ line
+  means the installed YAML parser does not honour the contracts the guard relies on; until the pinned dependencies are
+  reinstalled (`bun install --frozen-lockfile` in the ClawMem checkout), every YAML frontmatter block is read as plain
+  text — no title, tags or `authored_at` — and the process also printed one line to stderr at its first parse. Hermes
+  discards that stderr line, so there the doctor is the only signal.
+- **What may read differently.** A file whose first line is `---` followed by a language other than `yaml`/`yml` (any
+  case) or exactly `json` is indexed as plain text; so is frontmatter with a YAML anchor, `!!omap`, more than 32 levels
+  or 4,096 nodes, or over 64 KiB or 1,024 lines. A `<<` key is an ordinary key. `tags` keeps scalar entries only, each
+  ≤ 256 characters, at most 64. None of these appeared in 3,617 real frontmatter blocks measured across two vaults.
+  Run `clawmem update` after the restart; a file that now reads differently is re-indexed on its next change, or
+  `clawmem reindex --force` re-reads every file.
+
+Details: [release notes](../../RELEASE_NOTES.md#v0436--frontmatter-can-no-longer-run-code-or-blow-up-memory-while-it-is-indexed),
+[SECURITY.md](../../SECURITY.md), [troubleshooting](../troubleshooting.md#indexing-1).
 
 ## v0.43.5: `clawmem embed` waits for a self-hosted server that is not up yet, and its failed stops exit 1
 

@@ -856,7 +856,10 @@ directoryContext: false  # opt-in per-folder CLAUDE.md generation
 
 ### Frontmatter
 
-Parsed via `gray-matter`. Supported fields:
+YAML (or JSON) between `---` lines that open the document, parsed through a bounded engine (v0.43.6 — a `---js` block
+used to run as code): only `yaml`/`yml`/`json` blocks are read; a block with a YAML anchor, deeper than 32 levels, over
+4,096 nodes, over 64 KiB or over 1,024 lines is indexed as plain text; a `<<` key does not merge (it is kept as an
+ordinary key); `tags` keeps at most 64 scalar entries. Supported fields:
 
 ```yaml
 ---
@@ -1010,7 +1013,8 @@ clawmem serve --port 7438 &
 | Package | Purpose |
 |---|---|
 | `@modelcontextprotocol/sdk` | MCP server |
-| `gray-matter` | YAML frontmatter parsing |
+| `gray-matter` | frontmatter delimiting (pinned 4.0.3; engines replaced by ClawMem's bounded YAML/JSON, see v0.43.6) |
+| `js-yaml` | the YAML loader under ClawMem's bounded frontmatter engine (3.14.x) |
 | `node-llama-cpp` | GGUF model inference (reranking, query expansion, A-MEM) |
 | `sqlite-vec` | Vector similarity extension |
 | `yaml` | Config parsing |

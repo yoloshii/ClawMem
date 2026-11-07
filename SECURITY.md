@@ -2,9 +2,10 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-|---------|--------------------|
-| 0.1.x   | :white_check_mark: |
+| Version  | Supported          |
+|----------|--------------------|
+| 0.43.6+  | :white_check_mark: |
+| < 0.43.6 | :x: — upgrade; see v0.43.6 below |
 
 Only the latest release on `main` receives security fixes.
 
@@ -33,6 +34,8 @@ Given the local-first architecture, the primary security concerns are:
 
 5. **MCP tool abuse** -- The MCP server exposes tools that read/search the local vault. If a tool can be coerced into returning or modifying data outside its intended scope, report it.
 
+6. **Indexed Markdown as code-execution or memory-exhaustion input** -- Every indexed file's frontmatter is parsed by the indexing process (`clawmem update`, the watcher, the MCP `reindex`/`vault_sync` tools, `clawmem embed`, the canary). Before v0.43.6 a file whose first line was `---js` ran its frontmatter as JavaScript in that process, and crafted YAML (aliases, merge keys, `!!omap`) could expand to an object many orders of magnitude larger than the file. **Fixed in v0.43.6:** the eval engine is refused, the language is allow-listed, the YAML engine is ClawMem's own bounded one (no anchors, no merge, no omap, depth 32, 4,096 nodes, 64 KiB, 1,024 lines) and it checks its own contracts at first use, failing closed. A way to run code or exhaust memory through frontmatter, or through any other field of an indexed file, is a vulnerability: report it.
+
 ## Reporting a Vulnerability
 
 **Do not open a public issue for security vulnerabilities.**
@@ -49,7 +52,8 @@ You should receive an acknowledgment within 72 hours. For critical issues (data 
 ## Security Best Practices for Users
 
 - Keep Bun and dependencies up to date (`bun update`)
-- Only index trusted content into your vault
+- Only index trusted content into your vault. Since v0.43.6 an untrusted file cannot run code through its frontmatter, but its text still reaches the agent (threat 2 above)
+- After upgrading to v0.43.6 or later, restart `clawmem watch`, every `clawmem mcp` server and `clawmem serve`: they load the parser once at start. Run `clawmem doctor` once; a ✗ `Frontmatter guard` line means the installed YAML parser does not honour the contracts the guard relies on and YAML frontmatter is being read as plain text until the pinned dependencies are reinstalled
 - If using cloud embedding providers, treat your API key like a password
 - Run `llama-server` bound to `localhost` unless you need LAN access
 - Review collection paths in `config.yaml` -- don't index sensitive directories

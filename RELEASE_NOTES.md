@@ -4,6 +4,100 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.6 — frontmatter can no longer run code or blow up memory while it is indexed
+
+Two defects in frontmatter parsing, both reachable from any Markdown file ClawMem indexes, plus one unbounded cache.
+
+**Code execution.** gray-matter, the frontmatter library, reads the text after the opening `---` as a language name
+and runs the matching engine. Its default table includes a `javascript` engine that evaluates the block as code, and
+ClawMem passed no options, so a file whose first line was `---js` (or `---javascript`, any letter case, with a CRLF
+line ending or a byte-order mark before it) ran its frontmatter as JavaScript inside the indexing process: `clawmem
+update`, the watcher, the MCP `reindex` and `vault_sync` tools, the REST `/reindex`, `clawmem embed` (which re-parses
+every stored document) and the embedding canary. Anything that process could do, the file could do.
+
+**Memory amplification.** The default YAML engine accepted aliases, `<<` merge keys and `!!omap`, so a small block
+could expand to an object many orders of magnitude larger (an alias tree six levels deep, a mapping merged into itself
+128 times, an array key of 128 aliases to a 1 KiB string), and gray-matter's comment stripper is quadratic in runs of
+blank lines. **Unbounded cache.** gray-matter caches every parsed text in a module-level object for the life of the
+process; the watcher and the MCP servers retained every file they ever parsed, and a repeated malformed parse was
+served from that cache.
+
+### What changed
+
+- **One frozen options object on the one call** (`src/indexer.ts`, `FRONTMATTER_OPTIONS`). The `javascript` and
+  `coffee` engines refuse; after the call the language must be `yaml`/`yml` (any case) or exactly `json`, else the
+  file is read as plain text. gray-matter's excerpt step is off. Passing options also bypasses gray-matter's cache, so
+  nothing is retained between parses and no entry can be served to a later file.
+- **A bounded YAML engine of ClawMem's own** (`makeFrontmatterYamlEngine`). Built on js-yaml's safe schema minus the
+  merge and omap types; it refuses any anchor (so no alias can be read), stops at 32 levels of nesting and 4,096 nodes,
+  and takes at most 64 KiB. A refused block is read as plain text — the same path a malformed block took before.
+- **The block is measured before gray-matter sees it.** A frontmatter block over 64 KiB or over 1,024 lines (any line
+  ending) never reaches the library; the file is plain text. Worst case for a crafted note at the caps is about 0.1 s
+  of indexing.
+- **The guard checks itself.** At its first parse in a process the engine runs a self-test of the contracts it relies
+  on (the YAML loader reports every node, in order, with its depth, and exposes anchors). If the installed loader does
+  not, the guard marks itself broken: every YAML frontmatter block then reads as plain text, one line goes to stderr,
+  and `clawmem doctor` prints a ✗ line. Fail closed, never open.
+- **Bounded tags.** `tags` keeps string, number and boolean elements only, each up to 256 characters, at most 64;
+  nested lists and objects are dropped (they used to become joined strings or `[object Object]`).
+- **Pins.** `gray-matter` is pinned exactly to 4.0.3 (unmaintained since 2021; the fix relies on its engine lookup) and
+  `js-yaml` becomes a direct dependency at `~3.14.2`.
+
+### What this changes for your vault
+
+- A file whose first line is `---` followed by a language other than yaml/yml/json (`---js`, `---toml`, `---coffee`) is
+  indexed as plain text: no title, no tags, the whole file is the body. Before, `---js` ran the block; `---toml` already
+  read as plain text.
+- Frontmatter that defines a YAML anchor (`&name`), uses `!!omap`, nests deeper than 32 levels, has more than 4,096
+  nodes, or exceeds 64 KiB or 1,024 lines, is read as plain text. A `<<` key no longer merges; it is an ordinary key.
+  Measured over 3,617 real frontmatter blocks across two vaults: none used any of these.
+- `excerpt_separator` in a document has no effect (ClawMem never read the excerpt).
+- `tags` entries that were nested lists or objects are dropped; long entries (over 256 characters) are dropped; a list
+  over 64 entries is cut to its first 64.
+- No schema, config, CLI or MCP change. The memory the watcher and MCP servers held for parsed texts is gone.
+
+### Upgrading
+
+**Restart every long-lived ClawMem process** after upgrading: the fix lives in `src/indexer.ts`, which `clawmem watch`,
+every `clawmem mcp` server and `clawmem serve` load once at start and keep. One-shot commands (`update`, `embed`,
+`mine`, `curate`, `doctor`) pick up the fix on their next run. Find the long-lived ones with
+`ps -eo pid,lstart,args | grep -E 'clawmem (watch|mcp|serve)'`. Hermes discards its child's stderr, so a broken guard
+shows there only through `clawmem doctor`. See
+[upgrading](docs/guides/upgrading.md#v0436-frontmatter-can-no-longer-run-code-or-blow-up-memory-while-it-is-indexed).
+
+### Known limits
+
+- YAML 1.1 base-60 numbers (`1:30` → 90) are assembled with a quadratic step inside js-yaml; within the 64 KiB cap that
+  is about 0.1 s. Kept, since removing base-60 would change stored metadata.
+- The self-test narrows what a js-yaml patch release can silently change to the contracts it checks; a patch that
+  changed behaviour outside them (timestamp resolution, say) is caught only by the ordinary metadata tests.
+- The guard protects ClawMem's own parse. Another program that reads the same files with gray-matter's defaults is not
+  protected by this release.
+
+### Verification
+
+New tests, written first and run on v0.43.5's code before the change: `tests/unit/frontmatter-engines.test.ts`, 79 cases
+on Bun 1.3.14 and 1.4.2 — 53 failed on v0.43.5 (every exec spelling ran its payload; the alias, merge, omap and
+array-key fixtures parsed; the cache retained and served entries; the over-cap blocks reached the library; the pins and
+the self-check did not exist) and 26 guards passed, with identical results on both Bun versions. The tests drive the
+real `clawmem embed` and `clawmem doctor` as child processes; a positive control shows the same payload writing its
+marker through an unprotected parse. A source guard reads every shipped `.ts`/`.js` file with the TypeScript compiler's
+parser and fails unless gray-matter is bound once, by its default import, and called once, with the guarded options,
+and js-yaml's binding reaches only the engine builder — so the protection cannot be bypassed by a later edit without
+a test failing. Parity on real data, read-only: the old and the new parser return identical
+`{body, meta}` for every one of 40,335 stored documents across two vaults (32,710 with frontmatter) and for the raw file
+of every one of 4,886 file-backed documents.
+
+Full suite: 3,915 pass / 0 fail across 196 files on Bun 1.3.14, and the same on Bun 1.4.2. tsc reports the same 85
+errors as on v0.43.5, none in the files this release touches.
+
+The cross-model adversarial pass (codex) reviewed the design over seven turns to zero findings, and the code over four
+turns in a separate session to zero findings. All nine code findings were Low and all were in the test file: six on the
+first turn (a source guard that read the source with a regex, a test fixture that duplicated another after BOM stripping,
+line-count fixtures one line over, a missing JSON control, two documentation lines), then one, then two more in the
+test's hand-written tokenizer, which the final turn replaced with the TypeScript compiler's parser. No finding touched
+the shipped code.
+
 ## v0.43.5 — `clawmem embed` waits for a self-hosted server that is not up yet, and its failed stops exit 1
 
 A scheduled `clawmem embed` that started while its self-hosted embedding server was still down, with the in-process

@@ -6,7 +6,8 @@
       "name": "clawmem",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.25.1",
-        "gray-matter": "^4.0.3",
+        "gray-matter": "4.0.3",
+        "js-yaml": "~3.14.2",
         "node-llama-cpp": "^3.20.0",
         "sqlite-vec": "^0.1.7-alpha.2",
         "yaml": "^2.8.2",

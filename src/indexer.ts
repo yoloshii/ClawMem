@@ -10,6 +10,7 @@ import { isoNow } from "./clock.ts";
 import { readFileSync, statSync } from "fs";
 import { basename, isAbsolute, posix, relative, sep } from "path";
 import matter from "gray-matter";
+import jsYaml from "js-yaml";
 import { createHash } from "crypto";
 import type { Store } from "./store.ts";
 import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
@@ -129,6 +130,198 @@ export function extractTitle(content: string, filename: string): string {
 }
 
 // =============================================================================
+// Frontmatter engine (82.1 — v0.43.6)
+// =============================================================================
+//
+// gray-matter 4.0.3 reads the text after the opening `---` as a language name and runs the matching engine; its
+// default table includes a `javascript` engine that `eval`s the block, and its default YAML engine is an unbounded
+// js-yaml `safeLoad` (aliases, `<<` merges, `!!omap`). ClawMem parses frontmatter through ONE frozen options object,
+// FRONTMATTER_OPTIONS: the eval engine refuses (C1), the language is allow-listed after the call (C2), the excerpt
+// step is disabled (C3), tags are bounded (C4), gray-matter's module cache is bypassed (options disable it, C5), the
+// YAML engine is ClawMem's own bounded one (C7) that checks its own contracts with js-yaml at first use (C10), and
+// the block is measured BEFORE gray-matter sees it (C9). The binding itself is guarded by a source test (C6).
+
+/** Frontmatter block limits (operator 198 (a) / 201 (a) / 202 (a)): characters, lines, YAML depth and node count. */
+export const FRONTMATTER_LIMITS = Object.freeze({ chars: 65536, lines: 1024, depth: 32, nodes: 4096 });
+
+const YAML_MERGE_TAG = "tag:yaml.org,2002:merge";
+const YAML_OMAP_TAG = "tag:yaml.org,2002:omap";
+
+/** A js-yaml 3.x surface — what the engine needs, so T10 can hand it a fake. */
+export interface FrontmatterYamlLib {
+  safeLoad(src: string, options?: Record<string, unknown>): unknown;
+  Schema: new (definition: { include?: unknown[]; implicit?: unknown[]; explicit?: unknown[] }) => unknown;
+  CORE_SCHEMA: unknown;
+  DEFAULT_SAFE_SCHEMA: { implicit: { tag: string }[]; explicit: { tag: string }[] };
+}
+
+export interface FrontmatterYamlEngine {
+  /** Parses one frontmatter block; throws on anything over the limits, on an anchor, a merge key's expansion, `!!omap`. */
+  parse(src: string): unknown;
+  /** The self-check's verdict for THIS engine: `broken` ⇒ every parse throws (closed) until the process restarts. */
+  status(): { broken: boolean; reason?: string };
+}
+
+type ListenerState = { anchorMap?: Record<string, unknown>; anchor?: string | null };
+
+/**
+ * C7 + C10 — build the bounded YAML engine over `lib` (js-yaml 3.x). The engine refuses anchors (so no alias can be
+ * read and nothing is shared), has no merge type (a `<<` key is an ordinary key) and no `!!omap`, and stops at
+ * `FRONTMATTER_LIMITS.depth` levels / `.nodes` nodes / `.chars` characters. Before its FIRST parse it runs a self-test
+ * of the contracts those limits rely on — js-yaml reports every node to the listener, in order, with its depth, and
+ * exposes anchors through `state.anchorMap` / `state.anchor` — and marks itself BROKEN (every later parse throws;
+ * one stderr line, once) when a contract fails, so a js-yaml that stopped reporting could never fail open.
+ */
+export function makeFrontmatterYamlEngine(lib: FrontmatterYamlLib): FrontmatterYamlEngine {
+  const safe = lib.DEFAULT_SAFE_SCHEMA;
+  const schema = new lib.Schema({
+    include: [lib.CORE_SCHEMA],
+    implicit: safe.implicit.filter(t => t.tag !== YAML_MERGE_TAG),
+    explicit: safe.explicit.filter(t => t.tag !== YAML_OMAP_TAG),
+  });
+
+  /** One bounded load; `trace` (when given) records every listener event as `open:<depth>` / `close:<depth>`. */
+  const load = (src: string, trace?: string[]): unknown => {
+    if (src.length > FRONTMATTER_LIMITS.chars) throw new Error(`frontmatter block over ${FRONTMATTER_LIMITS.chars} characters`);
+    let depth = 0;
+    let nodes = 0;
+    let events = 0;
+    const listener = (event: string, state: ListenerState) => {
+      events++;
+      // Fail closed on a loader that hides its anchor state, and refuse any anchor — including `&__proto__`, which
+      // the `{}` anchorMap stores as a prototype rather than an own entry, so `state.anchor` is checked too.
+      if (!state || typeof state.anchorMap !== "object" || state.anchorMap === null) throw new Error("frontmatter YAML: anchor state unavailable");
+      if (Object.keys(state.anchorMap).length > 0 || state.anchor != null) throw new Error("frontmatter YAML: anchors are not accepted");
+      if (event === "open") {
+        depth++;
+        nodes++;
+        if (depth > FRONTMATTER_LIMITS.depth) throw new Error(`frontmatter YAML nested deeper than ${FRONTMATTER_LIMITS.depth}`);
+        if (nodes > FRONTMATTER_LIMITS.nodes) throw new Error(`frontmatter YAML over ${FRONTMATTER_LIMITS.nodes} nodes`);
+      } else {
+        depth--;
+      }
+      trace?.push(`${event}:${event === "open" ? depth : depth + 1}`);
+    };
+    const result = lib.safeLoad(src, { schema, listener });
+    // C10 (1): the listener is called for every non-empty block; a loader that called it less has dropped the limits.
+    if (events === 0 && src.trim() !== "") throw new Error("frontmatter YAML: the loader reported no nodes");
+    return result;
+  };
+
+  // C10 (2) — the self-test, once per engine, at first use (never at import: hooks and the stop-judge import this module).
+  const SELF_TEST_BLOCK = "a:\n  b: [1, 2]\n  c: d\n";
+  // js-yaml 3.14.2's events for that block, recorded 2026-11-07: the root mapping (1); key `a` (2) opens and closes
+  // before its value mapping (2) opens; inside it key `b` (3), the sequence (3) holding scalars 1 and 2 (4 each), then
+  // key `c` (3) and scalar `d` (3). 18 events — every node, in order, with its depth.
+  const SELF_TEST_TRACE = [
+    "open:1", "open:2", "close:2", "open:2", "open:3", "close:3", "open:3", "open:4", "close:4", "open:4", "close:4",
+    "close:3", "open:3", "close:3", "open:3", "close:3", "close:2", "close:1",
+  ];
+  let checked = false;
+  let broken: string | undefined;
+  const fail = (why: string) => { broken = why; process.stderr.write(`clawmem: frontmatter YAML guard self-test FAILED — ${why}; YAML frontmatter is read as plain text until this is fixed (clawmem doctor reports it)\n`); };
+  const selfTest = () => {
+    checked = true;
+    try {
+      // (a) the full event trace of a fixed nested block equals the recorded one — every node, in order, with its depth
+      const trace: string[] = [];
+      load(SELF_TEST_BLOCK, trace);
+      if (trace.join(" ") !== SELF_TEST_TRACE.join(" ")) return fail(`node trace differs (${trace.length} events)`);
+      // (b) depth 33 throws the depth error; (c) 4,097 nodes throw the node error
+      const deep = "a: " + "[".repeat(32) + "1" + "]".repeat(32);
+      if (!throws(() => load(deep), /deeper than/)) return fail("depth limit not enforced");
+      const wide = "a: [" + Array(4094).fill("1").join(", ") + "]";   // root + key + sequence + 4,094 scalars = 4,097 nodes
+      if (!throws(() => load(wide), /nodes/)) return fail("node limit not enforced");
+      // (d) an anchor on the FIRST of two sibling values throws at that value's own CLOSE event (js-yaml 3.14.2 sets
+      // `state.anchor` as the anchored node finishes composing, measured 2026-11-07), so the trace holds the root,
+      // key `a` and the value's open only (4 events) — never the sibling `b`, whose key opens as the 6th event
+      const t2: string[] = [];
+      if (!throws(() => load("a: &x 1\nb: 2", t2), /anchors are not accepted/)) return fail("anchors not visible to the listener");
+      if (t2.length > 4) return fail(`anchor refused only after ${t2.length} events (sibling composed)`);
+      // (e) the same block without the anchor parses to the expected object
+      const plain = load("a: 1\nb: 2") as Record<string, unknown>;
+      if (!plain || plain.a !== 1 || plain.b !== 2) return fail("plain block did not parse");
+    } catch (e) {
+      return fail(`self-test threw: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  return {
+    parse(src: string): unknown {
+      if (!checked) selfTest();
+      if (broken) throw new Error(`frontmatter YAML guard broken: ${broken}`);
+      return load(src);
+    },
+    status: () => (broken ? { broken: true, reason: broken } : { broken: false }),
+  };
+}
+
+function throws(fn: () => unknown, re: RegExp): boolean {
+  try { fn(); return false; } catch (e) { return re.test(e instanceof Error ? e.message : String(e)); }
+}
+
+const FRONTMATTER_YAML = makeFrontmatterYamlEngine(jsYaml as unknown as FrontmatterYamlLib);
+const TEST_GUARD_HOOK = process.env.CLAWMEM_TEST_FRONTMATTER_GUARD;   // test seam: "broken" forces the broken state
+
+/** The production engine's self-check verdict (`clawmem doctor` prints a ✗ line when it is broken). */
+export function frontmatterGuardStatus(): { broken: boolean; reason?: string } {
+  if (TEST_GUARD_HOOK === "broken") return { broken: true, reason: "forced by CLAWMEM_TEST_FRONTMATTER_GUARD (test hook)" };
+  try { FRONTMATTER_YAML.parse("self: check"); } catch { /* the status below carries the reason */ }
+  return FRONTMATTER_YAML.status();
+}
+
+const refuse = (what: string) => ({ parse(): never { throw new Error(`frontmatter ${what} engine is not accepted`); } });
+
+/** C1 / C3 / C5 / C7 — the ONE options object every gray-matter call receives (passing options bypasses its cache). */
+const FRONTMATTER_OPTIONS = Object.freeze({
+  engines: Object.freeze({
+    javascript: refuse("javascript"),
+    coffee: refuse("coffee"),
+    yaml: { parse: (src: string) => FRONTMATTER_YAML.parse(src) as object },
+    json: { parse: (src: string): object => { if (src.length > FRONTMATTER_LIMITS.chars) throw new Error("frontmatter block too large"); return JSON.parse(src); } },
+  }),
+  excerpt: (): string => "",
+});
+
+const ALLOWED_LANGUAGES = (lang: string) => ["yaml", "yml"].includes(lang.toLowerCase()) || lang === "json";
+
+/**
+ * C9 — measure the frontmatter block the way gray-matter delimits it, BEFORE calling it: strip one BOM; if the text
+ * starts with `---` and the fourth character is not `-`, the block runs from index 3 to the first `\n---` (or the end).
+ * Over the character cap, or over the line cap — lines counted the way the comment regex's `^` sees them: every CR, LF,
+ * U+2028 and U+2029, CRLF once — the text is NOT frontmatter. Linear: one indexOf, one pass.
+ */
+function frontmatterBlockWithinLimits(content: string): boolean {
+  const text = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+  if (!text.startsWith("---") || text.charAt(3) === "-") return true;      // not frontmatter: nothing to measure
+  const close = text.indexOf("\n---", 3);
+  const block = text.slice(3, close === -1 ? text.length : close);
+  if (block.length > FRONTMATTER_LIMITS.chars) return false;
+  let terminators = 0;
+  for (let i = 0; i < block.length; i++) {
+    const c = block.charCodeAt(i);
+    if (c === 0x0a || c === 0x2028 || c === 0x2029) terminators++;
+    else if (c === 0x0d) { terminators++; if (block.charCodeAt(i + 1) === 0x0a) i++; }
+    if (terminators + 1 > FRONTMATTER_LIMITS.lines) return false;
+  }
+  return true;
+}
+
+/** C4 — `tags`: scalar elements only (string / finite number / boolean), each ≤ 256 characters, at most 64. */
+function boundedTags(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const v of value) {
+    if (out.length >= 64) break;
+    if (typeof v === "string" || (typeof v === "number" && Number.isFinite(v)) || typeof v === "boolean") {
+      const s = String(v);
+      if (s.length <= 256) out.push(s);
+    }
+  }
+  return out;
+}
+
+// =============================================================================
 // Frontmatter Parsing
 // =============================================================================
 
@@ -138,12 +331,20 @@ export function parseDocument(content: string, relativePath: string): { body: st
   const str = (v: unknown): string | undefined =>
     typeof v === "string" ? v || undefined : undefined;
   try {
-    const { data, content: body } = matter(content);
+    if (!frontmatterBlockWithinLimits(content)) throw new Error("frontmatter block over the limits");   // C9
+    const file = matter(content, FRONTMATTER_OPTIONS);
+    // C2 — allow-list the language AFTER the call: `matter("")` returns early with no `language`, so an emptied file
+    // is yaml (→ authored_at null, clears a stored date); an EMPTY or comment-only block under a forbidden tag never
+    // reached an engine, and the Object-prototype names (`constructor`, `toString`, `valueOf`) return junk `data`.
+    const lang = (file as { language?: string }).language || "yaml";
+    if (!ALLOWED_LANGUAGES(lang)) throw new Error(`frontmatter language ${lang} is not accepted`);
+    const data = (file.data ?? {}) as Record<string, unknown>;
+    const body = file.content;
     return {
       body,
       meta: {
         title: str(data.title),
-        tags: Array.isArray(data.tags) ? data.tags.map(String) : undefined,
+        tags: boundedTags(data.tags),
         domain: str(data.domain),
         workstream: str(data.workstream),
         content_type: (str(data.content_type) as ContentType) || inferContentType(relativePath),

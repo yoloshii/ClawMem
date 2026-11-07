@@ -64,7 +64,7 @@ import { GoldFileError } from "./eval/gold.ts";
 import { runHookEval, HookEvalIntegrityError, PAIR_TREATMENTS, type RunHookEvalResult, type PairTreatment, type VectorExecSpec } from "./eval/hook-run.ts";
 import { aggregateReplicatedRunDirs, writeReplicatedArtifacts, type ReplicatedAggregate } from "./eval/replicated.ts";
 import { HookGoldFileError } from "./eval/hook-gold.ts";
-import { indexCollection, parseDocument, hashContent, pathWithin, watchTargets } from "./indexer.ts";
+import { indexCollection, parseDocument, hashContent, pathWithin, watchTargets, frontmatterGuardStatus } from "./indexer.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
@@ -3882,6 +3882,18 @@ async function cmdDoctor() {
   } catch (err) {
     console.log(`${c.red}✗${c.reset} Database: ${err}`);
     issues++;
+  }
+
+  // 1a. 82.1 (C10): the frontmatter YAML guard's self-test — a js-yaml that stopped reporting nodes, depth or anchors
+  // would otherwise drop the limits silently; a broken guard reads every YAML frontmatter block as plain text.
+  {
+    const guard = frontmatterGuardStatus();
+    if (guard.broken) {
+      console.log(`${c.red}✗${c.reset} Frontmatter guard: self-test FAILED (${guard.reason}) — YAML frontmatter is read as plain text (title, tags, authored_at not extracted) until the installed YAML parser's contracts are restored — reinstall the pinned dependencies`);
+      issues++;
+    } else {
+      console.log(`${c.green}✓${c.reset} Frontmatter guard: bounded YAML engine self-test passed`);
+    }
   }
 
   // 1b. 62.1 D10: the stop pipeline — migration and fence, older writers the fence caught, the one-time counter
