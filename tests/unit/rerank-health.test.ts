@@ -6,7 +6,7 @@ import { test, expect, describe, afterEach, beforeEach } from "bun:test";
 import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { createStore, RerankCoverageError, RerankMalformedResponseError, rerankCacheKey, rerankTextHash, rerankTransmittedText, rerankProviderNamespace, writeRerankProviderFingerprint, revokeRerankProviderFingerprint, isRerankProviderRevoked, readRerankProviderFingerprint, rerankIdentityState, _setRerankStateReadHook, RERANK_PROVIDER_ATTESTATION_TTL_MS } from "../../src/store.ts";
 import { blendRerank, RERANK_DEGENERATE_FLOOR } from "../../src/search-utils.ts";
-import { probeRerankHealth, assessRerankDegeneracy, RERANK_CALIB_FLOOR, RERANK_DISCRIM_MARGIN, RERANK_REQUEST_SPREAD_FLOOR, type GoldenTriple } from "../../src/health/rerank-health.ts";
+import { probeRerankHealth, assessRerankDegeneracy, RERANK_CALIB_FLOOR, RERANK_DISCRIM_MARGIN, RERANK_REQUEST_SPREAD_FLOOR, rerankDiscrimMargin, type GoldenTriple } from "../../src/health/rerank-health.ts";
 
 /**
  * A store whose configured rerank endpoint is already ATTESTED. Remote
@@ -355,6 +355,38 @@ describe("probeRerankHealth", () => {
     expect(res.ok).toBe(false);
     expect(res.maxScore).toBe(0.5); // calibration band is satisfied...
     expect(res.failures.some((f) => f.includes("margin"))).toBe(true); // ...but discrimination is not
+  });
+
+  test("rerankDiscrimMargin: default, valid override, invalid values fall back", () => {
+    expect(rerankDiscrimMargin(undefined)).toBe(RERANK_DISCRIM_MARGIN);
+    expect(rerankDiscrimMargin("")).toBe(RERANK_DISCRIM_MARGIN);
+    expect(rerankDiscrimMargin("0.1")).toBe(0.1);
+    for (const bad of ["abc", "0", "-0.2", "1", "2", "NaN"]) expect(rerankDiscrimMargin(bad)).toBe(RERANK_DISCRIM_MARGIN);
+  });
+
+  test("CLAWMEM_RERANK_DISCRIM_MARGIN: a saturating-but-correct reranker (1.0 vs 0.86) passes at 0.1, fails at the default", async () => {
+    const sat = fakeStore((f) => (f.endsWith("-rel") ? 1.0 : 0.86));
+    const prev = Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN;
+    try {
+      delete Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN;
+      expect((await probeRerankHealth(sat, { triples })).ok).toBe(false);
+      Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN = "0.1";
+      expect((await probeRerankHealth(sat, { triples })).ok).toBe(true);
+    } finally {
+      if (prev === undefined) delete Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN; else Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN = prev;
+    }
+  });
+
+  test("a lowered margin still rejects inverted and constant rerankers", async () => {
+    const prev = Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN;
+    try {
+      Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN = "0.1";
+      expect((await probeRerankHealth(fakeStore((f) => (f.endsWith("-rel") ? 0.2 : 0.9)), { triples })).ok).toBe(false); // inverted
+      expect((await probeRerankHealth(fakeStore(() => 0.5), { triples })).ok).toBe(false); // constant
+      expect((await probeRerankHealth(fakeStore(() => 1e-11), { triples })).ok).toBe(false); // collapse
+    } finally {
+      if (prev === undefined) delete Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN; else Bun.env.CLAWMEM_RERANK_DISCRIM_MARGIN = prev;
+    }
   });
 
   test("coverage failure (RerankCoverageError) surfaces as a probe failure", async () => {
