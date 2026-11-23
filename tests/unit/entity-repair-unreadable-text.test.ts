@@ -1,8 +1,8 @@
 /**
  * BACKLOG 82.3, Codex T1 S1, operator ruling 82 A — the entity repair and stored text that is not valid UTF-8.
  *
- * Bun reads a TEXT value whose bytes are not valid UTF-8 LOSSILY: a short value as the empty string (the whole value),
- * a longer one with U+FFFD in place of the bad bytes (85 A's correction of 82 A; both cases are tested below).
+ * Bun reads a TEXT value whose bytes are not valid UTF-8 LOSSILY: Bun 1.3.14 reads a short value as the empty string and
+ * a longer one with U+FFFD in place of the bad bytes; Bun 1.4.2 reads both with U+FFFD. Either way it does not read back as its bytes.
  * Older versions could store such bytes: their string binding of a value that started with U+FFFE stored every later
  * code unit byte-swapped, and a swapped code unit can be a lone surrogate (U+FFFE + U+00D8 was stored as `EDA080`).
  * The repair copies, compares and restores rows through strings, so such a value would be written back changed (a short
@@ -110,12 +110,14 @@ describe("82 A: the entity repair refuses stored text that does not read back as
     }
   });
 
-  test("the legacy bytes (a short value) really read as empty text (one case of the fact this rests on)", () => {
+  test("the legacy bytes (a short value) do not read back as their own bytes (the fact this rests on, on any Bun)", () => {
     const v = repairVault();
     plant(v.path, `UPDATE entity_triples SET source_fact = CAST(? AS TEXT) WHERE id = ?`, LEGACY_SURROGATE, v.t1);
     const db = openDatabase(v.path, { readonly: true });
     try {
-      expect(db.prepare(`SELECT source_fact AS f, hex(source_fact) AS h FROM entity_triples WHERE id = ?`).get(v.t1)).toEqual({ f: "", h: "EDA080" });
+      const r = db.prepare(`SELECT source_fact AS f, hex(source_fact) AS h FROM entity_triples WHERE id = ?`).get(v.t1) as { f: string; h: string };
+      expect(r.h).toBe("EDA080");
+      expect(Buffer.from(r.f, "utf-8").toString("hex").toUpperCase()).not.toBe("EDA080");   // "" on Bun 1.3.14, U+FFFD on 1.4.2
     } finally { db.close(); }
   });
 

@@ -234,7 +234,7 @@ file already listed selects that vault. The default index is named `general`, or
 vault on another file has that name (`default-index-2` and up when that name is configured for another file too), so
 `--vault general` reaches the vault your config calls `general`. The command opens vault files directly and
 initializes no store. The dry run, `--apply` and `--restore` refuse (exit 1, nothing written) while a stored text value
-among the values they read or write is not valid UTF-8 — Bun reads such a value lossily (a short one as empty text),
+among the values they read or write is not valid UTF-8 — Bun reads such a value lossily (on some Bun versions a short one as empty text),
 so the repair could not keep it ([what to do](../troubleshooting.md#stored-text-that-is-not-valid-utf-8)). Exit 1 when an apply or restore is refused, or a restore keeps a group because something
 changed it since or undoing it would put back a second open triple on one subject, predicate and object.
 Details: [Repairing links made before

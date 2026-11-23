@@ -223,7 +223,7 @@ export function missingPrerequisite(db: Database): string | null {
 
 /**
  * Bun reads a TEXT value whose bytes are not valid UTF-8 LOSSILY — a
- * short value as the empty string, a longer one with U+FFFD in place of the bad bytes (measured). Older versions could store such bytes (their binding of a value that started with U+FFFE stored every
+ * short value as the empty string on Bun 1.3.14 (with U+FFFD on 1.4.2), a longer one with U+FFFD in place of the bad bytes (measured). Older versions could store such bytes (their binding of a value that started with U+FFFE stored every
  * later code unit byte-swapped, and a swapped code unit can be a lone surrogate). The repair copies, compares and
  * restores rows through strings, so it cannot keep such a value: it refuses while one exists among the VALUES it reads
  * or writes — the entity tables it snapshots, the bodies it re-reads, and for a restore the log rows of its op.
@@ -268,7 +268,7 @@ function unreadableRefusal(found: { count: number; first: string[] }): EntityRep
   return new EntityRepairRefusal(
     `${found.count} stored text value${found.count === 1 ? "" : "s"} in the tables the entity repair reads or writes ` +
     `${found.count === 1 ? "does" : "do"} not read back as ${found.count === 1 ? "its" : "their"} own bytes (not valid UTF-8 — ` +
-    `older versions could store such bytes, and they read back changed — a short value as empty text): ${found.first.join(", ")}${more}. ` +
+    `older versions could store such bytes, and they read back changed): ${found.first.join(", ")}${more}. ` +
     `The repair cannot copy, compare or restore them — nothing written. Fix or remove those rows by hand ` +
     `(troubleshooting: "Stored text that is not valid UTF-8"), then run the dry run again`,
   );

@@ -693,8 +693,8 @@ mark), or a U+FFFE at the very start of a file — older versions already droppe
 
 **`clawmem repair entities`: "N stored text value(s) in the tables the entity repair reads or writes do not read back
 as their own bytes … nothing written."** (exit 1 — the dry run, `--apply` and `--restore` alike)
-- Bun reads a stored text value whose bytes are not valid UTF-8 lossily: a short value as empty text, a longer one with
-  U+FFFD in place of the bad bytes (both measured on Bun 1.3.14). Older versions could
+- Bun reads a stored text value whose bytes are not valid UTF-8 lossily: Bun 1.3.14 reads a short value as empty text
+  and a longer one with U+FFFD in place of the bad bytes; Bun 1.4.2 reads both with U+FFFD. Older versions could
   store such bytes: after a leading U+FFFE their binding stored every code unit byte-swapped, and a swapped code unit
   can be half of a UTF-16 pair (U+FFFE followed by U+00D8 was stored as the bytes `ED A0 80`). The entity repair copies,
   compares and restores rows through text, so it would write such a value back changed. It refuses instead, naming the

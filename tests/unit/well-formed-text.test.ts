@@ -3,7 +3,7 @@
  *
  * A JavaScript string can hold half of a surrogate pair (JSON "\ud800" from a REST or MCP client). Node's hash encodes
  * it as U+FFFD (EF BF BD), but SQLite stores it as ED A0 80 — so the hash of a body was not the hash of what was stored,
- * and Bun then reads those bytes back lossily (a short value like these as an empty string). The normalisation of a free-text field (`stripLeadingMarks`,
+ * and Bun then reads those bytes back lossily (on Bun 1.3.14 a short value like these as an empty string, on 1.4.2 with U+FFFD). The normalisation of a free-text field (`stripLeadingMarks`,
  * and so `normalizedContent`) replaces each lone surrogate with U+FFFD before hashing and storing; a whole pair is kept.
  * `insertContent` refuses a body that is not already normalised, the length unchanged included.
  */
@@ -104,7 +104,9 @@ describe("84 A: a write whose hash is stored with other bytes rewrites that row"
 
   test("saveMemory of the same text: the row now holds the body (hash = hash of its bytes), the new memory reads it, and the OLD document's search row follows", () => {
     const { s, body, hash, bad, oldId } = legacy("note " + HIGH + " end");
-    expect((s.db.prepare(`SELECT doc AS t FROM content WHERE hash = ?`).get(hash) as { t: string }).t).toBe("");   // the old row reads empty
+    const old = s.db.prepare(`SELECT doc AS t, CAST(doc AS BLOB) AS b FROM content WHERE hash = ?`).get(hash) as { t: string; b: Uint8Array };
+    expect(Buffer.from(old.b).equals(bad)).toBe(true);
+    expect(old.t).not.toBe(body);   // the old row does not read as the body ("" on Bun 1.3.14, U+FFFD on 1.4.2)
     saveMemory(s.db, { collection: "_clawmem", path: "memories/new.md", title: "new", body: "note " + HIGH + " end", contentType: "note" });
     const row = s.db.prepare(`SELECT doc AS t, CAST(doc AS BLOB) AS b FROM content WHERE hash = ?`).get(hash) as { t: string; b: Uint8Array };
     expect(row.t).toBe(body);
