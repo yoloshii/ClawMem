@@ -168,7 +168,7 @@ async function restVectorLeg(store: Store, query: string, limit: number, collect
   }
 }
 
-/** The degraded fields of a REST search reply (operator ruling 24 A): present only when something was degraded. */
+/** The degraded fields of a REST search reply: present only when something was degraded. */
 function restDegraded(...legs: (RestDegradedLeg | undefined)[]): { degraded?: true; degradedLegs?: RestDegradedLeg[] } {
   const listed = legs.filter((leg): leg is RestDegradedLeg => leg !== undefined);
   return listed.length > 0 ? { degraded: true, degradedLegs: listed } : {};
@@ -646,7 +646,7 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
     temporalEdges = store.buildTemporalBackbone();
   }
   if (doSemantic) {
-    // v0.43.7 (82.2 D4, operator ruling 28 A): the count of skipped neighbour rows is carried in the reply.
+    // v0.43.7 (82.2 D4): the count of skipped neighbour rows is carried in the reply.
     const built = await store.buildSemanticGraphDetailed();
     semanticEdges = built.edges;
     semanticSkipped = built.vectorFaults;

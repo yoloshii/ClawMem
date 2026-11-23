@@ -116,7 +116,7 @@ function isNonEmptyString(x: unknown): x is string {
  * until expiry, or write malformed attribution.
  */
 /**
- * BACKLOG 82.3, D7 (ruling 68 A): the identifier of a job that starts with a byte-order mark — its session id, or the
+ * BACKLOG 82.3, D7: the identifier of a job that starts with a byte-order mark — its session id, or the
  * collection or relative path of a display path it names — or null. Such a job can only come from a spool written
  * before the upgrade; it is inadmissible (applying it would bind the mark-led value again, be refused, and be retried on
  * every drain). A display path is bound as two identifiers split at its FIRST slash (`resolveDocId`,
@@ -141,7 +141,7 @@ export function markedIdentifierInJob(x: unknown): string | null {
   return null;
 }
 
-/** 68 A: the one line that reports a discarded job naming a mark-led identifier (the value is not printed), or null. */
+/** The one line that reports a discarded job naming a mark-led identifier (the value is not printed), or null. */
 export function markedJobReport(x: unknown): string | null {
   const marked = markedIdentifierInJob(x);
   if (marked === null) return null;
@@ -153,7 +153,7 @@ export function validateSurfacingBookkeepingJob(x: unknown): x is SurfacingBookk
   if (typeof x !== "object" || x === null) return false;
   const j = x as Record<string, unknown>;
   if (j.v !== 1 || j.kind !== "surfacing-bookkeeping") return false;
-  if (markedIdentifierInJob(j) !== null) return false;   // 68 A
+  if (markedIdentifierInJob(j) !== null) return false;
   if (!isNonEmptyString(j.jobId) || !isNonEmptyString(j.sessionId) || !isNonEmptyString(j.queryHash)) return false;
   if (!Number.isInteger(j.turnIndex) || (j.turnIndex as number) < 0) return false;
   // t62 (codex F61-2): the contract says the alignment row EXISTS — a job
@@ -533,7 +533,7 @@ export function drainSurfacingBookkeepingSpool(
         const parsed = JSON.parse(readFileSync(claim, "utf-8")) as unknown;
         const report = markedJobReport(parsed);
         if (report !== null) {
-          try { process.stderr.write(report + "\n"); } catch { /* stderr closed */ }   // 68 A: discarded below, reported
+          try { process.stderr.write(report + "\n"); } catch { /* stderr closed */ }   // discarded below, reported
         } else if (validateSurfacingBookkeepingJob(parsed)) job = parsed;
       }
     } catch { /* unreadable/unparsable → discard below */ }

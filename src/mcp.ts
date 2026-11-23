@@ -108,7 +108,7 @@ type StatusResult = {
 
 /**
  * 82.3 D7 — FREE TEXT at the tool boundary (a query, an entity name): a normalised field. Every leading byte-order
- * mark is removed, so a query that starts with one searches for the rest. Operator ruling 45 A: every free-text
+ * mark is removed, so a query that starts with one searches for the rest. Every free-text
  * input of this server goes through here, not only the five search tools.
  */
 const freeText = (text: string): string => stripLeadingMarks(text);
@@ -165,7 +165,7 @@ function degradedGuidanceText(legs: DegradedLeg[]): string {
 type VecLegDetail = { degraded: boolean; degradedReason?: DegradedLeg["reason"]; vectorFaults: number };
 
 /**
- * The degraded entries of ONE vector leg (v0.43.7, 82.2 D4; operator ruling 17 A): the older reason stays as it
+ * The degraded entries of ONE vector leg (v0.43.7, 82.2 D4): the older reason stays as it
  * is, and stored vectors the scan skipped as unusable are an entry of their own, with the count.
  */
 export function vectorLegEntries(leg: string, det: VecLegDetail): DegradedLeg[] {
@@ -2077,7 +2077,7 @@ This is the recommended entry point for ALL memory queries.`,
       }
 
       if (shouldBuildSemantic) {
-        // v0.43.7 (82.2 D4, operator ruling 28 A): the reply carries the count of neighbour rows the builder
+        // v0.43.7 (82.2 D4): the reply carries the count of neighbour rows the builder
         // skipped because their distance was not usable — only when there were any.
         const built = await store.buildSemanticGraphDetailed(semantic_threshold);
         results.semantic = built.edges;
@@ -2449,9 +2449,9 @@ This is the recommended entry point for ALL memory queries.`,
     },
     async ({ entity, as_of, direction, vault }) => {
       const store = getStore(vault);
-      // 79 A: a mark before a canonical id is refused (an identifier); before a name it is stripped (45 A, free text)
+      // a mark before a canonical id is refused (an identifier); before a name it is stripped (free text)
       if (markedEntityId(store.db, entity) !== null) refuseLeadingMark(trimSpace(entity), "entity (a canonical entity id)");
-      // a name: every leading space and mark goes (a space can precede the mark), then the free-text policy (45 A)
+      // a name: every leading space and mark goes (a space can precede the mark), then the free-text policy
       entity = freeText(entity.replace(/^[\s\uFFFE]+/, ""));
 
       // 76.2: an existing canonical ID, then every entity with exactly this name, then the

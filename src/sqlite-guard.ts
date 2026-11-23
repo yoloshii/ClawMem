@@ -72,7 +72,7 @@ const censusSeen = new Set<string>();
 /**
  * A statement as the census names it: white space collapsed. A READING statement also has each run of `?, ?, …`
  * written once (an `IN` list of any length is one pair per position). A WRITING statement (INSERT / REPLACE /
- * UPDATE — operator ruling 49 A) keeps every placeholder: its census maps each one to the column it writes, and a
+ * UPDATE) keeps every placeholder: its census maps each one to the column it writes, and a
  * folded `VALUES (?, …)` would no longer say which column a parameter feeds.
  */
 export function censusStatement(sql: string): string {

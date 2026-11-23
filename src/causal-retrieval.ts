@@ -108,7 +108,7 @@ export interface CausalDegradedLeg {
 }
 
 /**
- * The entries of one vector-anchor lookup (operator ruling 17 A): the older reason stays as it is; stored vectors
+ * The entries of one vector-anchor lookup: the older reason stays as it is; stored vectors
  * the scan skipped are an entry of their own, with the count.
  */
 function anchorEntries(leg: string, det: Pick<VecSearchDetailedResult, "degraded" | "degradedReason" | "vectorFaults">): CausalDegradedLeg[] {

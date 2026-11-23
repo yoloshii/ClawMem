@@ -486,7 +486,7 @@ export function watchTargets<C extends { name: string; path: string; pattern?: s
  */
 export const RESERVED_COLLECTIONS = new Set(["_clawmem"]);
 
-/** The mark-led paths this process has already warned about (82.3 D7, ruling 44 A): `collection`, NUL, `path`. */
+/** The mark-led paths this process has already warned about (82.3 D7): `collection`, NUL, `path`. */
 const warnedRefusedPaths = new Set<string>();
 
 /** Test seam: forget which refused paths were warned about, so a test sees the first warning again. */
@@ -553,7 +553,7 @@ export async function indexCollection(
       // is not touched for the second. The file is left out of `activePaths` too: no row is stored at its path.
       if (startsWithMark(relativePath)) {
         stats.refused++;
-        // Counted on EVERY pass; warned about ONCE per process per file (operator ruling 44 A) — under the watcher
+        // Counted on EVERY pass; warned about ONCE per process per file — under the watcher
         // a pass runs on every change in the collection.
         const refusedKey = `${collectionName}\u0000${relativePath}`;
         if (warnedRefusedPaths.has(refusedKey)) continue;

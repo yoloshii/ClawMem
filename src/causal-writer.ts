@@ -202,7 +202,7 @@ export function insertCausalEvent(db: Database, runId: number, ev: CausalEventIn
     ev.sourceFactOrdinal ?? null,
     ev.targetFactOrdinal ?? null,
     ev.confidence ?? null,
-    // BACKLOG 82.3, D7 (ruling 61 A): detail is normalised — often the model's own words; a refused detail would lose the event.
+    // BACKLOG 82.3, D7: detail is normalised — often the model's own words; a refused detail would lose the event.
     ev.detail == null ? null : truncateText(stripLeadingMarks(ev.detail), EVENT_DETAIL_MAX),   // never half of a pair (T2 S3)
     isoNow(),
   );
@@ -895,7 +895,7 @@ export async function runCausalStep(
         // weight re-derivation (the 0.9-metadata / 0.7-new-sighting case keeps 0.9).
         db.prepare(INSERT_LEGACY_SIGHTING_SQL).run(
           sourceDocId, targetDocId,
-          // 82.3 D7 (ruling 57 A): copied evidence text is normalised like a live sighting's
+          // 82.3 D7: copied evidence text is normalised like a live sighting's
           nullableStrip(legacy.sourceFact), nullableStrip(legacy.targetFact), nullableStrip(legacy.reasoning), legacy.confidence,
           runKey, runId, edge!.created_at ?? nowIso,
         );
@@ -933,7 +933,7 @@ export async function runCausalStep(
         const changes = insertSighting.run(
           cand.sourceDocId, cand.targetDocId,
           cand.sourceOrdinal, cand.targetOrdinal,
-          // 82.3 D7 (ruling 55 A): model text stored as evidence is normalised
+          // 82.3 D7: model text stored as evidence is normalised
           stripLeadingMarks(cand.sourceFact), stripLeadingMarks(cand.targetFact),
           stripLeadingMarks(cand.reasoning), cand.confidence,
           modelIdentity, CAUSAL_PROMPT_VERSION,

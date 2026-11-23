@@ -91,8 +91,8 @@ export async function judgePhaseA(
     const queryText = newFacts.join(". ");
     let existing: SearchResult[];
     try {
-      // The fault-carrying form (82.2 D4, ruling 16 B). The judge has no reply to mark: a skipped stored vector is
-      // named by the once-per-process warning, and a refused query vector falls back as any error does (ruling 10).
+      // The fault-carrying form (82.2 D4). The judge has no reply to mark: a skipped stored vector is
+      // named by the once-per-process warning, and a refused query vector falls back as any error does.
       existing = (await store.searchVecWithFaults(queryText, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, phaseDeadline)).results;
     } catch (e) {
       warnOnceOnVectorModelMismatch(e);

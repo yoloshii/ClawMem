@@ -6,16 +6,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ## v0.43.7 — unusable vectors are refused and repaired; values that start with a byte-order mark are no longer altered
 
-Two integrity defects (BACKLOG 82.2 and 82.3), one release. Neither runs code or reaches outside the vault; both could
+Two integrity defects, one release. Neither runs code or reaches outside the vault; both could
 change what the vault holds or what a search returns, without a sign.
 
-**Vectors (82.2).** An embedding reply was converted to a `Float32Array` without a check, so `null`, a numeric
+**Vectors.** An embedding reply was converted to a `Float32Array` without a check, so `null`, a numeric
 string, a boolean, `1e400`, an all-zero vector or a vector of enormous length was stored as it came. sqlite-vec then
 computed no distance, or a distance that is no distance (NaN, −Infinity), for such a vector — and one could sort FIRST
 in every vector search. The canary could pass a NaN margin. A stored vector was also read back as raw bytes in one
 graph path, so its affinity was computed on bytes against floats.
 
-**Byte-order marks (82.3).** Bun's SQLite binding changes a bound string that STARTS with U+FEFF or U+FFFE: a U+FEFF
+**Byte-order marks.** Bun's SQLite binding changes a bound string that STARTS with U+FEFF or U+FFFE: a U+FEFF
 is dropped (of two, one is kept); after a U+FFFE every later character is stored byte-swapped (U+FFFE then U+4E00 is
 stored as the letter `N`). A lookup with the same value is changed the same way, so it found the damaged row: a body
 was stored altered under the hash of its original text, a file named with a mark was stored under another name (and
@@ -242,11 +242,11 @@ exits listed above. A server that needs more than 120 s to start: set `CLAWMEM_E
 - A server that goes away after the wait behaves as before. Before the canary, a non-force run warns and goes on, and a
   `--force` run refuses at the canary. During the sweep, the remaining requests fail at once for 60 s, and each
   document whose fragments fail is charged an attempt (a document that completes resets its count). Three such runs in
-  a row still skip a document without a report. Recovery mid-run and the report are BACKLOG 77.3 and 77.4.
+  a row still skip a document without a report. Recovery mid-run and the report are follow-up work.
 - With the in-process fallback allowed, a server that is down still meets the fallback; the new model check refuses
   its vectors only where they differ from a vault's one stored model. A fresh vault, and a vault whose stored model is
-  the in-process one, still embed locally. One backend per run is BACKLOG 77.2.
-- A cloud setup can still fall back to the in-process model after a transport error (BACKLOG 77.2).
+  the in-process one, still embed locally. One backend per run is follow-up work.
+- A cloud setup can still fall back to the in-process model after a transport error (follow-up work).
 
 ### Verification
 
@@ -261,7 +261,7 @@ Full suite: 3,838 pass / 0 fail across 195 files (3 todo) on Bun 1.3.14 and the 
 85 errors as on v0.43.4, none in the files this release adds; the O1 seam audit passes.
 
 The cross-model adversarial pass (codex) reviewed the design over five turns (11, 9, 4, 1 and 0 findings), which
-narrowed it to this release and moved the rest to BACKLOG 77.2–77.4. Its first code turn found 3: the wait accepted a
+narrowed it to this release and moved the rest to follow-up work. Its first code turn found 3: the wait accepted a
 ready answer after the embed lease was lost during the probe, the test server's TCP front counted requests by the first
 bytes of a socket read (a request line split across reads went uncounted), and four docs said the wait came before
 anything the run does. Each code fix got a test that failed on the code before it. The second code turn cleared the
@@ -891,11 +891,11 @@ backoff), and the next invocation sent the same first call again — every minut
   entity such as `toolu_abcdef.ts` keeps its triple), or whose subject equals its object, is dropped; repeated facts
   in a block are kept once; an echoed `{{entity}}` or `{{path}}` is dropped. A fact or title that restates one of the
   prompt's own clauses is kept and counted, never dropped.
-- **Consolidation fits its prompts (BACKLOG 68.6).** Cluster synthesis and the deductive pass count their prompt
+- **Consolidation fits its prompts.** Cluster synthesis and the deductive pass count their prompt
   against the LLM's context and keep the sources that fit; numbering, index bounds, document mapping, the validation
   context and the statistics all use exactly those. Fewer than two sources fit: no synthesis that tick. A cut reply
   is not a synthesis or a deduction.
-- **Stale causal runs (BACKLOG 68.2).** The "still in progress after 1 h" warning counts runs started 1–24 hours
+- **Stale causal runs.** The "still in progress after 1 h" warning counts runs started 1–24 hours
   ago. Older ones are reported once, as information: "N unfinished causal run(s) older than 24 hours; not
   automatically replayed".
 - **`clawmem repair stop-queue --retry-now <id[,id…]|held> [--limit N]`** makes queued ranges due now (`held`: rows
@@ -936,9 +936,9 @@ tracked doc then took three more turns (3, 1 and 0 findings), ending with zero r
 ### What didn't change
 
 - The handoff summary's prompt and feedback; the legacy `generate()` request body (the judge test pins its bytes).
-- No schema migration; `CHECKPOINT_SCHEMA` stays 1. Only `ok` and `empty` commit a range (62.1 D3).
+- No schema migration; `CHECKPOINT_SCHEMA` stays 1. Only `ok` and `empty` commit a range.
 - The observer model. Content quality on the documented model stays weak, and it answers `<none/>` for about one
-  window in eight that holds real work; BACKLOG 69.4 evaluates a stronger model.
+  window in eight that holds real work; a stronger model is being evaluated.
 
 ---
 
@@ -1539,7 +1539,7 @@ apart from one lock-ordering fix in the Hermes plugin, which rests on its orderi
 SessionEnd flush took 162–173 ms through the real hook process on an idle vault and 431 ms with the
 vault held by another writer. Full suite: 3340 pass / 0 fail; `tsc` reports the same 85 errors as
 v0.40.3. Cross-model adversarial review (codex / GPT-6, one pinned session): the design took 22
-turns and 83 findings before any code, two of them settled by maintainer rulings; the implementation
+turns and 83 findings before any code; the implementation
 took five more turns and 22 findings (10 High); the docs, and the Hermes and doctor defects found
 while writing them, took 10 more turns and 51 findings. It cleared at turn 37 with zero remaining
 findings.
@@ -3087,10 +3087,10 @@ v0.23.0 made the FTS relevance signal real and deliberately deferred any ranking
 - **`search` ranks non-recency queries by the RAW BM25 transform** (`|bm25|/(1+|bm25|)`), mirroring the v0.22.0 vector-route pattern. Metadata — including pin — participates only inside groups of exactly-equal raw scores (deterministic tie order: pinned, then legacy composite, then path). `structuredContent` carries `scoreBasis: "fts-bm25"`. FTS-transform values and vector cosines remain independent, non-comparable channels.
 - **`minScore` on `search`** now filters the raw score for non-recency queries and has NO default — omitted means no filter, an explicit `0` is honored. Recency-intent queries ("latest…", "recent…") keep the composite regime with the previous default-0 floor and report `scoreBasis: "composite"`.
 - **Unchanged surfaces:** hooks/context-surfacing, `query`, `query_plan`, `intent_search`, `memory_retrieve`'s composite modes, the CLI `search` command, and the REST API keep their existing scoring. The change is scoped to the MCP `search` tool, exactly as evaluated.
-- **Bypass ops escape hatch:** `CLAWMEM_DISABLE_FTS_BYPASS=true` forces the full expansion path at both strong-signal-bypass consumers (MCP `query` pipeline + CLI `query`) — built for the 49.3 A/B harness, kept as an operational kill switch.
+- **Bypass ops escape hatch:** `CLAWMEM_DISABLE_FTS_BYPASS=true` forces the full expansion path at both strong-signal-bypass consumers (MCP `query` pipeline + CLI `query`) — built for the query-pipeline A/B harness, kept as an operational kill switch.
 - **`expandQueryCacheKey` exported** — the exact `llm_cache` key `expandQuery` reads/writes, so eval harnesses can delete/verify expansion cache rows without replicating private key construction.
-- **Bypass characterization (49.3, frozen census):** on a frozen 127-query census (51 judged keyword cases + 76 firing-hunt probes) over the frozen production snapshot, the strong-signal bypass fired on THREE — 3/51 on the judged set, 0/76 among the probes — all lone-or-near-lone pools, all with the correct top document. Frozen-corpus characterization only: the probes were selected to hunt firings, so these rates say nothing about production firing prevalence (unmeasured), and the firing set is snapshot-relative — one probe term began firing on the live index hours later as new documents mentioned it. On this frozen snapshot/census the gap ≥ 0.15 condition fired rarely — sibling documents suppress the gap on this corpus. Eval tooling: `scripts/eval-keyword-acceptance.ts` (freeze/run, FTS-only) and `scripts/eval-bypass-ab.ts` (freeze/run, live-service A/B with a verified expansion-cache freeze and census integrity re-execution).
-- **Bypass A/B verdict (49.3):** on the frozen census's complete fired population (3 natural cases; pre-registered zero-allowance gates; run gated on frozen service identity + an embed-geometry canary drift-check + rerank health), the bypass lost nothing — zero dropouts, zero hard regressions, bypass-arm MRR +0.038 higher — and saves ~56% wall time where it fires (1.9 s vs 4.3 s with a warm expansion cache). Verdict: `SAFE ON FROZEN CENSUS (n=3 fired; zero-allowance gates); population risk unvalidated` — thresholds 0.85/0.15 stand on this census; no tuning proposed.
+- **Bypass characterization (frozen census):** on a frozen 127-query census (51 judged keyword cases + 76 firing-hunt probes) over the frozen production snapshot, the strong-signal bypass fired on THREE — 3/51 on the judged set, 0/76 among the probes — all lone-or-near-lone pools, all with the correct top document. Frozen-corpus characterization only: the probes were selected to hunt firings, so these rates say nothing about production firing prevalence (unmeasured), and the firing set is snapshot-relative — one probe term began firing on the live index hours later as new documents mentioned it. On this frozen snapshot/census the gap ≥ 0.15 condition fired rarely — sibling documents suppress the gap on this corpus. Eval tooling: `scripts/eval-keyword-acceptance.ts` (freeze/run, FTS-only) and `scripts/eval-bypass-ab.ts` (freeze/run, live-service A/B with a verified expansion-cache freeze and census integrity re-execution).
+- **Bypass A/B verdict:** on the frozen census's complete fired population (3 natural cases; pre-registered zero-allowance gates; run gated on frozen service identity + an embed-geometry canary drift-check + rerank health), the bypass lost nothing — zero dropouts, zero hard regressions, bypass-arm MRR +0.038 higher — and saves ~56% wall time where it fires (1.9 s vs 4.3 s with a warm expansion cache). Verdict: `SAFE ON FROZEN CENSUS (n=3 fired; zero-allowance gates); population risk unvalidated` — thresholds 0.85/0.15 stand on this census; no tuning proposed.
 
 ---
 
@@ -3101,14 +3101,14 @@ The v0.22.0 design gate discovered that `searchFTS`'s exposed score was computed
 ### Behavior changes
 
 - **Exposed FTS score is now `|bm25|/(1+|bm25|)`** (`ftsScoreFromBm25`, exported): monotonic in match strength, bounded [0,1), per-row stable, clamps a hypothetical positive input to 0.
-- **`search` keeps the composite regime** (a regime change is gated on the 49.2 judged keyword eval) — but its searchScore input is now real, so keyword relevance finally contributes ordering. Observed `score`/`compositeScore` values shift accordingly; `minScore` semantics are unchanged. Compact results report the composite; non-compact carry both `score` (raw transform) and `compositeScore`.
+- **`search` keeps the composite regime** (a regime change is gated on a judged keyword eval) — but its searchScore input is now real, so keyword relevance finally contributes ordering. Observed `score`/`compositeScore` values shift accordingly; `minScore` semantics are unchanged. Compact results report the composite; non-compact carry both `score` (raw transform) and `compositeScore`.
 - **Strong-signal bypass is functional**: fires only on a strong (≥ 0.85 ⇔ |bm25| ≥ 5.67), clearly separated (gap ≥ 0.15) top hit; a lone weak match no longer triggers it. One shared helper (`hasStrongFtsSignal`) now backs both the MCP `query` pipeline and the CLI `query` command (previously a drifted duplicate).
 - **`memory_forget` targeting is stricter and safer**: the confidence gate (`score ≥ 0.7`, or a ≥ 0.2 gap when 2+ candidates exist) is live — previously every FTS candidate scored 1.0 and was auto-selected, including a lone garbage match. Weak matches now return the candidate list for disambiguation. Non-destructive pin/snooze behavior is unchanged.
 - **`query_plan`'s graph clause now carries RRF-fused scores into graph traversal** (parity with the causal and `intent_search` paths, via a shared `attachRrfScores` helper) — traversal seed mass was previously anchored on raw single-channel scores.
 - **Consolidation dup-gate and curator BM25 probe are live**: the `score ≥ 0.7` duplicate filter and the `> 0.3` retrieval probe actually discriminate now. A near-empty vault may honestly report a degraded BM25 probe where it previously passed vacuously.
 - **Scale honesty**: FTS-transform scores and vector cosines are independent monotonic signals, not a calibrated common scale. Mixed-channel merge points (REST hybrid max-merge, hook dedup) are no longer degenerate, but cross-channel calibration remains future, eval-gated work.
 
-Follow-on work: BACKLOG 49.2 (judged keyword eval → `search` regime recommendation; reports bypass firings) and 49.3 (query-pipeline A/B before any bypass-threshold tuning).
+Follow-on work: a judged keyword eval (→ `search` regime recommendation; reports bypass firings) and a query-pipeline A/B (before any bypass-threshold tuning).
 
 ---
 
@@ -3598,7 +3598,6 @@ Test coverage: 8 unit tests (`tests/unit/openclaw-paths.test.ts`) on the resolve
 ### Cross-references
 
 - Issue: https://github.com/yoloshii/ClawMem/issues/11 (@elquercarlos)
-- BACKLOG: `BACKLOG.md` Source 28 — full scope including the codex-validated implementation plan
 - OpenClaw delegation surfaces: `openclaw/src/cli/plugins-install-command.ts:669` (linked-path branch), `openclaw/src/cli/plugins-install-persist.ts:182` (auto-enable + slot selection), `openclaw/src/utils.ts:119` (`resolveConfigDir`)
 - Helper module: `src/openclaw-paths.ts` (mirrors OpenClaw's path-resolution semantics for the fallback path)
 
@@ -3895,7 +3894,7 @@ v0.9.0 is **safe to drop in** — the only behavior change on existing code path
 
 ## v0.8.5 — SPO Triple Extraction Fix: KG Actually Populates Now
 
-Fixes a bug cluster (BACKLOG.md §1.6) where `entity_triples` was stuck at zero rows on production vaults regardless of activity, making `kg_query` return empty for every entity and silently hollowing out the WHY / ENTITY graph-traversal paths in `intent_search`. Nine bugs across the decision-extractor → observer → entity-resolution → triple-storage pipeline were traced and fixed across four Codex review turns. The fix is entirely additive and strictly improves pre-v0.8.5 behavior — no schema changes, no API breaks, no required migration steps.
+Fixes a bug cluster where `entity_triples` was stuck at zero rows on production vaults regardless of activity, making `kg_query` return empty for every entity and silently hollowing out the WHY / ENTITY graph-traversal paths in `intent_search`. Nine bugs across the decision-extractor → observer → entity-resolution → triple-storage pipeline were traced and fixed across four Codex review turns. The fix is entirely additive and strictly improves pre-v0.8.5 behavior — no schema changes, no API breaks, no required migration steps.
 
 - **LLM-based SPO extraction replaces the old regex path** — the observer LLM now emits structured `<triples>` blocks alongside `<facts>`, parsed and validated in `parseObservationXml` against a fixed predicate vocabulary. The pre-v0.8.5 regex-based `extractTripleFromFact` required `subject verb object` sentence shape, which rejected the majority of real observation facts (descriptive phrases like "ClawMem now deploys via systemd user units on a remote host"). The LLM path extracts relational claims without sentence-shape constraints. `VALID_PREDICATES` is a tight 13-predicate set — `adopted`, `migrated_to`, `deployed_to`, `runs_on`, `replaced`, `depends_on`, `integrates_with`, `uses`, `prefers`, `avoids`, `caused_by`, `resolved_by`, `owned_by` — and the parser rejects anything outside it. `LITERAL_PREDICATES` marks `prefers`/`avoids` as literal-object predicates (object is stored as a string, not resolved to an entity).
 - **Canonical A-MEM entity IDs end-to-end via `ensureEntityCanonical`** — the old path minted `entity_nodes` rows with `entity_type='auto'` (not a valid compatibility bucket, so those entities never resolved via `kg_query` — a major root cause of the empty KG). The new helper in `src/entity.ts` resolves to a canonical `vault:type:slug` entity ID shared with the rest of A-MEM, never writes `'auto'`, and — unlike `upsertEntity` — does NOT bump `mention_count`, so SPO triple references don't inflate A-MEM's doc-mention counter. `INSERT OR IGNORE` + deterministic `makeEntityId` handles concurrent-insert races correctly.

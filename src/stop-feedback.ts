@@ -96,7 +96,7 @@ export function writeGeneralMembership(db: Database, usageId: number, manifest: 
   for (const m of manifest) {
     const vault = m.vault ?? "";
     const docId = carriedId(m) ?? (vault === "" ? resolveDocId(db, m.displayPath) : null);
-    // 82.3 D7 (ruling 56 A): the title is a copy of a stored title — bound as its bytes; the path stays guarded
+    // 82.3 D7: the title is a copy of a stored title — bound as its bytes; the path stays guarded
     runExact(db, ins, [usageId, vault, m.displayPath, docId, m.displayedTitle, now]);
     if (lastChanges(db) === 1 && vault === "" && docId !== null) bumpSurfaced(db, m.displayPath, now);
   }
@@ -117,7 +117,7 @@ export function writeMirrorMembership(db: Database, mirrorId: number, items: rea
   const ins = `INSERT OR IGNORE INTO feedback_ledger (usage_id, vault, display_path, vault_doc_id, displayed_title, created_at) VALUES (?, '', ?, ?, ?T, ?)`;
   for (const m of items) {
     const docId = carriedId(m) ?? resolveDocId(db, m.displayPath);
-    runExact(db, ins, [mirrorId, m.displayPath, docId, m.displayedTitle, now]);   // 82.3 D7 (56 A): the title as bytes
+    runExact(db, ins, [mirrorId, m.displayPath, docId, m.displayedTitle, now]);   // 82.3 D7: the title as bytes
     if (lastChanges(db) === 1 && docId !== null) bumpSurfaced(db, m.displayPath, now);
   }
   db.prepare(`INSERT OR IGNORE INTO feedback_turns (usage_id, state, attempts, updated_at) VALUES (?, 'pending', 0, ?)`).run(mirrorId, now);

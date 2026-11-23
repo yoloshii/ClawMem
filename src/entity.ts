@@ -1151,7 +1151,7 @@ export const CANONICAL_ENTITY_ID_RE = /^[a-z][a-z0-9-]*:[a-z_]+:[a-z0-9_]+$/;
 export const trimSpace = (s: string): string => s.replace(/^[^\S\uFEFF]+|[^\S\uFEFF]+$/g, "");
 
 /**
- * Operator ruling 79 A: kg_query's `entity` is a name OR a canonical id. Before an id a leading byte-order mark is
+ * kg_query's `entity` is a name OR a canonical id. Before an id a leading byte-order mark is
  * refused, never stripped — the argument is taken as an id when, without its leading whitespace and marks, it is
  * id-shaped or equals a stored entity id. Returns that bare id, or null when the argument is not a marked id.
  */
@@ -1195,7 +1195,7 @@ export function resolveEntityQuery(
   type Row = { entity_id: string; name: string; entity_type: string; mention_count: number | null };
   const toMatch = (r: Row): EntityQueryMatch =>
     ({ entity_id: r.entity_id, name: r.name, type: r.entity_type, mention_count: r.mention_count ?? 0 });
-  const arg = trimSpace(query);   // 79 A: not trim() — it also removes U+FEFF, which would turn a marked id into another
+  const arg = trimSpace(query);   // not trim() — it also removes U+FEFF, which would turn a marked id into another
   if (!arg) return { via: null, matches: [] };
 
   const byId = db.prepare(`

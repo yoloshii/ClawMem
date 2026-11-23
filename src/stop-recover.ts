@@ -49,7 +49,7 @@ export async function preserveAntipatternBodies(db: Database, opts?: { maxChunks
     `SELECT hash, doc, created_at FROM content WHERE rowid > ? AND rowid <= ? AND substr(doc, 1, 14) = '# Antipatterns'
        AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = content.hash)`
   );
-  // 82.3 D7 (ruling 56 A): the body and its time are copies of stored text — bound as their bytes (`?T`)
+  // 82.3 D7: the body and its time are copies of stored text — bound as their bytes (`?T`)
   const ins = `INSERT OR IGNORE INTO recovered_antipattern_bodies (hash, body, created_at) VALUES (?, ?T, ?T)`;
   while (after < max) {
     if (opts?.maxChunks !== undefined && chunks >= opts.maxChunks) return copied;

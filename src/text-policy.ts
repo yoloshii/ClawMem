@@ -21,7 +21,7 @@ export function startsWithMark(text: string): boolean {
 
 /**
  * The policy of a normalised field: the text without ANY leading U+FEFF / U+FFFE, and with each lone UTF-16 surrogate
- * (half of a pair, standing alone) replaced by U+FFFD (operator ruling 80 A). Nothing else is changed.
+ * (half of a pair, standing alone) replaced by U+FFFD. Nothing else is changed.
  *
  * A lone surrogate is hashed as U+FFFD by Node but stored by SQLite as other bytes, which Bun then reads back lossily
  * (sometimes as an empty string); replacing it first makes what is hashed, what is stored and what is read the same text.
@@ -34,8 +34,8 @@ export function stripLeadingMarks(text: string): string {
 }
 
 /**
- * A normalised field cut to at most `max` UTF-16 code units WITHOUT splitting a surrogate pair (Codex T2 S3, ruling
- * 80 A): a cut that would end in the first half of a pair ends before it. Normalise first, then cut with this.
+ * A normalised field cut to at most `max` UTF-16 code units WITHOUT splitting a surrogate pair (Codex T2 S3):
+ * a cut that would end in the first half of a pair ends before it. Normalise first, then cut with this.
  */
 export function truncateText(text: string, max: number): string {
   if (text.length <= max) return text;

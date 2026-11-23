@@ -222,11 +222,11 @@ export function missingPrerequisite(db: Database): string | null {
 }
 
 /**
- * Operator rulings 82 A / 85 A (Codex T1 S1, T2). Bun reads a TEXT value whose bytes are not valid UTF-8 LOSSILY — a
+ * Bun reads a TEXT value whose bytes are not valid UTF-8 LOSSILY — a
  * short value as the empty string, a longer one with U+FFFD in place of the bad bytes (measured). Older versions could store such bytes (their binding of a value that started with U+FFFE stored every
  * later code unit byte-swapped, and a swapped code unit can be a lone surrogate). The repair copies, compares and
  * restores rows through strings, so it cannot keep such a value: it refuses while one exists among the VALUES it reads
- * or writes (85 A) — the entity tables it snapshots, the bodies it re-reads, and for a restore the log rows of its op.
+ * or writes — the entity tables it snapshots, the bodies it re-reads, and for a restore the log rows of its op.
  * Each text value is read twice — as a string and as its bytes — and the string must give back the bytes.
  */
 export const REPAIR_TEXT_TABLES: Record<string, string> = {
@@ -385,7 +385,7 @@ function writeMentionMoves(
     onWrite?.(r, null);
   }
   for (const x of p.inserts) {
-    // 82.3 D7 (ruling 53 A): the moved row's text and time are stored copies; the entity id keeps the guarded binding
+    // 82.3 D7: the moved row's text and time are stored copies; the entity id keeps the guarded binding
     runExact(db, `INSERT INTO entity_mentions (entity_id, doc_id, mention_text, created_at) VALUES (?, ?, ?T, ?T)`, [x.entity, p.doc, x.text, x.at]);
     onWrite?.(null, x);
   }
@@ -487,7 +487,7 @@ export function planEntityRepair(
 ): EntityRepairPlan {
   const missing = missingPrerequisite(db);
   if (missing) throw new EntityRepairRefusal(`${missing} — open this vault with ClawMem once to finish its upgrade, then run the dry run again`);
-  refuseUnreadableText(db); // 82 A
+  refuseUnreadableText(db);
   const stats = plannerStatisticsRows(db);
   if (stats > 0) {
     throw new EntityRepairRefusal(
@@ -879,7 +879,7 @@ export function planEntityRepair(
       const movers = rows.filter(r => dest(r) !== r.entity);
       const read = bodyOf.get(doc) as { body: string | null; raw: Uint8Array | null } | null;
       if (typeof read?.body === "string" && read.raw instanceof Uint8Array && !readsBackExactly(read.body, read.raw)) {
-        throw unreadableRefusal({ count: 1, first: [`the body of document ${doc} (content.doc)`] }); // 82 A: the planner reads it
+        throw unreadableRefusal({ count: 1, first: [`the body of document ${doc} (content.doc)`] }); // the planner reads it
       }
       const body = (read?.body ?? "").toLowerCase();
       const moves = movers.map(r => {
@@ -1089,7 +1089,7 @@ export interface EntityRepairApplyReport {
 
 type Row = Record<string, string | number | null>;
 
-/** Entity-id columns: an identifier keeps the guarded binding, so a stored mark-led id is refused (D8 = C, ruling 53 A). */
+/** Entity-id columns: an identifier keeps the guarded binding, so a stored mark-led id is refused. */
 const ENTITY_ID_COLUMNS = new Set(["subject_entity_id", "object_entity_id", "entity_id", "entity_a", "entity_b", "canonical_id"]);
 
 /**
@@ -1195,7 +1195,7 @@ export function applyEntityRepair(
         dest.push(g.survivor);
         return;
       }
-      // 82.3 D7 (ruling 53 A): the copied text fields are stored copies; the entity ids keep the guarded binding
+      // 82.3 D7: the copied text fields are stored copies; the entity ids keep the guarded binding
       const r = runExact(db, `
         INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
         VALUES (?, ?T, ?, ?T, ?T, ?T, ?, ?, ?T, ?T)
@@ -1363,7 +1363,7 @@ export function restoreEntityRepair(db: Database, opId: string): EntityRepairRes
     }
     const rows = db.prepare(`SELECT id, comp, tbl, row_key, action, old_row, new_row FROM entity_repair_log WHERE op_id = ? ORDER BY id`).all(opId) as LogRow[];
     if (rows.length === 0) throw new EntityRepairRefusal(`no repair op ${opId} in entity_repair_log`);
-    { // 82 A / 85 A: the restore compares and writes back through strings — the entity tables and THIS op's log rows
+    { // the restore compares and writes back through strings — the entity tables and THIS op's log rows
       const found = unreadableText(db, { ...REPAIR_TEXT_TABLES, entity_repair_log: ["op_id = ?", [opId]] });
       if (found.count > 0) throw unreadableRefusal(found);
     }

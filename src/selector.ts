@@ -39,7 +39,7 @@ export function parseSelectorList(text: string): string[] {
 
 /**
  * Collection names, from every tool and REST parameter that takes them: one comma list (a single name is a list of
- * one). Every such argument is ONE string in MCP, REST and the CLI; there is no list form (operator ruling 43 A).
+ * one). Every such argument is ONE string in MCP, REST and the CLI; there is no list form.
  */
 export function parseCollectionList(names: string): string[] {
   return parseList(names, "collection");
@@ -52,7 +52,7 @@ export function parseCollectionList(names: string): string[] {
  *
  *  - `selector` — the whole text;
  *  - `collection` — what follows an explicit scheme;
- *  - `path` — what follows the FIRST slash of `collection/path` (operator ruling 46 A).
+ *  - `path` — what follows the FIRST slash of `collection/path`.
  *
  * Stated side effect of the first-slash rule: the bare selector `sub/<mark>x.md` is refused although a file can be
  * stored under that path — it reads as collection `sub`, path `<mark>x.md`. `collection/sub/<mark>x.md` and the

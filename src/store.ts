@@ -1821,7 +1821,7 @@ export type Store = {
   buildTemporalBackbone: () => number;
   countActiveRelations: (relationType: string) => number;
   buildSemanticGraph: (threshold?: number) => Promise<number>;
-  /** As `buildSemanticGraph`, with the count of neighbour rows skipped for an unusable distance (82.2 D4, ruling 28 A). */
+  /** As `buildSemanticGraph`, with the count of neighbour rows skipped for an unusable distance (82.2 D4). */
   buildSemanticGraphDetailed: (threshold?: number) => Promise<SemanticGraphBuild>;
 
   // A-MEM: Self-Evolving Memory
@@ -3176,7 +3176,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     }
 
     if (dedupChanges > 0) {
-      // 84 A (Codex T2 S1): a memory whose body row an older version stored with other bytes under this very hash is
+      // (Codex T2 S1) a memory whose body row an older version stored with other bytes under this very hash is
       // repaired here too — insertContent rewrites it (and its search rows) only when its bytes differ.
       if (dedupRow.hash === bodyHash) insertContent(db, bodyHash, body, now);
       return {
@@ -4429,7 +4429,7 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   const wanted = limit * 3;
   let k = wanted;
   let scan = screenVecHits(matchStmt.all(embedding, k) as { hash_seq: string; distance: unknown }[]);
-  // v0.43.7 (82.2 D4, operator ruling 18 A): rows whose distance is not usable can take the FIRST places of a scan
+  // v0.43.7 (82.2 D4): rows whose distance is not usable can take the FIRST places of a scan
   // (a -Infinity distance sorts first). A scan that met one rescans deeper until it holds what a healthy scan would
   // give — inside the escalation cap and the caller's deadline. A healthy vault is scanned once, as before.
   // The fault count and the first fault are STICKY across rounds (Codex T1 P2), as in the detailed path: a later round
@@ -4736,7 +4736,7 @@ export function projectVecResults(
 // falling back to client-side hydrateVecResults only on the raw-hit path — so neither the
 // blocking MATCH nor, under hydrated-v1, the hydration ever runs on the hook's event loop.
 //
-// v0.43.7 (82.2 D4, operator ruling 16 B): `searchVecWithFaults` is the form every route under `src/` calls — it
+// v0.43.7 (82.2 D4): `searchVecWithFaults` is the form every route under `src/` calls — it
 // returns the results WITH the count of stored vectors the scan skipped as unusable, so the route can say so.
 // `searchVec` keeps its list return for callers outside this tree; it drops the count (the once-per-process warning
 // still prints), and the call-site census refuses a caller of it under `src/`.

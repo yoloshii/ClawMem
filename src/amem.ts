@@ -1027,7 +1027,7 @@ If no evolution is needed:
     `);
 
     // Stamped with this version's writer (62.2): an unstamped entry after the upgrade marks an older writer.
-    // 82.3 D7 (ruling 56 A): previous_context is a copy of the stored context — bound as its bytes (`?T`)
+    // 82.3 D7: previous_context is a copy of the stored context — bound as its bytes (`?T`)
     const historySql = `
       INSERT INTO memory_evolution (
         memory_id,

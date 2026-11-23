@@ -107,7 +107,7 @@ export function sha256Hex(text: string): string {
 
 function head(raw: string | null | undefined): string | null {
   if (raw == null) return null;
-  const text = stripLeadingMarks(raw);                      // 82.3 D7 (ruling 55 A): model text stored as evidence
+  const text = stripLeadingMarks(raw);                      // 82.3 D7: model text stored as evidence
   return truncateText(text, JUDGE_HEAD_MAX);                // never half of a pair (Codex T2 S3)
 }
 

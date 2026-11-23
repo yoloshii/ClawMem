@@ -3,7 +3,7 @@
  *
  * Such a value can exist without any special writer: a path that began with TWO marks was stored with one by every
  * version before 82.3. Nothing in ClawMem reads such a value specially, and nothing rewrites, moves or deletes its
- * row because of the mark (operator ruling D8 = C). A consumer that binds it again is stopped by the guard
+ * row because of the mark. A consumer that binds it again is stopped by the guard
  * (`BomLeadingTextError`). This module is the POINTER to those rows: `clawmem doctor` prints what it finds.
  *
  * It is best effort, and says so: a column this list lacks, an untyped log column that holds a serialised row, and a
@@ -97,7 +97,7 @@ export type MarkedIdentifier = {
   /** False for a composite of unknown encoding: a candidate to check before any cleanup. */
   confirmed: boolean;
   /**
-   * Rulings 71 A, 72 A: true when no reader binds the value again — an identifier of an INACTIVE document (a search,
+   * true when no reader binds the value again — an identifier of an INACTIVE document (a search,
    * a hook and `update` read active rows only; a restore makes it active, and the next scan counts it again), or a
    * value of an `INERT_COLUMNS` column. Still listed, as a record; it alone does not fail the check.
    */
@@ -122,7 +122,7 @@ const quote = (name: string): string => `"${name.replace(/"/g, '""')}"`;
  * which may be a read-only one. At most `limitPerColumn` rows per column (default 50).
  */
 /**
- * Columns whose STORED values no reader binds again in a refusable way (rulings 71 A, 72 A, 73 A). `any`: a stored
+ * Columns whose STORED values no reader binds again in a refusable way. `any`: a stored
  * session id (a session is read by the current session's id, checked at the boundary). `path`: a value every reader
  * binds WHOLE — a feedback-ledger display path, the utility-signal path copied from it, a repair log's row key — is
  * inert only when its mark comes AFTER the slash (not refused, stored exactly); one that STARTS with a mark would be
@@ -158,7 +158,7 @@ export function scanMarkedIdentifiers(db: Database, opts: { limitPerColumn?: num
     const other = entry.encoding === "collection/path" ? PATH_PREDICATE(col)
       : entry.encoding === "unknown-composite" ? ANY_SLASH_PREDICATE(col) : null;
     const where = other ? `(${whole}) OR ${other}` : whole;
-    // the inert rule of rulings 71 A–73 A as SQL, so the counts and the order need no display cut (Codex T1 P1)
+    // the inert rule as SQL, so the counts and the order need no display cut (Codex T1 P1)
     const kind = INERT_COLUMNS.get(`${entry.table}.${entry.column}`);
     const inertParts = [
       ...(entry.table === "documents" && cols.has("active") ? ["active = 0"] : []),
@@ -194,7 +194,7 @@ export function scanMarkedIdentifiers(db: Database, opts: { limitPerColumn?: num
 
 /**
  * The doctor's block: one headline, then one line per row. `ok` is false while a value that is NOT inert is listed
- * (ruling 71 A: inert values stay listed, as a record, and do not fail the check).
+ * (inert values stay listed, as a record, and do not fail the check).
  */
 export function describeMarkedIdentifiers(scan: MarkedIdentifierScan): { ok: boolean; lines: string[] } {
   if (scan.counts.live + scan.counts.inert === 0) {

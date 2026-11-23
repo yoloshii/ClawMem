@@ -31,12 +31,12 @@ export class ContentContractError extends Error {
 export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
   const sound = normalizedContent(content);
   if (sound.body.length !== content.length) throw new ContentContractError("leading-mark");
-  if (sound.body !== content) throw new ContentContractError("not-normalised");   // 80 A: a lone surrogate keeps the length
+  if (sound.body !== content) throw new ContentContractError("not-normalised");   // a lone surrogate keeps the length
   if (sound.hash !== hash) throw new ContentContractError("hash-mismatch");
   const r = db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
     .run(hash, content, createdAt);
   if (r.changes > 0) return;
-  // Operator ruling 84 A: the hash is already stored. A row whose bytes are not this body's was written by an older
+  // The hash is already stored. A row whose bytes are not this body's was written by an older
   // version (a body holding a lone UTF-16 surrogate was hashed as U+FFFD and stored as other bytes, which read back
   // lossily, sometimes as empty text); the hash certifies this body, so the row is rewritten, and the search rows of the active documents
   // that hold it follow (the FTS triggers copy the body only when a DOCUMENT row changes).

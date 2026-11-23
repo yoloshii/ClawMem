@@ -713,7 +713,7 @@ async function cmdEmbed(args: string[]) {
   let endVerificationRan = false;
   let docInHand: EmbedChargeReceipt | null = null;
 
-  // v0.43.7 (BACKLOG 82.2, D2; operator ruling 81 A, Codex T1 P5): ONE finaliser ends every run past the lease. The
+  // v0.43.7 (BACKLOG 82.2, D2, Codex T1 P5): ONE finaliser ends every run past the lease. The
   // normal end hands it the end-of-run verification's decision (taint, clearing the taint, the canary baseline); a
   // fatal abort hands it the error (refund, unverified mark, lease loss — src/embed-abort.ts). Every taint and baseline
   // write of the command happens here, against the run state declared above.
@@ -818,7 +818,7 @@ async function cmdEmbed(args: string[]) {
     // successful same-dimension end probe. "Not verified" is never success (T8-M2).
     // v0.41.2 (BACKLOG 68.3): run scope, so the finalization (the no-work path included) knows what this run stored
     // (`totalFragments`, `removedStale` — declared in the command's scope since v0.43.7, for the abort finaliser).
-    // v0.43.7 (81 A): it decides and reports; `finaliseRun` performs the writes it returns.
+    // v0.43.7: it decides and reports; `finaliseRun` performs the writes it returns.
     const verifyEndOfRun = async (failedFragmentsCount: number): Promise<EndDecision> => {
       const decided = (taint: string | null, clearTaint = false, baseline: EndDecision["baseline"] = null): EndDecision => ({ taint, clearTaint, baseline });
       // A NON-destructive run (no --force clear) that stored no vectors cannot have mixed a second geometry into the
@@ -1590,7 +1590,7 @@ async function cmdQuery(args: string[]) {
     .filter(r => r.compositeScore >= minScore)
     .slice(0, limit);
 
-  // One warning line on stderr; `--json` stays a bare array when nothing was degraded (operator ruling 25 A).
+  // One warning line on stderr; `--json` stays a bare array when nothing was degraded.
   const report = cliVectorReport(vectorLegs);
   if (report.warning) console.error(report.warning);
   if (values.json) {
@@ -2403,7 +2403,7 @@ async function cmdSpoolIngest() {
   if (!raw) return;
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return; }
-  const marked = markedJobReport(parsed);                 // 82.3 D7 (68 A): never spooled, reported
+  const marked = markedJobReport(parsed);                 // 82.3 D7: never spooled, reported
   if (marked !== null) { console.error(marked); return; }
   if (!validateSurfacingBookkeepingJob(parsed)) return;
   const s = getStore();
@@ -3836,7 +3836,7 @@ async function cmdWatch() {
         console.log(`${c.dim}[${event}]${c.reset} ${target.col.name}/${target.relativePath}`);
         const stats = await indexCollection(s, target.col.name, target.col.path, target.col.pattern);
         // A refused file alone prints no line here: under the watcher a pass runs on every change, and the file was
-        // named once in the indexer's own warning (ruling 44 A). It is in the line whenever something else changed.
+        // named once in the indexer's own warning. It is in the line whenever something else changed.
         if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
           console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}${enrichSummaryNote(stats)}${refusedSummaryNote(stats)}`);
         }
@@ -4286,7 +4286,7 @@ async function cmdDoctor(args: string[] = []) {
     process.exitCode = 1;
   }
 
-  // BACKLOG 82.3, rulings 74 A / 76 A / 77 A — stored bodies the old string binding altered: a row whose hash is not the
+  // BACKLOG 82.3 — stored bodies the old string binding altered: a row whose hash is not the
   // hash of its text. Every body, every run; read-only, on its own read-only handle. Fails while an active document holds one.
   try {
     const { scanBodyHashes, describeBodyHashes } = await import("./body-hash-check.ts");
@@ -5413,9 +5413,9 @@ async function cmdMigrate(args: string[]) {
     die(`Cannot read manifest ${manifestPath}: ${err}`);
   }
   const note = flagValue("--note");
-  // BACKLOG 82.3, D7 (ruling 62 A): a note led by a byte-order mark is refused HERE, naming the flag, before any run
+  // BACKLOG 82.3, D7: a note led by a byte-order mark is refused HERE, naming the flag, before any run
   // row — not by the storage guard inside the retire transaction. The mark is not printed.
-  if (note && startsWithMark(note)) {   // exit 2, like every refused mark-led input (64 A)
+  if (note && startsWithMark(note)) {   // exit 2, like every refused mark-led input
     console.error(`${c.red}Error:${c.reset} --note starts with a byte-order mark (U+${note.charCodeAt(0).toString(16).toUpperCase()}); type the note without it. Nothing was changed.`);
     process.exit(2);
   }
@@ -5719,7 +5719,7 @@ async function cmdReflect(args: string[]) {
 
   for (const d of recentDocs) {
     // 82.3 D7: the full display name, not the bare stored path — a bare `folder/<mark>x.md` reads as a selector whose
-    // path starts with a mark and is refused (ruling 46 A); `collection/folder/<mark>x.md` names the row exactly.
+    // path starts with a mark and is refused; `collection/folder/<mark>x.md` names the row exactly.
     const doc = store.findDocument(`${d.collection}/${d.path}`);
     if ("error" in doc) continue;
     const body = store.getDocumentBody(doc) || "";
@@ -6689,7 +6689,7 @@ main().catch(err => {
     console.error(`${c.red}Error:${c.reset} ${err.message}`);
     process.exit(2);
   }
-  // 82.3 D7 (ruling 67 A): a statement the guard refused is reported as its message — it names the statement and the
+  // 82.3 D7: a statement the guard refused is reported as its message — it names the statement and the
   // doctor — never as a stack trace with source lines. Exit 1, as before.
   if (err instanceof BomLeadingTextError) {
     console.error(`${c.red}Error:${c.reset} ${err.message}`);

@@ -1,5 +1,5 @@
 /**
- * BACKLOG 82.3, operator rulings 74 A, 76 A, 77 A — stored BODIES that the old string binding altered: found and
+ * BACKLOG 82.3 — stored BODIES that the old string binding altered: found and
  * reported, never repaired.
  *
  * Every version before 82.3 hashed a body WITH its leading byte-order mark and then stored it through the string
@@ -8,8 +8,8 @@
  * whose hash is not the hash of its text — measured on a 76,505-body vault copy, no other row differs. Paths and titles
  * carry no hash: their damage cannot be found this way.
  *
- * Read-only: SELECT statements on the caller's handle. Every body is examined on every run (76 A). The check fails while
- * an ACTIVE document holds a damaged body (77 A); a body held only by inactive documents, or by none, stays listed as a
+ * Read-only: SELECT statements on the caller's handle. Every body is examined on every run. The check fails while
+ * an ACTIVE document holds a damaged body; a body held only by inactive documents, or by none, stays listed as a
  * record. `clawmem reindex --force` rewrites an active file-backed holder from its file; nothing else recovers the text.
  */
 import type { Database } from "bun:sqlite";

@@ -33,7 +33,7 @@ export async function cliVectorLeg(store: Pick<Store, "searchVecWithFaults">, qu
 }
 
 export interface CliVectorReport {
-  /** The fields a `--json` reply gains when something was degraded (operator ruling 25 A); undefined when nothing was. */
+  /** The fields a `--json` reply gains when something was degraded; undefined when nothing was. */
   degraded?: { degraded: true; degradedReason: "vector-fault"; vectorFaults?: number };
   /**
    * The ONE line for stderr about refused query vectors; undefined when none was refused. Stored vectors that

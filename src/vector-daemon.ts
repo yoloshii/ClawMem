@@ -1052,7 +1052,7 @@ export async function searchVecBounded(
       // cannot fire during it). The test seam models that scan's duration deterministically.
       testSyncScanDelay();
       {
-        // 82.2 D4 (operator ruling 16 B): the fault-carrying form — the count reaches the leg recorder here too.
+        // 82.2 D4: the fault-carrying form — the count reaches the leg recorder here too.
         const found = await store.searchVecWithFaults(query, model, limit, collectionId, collections, dateRange, deadline);
         results = found.results;
         if (found.vectorFaults > 0 && onOutcome) { try { onOutcome(traceStatus, protocol, found.vectorFaults); } catch { /* recorder must never break the leg */ } }
