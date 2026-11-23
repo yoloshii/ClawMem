@@ -46,6 +46,7 @@
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, statSync } from "node:fs";
 import { isoNow, epochNow, epochMs } from "../clock.ts";
+import { startsWithMark } from "../text-policy.ts";
 import { dirname, join } from "node:path";
 import type { Store } from "../store.ts";
 import { resolveStore } from "../store.ts";
@@ -114,10 +115,45 @@ function isNonEmptyString(x: unknown): x is string {
  * poison: applying it could mutate the wrong usage row, throw-and-retry
  * until expiry, or write malformed attribution.
  */
+/**
+ * BACKLOG 82.3, D7 (ruling 68 A): the identifier of a job that starts with a byte-order mark — its session id, or the
+ * collection or relative path of a display path it names — or null. Such a job can only come from a spool written
+ * before the upgrade; it is inadmissible (applying it would bind the mark-led value again, be refused, and be retried on
+ * every drain). A display path is bound as two identifiers split at its FIRST slash (`resolveDocId`,
+ * src/stop-feedback.ts), so only the start of each can be refused (Codex T1 S4): a mark that starts a deeper segment
+ * lies inside the relative path and binds as it is.
+ */
+export function markedIdentifierInJob(x: unknown): string | null {
+  if (typeof x !== "object" || x === null) return null;
+  const j = x as Record<string, unknown>;
+  const led = (v: unknown) => {
+    if (typeof v !== "string") return false;
+    const slash = v.indexOf("/");
+    return slash < 0 ? startsWithMark(v) : startsWithMark(v.slice(0, slash)) || startsWithMark(v.slice(slash + 1));
+  };
+  if (typeof j.sessionId === "string" && startsWithMark(j.sessionId)) return "session id";
+  if (Array.isArray(j.injectedPaths) && j.injectedPaths.some(led)) return "injected path";
+  if (Array.isArray(j.vaults)) for (const g of j.vaults as unknown[]) {
+    const docs = (g as { docs?: unknown } | null)?.docs;
+    if (Array.isArray(docs) && docs.some(d => led((d as { displayPath?: unknown } | null)?.displayPath))) return "display path";
+  }
+  if (Array.isArray(j.manifest) && (j.manifest as unknown[]).some(m => led((m as { displayPath?: unknown } | null)?.displayPath))) return "manifest path";
+  return null;
+}
+
+/** 68 A: the one line that reports a discarded job naming a mark-led identifier (the value is not printed), or null. */
+export function markedJobReport(x: unknown): string | null {
+  const marked = markedIdentifierInJob(x);
+  if (marked === null) return null;
+  const id = (x as { jobId?: unknown }).jobId;
+  return `[clawmem] spool: job ${typeof id === "string" ? id.slice(0, 80) : "?"} discarded — its ${marked} starts with a byte-order mark (a spool from before the upgrade).`;
+}
+
 export function validateSurfacingBookkeepingJob(x: unknown): x is SurfacingBookkeepingJob {
   if (typeof x !== "object" || x === null) return false;
   const j = x as Record<string, unknown>;
   if (j.v !== 1 || j.kind !== "surfacing-bookkeeping") return false;
+  if (markedIdentifierInJob(j) !== null) return false;   // 68 A
   if (!isNonEmptyString(j.jobId) || !isNonEmptyString(j.sessionId) || !isNonEmptyString(j.queryHash)) return false;
   if (!Number.isInteger(j.turnIndex) || (j.turnIndex as number) < 0) return false;
   // t62 (codex F61-2): the contract says the alignment row EXISTS — a job
@@ -495,7 +531,10 @@ export function drainSurfacingBookkeepingSpool(
       const stale = now - statSync(claim).mtimeMs > SPOOL_MAX_AGE_MS;
       if (!stale) {
         const parsed = JSON.parse(readFileSync(claim, "utf-8")) as unknown;
-        if (validateSurfacingBookkeepingJob(parsed)) job = parsed;
+        const report = markedJobReport(parsed);
+        if (report !== null) {
+          try { process.stderr.write(report + "\n"); } catch { /* stderr closed */ }   // 68 A: discarded below, reported
+        } else if (validateSurfacingBookkeepingJob(parsed)) job = parsed;
       }
     } catch { /* unreadable/unparsable → discard below */ }
     if (!job) {

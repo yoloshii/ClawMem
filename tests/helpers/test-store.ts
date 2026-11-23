@@ -1,9 +1,10 @@
 /**
  * Shared test store factory — creates in-memory SQLite stores.
  */
-import { createStore, insertContent, insertDocument, type Store } from "../../src/store.ts";
+import { createStore, insertDocument, type Store } from "../../src/store.ts";
 import { TEST_COLLECTION } from "./fixtures.ts";
 
+import { seedContent } from "./seed-content.ts";
 /**
  * Create a fresh in-memory store with full schema.
  */
@@ -37,7 +38,7 @@ export function seedDocuments(store: Store, docs: SeedDoc[]): number[] {
     const modifiedAt = doc.modifiedAt || now;
 
     // Insert content + document (collections are config-based, not a DB table)
-    insertContent(store.db, hash, doc.body, now);
+    seedContent(store.db, hash, doc.body, now);
     insertDocument(store.db, collection, doc.path, doc.title, hash, now, modifiedAt);
 
     // Get the inserted doc ID

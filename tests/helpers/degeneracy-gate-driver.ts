@@ -19,6 +19,7 @@
  *    the action is disarmed -> arbitration present -> the junk IS injected.
  *    The toggle is the only difference between the arms.
  */
+import { stubSearchVec } from "./vec-stub.ts";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { newSurfacingTrace } from "../../src/eval/hook-trace.ts";
 import { createTestStore, seedDocuments } from "./test-store.ts";
@@ -40,7 +41,7 @@ seedDocuments(store, [
   // reachable only through the expansion lane below.
   { path: "m/dg-junk.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows and frost dates", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
 ]);
-store.searchVec = async () => [];
+stubSearchVec(store, async () => []);
 store.expandQuery = async () => [{ type: "lex", query: "gardening almanac planting" }] as Awaited<ReturnType<Store["expandQuery"]>>;
 // Full coverage, CONSTANT scores: the inert regime — every doc 0.5, spread 0.
 store.rerank = async (_q, docs) => docs.map(d => ({ file: d.file, score: 0.5 }));

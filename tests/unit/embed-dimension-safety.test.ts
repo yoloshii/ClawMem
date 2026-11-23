@@ -36,10 +36,11 @@ import { hashContent } from "../../src/indexer.ts";
 import { tmpdir } from "node:os";
 import { unlinkSync } from "node:fs";
 
+import { seedContent } from "../helpers/seed-content.ts";
 function seed(store: Store, col: string, path: string, body: string): string {
   const hash = hashContent(body + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
   return hash;
 }
@@ -214,7 +215,7 @@ describe("retry budget resets — success and content change (codex T5 HIGH-1)",
     // Content edited → new hash → updateDocument must reset the budget so the new
     // content is re-embeddable (not excluded by the OLD content's exhausted attempts).
     const newHash = hashContent("new body" + "a.md");
-    store.insertContent(newHash, "new body", new Date().toISOString());
+    seedContent(store.db, newHash, "new body", new Date().toISOString());
     updateDocument(store.db, doc.id, "a.md", newHash, new Date().toISOString());
     const row = store.db.prepare("SELECT embed_state, embed_attempts FROM documents WHERE id=?").get(doc.id) as { embed_state: string; embed_attempts: number };
     expect(row.embed_state).toBe("pending");
@@ -232,7 +233,7 @@ describe("retry budget resets — success and content change (codex T5 HIGH-1)",
     // a bypass path (decision/antipattern merges, saveMemory, beads sync) that
     // updates hash directly without going through updateDocument/reactivateDocument.
     const newHash = hashContent("brand new content");
-    store.insertContent(newHash, "brand new content", new Date().toISOString());
+    seedContent(store.db, newHash, "brand new content", new Date().toISOString());
     store.db.prepare("UPDATE documents SET hash=? WHERE id=?").run(newHash, doc.id);
     const row = store.db.prepare("SELECT embed_state, embed_attempts FROM documents WHERE id=?").get(doc.id) as { embed_state: string; embed_attempts: number };
     expect(row.embed_state).toBe("pending");

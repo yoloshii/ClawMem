@@ -24,6 +24,7 @@
 import type { Store, SearchResult, VecSearchDetailedResult } from "./store.ts";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { DEFAULT_EMBED_MODEL, rethrowIfFatalVectorError } from "./store.ts";
+import { isRefusedEmbedResponse } from "./vector-guard.ts";
 import type { LLM } from "./llm.ts";
 import { classifyIntent, extractTemporalConstraint, type IntentType, type IntentResult } from "./intent.ts";
 import { reciprocalRankFusion, toRanked, attachRrfScores, type RankedResult } from "./search-utils.ts";
@@ -102,6 +103,19 @@ export interface CausalRetrievalOptions {
 export interface CausalDegradedLeg {
   leg: string;
   reason: NonNullable<VecSearchDetailedResult["degradedReason"]>;
+  /** v0.43.7 (82.2 D4): stored vectors the leg's scan skipped as unusable (with reason `vector-fault`). */
+  vectorFaults?: number;
+}
+
+/**
+ * The entries of one vector-anchor lookup (operator ruling 17 A): the older reason stays as it is; stored vectors
+ * the scan skipped are an entry of their own, with the count.
+ */
+function anchorEntries(leg: string, det: Pick<VecSearchDetailedResult, "degraded" | "degradedReason" | "vectorFaults">): CausalDegradedLeg[] {
+  const entries: CausalDegradedLeg[] = [];
+  if (det.degraded && det.degradedReason && det.degradedReason !== "vector-fault") entries.push({ leg, reason: det.degradedReason });
+  if (det.vectorFaults > 0) entries.push({ leg, reason: "vector-fault", vectorFaults: det.vectorFaults });
+  return entries;
 }
 
 export interface CausalRetrievalResult {
@@ -349,8 +363,13 @@ export async function runCausalRetrieval(
       dateRange,
     });
     extVec = det.results;
-    if (det.degraded && det.degradedReason) degraded.push({ leg: "causal:vector", reason: det.degradedReason });
-  } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
+    degraded.push(...anchorEntries("causal:vector", det));
+  } catch (e) {
+    // v0.43.7 (82.2 D4): a refused QUERY vector is handled before the fatal rethrow — the anchors come from the
+    // lexical side only, and the trace records it. Dimension and model errors keep rethrowing.
+    if (isRefusedEmbedResponse(e)) degraded.push({ leg: "causal:vector", reason: "vector-fault" });
+    else rethrowIfFatalVectorError(e); /* else: no vectors */
+  }
   anchorLists.push(extVec.map(toRanked));
   listWeights.push(wV);
 
@@ -364,7 +383,12 @@ export async function runCausalRetrieval(
     try {
       const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, budgets.obsAnchorK, { collections: ["_clawmem"], dateRange, observationsOnly: true });
       obsVec = det.results;
-    } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
+      // Before v0.43.7 this lookup recorded nothing; only what is new is recorded: skipped stored vectors.
+      if (det.vectorFaults > 0) degraded.push({ leg: "causal:observation-vector", reason: "vector-fault", vectorFaults: det.vectorFaults });
+    } catch (e) {
+      if (isRefusedEmbedResponse(e)) degraded.push({ leg: "causal:observation-vector", reason: "vector-fault" });
+      else rethrowIfFatalVectorError(e); /* else: no vectors */
+    }
     if (obsFts.length > 0) { anchorLists.push(obsFts.map(toRanked)); listWeights.push(wB); }
     if (obsVec.length > 0) { anchorLists.push(obsVec.map(toRanked)); listWeights.push(wV); }
   }
@@ -412,7 +436,12 @@ export async function runCausalRetrieval(
     let anchorEmbeddingResult: Awaited<ReturnType<LLM["embed"]>> = null;
     try {
       anchorEmbeddingResult = await llm.embed(query);
-    } catch { /* embedding service down — graph legs skipped, fused anchors retained */ }
+    } catch (e) {
+      /* embedding service down — graph legs skipped, fused anchors retained */
+      // v0.43.7 (82.2 D4): a REFUSED query vector skips the graph legs the same way, and is MARKED — before,
+      // nothing said that the expansion did not run.
+      if (isRefusedEmbedResponse(e)) degraded.push({ leg: "causal:graph", reason: "vector-fault" });
+    }
     if (anchorEmbeddingResult) {
       let merged: { hash: string; score: number }[] = fused.map(r => ({ hash: r.hash, score: r.score }));
       // Seeds: collection policy only — every fused entry already passed its search leg's

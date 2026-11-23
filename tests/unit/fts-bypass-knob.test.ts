@@ -22,6 +22,7 @@ import { hasStrongFtsSignal, ftsBypassEnabled } from "../../src/search-utils.ts"
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { hashContent } from "../../src/indexer.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const TEST_DB = "/tmp/clawmem-fts-bypass-knob-test.sqlite";
 const REPO_ROOT = new URL("../..", import.meta.url).pathname;
 
@@ -48,7 +49,7 @@ let savedIndexPath: string | undefined;
 function seedDoc(store: Store, col: string, path: string, body: string) {
   const hash = hashContent(body + col + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
 }
 

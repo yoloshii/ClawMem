@@ -22,6 +22,8 @@ type LlamaModel = any;
 type LlamaEmbeddingContext = any;
 type LlamaToken = any;
 
+import { storableVector, isRefusedEmbedResponse, EmbedEnvelopeError } from "./vector-guard.ts";
+import { startsWithMark } from "./text-policy.ts";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
@@ -64,7 +66,8 @@ export type TokenLogProb = {
  * Embedding result
  */
 export type EmbeddingResult = {
-  embedding: number[];
+  /** v0.43.7 (BACKLOG 82.2): validated at the response boundary (`storableVector`) — callers pass it on as it is. */
+  embedding: Float32Array;
   model: string;
 };
 
@@ -172,6 +175,11 @@ export type EmbedOptions = {
    * and retry sleeps keep running; the signal actually CANCELS them.
    */
   signal?: AbortSignal;
+  /**
+   * v0.43.7 (BACKLOG 82.2): what this vector is for — a fragment's `hash_seq`, a probe name, or `query`. It is
+   * carried by the typed error when the endpoint's reply is refused.
+   */
+  context?: string;
 };
 
 /**
@@ -325,6 +333,74 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
+
+// =============================================================================
+// Embedding response boundary (v0.43.7, BACKLOG 82.2)
+// =============================================================================
+
+/** The context an embedding error carries when the caller gave none. */
+export const UNSPECIFIED_EMBED_CONTEXT = "unspecified";
+
+
+/** The in-process model's vector as something the validator judges: an array, or a `Float32Array` as it is. */
+function localVector(v: unknown): unknown {
+  if (Array.isArray(v) || v instanceof Float32Array) return v;
+  if (ArrayBuffer.isView(v) && !(v instanceof DataView)) return Array.from(v as unknown as ArrayLike<unknown>);
+  return v;
+}
+
+/**
+ * Read a 2xx embedding reply's body as JSON. A body that is not JSON is a malformed envelope; a body that could not
+ * be READ (the connection was cut, the caller's deadline passed) is thrown as it is and stays "no response".
+ */
+async function readEmbedJson(resp: Response, contexts: string[]): Promise<unknown> {
+  const text = await resp.text();
+  try { return JSON.parse(text); }
+  catch { throw new EmbedEnvelopeError("the reply body is not JSON", { context: contexts[0] ?? UNSPECIFIED_EMBED_CONTEXT }); }
+}
+
+/**
+ * Judge a 2xx `/v1/embeddings` reply for `count` inputs: the envelope's shape, then every item through
+ * `storableVector`. Returns the vectors in REQUEST order. Throws `EmbedEnvelopeError` (no `data` array, an item
+ * without `embedding`, an `index` that is missing, repeated or out of range, a count that differs from the request,
+ * a model name that starts with a byte-order mark) or `VecPoisonError` (an item the validator refuses), each with
+ * the batch item index and that item's context. One exception: a reply to ONE input may omit `index`.
+ */
+export function parseEmbedEnvelope(
+  body: unknown, count: number, contexts: string[], fallbackModel: string,
+): { results: EmbeddingResult[]; totalTokens: number } {
+  const ctx = (i?: number) => ({ context: contexts[i ?? 0] ?? UNSPECIFIED_EMBED_CONTEXT, ...(count > 1 && i !== undefined ? { index: i } : {}) });
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new EmbedEnvelopeError("the reply is not a JSON object", ctx());
+  const env = body as { data?: unknown; model?: unknown; usage?: { total_tokens?: unknown; prompt_tokens?: unknown } };
+  if (!Array.isArray(env.data)) throw new EmbedEnvelopeError("the reply has no `data` array", ctx());
+  if (env.data.length !== count) {
+    throw new EmbedEnvelopeError(`the reply has ${env.data.length} item(s) for ${count} input(s)`, ctx());
+  }
+  let model = fallbackModel;
+  if (env.model !== undefined && env.model !== null && env.model !== "") {
+    if (typeof env.model !== "string") throw new EmbedEnvelopeError("the reply's `model` is not a string", ctx());
+    if (startsWithMark(env.model)) throw new EmbedEnvelopeError("the reply's `model` name starts with a byte-order mark", ctx());
+    model = env.model;
+  }
+  const results: (EmbeddingResult | undefined)[] = new Array(count).fill(undefined);
+  for (let pos = 0; pos < env.data.length; pos++) {
+    const item = env.data[pos] as { embedding?: unknown; index?: unknown } | null;
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new EmbedEnvelopeError(`item ${pos} of the reply is not an object`, ctx());
+    // A reply to ONE input may leave `index` out (some OpenAI-compatible servers do): the one item can only be
+    // item 0. A batch item must say which input it answers, and an `index` that IS present is always checked.
+    const index = count === 1 && !("index" in item) ? 0 : item.index;
+    if (typeof index !== "number" || !Number.isInteger(index)) throw new EmbedEnvelopeError(`item ${pos} of the reply has no integer \`index\``, ctx());
+    if (index < 0 || index >= count) throw new EmbedEnvelopeError(`item ${pos} of the reply has index ${index}, outside the request`, ctx());
+    if (results[index] !== undefined) throw new EmbedEnvelopeError(`index ${index} is repeated in the reply`, ctx(index));
+    if (item.embedding === undefined || item.embedding === null) {
+      throw new EmbedEnvelopeError(`item ${pos} of the reply has no \`embedding\``, ctx(index));
+    }
+    results[index] = { embedding: storableVector(item.embedding, ctx(index)), model };
+  }
+  const usage = env.usage;
+  const tokens = typeof usage?.total_tokens === "number" ? usage.total_tokens : typeof usage?.prompt_tokens === "number" ? usage.prompt_tokens : 0;
+  return { results: results as EmbeddingResult[], totalTokens: tokens };
+}
 
 // =============================================================================
 // LLM Interface
@@ -960,7 +1036,7 @@ export class LlamaCpp implements LLM {
     // Remote server or cloud API — preferred path
     if (this.remoteEmbedUrl && !this.isRemoteEmbedDown()) {
       const extraParams = this.getCloudEmbedParams(!!options.isQuery);
-      const result = await this.embedRemote(text, extraParams, undefined, options.signal);
+      const result = await this.embedRemote(text, extraParams, undefined, options.signal, options.context);
       if (result) return result;
       // Cloud providers don't fall back — if API key is set, the user chose cloud
       if (this.isCloudEmbedding()) return null;
@@ -989,7 +1065,7 @@ export class LlamaCpp implements LLM {
     }
 
     // In-process fallback via node-llama-cpp (auto-downloads EmbeddingGemma on first use)
-    return this.embedLocal(text);
+    return this.embedLocal(text, options.context);
   }
 
   /**
@@ -997,13 +1073,13 @@ export class LlamaCpp implements LLM {
    * Remote: single HTTP request with up to 50 texts.
    * Local: sequential via node-llama-cpp embedding context.
    */
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], contexts?: string[]): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
 
     // Remote server or cloud API
     if (this.remoteEmbedUrl && !this.isRemoteEmbedDown()) {
       const extraParams = this.getCloudEmbedParams(false);
-      const results = await this.embedRemoteBatch(texts, extraParams);
+      const results = await this.embedRemoteBatch(texts, extraParams, undefined, contexts);
       // If we got at least one result, remote is working
       if (results.some(r => r !== null)) return results;
       // Cloud providers don't fall back
@@ -1026,42 +1102,46 @@ export class LlamaCpp implements LLM {
     }
 
     // In-process fallback via node-llama-cpp
-    return this.embedLocalBatch(texts);
+    return this.embedLocalBatch(texts, contexts);
   }
 
   /** In-process embedding via node-llama-cpp with truncation guard */
-  private async embedLocal(text: string): Promise<EmbeddingResult | null> {
+  private async embedLocal(text: string, vectorContext = UNSPECIFIED_EMBED_CONTEXT): Promise<EmbeddingResult | null> {
     try {
       const context = await this.ensureEmbedContext();
       const safeText = this.truncateForLocalEmbed(text);
       const embedding = await context.getEmbeddingFor(safeText);
       return {
-        embedding: Array.from(embedding.vector),
+        embedding: storableVector(localVector(embedding.vector), { context: vectorContext }),
         model: this.embedModelUri,
       };
     } catch (error) {
+      if (isRefusedEmbedResponse(error)) throw error; // v0.43.7 (82.2): a refused vector is never "no response"
       console.error("[embed] Local embedding error:", error);
       return null;
     }
   }
 
   /** In-process batch embedding via node-llama-cpp with truncation guard */
-  private async embedLocalBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  private async embedLocalBatch(texts: string[], contexts?: string[]): Promise<(EmbeddingResult | null)[]> {
     try {
       const context = await this.ensureEmbedContext();
       const results: (EmbeddingResult | null)[] = [];
-      for (const text of texts) {
+      for (let i = 0; i < texts.length; i++) {
         try {
-          const safeText = this.truncateForLocalEmbed(text);
+          const safeText = this.truncateForLocalEmbed(texts[i]!);
           const embedding = await context.getEmbeddingFor(safeText);
-          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+          const vector = storableVector(localVector(embedding.vector), { context: contexts?.[i] ?? UNSPECIFIED_EMBED_CONTEXT, index: i });
+          results.push({ embedding: vector, model: this.embedModelUri });
         } catch (err) {
+          if (isRefusedEmbedResponse(err)) throw err; // v0.43.7 (82.2): one refused item refuses the batch
           console.error("[embed] Local batch embedding error:", err);
           results.push(null);
         }
       }
       return results;
     } catch (error) {
+      if (isRefusedEmbedResponse(error)) throw error;
       console.error("[embed] Failed to initialize local embedding:", error);
       return texts.map(() => null);
     }
@@ -1430,7 +1510,7 @@ export class LlamaCpp implements LLM {
     return { kind: "ok", dim: embedding.length, model };
   }
 
-  private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5, signal?: AbortSignal): Promise<EmbeddingResult | null> {
+  private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5, signal?: AbortSignal, context = UNSPECIFIED_EMBED_CONTEXT): Promise<EmbeddingResult | null> {
     if (this.isRemoteEmbedDown()) return null;
     const input = this.truncateForEmbed(text);
     for (let attempt = 0; attempt < retries; attempt++) {
@@ -1461,15 +1541,11 @@ export class LlamaCpp implements LLM {
           return null;
         }
         this.remoteEmbedHttpErrorStreak = 0;
-        const data = await resp.json() as {
-          data: { embedding: number[] }[];
-          model?: string;
-        };
-        return {
-          embedding: data.data[0]!.embedding,
-          model: data.model || this.remoteEmbedUrl!,
-        };
+        // v0.43.7 (BACKLOG 82.2): a 2xx reply is judged here, raw. A refused one is thrown, never read as "no response".
+        const parsed = parseEmbedEnvelope(await readEmbedJson(resp, [context]), 1, [context], this.remoteEmbedUrl!);
+        return parsed.results[0]!;
       } catch (error) {
+        if (isRefusedEmbedResponse(error)) throw error; // the endpoint answered: no cooldown, no fallback
         // An abort/timeout is an intentional caller-driven cancellation (the
         // query-path deadline), NOT a transport failure — do not trip the 60s
         // remote-down cooldown, which would needlessly force local fallback.
@@ -1492,7 +1568,7 @@ export class LlamaCpp implements LLM {
   /** Token usage from the last successful batch embed call (for adaptive pacing) */
   lastBatchTokens = 0;
 
-  private async embedRemoteBatch(texts: string[], extraParams: Record<string, unknown> = {}, retries = 3): Promise<(EmbeddingResult | null)[]> {
+  private async embedRemoteBatch(texts: string[], extraParams: Record<string, unknown> = {}, retries = 3, contexts?: string[]): Promise<(EmbeddingResult | null)[]> {
     if (this.isRemoteEmbedDown()) return texts.map(() => null);
     const truncated = texts.map(t => this.truncateForEmbed(t));
     for (let attempt = 0; attempt < retries; attempt++) {
@@ -1518,19 +1594,14 @@ export class LlamaCpp implements LLM {
           return texts.map(() => null);
         }
         this.remoteEmbedHttpErrorStreak = 0;
-        const data = await resp.json() as {
-          data: { embedding: number[]; index: number }[];
-          model?: string;
-          usage?: { total_tokens?: number; prompt_tokens?: number };
-        };
-        this.lastBatchTokens = data.usage?.total_tokens ?? data.usage?.prompt_tokens ?? 0;
-        const modelName = data.model || this.remoteEmbedUrl!;
-        const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
-        for (const item of data.data) {
-          results[item.index] = { embedding: item.embedding, model: modelName };
-        }
-        return results;
+        // v0.43.7 (BACKLOG 82.2): the whole batch is judged before the caller sees any of it — one refused item
+        // refuses the batch.
+        const ctxs = texts.map((_, i) => contexts?.[i] ?? UNSPECIFIED_EMBED_CONTEXT);
+        const parsed = parseEmbedEnvelope(await readEmbedJson(resp, ctxs), texts.length, ctxs, this.remoteEmbedUrl!);
+        this.lastBatchTokens = parsed.totalTokens;
+        return parsed.results;
       } catch (error) {
+        if (isRefusedEmbedResponse(error)) throw error; // the endpoint answered: no cooldown, no fallback
         if (this.isTransportError(error)) {
           this.markRemoteEmbedDown();
         } else {

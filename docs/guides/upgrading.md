@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.43.6**.
+Guide for upgrading between released versions. Current: **v0.43.7**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,6 +59,86 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 **Already on the sidecar?** It stays correct, and nothing requires a change. The Q8_0 GGUF frees about 3 GB of VRAM, is somewhat slower per document, and ranked like the sidecar in a side-by-side comparison ([measurements](inference-services.md#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar)). To switch, stop the sidecar (`docker compose stop reranker`; its `unless-stopped` policy keeps it down across reboots), start the GGUF on `:8090`, and run `clawmem rerank-health`.
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
+
+---
+
+## v0.43.7: unusable vectors are refused and repaired; values that start with a byte-order mark are no longer altered
+
+Two integrity fixes. **Vectors:** an embedding reply that is not a vector of finite numbers of a usable length is
+refused where it arrives, and the vectors already stored that are not usable are found and removed. **Byte-order
+marks:** Bun's SQLite binding altered a bound string that started with U+FEFF or U+FFFE, silently; every database
+handle now refuses such a binding, free text loses its leading marks before it is stored, and an identifier that
+starts with one is refused. Details: [release notes](../../RELEASE_NOTES.md), [troubleshooting](../troubleshooting.md#byte-order-marks-in-stored-values-v0437).
+
+**Bun 1.3.14 or newer is required** (1.4.0 or later recommended). On a Bun older than 1.2.21 ClawMem refuses to open a
+vault ("sqlite guard self-check failed"); 1.3.14 is the lowest version the whole suite was run on. Check `bun --version`
+before you upgrade.
+
+**Before upgrading — is the vault degraded?** A vault that holds an identifier stored with a leading mark by an older
+version is degraded under v0.43.7 until you clean it by hand (some calls are refused, some replies are silently
+incomplete; [what and why](../troubleshooting.md#stored-identifiers-that-start-with-a-byte-order-mark)). A quick
+read-only look at the four columns that matter most:
+
+```bash
+sqlite3 -readonly ~/.cache/clawmem/index.sqlite "
+SELECT 'documents.path', id, hex(path) FROM documents WHERE substr(CAST(path AS BLOB), 1, 3) IN (X'EFBBBF', X'EFBFBE')
+UNION ALL SELECT 'documents.collection', id, hex(collection) FROM documents WHERE substr(CAST(collection AS BLOB), 1, 3) IN (X'EFBBBF', X'EFBFBE')
+UNION ALL SELECT 'session_log.session_id', rowid, hex(session_id) FROM session_log WHERE substr(CAST(session_id AS BLOB), 1, 3) IN (X'EFBBBF', X'EFBFBE')
+UNION ALL SELECT 'session_log.handoff_path', rowid, hex(handoff_path) FROM session_log
+  WHERE substr(CAST(handoff_path AS BLOB), 1, 3) IN (X'EFBBBF', X'EFBFBE')
+     OR substr(CAST(handoff_path AS BLOB), instr(CAST(handoff_path AS BLOB), X'2F') + 1, 3) IN (X'EFBBBF', X'EFBFBE');"
+```
+
+No output means none in those four columns. That is a partial look: the doctor reads about sixty identifier columns
+(`src/identifier-columns.ts`). The complete check before you switch is the new version's doctor on a COPY of the vault:
+`sqlite3 ~/.cache/clawmem/index.sqlite ".backup /tmp/vault-copy.sqlite"` (a consistent copy while ClawMem runs), then
+the new version's doctor on it without installing that version —
+`INDEX_PATH=/tmp/vault-copy.sqlite bunx clawmem@0.43.7 doctor`, or `INDEX_PATH=/tmp/vault-copy.sqlite bun src/clawmem.ts doctor`
+from a checkout of the `v0.43.7` tag. Set `INDEX_PATH` in both: without it the doctor opens your real vault. With it,
+the doctor migrates the copy, never your vault. Read its "Stored identifiers" and "Stored bodies" checks.
+
+**The order, after installing the new version.** Old code stays loaded in long-running processes, and the
+guarantees start only when it is gone from memory:
+1. Stop `clawmem watch`, the vector daemon, `clawmem serve` and the systemd units that run them; let a running
+   `clawmem embed` finish (it holds the embedding lease).
+2. Install v0.43.7. Start the daemons again; reconnect or restart every agent session that runs `clawmem mcp`
+   (`/mcp` → reconnect in Claude Code), and the REST server. Find the stragglers with
+   `ps -eo pid,lstart,args | grep -E '[c]lawmem(\.ts)? (watch|mcp|serve|embed)'` — it matches both the installed
+   command and the launcher's form (`bun …/src/clawmem.ts watch`). Any process whose start time (`lstart`) is before
+   the install still runs the old code.
+3. `clawmem doctor`. If "Stored identifiers" fails, do the
+   [cleanup by hand](../troubleshooting.md#stored-identifiers-that-start-with-a-byte-order-mark) now (it stops the
+   processes again while it runs).
+4. If "Stored bodies" fails (an active document holds a body an older version altered):
+   `clawmem reindex --force`. It rewrites every ACTIVE file-backed document from its file. While step 3's check fails it
+   stops at the first collection that binds such a value (inert values do not stop it): that collection rolls back,
+   the collections before it stay committed, and the ones after it are not indexed (exit 1). Clean first. An archived document you want back: restore it first, then re-index.
+   Cost: it re-reads EVERY active file and, with a note model configured, makes one model call per rewritten document
+   (the A-MEM note) — on a large vault, one call per file. Healthy documents keep their hash and their embeddings.
+5. `clawmem repair vectors` (dry run), then `clawmem repair vectors --run`.
+6. `clawmem embed` — it embeds again the documents steps 4 and 5 scheduled (the whole document).
+7. `build_graphs` (the MCP tool, or REST `POST /graphs/build`).
+8. `clawmem spool-drain` once: a surfacing job queued before the upgrade that names a marked path or session id is
+   discarded and reported, and only a manual drain shows that line.
+
+**What the forced re-index repairs, and what it does not.** Three groups:
+- *Repaired:* an active, file-backed document whose body began with a mark — new body without the mark, new hash.
+- *Kept as stored:* a forgotten or archived document (skipped before its file is read, which is what keeps its
+  lifecycle state), and a row stored under a marked identifier. Their altered text stays altered.
+- *No source:* an API-born memory (hooks, `memory_*` tools, REST). Its text cannot be recovered.
+
+Damage to a BODY is visible (the doctor's "Stored bodies" check: its row keeps the hash of the original text). Damage to
+a path or a title is not: they carry no hash. A plain `clawmem update` repairs nothing here — the unchanged file is
+skipped before it is read.
+
+**What may read differently.** A query, a title, a body or an observation field that started with a mark is stored
+without it. An identifier you type with a leading mark is refused (CLI exit 2, REST 400, an MCP tool error), never
+stripped. A file whose name starts with a mark is skipped and named once per process (rename it). `semantic_threshold`
+outside 0–1 is refused. A vector search skips stored vectors that give no usable distance and says so
+(`vector-fault`). `clawmem embed` stops with exit 1 on a refused reply.
+
+**Rolling back** to v0.43.6 after `repair vectors` is safe: vectors are derived data, and rows written by v0.43.7 are
+readable by the older version. Bun stays at the newer version.
 
 ---
 

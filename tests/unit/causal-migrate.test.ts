@@ -20,6 +20,7 @@ import {
 } from "../../src/causal-writer.ts";
 import { createHash, randomUUID } from "node:crypto";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 let dir: string;
 
@@ -37,7 +38,7 @@ function mkDoc(path: string, opts?: { collection?: string; observationType?: str
   const collection = opts?.collection ?? "_clawmem";
   const hash = createHash("sha256").update(collection + path).digest("hex");
   const ts = "2026-08-01T00:00:00.000Z";
-  (store as any).insertContent(hash, `body of ${path}`, ts);
+  seedContent(store.db, hash, `body of ${path}`, ts);
   (store as any).insertDocument(collection, path, path, hash, ts, ts);
   const id = (store as any).findActiveDocument(collection, path)!.id;
   if (opts?.observationType) {
@@ -542,4 +543,32 @@ describe("restoreRetiredEdge", () => {
     expect(store.db.prepare(`SELECT COUNT(*) n FROM causal_runs`).get()).toEqual({ n: 0 });
     expect(archivedEdge(a, b)).toBeDefined();
   });
+});
+
+// ─── BACKLOG 82.3, D7 — a --note led by a byte-order mark (ruling 62 A) ──────
+// The note is refused when the CLI reads the flag, with a message naming the flag, before any run row is written —
+// not by the storage guard deep in the retire transaction (whose message points at the doctor, which does not apply).
+describe("--note led by a byte-order mark (62 A)", () => {
+  test.each([["U+FEFF", String.fromCharCode(0xfeff)], ["U+FFFE", String.fromCharCode(0xfffe)]])(
+    "%s: refused at the flag — exit 2, the message names --note, no run row, the edge untouched",
+    (_name, mark) => {
+      const [a, b] = laneDocs();
+      insertEdge(a, b, { metadata: null });
+      const manifestPath = join(dir, "manifest.json");
+      writeFileSync(manifestPath, JSON.stringify(buildResolutionManifest(causalWitnessCensus(store.db)), null, 2));
+      for (const extra of [["--apply"], []]) {
+        const proc = Bun.spawnSync(
+          ["bun", "src/clawmem.ts", "migrate", "causal-witnesses", "--resolve-unmaterializable", "retire-edge",
+           "--manifest", manifestPath, "--edge", `${a}:${b}`, "--note", mark + "unprovable origin", ...extra],
+          { env: { ...process.env, INDEX_PATH: join(dir, "vault.sqlite") }, cwd: process.cwd() },
+        );
+        expect(proc.exitCode).toBe(2);                         // 64 A: the exit code of every refused mark-led input
+        expect(new TextDecoder().decode(proc.stderr)).toContain("--note");
+      }
+      expect(store.db.prepare(`SELECT COUNT(*) n FROM causal_runs WHERE source = 'cli_migrate'`).get()).toEqual({ n: 0 });
+      expect(activeEdge(a, b)).toBeDefined();
+      expect(archivedEdge(a, b)).toBeUndefined();
+    },
+    30_000,
+  );
 });

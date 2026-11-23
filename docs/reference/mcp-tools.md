@@ -301,6 +301,14 @@ Trigger re-scan of all collections. The summary (and `structuredContent`) carrie
 `enrichAttempted`/`enrichStored` note counters — a run whose every enrichment produced
 nothing reports the gap explicitly instead of an unqualified success (v0.37.0).
 
+From v0.43.7 it also carries `refused`: files skipped because their name starts with a byte-order mark (U+FEFF or
+U+FFFE). The summary then ends `!N refused (path starts with a byte-order mark; rename the file)`; each file is named
+once per process in the server's stderr. A path, selector element, collection or vault name passed to ANY tool that
+starts with such a mark is refused with a tool error naming the field, never stripped; a free-text `query` loses its
+leading marks. `kg_query`'s `entity` is either: before a NAME a leading mark is removed; before a canonical entity ID
+(an argument that, without its leading spaces and marks, is shaped `vault:type:slug` or equals a stored entity ID) it is
+refused with a tool error.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `vault` | string | — | Named vault |
@@ -331,7 +339,7 @@ Build temporal backbone and semantic graph.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `graph_types` | array | `["all"]` | `temporal`, `semantic`, or `all` |
-| `semantic_threshold` | number | 0.7 | Similarity threshold for semantic edges |
+| `semantic_threshold` | number | 0.7 | Similarity threshold for semantic edges, from 0 to 1. A value outside that range is refused and nothing is built (v0.43.7). |
 | `vault` | string | — | Named vault |
 
 **Response** (v0.28.0+):
@@ -340,6 +348,7 @@ Build temporal backbone and semantic graph.
 |---|---|
 | `temporal` / `semantic` | Edges **newly written by this call**. Inserts are idempotent, so a rebuild over an unchanged corpus correctly returns `0`. |
 | `temporalTotal` / `semanticTotal` | Edges of that type **currently in the active graph** — both endpoints active. |
+| `semanticSkipped` | v0.43.7. Neighbour rows the semantic build skipped because a stored vector gave no usable distance. Present only when above zero; `clawmem doctor --full` finds the vectors and `clawmem repair vectors` removes them. |
 
 Text output reads `Temporal graph: N new edge(s), M total`.
 
@@ -391,7 +400,7 @@ Query the SPO knowledge graph for an entity's temporal relationships.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `entity` | string | required | Entity name or ID |
+| `entity` | string | required | Entity name or ID. A byte-order mark before an ID is refused (v0.43.7); one before a name is removed |
 | `as_of` | string | — | Date filter (YYYY-MM-DD) — only facts valid at this date |
 | `direction` | enum | `both` | `outgoing`, `incoming`, or `both` |
 | `vault` | string | — | Named vault |

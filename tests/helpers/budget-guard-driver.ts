@@ -18,6 +18,7 @@
  *    and the failure guard must arbitrate.
  * The spawning test parses the single BUDGETDRIVER:: line from stdout.
  */
+import { stubSearchVec } from "./vec-stub.ts";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { newSurfacingTrace } from "../../src/eval/hook-trace.ts";
 import { createTestStore, seedDocuments } from "./test-store.ts";
@@ -61,13 +62,13 @@ seedDocuments(store, [
 // genuinely closed when the candidate legs run, so optional legs skip while
 // the primary-FTS floor still produces candidates.
 const VECTOR_SYNC_DELAY_MS = Number(process.env.CLAWMEM_TEST_VECTOR_SYNC_DELAY_MS ?? "0");
-store.searchVec = async () => {
+stubSearchVec(store, async () => {
   if (VECTOR_SYNC_DELAY_MS > 0) {
     const until = Date.now() + VECTOR_SYNC_DELAY_MS;
     while (Date.now() < until) { /* synchronous busy-wait — the race timer cannot fire */ }
   }
   return [];
-};
+});
 if (EXPAND_HTTP_MODE) {
   // REAL store.expandQuery; the LLM fetch sleeps but honors the abort.
   globalThis.fetch = (async (_url: unknown, init?: { signal?: AbortSignal }) => {
@@ -187,10 +188,10 @@ if (PRIOR_SLOW_FIRST) {
     return realSearchFTS(query, limit);
   }) as Store["searchFTS"];
   const baseVec = store.searchVec;
-  store.searchVec = async (...args: Parameters<Store["searchVec"]>) => {
+  stubSearchVec(store, async (...args: Parameters<Store["searchVec"]>) => {
     vecCallsTotal++;
     return baseVec(...args);
-  };
+  });
 }
 
 const trace = newSurfacingTrace();

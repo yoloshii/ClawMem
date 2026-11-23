@@ -7,10 +7,11 @@ import {
   parseLinkGenerationFromLLM,
   parseMemoryNoteFromLLM,
 } from "../../src/amem.ts";
-import { insertContent, insertDocument } from "../../src/store.ts";
+import { insertDocument } from "../../src/store.ts";
 import { createMockLLM } from "../helpers/mock-llm.ts";
 import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
 
 describe("extractJsonFromLLM", () => {
@@ -407,7 +408,7 @@ describe("generateMemoryLinks vector readiness", () => {
     store.db.exec("DROP TABLE IF EXISTS vectors_vec");
 
     const now = new Date().toISOString();
-    insertContent(store.db, "hash-a", "Profile facts", now);
+    seedContent(store.db, "hash-a", "Profile facts", now);
     insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
     const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
 
@@ -421,7 +422,7 @@ describe("generateMemoryLinks vector readiness", () => {
     store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
 
     const now = new Date().toISOString();
-    insertContent(store.db, "hash-a", "Profile facts", now);
+    seedContent(store.db, "hash-a", "Profile facts", now);
     insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
     const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };
 
@@ -435,8 +436,8 @@ describe("generateMemoryLinks vector readiness", () => {
     store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY)");
 
     const now = new Date().toISOString();
-    insertContent(store.db, "hash-a", "Profile facts", now);
-    insertContent(store.db, "hash-b", "More profile facts", now);
+    seedContent(store.db, "hash-a", "Profile facts", now);
+    seedContent(store.db, "hash-b", "More profile facts", now);
     insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
     insertDocument(store.db, "test", "notes/peer.md", "Peer", "hash-b", now, now);
     store.db.prepare("INSERT INTO vectors_vec (hash_seq) VALUES (?)").run("hash-a_0");
@@ -453,7 +454,7 @@ describe("generateMemoryLinks vector readiness", () => {
     store.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
 
     const now = new Date().toISOString();
-    insertContent(store.db, "hash-a", "Profile facts", now);
+    seedContent(store.db, "hash-a", "Profile facts", now);
     insertDocument(store.db, "test", "users/cooper.md", "Cooper", "hash-a", now, now);
     store.db.prepare("INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)").run("hash-a_0", new Uint8Array([1, 2, 3]));
     const row = store.db.prepare("SELECT id FROM documents WHERE hash = ?").get("hash-a") as { id: number };

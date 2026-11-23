@@ -30,6 +30,7 @@ import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { clearConfigCache } from "../../src/config.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const TEST_DB = "/tmp/clawmem-memory-stats-rank-test.sqlite";
 
 const fakeLlm = {
@@ -55,7 +56,7 @@ function seedDoc(
 ): void {
   const hash = hashContent(body + col + path);
   const created = opts.createdAt ?? iso(0);
-  store.insertContent(hash, body, created);
+  seedContent(store.db, hash, body, created);
   store.insertDocument(col, path, path, hash, created, created);
   // 62.1 D9: a counter write carries a fresh counter stamp (an unstamped one is an older ClawMem's and is ignored).
   store.db.prepare(
@@ -102,7 +103,7 @@ beforeAll(async () => {
   // production contract, not incidental ordering.
   const dupBody = "duplicontent twin body";
   const dupHash = hashContent(dupBody);
-  seedStore.insertContent(dupHash, dupBody, iso(1));
+  seedContent(seedStore.db, dupHash, dupBody, iso(1));
   seedStore.insertDocument("dupcol", "dup-two.md", "dup-two.md", dupHash, iso(1), iso(1));
   seedStore.insertDocument("dupcol", "dup-one.md", "dup-one.md", dupHash, iso(1), iso(1));
   // Collection "pincap": engineered NEGATIVE pin delta — fresh decision, quality 1.0

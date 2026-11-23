@@ -15,10 +15,11 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, insertContent, insertDocument, type Store } from "../../src/store.ts";
+import { createStore, insertDocument, type Store } from "../../src/store.ts";
 import { stalenessCheck } from "../../src/hooks/staleness-check.ts";
 import { clearConfigCache } from "../../src/config.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 
 beforeEach(() => {
@@ -28,7 +29,7 @@ beforeEach(() => {
 /** Seed a document. `documents.hash` is a FK into `content`, so both rows are needed. */
 function seed(path: string, iso: string): void {
   const hash = `h-${path}`;
-  insertContent(store.db, hash, `body of ${path}`, iso);
+  seedContent(store.db, hash, `body of ${path}`, iso);
   insertDocument(store.db, "test", path, "T", hash, iso, iso);
 }
 
@@ -125,7 +126,7 @@ describe("the Store exposes no row-destroying operation", () => {
   it("cleanupOrphanedContent still removes genuinely unreferenced content", () => {
     // The fix must not turn the helper into a no-op: content no document references at all
     // is still collectable, and cannot cascade because nothing points at it.
-    insertContent(store.db, "orphan-hash", "nothing references this", new Date().toISOString());
+    seedContent(store.db, "orphan-hash", "nothing references this", new Date().toISOString());
     const contentBefore = (
       store.db.prepare("SELECT COUNT(*) AS n FROM content").get() as { n: number }
     ).n;

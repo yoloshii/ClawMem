@@ -16,7 +16,7 @@ import {
   readTranscript,
   validateTranscriptPath,
 } from "../hooks.ts";
-import { hashContent } from "../indexer.ts";
+import { normalizedContent } from "../text-policy.ts";
 import { extractObservations, type Observation, LITERAL_PREDICATES } from "../observer.ts";
 import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
@@ -937,8 +937,7 @@ export function persistObservationDoc(
   dateStr: string,
   timestamp: string
 ): ObservationWithDoc | null {
-  const obsBody = formatObservation(obs, dateStr, sessionId);
-  const obsHash = hashContent(obsBody);
+  const { body: obsBody, hash: obsHash } = normalizedContent(formatObservation(obs, dateStr, sessionId));
   const obsPath = `observations/${dateStr}-${sessionId.slice(0, 8)}-${obs.type}-${obsHash.slice(0, 8)}.md`;
 
   store.insertContent(obsHash, obsBody, timestamp);

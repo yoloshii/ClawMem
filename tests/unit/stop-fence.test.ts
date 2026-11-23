@@ -11,10 +11,11 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createStore, insertContent, type Store } from "../../src/store.ts";
+import { createStore, type Store } from "../../src/store.ts";
 import { createTestStore } from "../helpers/test-store.ts";
 import { logInjection } from "../../src/hooks.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // The objects the migration adds (design D9, D10; IMPL-PLAN step (a)).
 const STOP_TABLES = [
   "utility_signals", "feedback_ledger", "feedback_turns", "stop_cursors", "stop_retries", "stop_items", "session_docs",
@@ -179,7 +180,7 @@ function docRow(db: Database, collection: string, path: string) {
 }
 function addContent(db: Database, body: string): string {
   const hash = `h-${Bun.hash(body).toString(16)}-${Math.random().toString(36).slice(2, 8)}`;
-  insertContent(db, hash, body, NOW());
+  seedContent(db, hash, body, NOW());
   return hash;
 }
 async function readyOf(db: Database): Promise<boolean> {

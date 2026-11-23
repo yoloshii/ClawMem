@@ -18,6 +18,7 @@ import { createStore, getReconcilableDocumentPaths, type Store } from "../../src
 import { indexCollection, hashContent } from "../../src/indexer.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const ROOT = "/tmp/clawmem-origin-reconciliation-test";
 const CONTENT = `${ROOT}/content`;
 const DB = `${ROOT}/vault.sqlite`;
@@ -43,7 +44,7 @@ function seedDbBorn(path: string): void {
   const body = `# ${path}\n\nDB-born row with no file behind it.\n`;
   const hash = hashContent(body + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument("docs", path, path, hash, now, now); // origin defaults to 'api'
 }
 
@@ -163,7 +164,7 @@ describe("legacy NULL-origin rows", () => {
     const body = "# legacy\n\nold row\n";
     const hash = hashContent(body);
     const now = new Date().toISOString();
-    store.insertContent(hash, body, now);
+    seedContent(store.db, hash, body, now);
     store.insertDocument("docs", "legacy.md", "legacy", hash, now, now);
     store.db.prepare("UPDATE documents SET origin = NULL, content_hash = NULL WHERE collection = 'docs' AND path = 'legacy.md'").run();
 

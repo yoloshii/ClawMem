@@ -45,6 +45,11 @@ export function startEmbedFixture(opts: {
   script?: Script;
   /** Reset the n-th HTTP request (1-based, in arrival order) instead of passing it to the server. */
   resetRequest?: (n: number) => boolean;
+  /**
+   * v0.43.7 (BACKLOG 82.2): replace ONE item's `embedding` in a 200 reply with any JSON value (a poisoned vector).
+   * `nth` counts requests of that phase from 1; return `undefined` to keep the healthy vector.
+   */
+  item?: (at: { phase: Phase; nth: number; text: string; index: number }) => unknown;
 }): EmbedFixture {
   const seen: EmbedFixture["seen"] = [];
   const perPhase: Record<Phase, number> = { canary: 0, dim: 0, fragment: 0, other: 0 };
@@ -64,7 +69,13 @@ export function startEmbedFixture(opts: {
       const model = r.model ?? opts.model ?? "bow-embed";
       seen.push({ phase, status, model });
       if (status !== 200) return new Response(`scripted ${status}`, { status });
-      return Response.json({ data: list.map((t, index) => ({ embedding: bow(t, r.dim ?? 64), index })), model });
+      return Response.json({
+        data: list.map((t, index) => {
+          const replaced = opts.item?.({ phase, nth, text: t, index });
+          return { embedding: replaced === undefined ? bow(t, r.dim ?? 64) : replaced, index };
+        }),
+        model,
+      });
     },
   });
   const front: FrontStats = { requests: 0, resets: 0, firstReset: null, answersBeforeFirstReset: null, answers: 0 };

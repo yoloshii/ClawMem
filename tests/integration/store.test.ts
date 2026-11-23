@@ -18,6 +18,8 @@ import {
   type Store,
 } from "../../src/store.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
+import { normalizedContent } from "../../src/text-policy.ts";
 let store: Store;
 
 beforeEach(() => {
@@ -61,18 +63,20 @@ describe("createStore", () => {
 
 describe("document CRUD", () => {
   it("insertContent + insertDocument creates doc visible in findActiveDocument", () => {
-    insertContent(store.db, "h1", "body text", "2026-03-01T00:00:00Z");
-    insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
+    // 82.3 D7: this case is about the real writer, so it takes the body and its hash from `normalizedContent`.
+    const { body, hash } = normalizedContent("body text");
+    insertContent(store.db, hash, body, "2026-03-01T00:00:00Z");
+    insertDocument(store.db, "test", "file.md", "Title", hash, "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const doc = findActiveDocument(store.db, "test", "file.md");
     expect(doc).toBeDefined();
     expect(doc!.title).toBe("Title");
   });
 
   it("updateDocument changes hash and modifiedAt", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const doc = findActiveDocument(store.db, "test", "file.md")!;
-    insertContent(store.db, "h2", "new body", "2026-03-02T00:00:00Z");
+    seedContent(store.db, "h2", "new body", "2026-03-02T00:00:00Z");
     updateDocument(store.db, doc.id, "New Title", "h2", "2026-03-02T00:00:00Z");
     const updated = findActiveDocument(store.db, "test", "file.md")!;
     expect(updated.hash).toBe("h2");
@@ -80,7 +84,7 @@ describe("document CRUD", () => {
   });
 
   it("deactivateDocument sets active=0 and records why (S55.6 D9)", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     deactivateDocument(store.db, "test", "file.md", "forget");
     const doc = findActiveDocument(store.db, "test", "file.md");
@@ -93,7 +97,7 @@ describe("document CRUD", () => {
   });
 
   it("reactivateDocument re-enables inactive doc", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const doc = findActiveDocument(store.db, "test", "file.md")!;
     deactivateDocument(store.db, "test", "file.md", "absent");
@@ -108,7 +112,7 @@ describe("document CRUD", () => {
   });
 
   it("findAnyDocument returns inactive documents", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     deactivateDocument(store.db, "test", "file.md", "absent");
     const doc = findAnyDocument(store.db, "test", "file.md");
@@ -116,8 +120,8 @@ describe("document CRUD", () => {
   });
 
   it("getActiveDocumentPaths returns only active paths", () => {
-    insertContent(store.db, "h1", "body1", "2026-03-01T00:00:00Z");
-    insertContent(store.db, "h2", "body2", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body1", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h2", "body2", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "a.md", "A", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "b.md", "B", "h2", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     deactivateDocument(store.db, "test", "b.md", "absent");
@@ -131,7 +135,7 @@ describe("document CRUD", () => {
 
 describe("document metadata", () => {
   it("updateDocumentMeta sets content_type, confidence, quality_score", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const doc = findActiveDocument(store.db, "test", "file.md")!;
     store.updateDocumentMeta(doc.id, {
@@ -146,7 +150,7 @@ describe("document metadata", () => {
   });
 
   it("incrementAccessCount increments for matching paths", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     store.incrementAccessCount(["test/file.md"]);
     const row = store.db.prepare(
@@ -161,7 +165,7 @@ describe("document metadata", () => {
 
 describe("pin/snooze lifecycle", () => {
   it("pinDocument sets pinned=1", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     store.pinDocument("test", "file.md", true);
     const row = store.db.prepare("SELECT pinned FROM documents WHERE collection = 'test' AND path = 'file.md'").get() as { pinned: number };
@@ -169,7 +173,7 @@ describe("pin/snooze lifecycle", () => {
   });
 
   it("pinDocument unpin sets pinned=0", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     store.pinDocument("test", "file.md", true);
     store.pinDocument("test", "file.md", false);
@@ -178,7 +182,7 @@ describe("pin/snooze lifecycle", () => {
   });
 
   it("snoozeDocument sets snoozed_until date", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     store.snoozeDocument("test", "file.md", "2026-04-01");
     const row = store.db.prepare("SELECT snoozed_until FROM documents WHERE collection = 'test' AND path = 'file.md'").get() as { snoozed_until: string };
@@ -186,7 +190,7 @@ describe("pin/snooze lifecycle", () => {
   });
 
   it("snoozeDocument with null removes snooze", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     store.snoozeDocument("test", "file.md", "2026-04-01");
     store.snoozeDocument("test", "file.md", null);
@@ -254,7 +258,7 @@ describe("co-activation", () => {
 
 describe("lifecycle management", () => {
   it("archiveDocuments sets archived_at and active=0", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const doc = findActiveDocument(store.db, "test", "file.md")!;
     store.archiveDocuments([doc.id]);
@@ -264,7 +268,7 @@ describe("lifecycle management", () => {
   });
 
   it("getLifecycleStats returns correct counts", () => {
-    insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
+    seedContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const stats = store.getLifecycleStats();
     expect(stats).toBeDefined();
@@ -274,7 +278,7 @@ describe("lifecycle management", () => {
   it("getLifecycleStats: forgotten counts only forget; deactivation_reasons partitions every inactive row", () => {
     const at = "2026-03-01T00:00:00Z";
     const seed = (path: string, active: number, reason: string | null, archivedAt: string | null) => {
-      insertContent(store.db, `h-${path}`, `body of ${path}`, at);
+      seedContent(store.db, `h-${path}`, `body of ${path}`, at);
       insertDocument(store.db, "test", path, path, `h-${path}`, at, at);
       store.db.prepare(`UPDATE documents SET active = ?, deactivated_reason = ?, archived_at = ? WHERE collection = 'test' AND path = ?`)
         .run(active, reason, archivedAt, path);

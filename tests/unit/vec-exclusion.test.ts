@@ -23,13 +23,14 @@ import { adaptiveTraversal } from "../../src/graph-traversal.ts";
 import { hasRecencyIntent } from "../../src/memory.ts";
 import { hashContent } from "../../src/indexer.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const MODEL = "test-model";
 const DIM = 4;
 
 function seedDoc(store: Store, col: string, path: string, body: string): string {
   const hash = hashContent(body + col + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
   return hash;
 }

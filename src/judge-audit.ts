@@ -11,6 +11,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { stripLeadingMarks, truncateText } from "./text-policy.ts";
 
 export type JudgeConsumer = "decision-extractor" | "merge-phase2" | "merge-phase3";
 
@@ -104,9 +105,10 @@ export function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function head(text: string | null | undefined): string | null {
-  if (text == null) return null;
-  return text.length > JUDGE_HEAD_MAX ? text.slice(0, JUDGE_HEAD_MAX) : text;
+function head(raw: string | null | undefined): string | null {
+  if (raw == null) return null;
+  const text = stripLeadingMarks(raw);                      // 82.3 D7 (ruling 55 A): model text stored as evidence
+  return truncateText(text, JUDGE_HEAD_MAX);                // never half of a pair (Codex T2 S3)
 }
 
 export function insertJudgeRun(db: Database, input: JudgeRunInput): number {

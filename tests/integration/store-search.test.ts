@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import {
   createStore,
-  insertContent,
   insertDocument,
   searchFTS,
   findDocument,
   type Store,
 } from "../../src/store.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 
 beforeEach(() => {
@@ -17,7 +17,7 @@ beforeEach(() => {
 function addDoc(path: string, title: string, body: string, hash?: string) {
   const h = hash || `hash_${path}_${Math.random().toString(36).slice(2)}`;
   const now = new Date().toISOString();
-  insertContent(store.db, h, body, now);
+  seedContent(store.db, h, body, now);
   insertDocument(store.db, "test", path, title, h, now, now);
 }
 

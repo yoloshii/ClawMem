@@ -4,6 +4,97 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.7 — unusable vectors are refused and repaired; values that start with a byte-order mark are no longer altered
+
+Two integrity defects (BACKLOG 82.2 and 82.3), one release. Neither runs code or reaches outside the vault; both could
+change what the vault holds or what a search returns, without a sign.
+
+**Vectors (82.2).** An embedding reply was converted to a `Float32Array` without a check, so `null`, a numeric
+string, a boolean, `1e400`, an all-zero vector or a vector of enormous length was stored as it came. sqlite-vec then
+computed no distance, or a distance that is no distance (NaN, −Infinity), for such a vector — and one could sort FIRST
+in every vector search. The canary could pass a NaN margin. A stored vector was also read back as raw bytes in one
+graph path, so its affinity was computed on bytes against floats.
+
+**Byte-order marks (82.3).** Bun's SQLite binding changes a bound string that STARTS with U+FEFF or U+FFFE: a U+FEFF
+is dropped (of two, one is kept); after a U+FFFE every later character is stored byte-swapped (U+FFFE then U+4E00 is
+stored as the letter `N`). A lookup with the same value is changed the same way, so it found the damaged row: a body
+was stored altered under the hash of its original text, a file named with a mark was stored under another name (and
+was never searchable), and two identifiers that differ only by a leading mark could address one row. Measured
+identically on all seven Bun versions tested, spanning 1.0.0 to 1.4.2 (1.0.0, 1.1.45, 1.2.0, 1.2.20, 1.2.21, 1.3.14,
+1.4.2; SQLite 3.38.5 to 3.53.2). The versions between them were not measured; since the behaviour is the same at
+both ends and at every point tested, every release before v0.43.7 is taken to be affected.
+
+### What changed — vectors
+
+- **Validated where it arrives.** Every embedding reply is checked raw, once, at the response boundary
+  (`src/vector-guard.ts`): an array of numbers, finite before and after float32 conversion, with a length (L2 norm)
+  between 1e-6 and 1e6. A refused reply is `VecPoisonError`; a reply of the wrong shape (no `data`, an item without
+  `embedding`, a repeated index, a short count) is `EmbedEnvelopeError`. Neither trips the endpoint-down cooldown.
+- **`clawmem embed` stops on a refused reply (exit 1)**, naming the batch index. Nothing of that batch is stored,
+  earlier batches stay, the document stays pending with its error. One (dimension, model) pair binds the whole run.
+  With `--force`, nothing is cleared unless every reply so far validated; a malformed canary reply always aborts,
+  `--force-geometry` included.
+- **The canary** validates every probe before computing margins; a non-finite margin or drift fails, and a battery
+  answered in part is judged on what was answered.
+- **Searches** accept a stored vector's distance only when it is a finite number in [0, 2] (with a 1e-4 tolerance);
+  anything else is a fault — the hit is skipped and counted, and an MCP reply lists the leg as `vector-fault`.
+  `vsearch` given a refused query vector returns an explicit error.
+- **`clawmem doctor`** reports "Stored vectors: N bad among M examined of T" from a bounded, rotating sample;
+  `--full` examines every vector and finds vector rows without metadata. **`clawmem repair vectors`** (dry run;
+  `--run`, `--limit N`, `--vault`, `--json`) removes the vectors that are not usable, schedules their documents to be
+  embedded again, and deletes similarity relations whose stored weight is not a cosine similarity (negative ones in
+  range are kept and counted).
+- **`build_graphs`** refuses a `semantic_threshold` outside 0–1 and reports `semanticSkipped` when stored vectors gave
+  no usable distance. Graph affinity reads stored vectors as floats again.
+
+### What changed — byte-order marks
+
+- **Every database handle is guarded.** A bound string whose FIRST character is U+FEFF or U+FFFE is refused before
+  the statement runs (`BomLeadingTextError`). The process prints ONE line to stderr at its first refusal, naming
+  `clawmem doctor`; the CLI prints the refusal as one message (exit 1). The guard checks itself before the first vault
+  opens; on a Bun that cannot pass the check, no vault is opened.
+- **Free text is normalised before it is stored.** A body, a title, a query and the other free-text fields lose their
+  leading marks, and a lone UTF-16 surrogate (half of a pair, e.g. JSON `"\ud800"`) becomes U+FFFD; a body's hash is
+  the hash of what is stored.
+- **Identifiers are refused, never stripped.** A path, a selector element, a collection, vault or session name that
+  starts with a mark is refused (CLI exit 2, REST 400, an MCP tool error). A file whose name starts with one is
+  skipped on every pass, named once per process, and counted as `refused`. `kg_query`'s `entity` takes a name or a
+  canonical id: a mark before an id is refused, one before a name is removed.
+- **Stored values from older versions are found and reported, not repaired automatically** — with one exception: a
+  body an older version stored with a lone UTF-16 surrogate is rewritten when the same text is saved again (its hash
+  already names that text). `clawmem doctor` lists
+  stored identifiers that start with a mark ("Stored identifiers", tagging the ones no reader binds again as inert),
+  and stored bodies whose hash is not the hash of their text ("Stored bodies", every body, every run). A surfacing job
+  queued before the upgrade that names a marked path or session id is discarded and reported.
+
+### What this changes for your vault
+
+- **Bun 1.3.14 or newer is required.** Below 1.2.21 ClawMem refuses to open a vault.
+- **A vault that holds an identifier stored with a leading mark is degraded until you clean it by hand**: a call that
+  binds that value again is refused (`update` of its collection fails and rolls back; `reindex --force` stops at that
+  collection, keeping the collections it already committed and leaving later ones unindexed), and where a call catches every error its reply is incomplete with no sign in it. Work skipped while the
+  row was there is not redone by the cleanup. The guard's line, the doctor and the scan in the upgrade guide are the
+  signals; the cleanup is in the troubleshooting guide. Both vaults measured before release held none.
+- **A body an older version altered** is repaired by `clawmem reindex --force` when an active file-backed document
+  holds it. A forgotten or archived document keeps its altered text, and an API-born memory has no source. Damage to a
+  path or a title cannot be detected (no hash). Measured before release on a 76,505-body vault: no altered body.
+- A query, title or body that started with a mark is stored without it.
+- **Searches screen the distances they get back, not the stored vectors.** A hit whose returned distance is unusable is
+  skipped and counted. A stored vector the extension cannot compute with can still return an ordinary distance and be
+  ranked on it: a stored `[1e38, 0]` against a query `[1, 0]` returns distance 1 (score 0), with no fault and no warning. Only
+  `clawmem doctor` (a bounded sample) and `clawmem repair vectors` (every vector) inspect stored vectors;
+  `repair vectors --run` removes the unusable ones and `embed` replaces them.
+- No schema change. Rolling back to v0.43.6 after `repair vectors` is safe.
+
+### Upgrading
+
+Order (details in the [upgrade guide](docs/guides/upgrading.md#v0437-unusable-vectors-are-refused-and-repaired-values-that-start-with-a-byte-order-mark-are-no-longer-altered)):
+stop the watcher, the vector daemon and the servers → install → start them and reconnect every MCP session →
+`clawmem doctor` → the identifier cleanup if listed → `clawmem reindex --force` if "Stored bodies" fails →
+`clawmem repair vectors --run` → `clawmem embed` → `build_graphs` → `clawmem spool-drain` once.
+
+---
+
 ## v0.43.6 — frontmatter can no longer run code or blow up memory while it is indexed
 
 Two defects in frontmatter parsing, both reachable from any Markdown file ClawMem indexes, plus one unbounded cache.

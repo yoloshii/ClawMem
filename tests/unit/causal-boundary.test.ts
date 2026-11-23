@@ -26,6 +26,7 @@ import { hashContent } from "../../src/indexer.ts";
 import { adaptiveTraversal, mpfpTraversal } from "../../src/graph-traversal.ts";
 import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal, baseAdmissible } from "../../src/causal-retrieval.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const TEST_DB = "/tmp/clawmem-causal-boundary-test.sqlite";
 const MODEL = "causal-fake";
 
@@ -64,7 +65,7 @@ const WHY_QUERY = "why did the pipeline deploy fail after the cache migration";
 function seedDoc(store: Store, col: string, path: string, body: string, opts?: { contentType?: string; modifiedAt?: string }): string {
   const hash = hashContent(body + col + path);
   const now = opts?.modifiedAt ?? new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
   if (opts?.contentType) {
     const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1`).get(hash) as { id: number };

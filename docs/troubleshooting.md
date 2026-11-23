@@ -8,6 +8,13 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - On Linux, Bun installed via snap (`/snap/bin/bun`) cannot read stdin due to snap's confinement sandbox. Hooks receive no prompt input and silently return empty context.
 - Fix: Install Bun via the official installer (`curl -fsSL https://bun.sh/install | bash`) which places it at `~/.bun/bin/bun`. The `bin/clawmem` wrapper prefers `~/.bun/bin/bun` over the system bun for this reason. If hooks return empty on a snap-based system, verify `~/.bun/bin/bun` exists and is executable.
 
+**"sqlite guard self-check failed at … ClawMem needs Bun 1.3.14 or newer" (v0.43.7+)**
+- Every database handle ClawMem opens refuses a bound string that starts with a byte-order mark (below). Before the
+  first vault opens in a process, the guard proves itself on a scratch database; on a Bun older than 1.2.21 it cannot
+  (prepared statements have no `raw` there), so no vault is opened at all. 1.3.14 is the lowest version the whole suite
+  was run on and passed; 1.2.21 passes the self-check but not the suite.
+- Fix: upgrade Bun (`bun upgrade`, or the official installer), then restart every long-running ClawMem process.
+
 **Two Bun binaries on PATH**
 - If both snap bun (`/snap/bin/bun`) and native bun (`~/.bun/bin/bun`) are installed, `which bun` may return the snap version. Direct `bun -e` or `bun run` commands will use the wrong binary.
 - Fix: The `bin/clawmem` wrapper handles this automatically. For manual commands, use `~/.bun/bin/bun` explicitly or add `~/.bun/bin` to PATH before `/snap/bin`.
@@ -150,6 +157,20 @@ builders operate on — so archiving documents legitimately lowers the total.
   - **Missing EOS anchor** — a last-token model whose GGUF conversion lost `tokenizer.ggml.add_eos_token`: the server never appends the terminator the model reads its embedding from, so last-token pooling reads an arbitrary final text token. Signature: similarity tracks how texts END, not what they mean — identical-vocabulary pairs score low; similarity swings with the truncation point; texts sharing a final word score deceptively high; self-similarity stays ~1.0 (so stored-vs-fresh checks pass). Verified real-world: this exact failure served an entire vault ~0.33 on echo pairs while basic-English probes looked healthy.
 - Diagnose: embed two paraphrases and one unrelated sentence through your endpoint and compare cosine similarity. A healthy model scores the paraphrase pair > 0.75 and the unrelated pair < 0.45. Also test a near-identical pair differing only in the final word — it must score HIGH; low means an unanchored last-token readout. Beware the shared-suffix confound when testing terminators by hand: appending ANY common suffix to both texts inflates similarity by last-token identity — only genuine semantic separation (related high AND unrelated low) proves the fix. `clawmem doctor` runs this battery automatically (geometry canary), and `clawmem embed` refuses to build against a failing geometry (override: `--force-geometry`).
 - Fix: launch the embedding `llama-server` with the pooling its model requires (`--pooling last` for Qwen3-Embedding / last-token models), restore the EOS append when the GGUF lost it (`--override-kv tokenizer.ggml.add_eos_token=bool:true` — a no-op when the metadata is already correct), and ensure outputs are L2-normalized. **A full `clawmem embed --force` is REQUIRED after any serving-side pooling/normalization/EOS change**: the old vectors are faithful to the old geometry, and two geometries at the same dimension are mutually incompatible — fresh queries against stale vectors are cosine-meaningless.
+- **A second cause (v0.43.7): stored vectors that are not usable.** A vector with a non-finite element, a length outside
+  1e-6 to 1e6, or a blob of the wrong size CAN give no distance, or a distance that is no distance (not every one does),
+  and before v0.43.7 such a one could sort first in every vector search. Searches now skip and count a hit whose RETURNED distance is unusable (an
+  MCP reply lists the leg as `vector-fault`); they do not read the stored vector, so one the extension cannot compute
+  with can still return an ordinary distance and be ranked (a stored `[1e38, 0]` against `[1, 0]` returns distance 1, score 0, no fault). `clawmem doctor` reports "Stored vectors: N bad among M examined of T" from a bounded sample;
+  `clawmem doctor --full` examines every vector; `clawmem repair vectors --run` removes them and schedules their
+  documents to be embedded again ([CLI reference](reference/cli.md#vector-repair-v0437)). A sample of 0 bad is not a
+  statement about the whole vault.
+- **`clawmem embed` stops with a refused vector (v0.43.7).** An embedding reply that is not a vector of finite numbers
+  of a usable length (`VecPoisonError`), or a reply of the wrong shape — no `data`, an item without `embedding`, a
+  repeated index, a short count (`EmbedEnvelopeError`) — stops the run with exit 1, naming the batch index. Nothing
+  of the refused batch is stored; earlier batches stay; the document stays pending with its error recorded. Fix the
+  endpoint (the reply is the server's), then run `clawmem embed` again. A malformed canary reply always aborts,
+  `--force-geometry` included.
 - Note on `_clawmem/` system docs (observations/deductions): since v0.21.0 the MCP retrieval tools exclude the `_clawmem` collection by default (pass `includeInternal: true` to include it; an explicit `collection` filter naming `_clawmem` also overrides). If internal docs dominate results even with a HEALTHY model, that is the composite-scoring floor (system docs carry high confidence and non-decaying recency), not geometry — the default exclusion is the remedy there.
 - Operational: don't run `embed --force` while the file watcher is indexing bulk changes — stop the watcher or expect write contention (the run now survives transient `SQLITE_BUSY`, but contention still slows it). If you pipe embed output through `tee`, remember the pipeline exit code is `tee`'s — check `PIPESTATUS[0]` for the embed's own status.
 
@@ -467,7 +488,7 @@ builders operate on — so archiving documents legitimately lowers the total.
   1. `[mcp] Received SIGTERM, shutting down...` present: the host's own lifecycle tore the server down (OpenClaw's process teardown sends SIGTERM first). Investigate the gateway's session/catalog lifecycle, not ClawMem.
   2. Silence with the process gone: a SIGKILL-class death, most commonly the kernel OOM killer. OpenClaw spawns MCP servers with `oom_score_adj=1000`, the maximum OOM preference, so they are the kernel's first victim under any memory pressure (openclaw/openclaw@cc9dcd3d69e, April 2026, present in current releases; the wrap protects the gateway by sacrificing child processes). Verify: `cat /proc/$(pgrep -f "clawmem.ts mcp" | head -1)/oom_score_adj` prints `1000`, and `dmesg -T | grep -iE "oom|killed process"` shows the kill. Mitigation: set `OPENCLAW_CHILD_OOM_SCORE_ADJ=0` in the gateway's environment (OpenClaw's own opt-out) and/or add memory headroom.
   3. A stack trace on stderr: a genuine server crash. Capture it and file it at yoloshii/ClawMem with the trace. This is the one case that is a ClawMem bug.
-- Note: the npm package's `clawmem` bin always execs bun (`engines: bun >=1.0.0`); Node is never the server runtime, so the host's Node version is not a variable here. When reporting, include `bun --version` and the OpenClaw version.
+- Note: the npm package's `clawmem` bin always execs bun (`engines: bun >=1.3.14`); Node is never the server runtime, so the host's Node version is not a variable here. When reporting, include `bun --version` and the OpenClaw version.
 
 **`clawmem setup openclaw` installs into the wrong profile / ignores `OPENCLAW_STATE_DIR` (ClawMem v0.10.0–v0.10.3)**
 - Symptom: running `OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw` (or running ClawMem setup while OpenClaw is configured for a non-default profile via `--profile` / `OPENCLAW_STATE_DIR`) installs the plugin into `~/.openclaw/extensions/clawmem` instead of the profile-specific extensions directory. The default profile picks the plugin up; the active profile does not see it.
@@ -560,6 +581,141 @@ builders operate on — so archiving documents legitimately lowers the total.
   it; the doctor line is the signal there).
 - Cause: a dependency not at the pinned version (`gray-matter` 4.0.3, `js-yaml` 3.14.x). Fix: `bun install
   --frozen-lockfile` in the ClawMem checkout, restart the long-lived processes, run `clawmem doctor` again.
+
+## Byte-order marks in stored values (v0.43.7)
+
+A byte-order mark is the character U+FEFF, or its byte-swapped form U+FFFE. Bun's SQLite binding changes a bound
+string that STARTS with one: a U+FEFF is dropped (of two, one is kept), and after a U+FFFE every later character is
+stored byte-swapped. The same change applied to a lookup, so a lookup with the marked value found the altered row:
+the damage was silent. From v0.43.7 every database handle ClawMem opens refuses such a binding before it runs
+(`BomLeadingTextError`); a body, a title and the other free-text fields lose their leading marks before they are
+stored; and an identifier (a path, a collection or vault name, a session id) that starts with one is refused, never
+stripped — `x.md` and a marked `x.md` are two different files.
+
+**"[clawmem] A statement was refused: a bound string starts with a byte-order mark (U+FEFF). Results of this process may be incomplete."**
+- A process printed this once, at its first refusal. Either a writer missed its normalisation (a bug: report it with
+  the statement the error names) or — the usual case — the vault holds an identifier stored with a mark by an older
+  version, and this process bound it again. Run `clawmem doctor` and read the "Stored identifiers" check (below).
+- A CLI command that meets it prints `Error: a bound string starts with U+FEFF (parameter N of: <statement>). SQLite
+  would store it altered, so the statement did not run.` and exits 1. A hook that meets it ends fail-open, and its
+  host may discard the warning: there, the doctor is the signal.
+
+**"the path starts with a byte-order mark (U+FEFF); such a name is refused, not stripped" (exit 2, REST 400, an MCP tool error)**
+- An identifier you passed — a path, a selector element, a collection or vault name — starts with a mark (the message
+  names which). Type it without the mark, or pass the name exactly as it is stored. Nothing was changed. The retire
+  command's `--note` is refused the same way, with its own line, exit 2.
+
+**"[indexer] refused: notes/<U+FEFF>x.md — the path starts with a byte-order mark; such a file is not indexed"**
+- A FILE in a collection has a name that starts with a mark. It is skipped on every pass and named once per process;
+  `update`, the MCP `reindex` reply and REST `/reindex` count it as `refused`. Rename the file without the mark.
+- Older versions stored such a file under an altered name — without the U+FEFF (`x.md`), or with the mark dropped and
+  every later character byte-swapped after a U+FFFE — and marked that row absent in the same pass, so the file was
+  never searchable. A row that is still active under the altered name (its file was renamed to the marked name later)
+  goes absent on the first pass after the upgrade, and stays absent. After the rename, a U+FEFF file comes back as the
+  same document; a U+FFFE file becomes a new document, and the byte-swapped row stays absent.
+
+### Stored identifiers that start with a byte-order mark
+
+The doctor's "Stored identifiers" check lists stored values that start with a mark: table, rowid, column and the
+value in hex (a marked path and its unmarked twin print alike anywhere else, so read the hex). Such a value got there
+before v0.43.7: a path that began with TWO marks was stored with one, and other tools that write the database store
+what they are given. ClawMem never rewrites, moves or deletes such a row because of its mark.
+
+What a listed value does (accepted with v0.43.7; the state is DEGRADED until you clean it, and part of it is silent):
+- A call is refused only where it binds the stored value AGAIN. Reading the row is not one. `update` of the
+  collection fails and rolls back (exit 1) while the row is an active filesystem document of a configured collection;
+  a search that hydrates that row fails; `reindex --force` stops at that collection (exit 1): the collection rolls
+  back, collections indexed before it stay committed, and later ones are not indexed.
+- Where a call catches every error, the refusal is swallowed like any other error and the reply is incomplete with
+  no sign in it: a retrieval reply built without the leg that met the row; a hook that leaves out a section; a stop
+  range committed without its contradiction judgment or its triples; entity enrichment that reports 0; maintenance
+  recorded as complete. Work queued behind a refused item can wait on every pass.
+- Three units can be left half-done: a compaction registration spent with its payload unread; entities created for
+  a triple that was then refused; (prod build) an outbox item written at its destination and still queued.
+- What was skipped while the row was there is NOT redone by the cleanup — that loss stays unless you restore a copy
+  of the vault from before it or redo the work by hand.
+- `clawmem repair entities` (dry run and `--apply`) stops with the typed error before anything is written when a
+  triple's `predicate`, `object_literal`, `valid_from` or `valid_to` starts with a mark. Find those with the scan in the
+  upgrade guide on those four columns; correct the value by hand on a copy, or restore a copy.
+
+**INERT values.** A listed value is tagged `[inert — kept as a record]` when no reader binds it again: every
+identifier of an INACTIVE document; a stored session id (`session_log.session_id`); a `feedback_ledger.display_path`,
+`utility_signals.path`, `counter_repair_log.row_key` or `entity_repair_log.row_key` whose mark comes AFTER the slash.
+Inert values stay listed and do not fail the check. A value tagged `[UNCONFIRMED …]` belongs to a column whose
+encoding the list does not know: check it by hand before any cleanup.
+
+**The cleanup, by hand** (there is no repair command):
+1. Stop `clawmem watch`, the vector daemon and `clawmem serve`, and close or reconnect every agent session that runs a
+   `clawmem mcp` server.
+2. Copy the vault file (`~/.cache/clawmem/index.sqlite` by default), with its `-wal` file if one exists.
+3. Rename the file on disk without the mark, if it still exists.
+4. For each line of the doctor's list, run the statement for ITS table and column — a rowid belongs to one table:
+
+| Listed column | Statement | Notes |
+|---|---|---|
+| `documents` `path`, `collection`, `topic_key` | `UPDATE documents SET active = 0, deactivated_reason = 'forget' WHERE id = <rowid>;` | Retires the document (what a forget does). Its values are then inert. After the rename and `update`, the file is a NEW document. |
+| `session_log` `handoff_path` | `UPDATE session_log SET handoff_path = NULL WHERE rowid = <rowid>;` | Needed as well: session bootstrap, profile construction and `update`'s closing profile refresh read the handoff by its path, so they still fail after the document statement alone. |
+| `session_log` `session_id` | none | Inert. |
+| `feedback_ledger` `display_path`, `utility_signals` `path` | none | Inert when the mark is after the slash. With the mark at the start: `NOT NULL` with dependants — restore the copy, or leave the reader that binds it refused. |
+| `counter_repair_log` / `entity_repair_log` `row_key` | none | Inert when the mark is after the slash; otherwise UNCONFIRMED. |
+| any other table (transcripts and stop state, causal runs and their events, triples and their provenance, usage rows and their feedback turns) | none given | These have dependants: restore the copy, or remove the dependants first by hand on a copy. |
+
+5. Run `clawmem update`, then `clawmem doctor`: the check passes, with the retired values listed as inert.
+6. Then repair bodies (next item). Restart the processes you stopped.
+
+### Stored bodies whose hash is not the hash of their text
+
+The doctor's "Stored bodies" check (v0.43.7) hashes every stored body on every run. Older versions hashed a body that
+began with a mark WITH the mark, and stored it altered (above), so such a row keeps the hash of its original text.
+Every writer of v0.43.7 hashes exactly what it stores. The check names the pattern when one of those two alterations
+explains the mismatch (`feff-dropped`, `fffe-swapped`) and `other`, of unknown cause, when neither does — one known
+source: a body an older version received over REST or MCP holding a lone UTF-16 surrogate (half of a pair) was hashed
+as U+FFFD but stored as other bytes, which read back lossily, sometimes as empty text (since v0.43.7 such a surrogate is stored as U+FFFD, and a later save of the same text
+rewrites that old row to it, so every document holding it reads it again — search rows included).
+It lists the documents that hold each body. Paths and titles carry no hash:
+their damage cannot be found this way. Where such a body came from: a mark straight after a frontmatter block (either
+mark), or a U+FFFE at the very start of a file — older versions already dropped a U+FEFF at the very start of a file.
+
+- **An active file-backed document:** `clawmem reindex --force` rewrites it from its file (new body without the mark,
+  new hash; its embeddings are scheduled again; `clawmem embed` re-embeds it). An ordinary `update` does not: the
+  unchanged file is skipped before it is read. It re-reads every active file and, with a note model configured, makes one model
+  call per rewritten document; healthy documents keep their hash and embeddings. Run the identifier cleanup first — while the "Stored identifiers" check fails
+  (a listed value that is not inert), `reindex --force` stops at the first collection that binds it — earlier
+  collections stay committed, later ones are not indexed; inert values do not stop it.
+- **A forgotten or archived document** keeps its lifecycle state AND its altered text: a forced re-index skips it.
+  Restore an archived one first (`lifecycle_restore`) and THEN run `reindex --force`; a document restored after the
+  forced re-index stays altered until you run it again.
+- **An API-born memory** (hooks, `memory_*` tools, REST) has no file: its text is lost. Forget it, or restore a copy.
+- The check fails while an ACTIVE document holds such a body; one held only by inactive documents, or by none, is
+  listed as a record and passes. Measured before release on a 76,505-body vault: 0 found.
+
+### Stored text that is not valid UTF-8
+
+**`clawmem repair entities`: "N stored text value(s) in the tables the entity repair reads or writes do not read back
+as their own bytes … nothing written."** (exit 1 — the dry run, `--apply` and `--restore` alike)
+- Bun reads a stored text value whose bytes are not valid UTF-8 lossily: a short value as empty text, a longer one with
+  U+FFFD in place of the bad bytes (both measured on Bun 1.3.14). Older versions could
+  store such bytes: after a leading U+FFFE their binding stored every code unit byte-swapped, and a swapped code unit
+  can be half of a UTF-16 pair (U+FFFE followed by U+00D8 was stored as the bytes `ED A0 80`). The entity repair copies,
+  compares and restores rows through text, so it would write such a value back changed. It refuses instead, naming the
+  first five values as `table.column rowid N` (or "the body of document N" for a document whose mentions it re-reads).
+  It checks the values it reads or writes: every row of `entity_nodes`, `entities_fts`, `entity_mentions`,
+  `entity_cooccurrences`, `entity_triples`, `entity_triple_provenance` and the entity links in `memory_relations`; the
+  bodies of the documents it re-reads; and, for `--restore`, the `entity_repair_log` rows of the op it restores — so an
+  older op's damaged log row blocks only that op's restore. Other bodies do not stop it.
+- To fix: stop ClawMem's processes, back the vault up (`sqlite3 <vault> ".backup <copy>"`), and look at each named value
+  with `sqlite3 <vault> "SELECT hex(<column>) FROM <table> WHERE rowid = N"`. Write the text it should hold
+  (`UPDATE <table> SET <column> = '<text>' WHERE rowid = N`), or set it to NULL where the column allows it; a body is
+  repaired by `clawmem reindex --force` when an active file-backed document holds it. Then run the dry run again.
+- Measured before release on a vault copy (22,464 entities, 14,246 triples): none. The check costs about 0.15–0.6 s.
+
+**"[clawmem] spool: job … discarded — its … starts with a byte-order mark (a spool from before the upgrade)."**
+- A surfacing-bookkeeping job written before v0.43.7 named a session id, or a path whose collection or relative path
+  (the part after the first slash) starts with a mark — in its injected paths, its per-vault documents or its manifest
+  (`… injected path`, `… display path`, `… manifest path`). A mark that starts a deeper folder or file name
+  (`notes/sub/<mark>x.md`) is not one of those: the job is applied. A discarded job is never applied
+  or retried; any other entries in that job are dropped with it (they could not be applied either). The line shows on
+  a manual `clawmem spool-drain` only — the hook's drain discards stderr — so run that once after upgrading.
 
 ## General
 

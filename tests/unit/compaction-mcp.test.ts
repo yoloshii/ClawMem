@@ -25,6 +25,7 @@ const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
 const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { EVOLUTION_WRITER_FLOOR_FLAG } from "../../src/compaction-state.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const MODEL = "quarantine-mcp-fake";
 const vec = () => new Float32Array([0.1, 0.1, 1, 0]);
 const CANARY = "CANARY-MCPQ";
@@ -53,7 +54,7 @@ beforeAll(async () => {
   const at = (min: number) => new Date(t0 + min * 60_000).toISOString();
   const seed = (path: string, body: string, origin: string | null, modifiedAt: string) => {
     const hash = hashContent(body + path);
-    seedStore.insertContent(hash, body, modifiedAt);
+    seedContent(seedStore.db, hash, body, modifiedAt);
     seedStore.insertDocument("agent-memory", path, path, hash, modifiedAt, modifiedAt);
     seedStore.db.prepare("UPDATE documents SET origin = ? WHERE collection = 'agent-memory' AND path = ?").run(origin, path);
     seedStore.markEmbedSynced(hash);
@@ -104,7 +105,7 @@ beforeAll(async () => {
   // relative path in another collection equal to a real note's display path.
   const plain = (collection: string, path: string, body: string) => {
     const hash = hashContent(body + collection + path);
-    seedStore.insertContent(hash, body, at(20));
+    seedContent(seedStore.db, hash, body, at(20));
     seedStore.insertDocument(collection, path, path, hash, at(20), at(20));
   };
   plain("agent-memory", "shared.md", "a shared name in the agent memory collection");

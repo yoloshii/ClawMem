@@ -406,7 +406,7 @@ describe("LLM Remote Fallback", () => {
       // Embed should still try remote (different cooldown) — same fetch mock handles both
       const result = await llm.embed("test");
       expect(result).toBeDefined();
-      expect(result!.embedding).toEqual([0.1, 0.2]);
+      expect(Array.from(result!.embedding)).toEqual([Math.fround(0.1), Math.fround(0.2)]); // a validated Float32Array since v0.43.7
     });
 
     it("embed cooldown does not affect LLM", async () => {
@@ -509,7 +509,7 @@ describe("LLM Remote Fallback", () => {
       }) as any;
       const next = await llm.embed("q2");
       expect(fetchCalled).toBe(true);
-      expect(next?.embedding).toEqual([0.1, 0.2]);
+      expect(Array.from(next!.embedding)).toEqual([Math.fround(0.1), Math.fround(0.2)]); // a validated Float32Array since v0.43.7
     }, 10000);
 
     it("skips the LOCAL embed fallback when a deadline signal is set (remote in cooldown) — Medium fix", async () => {

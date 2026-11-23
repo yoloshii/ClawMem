@@ -33,6 +33,7 @@ import { sanitizeSnippet } from "../promptguard.ts";
 import { shouldSkipRetrieval, hasForceRetrieveIntent, isRetrievedNoise, needsPriorContext, contentTokenSet } from "../retrieval-gate.ts";
 import { selectCandidatePool, dropUnarbitrated, candidateKey, finalOrderingKeys, fuseRerankLane, compareOrderingKeys, relevanceAdmission, resolveAdmissionBasis, ADMISSION_PARAMS, ADMISSION_POLICY_ACTIVE, RERANK_LANE_ACTIVE, RERANK_DEGENERACY_GATE_ACTIVE, type LaneList, type FusionMembership, type OrderingKey } from "./surfacing-fusion.ts";
 import { assessRerankDegeneracy } from "../health/rerank-health.ts";
+import { isRefusedEmbedResponse } from "../vector-guard.ts";
 import { vectorDaemonLikelyAvailable, searchVecDaemonRequired, type VecExecStatus, type VecResponseProtocol } from "../vector-daemon.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
 import { registerSurfacingTranscript, surfacingIdentity, type UsageIdentity } from "../stop-identity.ts";
@@ -629,8 +630,14 @@ export async function contextSurfacing(
   // protocol; otherwise the production contract (daemon when live, in-process fallback when not).
   // Read per call — the eval arms it at run time, after this module was imported.
   const vectorDaemonRequired = process.env.CLAWMEM_VECTOR_DAEMON_REQUIRED === "1";
-  const recordVectorLeg = (leg: "primary" | "prior" | "deep") => (path: VecExecStatus, protocol?: VecResponseProtocol): void => {
-    if (trace) (trace.vectorLegs ??= []).push({ leg, path, ...(protocol ? { protocol } : {}) });
+  // v0.43.7 (82.2 D4): an ok leg also records how many stored vectors the scan skipped as unusable (the field is
+  // absent when the count is zero, so a healthy trace is unchanged).
+  type VectorLegEntry = NonNullable<NonNullable<typeof trace>["vectorLegs"]>[number];
+  const recordVectorLeg = (leg: "primary" | "prior" | "deep") => (path: VecExecStatus, protocol?: VecResponseProtocol, vectorFaults?: number): VectorLegEntry | undefined => {
+    if (!trace) return undefined;
+    const entry: VectorLegEntry = { leg, path, ...(protocol ? { protocol } : {}), ...(vectorFaults ? { vectorFaults } : {}) };
+    (trace.vectorLegs ??= []).push(entry);
+    return entry;
   };
   // hydrated-v1 request inputs (codex #28 t87 F4): snippet construction runs against the RAW
   // CURRENT PROMPT + resolved session topic on EVERY leg — the prior leg searches with joined
@@ -656,9 +663,24 @@ export async function contextSurfacing(
   const isVectorTimeout = (e: unknown): boolean => e instanceof Error && e.message === "vector timeout";
   const vectorLegInvocation = (leg: "primary" | "prior" | "deep") => {
     let status: VecExecStatus | null = null;
+    let entry: VectorLegEntry | undefined;
     const toLedger = recordVectorLeg(leg);
     return {
-      onPath: (path: VecExecStatus, protocol?: VecResponseProtocol): void => { status = path; toLedger(path, protocol); },
+      // The in-process leg reports twice: its path before the search runs, its fault count after. The second
+      // call (same path) adds the count to the SAME entry — one entry per invocation.
+      onPath: (path: VecExecStatus, protocol?: VecResponseProtocol, vectorFaults?: number): void => {
+        if (entry && status === path) { if (vectorFaults) entry.vectorFaults = vectorFaults; return; }
+        status = path;
+        entry = toLedger(path, protocol, vectorFaults);
+      },
+      // 82.2 D4: the embedding endpoint answered the QUERY with a vector that must not be used — thrown by the
+      // daemon client (already recorded `vector-fault`) or by the in-process search (recorded `absent` before it
+      // ran). Either way this invocation's path IS `vector-fault`, and the leg is lexical only.
+      onRefusedQueryVector: (e: unknown): void => {
+        if (!isRefusedEmbedResponse(e) || status === "vector-fault") return;
+        status = "vector-fault";
+        if (entry) entry.path = "vector-fault"; else entry = toLedger("vector-fault");
+      },
       status: (): VecExecStatus | null => status,
     };
   };
@@ -713,6 +735,7 @@ export async function contextSurfacing(
       primaryRace = "settled";
     } catch (e) {
       primaryRace = isVectorTimeout(e) ? "timeout" : "threw";
+      primaryLeg.onRefusedQueryVector(e);
       // Vector search unavailable, timed out, or errored — fall back to BM25. A vault-wide
       // embedding-model mismatch is a persistent config error, not a transient miss: surface it
       // loudly once, then degrade (the hook stays fail-open).
@@ -792,7 +815,7 @@ export async function contextSurfacing(
         const priorVec = await raceDeadline(priorVecPromise, priorDeadline, () => new Error("vector timeout"));
         priorRace = "settled";
         if (priorVec.length > 0) lanes.push({ lane: "prior-vector", results: priorVec, variantQuery: joinedPriors });
-      } catch (e) { priorRace = isVectorTimeout(e) ? "timeout" : "threw"; warnOnceOnVectorModelMismatch(e); /* prior leg is supplementary — non-fatal */ }
+      } catch (e) { priorRace = isVectorTimeout(e) ? "timeout" : "threw"; priorLeg.onRefusedQueryVector(e); warnOnceOnVectorModelMismatch(e); /* prior leg is supplementary — non-fatal */ }
       finally {
           recordVectorLegDeadline("prior", priorDeadline, priorStart, spanStart(), priorRace, priorLeg.status()); // codex t81 P2: prior leg vs its own dynamic deadline
         }
@@ -909,7 +932,7 @@ export async function contextSurfacing(
                   : searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadline, deepLeg.onPath, hydration);
                 hits = await raceDeadline(deepVec, workDeadline, () => new Error("vector timeout"));
                 deepRace = "settled";
-              } catch (e) { deepRace = isVectorTimeout(e) ? "timeout" : "threw"; warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
+              } catch (e) { deepRace = isVectorTimeout(e) ? "timeout" : "threw"; deepLeg.onRefusedQueryVector(e); warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
               finally {
                 recordVectorLegDeadline("deep", workDeadline, deepStart, spanStart(), deepRace, deepLeg.status()); // codex t81 P2: each deep invocation vs the work deadline it was bounded by
               }

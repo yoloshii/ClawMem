@@ -24,6 +24,7 @@ import { applyCompositeScoring } from "../../src/memory.ts";
 import { enrichResults } from "../../src/search-utils.ts";
 import { rankRawPrimary } from "../../src/scoring-regime.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const TEST_DB = "/tmp/clawmem-mcp-routes-test.sqlite";
 const MODEL = "route-fake";
 
@@ -57,7 +58,7 @@ let seedStore: Store;
 function seedDoc(store: Store, col: string, path: string, body: string, opts?: { contentType?: string; modifiedAt?: string }): string {
   const hash = hashContent(body + col + path);
   const now = opts?.modifiedAt ?? new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
   if (opts?.contentType) {
     const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1`).get(hash) as { id: number };

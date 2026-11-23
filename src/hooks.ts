@@ -5,6 +5,7 @@
  * This module provides the I/O layer and dispatches to individual hook handlers.
  */
 
+import { stripLeadingMarks, truncateText } from "./text-policy.ts";
 import type { Store } from "./store.ts";
 import { isoNow, toDate, epochNow } from "./clock.ts";
 import { createHash } from "node:crypto";
@@ -81,7 +82,9 @@ export function parseHookInput(text: string): HookInput {
     const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
     return {
       sessionId: parsed.session_id ?? parsed.sessionId,
-      prompt: parsed.prompt,
+      // 82.3 D7: the prompt is free text — a normalised field; every leading byte-order mark is removed here, once,
+      // for every hook. An identifier (the session id) is NOT changed here.
+      prompt: typeof parsed.prompt === "string" ? stripLeadingMarks(parsed.prompt) : parsed.prompt,
       transcriptPath: parsed.transcript_path ?? parsed.transcriptPath,
       hookEventName: parsed.hook_event_name ?? parsed.hookEventName,
       toolInput: parsed.tool_input ?? parsed.toolInput,
@@ -244,7 +247,8 @@ export function wasPromptSeenRecently(store: Store, hookName: string, prompt: st
   const windowSec = windowSecRaw ? parseInt(windowSecRaw, 10) : 600;
   if (!Number.isFinite(windowSec) || windowSec <= 0) return false;
 
-  const normalized = (prompt || "").trim();
+  // 82.3 D7: a hook prompt is a normalised field. `.trim()` removes U+FEFF but not U+FFFE, so marks are stripped too.
+  const normalized = stripLeadingMarks((prompt || "").trim()).trim();
   if (!normalized) return false;
 
   const hash = createHash("sha256").update(normalized).digest("hex");
@@ -263,7 +267,7 @@ export function wasPromptSeenRecently(store: Store, hookName: string, prompt: st
     }
   }
 
-  const preview = normalized.slice(0, 120);
+  const preview = truncateText(normalized, 120);                       // never half of a pair (Codex T2 S3)
   // Best-effort dedup bookkeeping. Under writer contention this UPSERT can hit
   // SQLITE_BUSY — especially from the context-surfacing hook, which caps its
   // busy_timeout low (B3) so its own writes cannot stall the tight

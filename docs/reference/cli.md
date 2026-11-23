@@ -233,10 +233,94 @@ The vaults are the default index and each configured vault, one per database fil
 file already listed selects that vault. The default index is named `general`, or `default-index` when a configured
 vault on another file has that name (`default-index-2` and up when that name is configured for another file too), so
 `--vault general` reaches the vault your config calls `general`. The command opens vault files directly and
-initializes no store. Exit 1 when an apply or restore is refused, or a restore keeps a group because something
+initializes no store. The dry run, `--apply` and `--restore` refuse (exit 1, nothing written) while a stored text value
+among the values they read or write is not valid UTF-8 — Bun reads such a value lossily (a short one as empty text),
+so the repair could not keep it ([what to do](../troubleshooting.md#stored-text-that-is-not-valid-utf-8)). Exit 1 when an apply or restore is refused, or a restore keeps a group because something
 changed it since or undoing it would put back a second open triple on one subject, predicate and object.
 Details: [Repairing links made before
 v0.43.2](../internals/entity-resolution.md#repairing-links-made-before-v0432).
+
+## Vector repair (v0.43.7)
+
+```bash
+clawmem doctor                                # "Stored vectors: 0 bad among N examined of M" — a sample of at most 2000 keys
+clawmem doctor --full                         # Examines every stored vector, and finds vector rows that have no metadata row
+clawmem repair vectors                        # Dry run: what would be removed and reset (nothing written)
+clawmem repair vectors --vault <name> --json  # One vault, as one JSON object
+clawmem repair vectors --run                  # Remove the vectors that are not usable; their documents are embedded again
+clawmem repair vectors --run --limit <N>      # Delete at most N vector rows in this run
+```
+
+A stored vector is **not usable** when the reader refuses it (an element that is not a finite number: `non-finite`;
+a length outside 1e-6 to 1e6: `unsupported-norm`; a blob that is not a vector of the table's size: `malformed-blob`)
+or when sqlite-vec cannot compute with it (`native-uncomputable`). Such a vector CAN give no distance, or a distance
+that is no distance, and before v0.43.7 one of them could sort first in a vector search — but not every one does. Searches now skip and count a
+hit whose RETURNED distance is unusable, but they do not read the stored vector: one that cannot be computed with
+can still return an ordinary distance and be ranked (a stored `[1e38, 0]` against a query `[1, 0]` returns distance 1, score 0,
+with no fault). The doctor's sample and this command inspect the stored vectors; `--run` removes the unusable ones.
+
+`clawmem doctor` examines a bounded sample, starting at a different key on each run, and says so: "among N examined
+of M" is never a statement about the whole vault. `--full` examines every key and reports vector rows that have no
+metadata row (`orphan`). It reads through one read transaction on a read-only handle, so its report describes one
+state of the database; while a `--full` scan runs, the write-ahead log cannot be checkpointed past that state. When
+the doctor cannot examine the vectors (an error of the extension or of the vector table's schema) it says "could
+not examine": that is never a finding and never a reason to delete. The doctor also reports a stored canary
+baseline that is damaged (`Canary baseline: damaged`); `clawmem embed --force --recalibrate-canary` replaces it.
+
+`repair vectors` works in two phases and reports them apart.
+
+- **VECTORS.** Lists each vector that is not usable with its reason. With `--run`, for each one: the vector row and
+  its metadata row are deleted, and every active document row of that content is set to be embedded again
+  (`embed_state = pending`, attempts 0). Nothing else of a document changes. Each vector is examined again under the
+  write lock: one that an embed replaced meanwhile is healthy and is kept.
+- **RELATIONS.** A similarity relation written by the link builder (`build_graphs`) whose stored weight is not a
+  cosine similarity — not a finite number, or outside -1 to 1 by more than 1e-4 — is deleted. A negative weight
+  inside that range is kept and counted. A relation of type `semantic` that the link builder did not write (a
+  dependency link, a link a model judged) is never deleted; one whose weight is outside the range is counted. Causal
+  and other relations are not touched. What the command cannot repair, and says: a similarity relation with a valid
+  weight that was computed from a vector now removed cannot be told from any other, and `build_graphs` does not
+  replace an existing relation — the run prints how many such relations each repaired document has, and they stay.
+
+`--run` takes the embedding lease that `clawmem embed` holds, so the two never write the vector tables at the same
+time; when an embed or another repair holds it, the command changes nothing and exits 1. Each page of work is one
+transaction: an error in a page rolls that page back, the pages before it stay committed, and the output says what
+each phase did. `--limit N` bounds the vector rows deleted (not the rows scanned or shown); when it stops the vector
+phase, the relation phase does not run and the output says "relations: not run — vector phase incomplete".
+`--limit` goes with `--run`. The default vault is the default index; `--vault` takes a name as `repair entities`
+does.
+
+Exit 0: nothing to do in either phase, or both phases completed. Exit 1: something to do (dry run), a run stopped
+by `--limit`, a refused or failed run. Exit 2: usage.
+
+Order after an upgrade: restart the long-running processes, then `clawmem repair vectors --run`, then
+`clawmem embed` (it embeds the affected documents again — the whole document, not one fragment), then `build_graphs`.
+
+## Byte-order marks: doctor checks and refusals (v0.43.7)
+
+```bash
+clawmem doctor                 # "Stored identifiers": stored values that start with a byte-order mark (table, rowid, column, hex)
+                               # "Stored bodies": bodies whose hash is not the hash of their text (every body, every run)
+clawmem reindex --force        # rewrite every ACTIVE file-backed document from its file (repairs an altered body)
+clawmem spool-drain            # once after upgrading: shows a pre-upgrade surfacing job it discarded
+```
+
+**Stored identifiers** lists each stored identifier that starts with U+FEFF or U+FFFE, by table, rowid and column,
+with the value in hex. It fails (exit 1) while a value that is not INERT is listed; `[inert — kept as a record]` marks
+a value no reader binds again (an inactive document's identifiers, a stored session id, a display path or repair-log
+key whose mark comes after the slash). `[UNCONFIRMED …]` marks a column whose encoding the list does not know. It is
+best effort — a column the list lacks, or a value inside JSON, is not seen; the guard sees every binding.
+
+**Stored bodies** hashes every stored body and lists each one whose hash is not the hash of its text, with its
+pattern (`feff-dropped`, `fffe-swapped`, `other`) and the documents that hold it. It fails while an active document
+holds one. On a vault of 76,505 bodies (1.6 GB of text) it took about 1.6 s with a warm file cache and 180 MB; the
+same scan from a cold cache took about 10 s.
+
+Refusals: a CLI argument, flag, selector element, collection or vault name that starts with a mark exits 2 and changes
+nothing (the retire command's `--note` too). A statement the guard refuses prints `Error: a bound string starts with
+U+FEFF …` without a stack trace and exits 1. `update`, `reindex` and the MCP / REST re-index count files whose name
+starts with a mark as `refused` (`!N refused` in the summary; the REST `/reindex` and MCP `reindex` replies carry
+`refused`). `reindex --force` keeps a forgotten or archived document's state and stored text, and rewrites no row
+stored under a marked identifier. Procedures: [troubleshooting](../troubleshooting.md#byte-order-marks-in-stored-values-v0437).
 
 ## Stop pipeline (v0.41.0)
 

@@ -16,6 +16,7 @@ import type { Store } from "./store.ts";
 import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { normalizeIsoTimestamp } from "./normalize.ts";
+import { normalizedContent, refuseLeadingMark, showLeadingMarks, startsWithMark, stripLeadingMarks } from "./text-policy.ts";
 
 // =============================================================================
 // Types
@@ -78,6 +79,11 @@ export interface IndexStats {
    */
   enrichAttempted: number;
   enrichStored: number;
+  /**
+   * 82.3 D7: files that were NOT indexed because their relative path starts with a byte-order mark (U+FEFF or
+   * U+FFFE). A path is an identifier: it is refused, never stripped. Each one is named in a warning line.
+   */
+  refused: number;
 }
 
 // =============================================================================
@@ -124,9 +130,9 @@ export function extractTitle(content: string, filename: string): string {
   const lines = content.split("\n");
   for (const line of lines) {
     const match = line.match(/^#+\s+(.+)/);
-    if (match?.[1]) return match[1].trim();
+    if (match?.[1]) return stripLeadingMarks(match[1].trim());      // 82.3 D7: a title is a normalised field
   }
-  return basename(filename).replace(/\.(md|txt)$/i, "");
+  return stripLeadingMarks(basename(filename).replace(/\.(md|txt)$/i, ""));
 }
 
 // =============================================================================
@@ -325,11 +331,17 @@ function boundedTags(value: unknown): string[] | undefined {
 // Frontmatter Parsing
 // =============================================================================
 
-export function parseDocument(content: string, relativePath: string): { body: string; meta: DocumentMeta } {
+/**
+ * BACKLOG 82.3, D7 — the body and the frontmatter scalars are NORMALISED fields: every leading U+FEFF / U+FFFE is
+ * removed here, in both branches, before anything is hashed or stored. `leadingMarkRemoved` is true when THIS
+ * function removed a mark from the body. The frontmatter reader removes a U+FEFF at the very start of the file, as
+ * it did before 82.3; that removal is not counted.
+ */
+export function parseDocument(content: string, relativePath: string): { body: string; meta: DocumentMeta; leadingMarkRemoved: boolean } {
   // gray-matter coerces YAML values: `title: 2023-09-27` → Date, `title: true` → boolean.
   // All frontmatter fields must be runtime-checked to prevent SQLite binding errors.
   const str = (v: unknown): string | undefined =>
-    typeof v === "string" ? v || undefined : undefined;
+    typeof v === "string" ? stripLeadingMarks(v) || undefined : undefined;
   try {
     if (!frontmatterBlockWithinLimits(content)) throw new Error("frontmatter block over the limits");   // C9
     const file = matter(content, FRONTMATTER_OPTIONS);
@@ -339,9 +351,10 @@ export function parseDocument(content: string, relativePath: string): { body: st
     const lang = (file as { language?: string }).language || "yaml";
     if (!ALLOWED_LANGUAGES(lang)) throw new Error(`frontmatter language ${lang} is not accepted`);
     const data = (file.data ?? {}) as Record<string, unknown>;
-    const body = file.content;
+    const body = stripLeadingMarks(file.content);
     return {
       body,
+      leadingMarkRemoved: body.length !== file.content.length,
       meta: {
         title: str(data.title),
         tags: boundedTags(data.tags),
@@ -358,8 +371,10 @@ export function parseDocument(content: string, relativePath: string): { body: st
     // If frontmatter parsing fails, treat entire content as body.
     // authored_at stays undefined (= leave any stored value untouched):
     // a parse failure is not a declared absence.
+    const body = stripLeadingMarks(content);
     return {
-      body: content,
+      body,
+      leadingMarkRemoved: body.length !== content.length,
       meta: {
         content_type: inferContentType(relativePath),
       },
@@ -471,6 +486,12 @@ export function watchTargets<C extends { name: string; path: string; pattern?: s
  */
 export const RESERVED_COLLECTIONS = new Set(["_clawmem"]);
 
+/** The mark-led paths this process has already warned about (82.3 D7, ruling 44 A): `collection`, NUL, `path`. */
+const warnedRefusedPaths = new Set<string>();
+
+/** Test seam: forget which refused paths were warned about, so a test sees the first warning again. */
+export function resetRefusedPathWarnings(): void { warnedRefusedPaths.clear(); }
+
 export async function indexCollection(
   store: Store,
   collectionName: string,
@@ -484,7 +505,8 @@ export async function indexCollection(
       `it cannot be reconciled against a root.`,
     );
   }
-  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, enrichAttempted: 0, enrichStored: 0 };
+  refuseLeadingMark(collectionName, "collection");       // 82.3 D7: an identifier — refused before anything is read
+  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, enrichAttempted: 0, enrichStored: 0, refused: 0 };
   const activePaths = new Set<string>();
 
   // importMode: an additive DB-born ingest routed through the filesystem pipeline via a
@@ -525,6 +547,21 @@ export async function indexCollection(
   try {
     for (const relativePath of allEntries) {
       if (shouldExclude(relativePath)) continue;
+
+      // 82.3 D7: a path is an IDENTIFIER. One that starts with a byte-order mark is refused — skipped, counted and
+      // named — and never stripped: `x.md` and a mark followed by `x.md` are two files, and the row of the first
+      // is not touched for the second. The file is left out of `activePaths` too: no row is stored at its path.
+      if (startsWithMark(relativePath)) {
+        stats.refused++;
+        // Counted on EVERY pass; warned about ONCE per process per file (operator ruling 44 A) — under the watcher
+        // a pass runs on every change in the collection.
+        const refusedKey = `${collectionName}\u0000${relativePath}`;
+        if (warnedRefusedPaths.has(refusedKey)) continue;
+        warnedRefusedPaths.add(refusedKey);
+        console.warn(`[indexer] refused: ${collectionName}/${showLeadingMarks(relativePath)} — the path starts with a byte-order mark; ` +
+          `such a file is not indexed (the database would store its name altered). Rename the file without the mark.`);
+        continue;
+      }
 
       // 62.2: the pre-compaction snapshot ClawMem ≤ v0.39.x wrote into Claude Code memory dirs,
       // recognised by its exact header — never indexed, and left out of activePaths. The file on disk
@@ -622,7 +659,7 @@ export async function indexCollection(
         // documents without operational side-effects.
         const { body, meta } = parseDocument(content, relativePath);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
-        const docHash = hashContent(body);
+        const docHash = normalizedContent(body).hash;          // 82.3 D7: the body is normalised by parseDocument
         const contentType = meta.content_type || inferContentType(relativePath);
 
         const prev = store.db.prepare(
@@ -707,7 +744,7 @@ export async function indexCollection(
 
         const { body, meta } = parseDocument(content, relativePath);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
-        const docHash = hashContent(body);
+        const docHash = normalizedContent(body).hash;          // 82.3 D7: the body is normalised by parseDocument
         const contentType = meta.content_type || inferContentType(relativePath);
 
         store.insertContent(docHash, body, now);

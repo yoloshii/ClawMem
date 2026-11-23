@@ -18,6 +18,7 @@ import { canaryProbeInputs } from "../../src/canary.ts";
 import { startEmbedFixture } from "../helpers/embed-readiness-fixture.ts";
 import { LlamaCpp } from "../../src/llm.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const ROOT = join(import.meta.dir, "../..");
 const TAINT = "embed_geometry_taint";
 
@@ -74,7 +75,7 @@ function seed(opts: { stale?: boolean; taint?: string; embedded?: boolean } = {}
   const now = new Date().toISOString();
   const body = "The ingest pipeline batches its writes in groups of five hundred to cut the fsync cost.";
   const hash = hashContent(body);
-  st.insertContent(hash, body, now);
+  seedContent(st.db, hash, body, now);
   st.insertDocument("notes", "pipeline.md", "pipeline", hash, now, now);
   if (opts.embedded) {
     st.ensureVecTable(64);

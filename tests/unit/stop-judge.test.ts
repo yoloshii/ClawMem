@@ -17,6 +17,7 @@ import { decisionExtractor } from "../../src/hooks/decision-extractor.ts";
 import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { human, assistant, writeTranscriptFile, appendEntries } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let server: ReturnType<typeof Bun.serve>;
 let hits = 0;
 const VERDICT = [{ new_idx: 0, old_idx: 0, relation: "contradiction", confidence: 0.9, reasoning: "The new decision reverses the earlier runtime choice." }];
@@ -65,7 +66,7 @@ function priorDecision(store: Store): number {
   const path = "decisions/2026-08-01-othersess.md";
   const body = "The team adopted node as the build runtime — prior decision record.";
   const hash = createHash("sha256").update(body).digest("hex");
-  store.insertContent(hash, body, "2026-08-01T00:00:00.000Z");
+  seedContent(store.db, hash, body, "2026-08-01T00:00:00.000Z");
   store.insertDocument("_clawmem", path, "Decisions 2026-08-01", hash, "2026-08-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z");
   const id = store.findActiveDocument("_clawmem", path)!.id;
   store.db.prepare(`UPDATE documents SET content_type = 'decision', confidence = 0.8 WHERE id = ?`).run(id);
@@ -102,7 +103,7 @@ describe("D3/D8 the judge applies a verdict once, to the content it judged (test
       beforePhaseB: () => {
         const body = "The team adopted node as the build runtime — revised record with a new rationale.";
         const hash = createHash("sha256").update(body).digest("hex");
-        store.insertContent(hash, body, new Date().toISOString());
+        seedContent(store.db, hash, body, new Date().toISOString());
         store.updateDocument(prior, "Decisions 2026-08-01", hash, new Date().toISOString());
       },
     });

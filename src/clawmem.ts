@@ -32,6 +32,9 @@ import {
   VecModelMismatchError,
   EmbedLeaseLostError,
 } from "./store.ts";
+import { storableVector, isRefusedEmbedResponse } from "./vector-guard.ts";
+import { cliVectorLeg, cliVectorReport, VECTOR_SEARCH_UNAVAILABLE, type CliVectorLeg } from "./cli-vector-leg.ts";
+import { finaliseEmbedAbort, type EmbedChargeReceipt } from "./embed-abort.ts";
 import { startVectorDaemon, vectorDaemonHealth, type VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
@@ -65,6 +68,8 @@ import { runHookEval, HookEvalIntegrityError, PAIR_TREATMENTS, type RunHookEvalR
 import { aggregateReplicatedRunDirs, writeReplicatedArtifacts, type ReplicatedAggregate } from "./eval/replicated.ts";
 import { HookGoldFileError } from "./eval/hook-gold.ts";
 import { indexCollection, parseDocument, hashContent, pathWithin, watchTargets, frontmatterGuardStatus } from "./indexer.ts";
+import { BomLeadingIdentifierError, refuseLeadingMark, startsWithMark, stripLeadingMarks } from "./text-policy.ts";
+import { BomLeadingTextError } from "./sqlite-guard.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
@@ -82,7 +87,7 @@ import {
   startHeavyMaintenanceWorker,
 } from "./maintenance.ts";
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
-import { consumePendingSurfacingBookkeeping, writeSurfacingBookkeepingSpoolJob, drainSurfacingBookkeepingSpool, validateSurfacingBookkeepingJob, serializeSurfacingBookkeepingJob, SPOOL_JOB_MAX_BYTES } from "./hooks/surfacing-bookkeeping.ts";
+import { consumePendingSurfacingBookkeeping, writeSurfacingBookkeepingSpoolJob, drainSurfacingBookkeepingSpool, validateSurfacingBookkeepingJob, markedJobReport, serializeSurfacingBookkeepingJob, SPOOL_JOB_MAX_BYTES } from "./hooks/surfacing-bookkeeping.ts";
 import { contextSurfacing, assertHookBudgetConfig } from "./hooks/context-surfacing.ts";
 import { monoNow, elapsed, evidenceMs, deadlineAfter, remainingForTimeout, duration, sleep, scaled, type MonoInstant, isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
@@ -182,6 +187,11 @@ function enrichSummaryNote(stats: { enrichAttempted: number; enrichStored: numbe
   return `, ${c.red}✎${stats.enrichStored}/${stats.enrichAttempted} notes — ${empty} produced nothing (LLM endpoint problem? run 'clawmem doctor')${c.reset}`;
 }
 
+/** 82.3 D7: the files an index pass refused (a path that starts with a byte-order mark). Empty when there is none. */
+function refusedSummaryNote(stats: { refused: number }): string {
+  return stats.refused === 0 ? "" : `, ${c.red}!${stats.refused} refused${c.reset} (path starts with a byte-order mark; each file is named once in a "[indexer] refused" warning)`;
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -223,6 +233,7 @@ async function cmdCollectionAdd(args: string[]) {
   if (!existsSync(absPath)) die(`Directory not found: ${absPath}`);
 
   const name = values.name || basename(absPath).toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  refuseLeadingMark(name, "collection");                                // 82.3 D7: its own message (exit 2), the mark not printed
   if (!isValidCollectionName(name)) die(`Invalid collection name: ${name}`);
 
   collectionsAdd(name, absPath, values.pattern);
@@ -258,6 +269,7 @@ async function cmdCollectionList() {
 async function cmdCollectionRemove(args: string[]) {
   const name = args[0];
   if (!name) die("Usage: clawmem collection remove <name>");
+  refuseLeadingMark(name, "collection");                                // 82.3 D7 (Codex T1 P3): before the config is read or edited
 
   if (collectionsRemove(name)) {
     console.log(`${c.green}Removed collection '${name}'${c.reset}`);
@@ -293,7 +305,7 @@ async function cmdUpdate(args: string[]) {
 
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern);
-    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed${enrichSummaryNote(stats)}`);
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed${enrichSummaryNote(stats)}${refusedSummaryNote(stats)}`);
   }
 
   // Auto-embed if --embed flag is set
@@ -423,6 +435,7 @@ async function cmdMine(args: string[]) {
   if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N] | --backfill-dates [--apply]");
   const absDir = pathResolve(dir);
   if (!existsSync(absDir)) die(`Directory not found: ${absDir}`);
+  if (values.collection) refuseLeadingMark(values.collection, "collection");   // 82.3 D7: before any file is read
 
   const { scanConversationDir, normalizeFile, chunkConversation } = await import("./normalize.ts");
 
@@ -457,7 +470,7 @@ async function cmdMine(args: string[]) {
   if (totalConversations === 0) die("No conversation files could be parsed");
   console.log(`\n${c.bold}Parsed:${c.reset} ${totalConversations} conversations → ${totalChunks} exchange chunks`);
 
-  const collectionName = values.collection || "conversations";
+  const collectionName = refuseLeadingMark(values.collection || "conversations", "collection");   // 82.3 D7: before any file is read
 
   // §51.1 D10 — exclusive backfill mode: derive authored_at for already-mined
   // docs from their source transcripts. Metadata-only; dry-run by default.
@@ -692,6 +705,35 @@ async function cmdEmbed(args: string[]) {
     }
   };
 
+  // v0.43.7 (BACKLOG 82.2, D2): the state a fatal abort's finaliser needs lives in the COMMAND's scope — what this
+  // run stored or cleared, whether its end was verified, and the document in hand with its charge receipt.
+  let totalFragments = 0;
+  let removedStale = 0;
+  let clearedIndex = false;
+  let endVerificationRan = false;
+  let docInHand: EmbedChargeReceipt | null = null;
+
+  // v0.43.7 (BACKLOG 82.2, D2; operator ruling 81 A, Codex T1 P5): ONE finaliser ends every run past the lease. The
+  // normal end hands it the end-of-run verification's decision (taint, clearing the taint, the canary baseline); a
+  // fatal abort hands it the error (refund, unverified mark, lease loss — src/embed-abort.ts). Every taint and baseline
+  // write of the command happens here, against the run state declared above.
+  type EndDecision = { taint: string | null; clearTaint: boolean; baseline: { state: CanaryCheckResult; recalibrate: boolean } | null };
+  type RunEnding =
+    | { kind: "completed"; end: EndDecision }
+    | { kind: "aborted"; err: FatalVectorError; leaseLost: boolean };
+  const finaliseRun = async (ending: RunEnding): Promise<void> => {
+    if (ending.kind === "aborted") {
+      const report = await finaliseEmbedAbort(s, { err: ending.err, docInHand, clearedIndex, vectorsCommitted: totalFragments, endVerificationRan, leaseLost: ending.leaseLost, leaseGuard });
+      for (const line of report.lines) console.error(`  ${c.red}${line}${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { taint, clearTaint, baseline } = ending.end;
+    if (taint !== null) await markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", taint, leaseGuard));
+    if (clearTaint) await markSafeGlobal("clearVaultFlag(taint)", () => s.clearVaultFlag("embed_geometry_taint", leaseGuard));
+    if (baseline) persistCanaryBaselineIfFirst(s, baseline.state, { recalibrate: baseline.recalibrate, leaseGuard });
+  };
+
   try {
     const embedUrl = process.env.CLAWMEM_EMBED_URL;
     if (embedUrl) {
@@ -737,9 +779,22 @@ async function cmdEmbed(args: string[]) {
     }
 
     let canaryState: CanaryCheckResult | null = null;
+    // v0.43.7 (BACKLOG 82.2, D2): ONE (dimension, model) pair binds the whole run and every response in it — the
+    // canary probes, the dimension probe, each fragment, the end-of-run probe. It is taken from the first validated
+    // response (every ANSWERED probe of the battery, also of one that ends `unavailable`); a later response that
+    // disagrees is the existing fatal dimension / model error.
+    const run: { binding: { dim: number; model: string } | null } = { binding: null };
+    const bindRun = (dim: number, model: string | undefined): void => {
+      const b = run.binding;
+      if (b === null) { run.binding = { dim, model: model ?? "" }; return; }
+      if (dim !== b.dim) throw new VecDimensionMismatchError(b.dim, dim);
+      if (b.model && model && model !== b.model) throw new VecModelMismatchError(b.model, model);
+      if (!b.model && model) b.model = model;
+    };
     {
-      const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key), { ignoreBaseline: recalibrate });
-      if (!("unavailable" in outcome)) canaryState = outcome;
+      const outcome = await runCanaryBattery(t => llm.embed(t, { context: "canary probe" }), key => s.getCanaryBaseline(key), { ignoreBaseline: recalibrate });
+      if (!("unavailable" in outcome) && !("malformed" in outcome)) canaryState = outcome;
+      if (!("malformed" in outcome) && outcome.binding) run.binding = { ...outcome.binding };
       const gate = canaryGate(outcome, { force: !!values.force, forceGeometry: !!values["force-geometry"] });
       if (gate.action === "abort") {
         console.error(`${c.red}Embed aborted: ${gate.reason}${c.reset}`);
@@ -761,84 +816,93 @@ async function cmdEmbed(args: string[]) {
     // Absent preflight vectors (canary unavailable, run proceeded) → persistent
     // unverified taint + nonzero; baseline persist/recalibration happens ONLY after a
     // successful same-dimension end probe. "Not verified" is never success (T8-M2).
-    // v0.41.2 (BACKLOG 68.3): run scope, so the finalization (the no-work path included) knows what this run stored.
-    let totalFragments = 0;
-    let removedStale = 0;
-    const verifyEndOfRun = async (failedFragmentsCount: number) => {
-      const setTaint = (reason: string) =>
-        markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
+    // v0.41.2 (BACKLOG 68.3): run scope, so the finalization (the no-work path included) knows what this run stored
+    // (`totalFragments`, `removedStale` — declared in the command's scope since v0.43.7, for the abort finaliser).
+    // v0.43.7 (81 A): it decides and reports; `finaliseRun` performs the writes it returns.
+    const verifyEndOfRun = async (failedFragmentsCount: number): Promise<EndDecision> => {
+      const decided = (taint: string | null, clearTaint = false, baseline: EndDecision["baseline"] = null): EndDecision => ({ taint, clearTaint, baseline });
       // A NON-destructive run (no --force clear) that stored no vectors cannot have mixed a second geometry into the
       // table: it never sets the taint. It still says so and exits non-zero when it was not verified (BACKLOG 68.3).
       const nothingStored = !values.force && totalFragments === 0;
       const unchanged = `this run wrote 0 vectors${removedStale > 0 ? ` (removed ${removedStale} stale)` : ""}, so the vault's geometry is unchanged — no taint set`;
       if (!canaryState) {
+        endVerificationRan = true; // this branch decides the taint itself
         if (nothingStored) {
           console.error(`${c.yellow}WARNING: this run had NO validated preflight geometry (canary unavailable); ${unchanged}. Re-run 'clawmem embed' once the server answers.${c.reset}`);
           process.exitCode = 1;
-          return;
+          return decided(null);
         }
         console.error(`${c.red}WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.${c.reset}`);
-        await setTaint(`no preflight validation at ${isoNow()}`);
         process.exitCode = 1;
-        return;
+        return decided(`no preflight validation at ${isoNow()}`);
       }
       let endDrift: number | null = null;
       try {
-        const fresh = await llm.embed(canaryProbeInputs().get("rel_a")!);
+        const fresh = await llm.embed(canaryProbeInputs().get("rel_a")!, { context: "end-of-run probe" });
         const pre = canaryState.vectors.get("rel_a")!;
-        if (fresh && fresh.embedding.length === pre.length) {
-          endDrift = cosineSim(pre, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
+        if (fresh) {
+          // v0.43.7 (82.2): the end probe is validated and bound like every other response of the run. A refused
+          // answer, or one of another dimension or model, is fatal — the abort finaliser marks the vault unverified.
+          const vector = storableVector(fresh.embedding, { context: "end-of-run probe" });
+          bindRun(vector.length, fresh.model);
+          endDrift = cosineSim(pre, vector);
         }
-      } catch { /* endpoint gone at the very end — endDrift stays null → unverified */ }
+      } catch (e) {
+        if (e instanceof FatalVectorError) throw e;
+        /* endpoint gone at the very end — endDrift stays null → unverified */
+      }
+      endVerificationRan = true; // every branch below decides the taint itself
       if (endDrift === null) {
+        process.exitCode = 1;
         if (nothingStored) {
           console.error(`${c.yellow}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed); ${unchanged}.${c.reset}`);
-        } else {
-          console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
-          await setTaint(`unverified end-of-run at ${isoNow()}`);
+          return decided(null);
         }
+        console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
+        return decided(`unverified end-of-run at ${isoNow()}`);
+      } else if (!(endDrift >= CANARY_DRIFT_FLOOR)) { // also a drift that is not a finite number (NaN < floor is false)
         process.exitCode = 1;
-      } else if (endDrift < CANARY_DRIFT_FLOOR) {
         if (nothingStored) {
           console.error(`${c.yellow}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}); ${unchanged}. Stabilize the server before the next run.${c.reset}`);
-        } else {
-          console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
-          await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${isoNow()}`);
+          return decided(null);
         }
-        process.exitCode = 1;
+        console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
+        return decided(`mid-run drift ${endDrift.toFixed(4)} at ${isoNow()}`);
       } else {
         // Verified end. A FULL verified rebuild (--force) clears any standing taint —
         // the mixed-geometry state the flag records has been rebuilt away (T8-M1).
         // leaseLost is re-checked first: a reclaimed holder must not clear a
         // successor's taint (T9-M4).
         // v0.41.2: only a PASSING preflight clears it — an overridden failed canary (--force-geometry) does not.
-        if (values.force && failedFragmentsCount === 0 && !leaseLost && canaryState.pass) {
-          await markSafeGlobal("clearVaultFlag(taint)", () => s.clearVaultFlag("embed_geometry_taint", leaseGuard));
-        }
-        if (canaryState.pass) {
-          persistCanaryBaselineIfFirst(s, canaryState, { recalibrate, leaseGuard });
-        }
+        return decided(
+          null,
+          !!values.force && failedFragmentsCount === 0 && !leaseLost && canaryState.pass,
+          canaryState.pass ? { state: canaryState, recalibrate } : null,
+        );
       }
     };
     // v0.43.5 (BACKLOG 77.1 (c)): a run that scheduled work and wrote no vector failed, whatever the canary said —
     // through v0.43.4 a verified end let it exit 0. A no-work run (scheduledDocs 0) keeps the finalization above.
-    const finalizeCanary = async (failedFragmentsCount: number, scheduledDocs: number) => {
-      await verifyEndOfRun(failedFragmentsCount);
+    const finalizeCanary = async (failedFragmentsCount: number, scheduledDocs: number): Promise<EndDecision> => {
+      const end = await verifyEndOfRun(failedFragmentsCount);
       if (scheduledDocs > 0 && totalFragments === 0) {
         console.error(`${c.red}No documents were embedded: ${scheduledDocs} scheduled, 0 vectors written.${c.reset}`);
         process.exitCode = 1;
       }
+      return end;
     };
 
     // Probe the live model's output dimension (+ model name). Returns null on ANY
     // failure so a down/flaky endpoint can NEVER trigger a destructive clear.
+    // v0.43.7 (BACKLOG 82.2): the probe's vector is VALIDATED — through v0.43.6 any non-empty embedding counted,
+    // and the index was cleared right after it. A REFUSED answer is thrown (it is not "no response").
     const probeEmbed = async (): Promise<{ dim: number; model: string } | null> => {
-      try {
-        const r = await llm.embed("clawmem dimension probe");
-        return r && r.embedding && r.embedding.length > 0
-          ? { dim: r.embedding.length, model: r.model ?? "" }
-          : null;
-      } catch { return null; }
+      let r: Awaited<ReturnType<typeof llm.embed>>;
+      try { r = await llm.embed("clawmem dimension probe", { context: "dimension probe" }); }
+      catch (e) { if (isRefusedEmbedResponse(e)) throw e; return null; }
+      if (!r || !r.embedding) return null;
+      const vector = storableVector(r.embedding, { context: "dimension probe" });
+      return { dim: vector.length, model: r.model ?? "" };
     };
 
     // Bind the whole run to one (dim, model); every fragment is validated before it is
@@ -849,9 +913,29 @@ async function cmdEmbed(args: string[]) {
     if (values.force) {
       // Probe FIRST — validate the endpoint before destroying anything (so a force
       // re-embed against a dead endpoint cannot clear the vault and then fail).
-      const probe = await probeEmbed();
+      // v0.43.7 (BACKLOG 82.2, D2) — the ONE admission rule for the clear. ALL must hold: (1) no response of this
+      // run so far was refused (a malformed battery already aborted above; a refused dimension probe aborts here,
+      // and no flag overrides either); (2) the dimension probe returned a validated vector that agrees with the
+      // run's binding; (3) the battery passed, or it failed / was unavailable AND --force-geometry was given (the gate).
+      let probe: { dim: number; model: string } | null;
+      try { probe = await probeEmbed(); }
+      catch (e) {
+        if (!isRefusedEmbedResponse(e)) throw e;
+        console.error(`${c.red}Force re-embed aborted: the embedding endpoint returned a malformed answer to the dimension probe. Nothing was cleared, and no flag overrides this.${c.reset}`);
+        console.error(`  ${c.red}${e.message}${c.reset}`);
+        process.exitCode = 1;
+        return;
+      }
       if (!probe) {
         console.error(`${c.red}Force re-embed aborted: could not reach the embedding endpoint. Nothing was cleared.${c.reset}`);
+        process.exitCode = 1;
+        return;
+      }
+      try { bindRun(probe.dim, probe.model); }
+      catch (e) {
+        if (!(e instanceof FatalVectorError)) throw e;
+        const b = run.binding!;
+        console.error(`${c.red}Force re-embed aborted: the dimension probe (dimension ${probe.dim}, model "${probe.model}") does not agree with the canary probes of this run (dimension ${b.dim}, model "${b.model}") — the endpoint is not stable. Nothing was cleared.${c.reset}`);
         process.exitCode = 1;
         return;
       }
@@ -859,13 +943,15 @@ async function cmdEmbed(args: string[]) {
       expectedDim = probe.dim;
       expectedModel = probe.model || null;
       s.clearAllEmbeddings(leaseGuard);
+      clearedIndex = true;
     } else {
       // Implicit run: NON-DESTRUCTIVE drift check (dimension AND model). Catches
       // drift even when the worklist is empty (query embeddings would already be
       // incompatible with the stored table). Never clears — aborts with instructions.
       const existingDim = s.getVecTableDim(); // throws VecSchemaError on malformed DDL → caught below
       if (existingDim !== null) {
-        const probe = await probeEmbed();
+        const probe = await probeEmbed(); // a REFUSED answer is fatal here too (82.2): caught below, exit 1
+        if (probe) bindRun(probe.dim, probe.model);
         if (probe && probe.dim !== existingDim) {
           console.error(`${c.red}Embedding dimension changed (${existingDim} → ${probe.dim}). Run 'clawmem embed --force' to clear and rebuild the full vault.${c.reset}`);
           process.exitCode = 1;
@@ -921,7 +1007,7 @@ async function cmdEmbed(args: string[]) {
       // it must not skip end verification, silently exit zero on an unvalidated
       // endpoint, or persist/recalibrate a baseline without a verified end.
       console.log(`${c.green}All documents already embedded${c.reset}`);
-      await finalizeCanary(0, 0);
+      await finaliseRun({ kind: "completed", end: await finalizeCanary(0, 0) });
       return;
     }
 
@@ -960,6 +1046,7 @@ async function cmdEmbed(args: string[]) {
     // checks alone cannot do: catch a different 2560-d model.
     const bindAndValidate = (result: { embedding: number[] | Float32Array; model?: string }) => {
       const dim = result.embedding.length;
+      bindRun(dim, result.model); // the run's own binding (82.2): the probes of this run and every fragment agree
       if (expectedDim === null) {
         expectedDim = dim;
         if (!expectedModel && result.model) expectedModel = result.model;
@@ -998,7 +1085,12 @@ async function cmdEmbed(args: string[]) {
       // getHashesNeedingFragments). Completion setters below are state-only.
       // A state MARKER must never kill the run ((f).4) — markSafeGlobal above.
       const markSafe = markSafeGlobal;
-      await markSafe("markEmbedStart", () => s.markEmbedStart(hash, leaseGuard));
+      // v0.43.7 (BACKLOG 82.2): the charge receipt. A start marker that did not commit (still busy after its
+      // retries) charged nothing: there is then no receipt, and an abort gives nothing back.
+      docInHand = null;
+      const receipt: { ids: number[] | null } = { ids: null };
+      await markSafe("markEmbedStart", () => { receipt.ids = s.markEmbedStart(hash, leaseGuard); });
+      docInHand = receipt.ids ? { hash, chargedIds: receipt.ids } : null;
       console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
 
       if (isCloudEmbed) {
@@ -1037,7 +1129,7 @@ async function cmdEmbed(args: string[]) {
           const reqStart = monoNow();
 
           try {
-            const results = await llm.embedBatch(batchTexts);
+            const results = await llm.embedBatch(batchTexts, batchTexts.map((_, i) => `${hash}_${batchStartIdx + i}`));
             const reqMs = evidenceMs(elapsed(reqStart));
             const tokensUsed = llm.lastBatchTokens;
 
@@ -1050,12 +1142,13 @@ async function cmdEmbed(args: string[]) {
                 // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
                 // the exact formatted embed input, written in the same atomic transaction.
                 const embedInputFp = createHash("sha256").update(allTexts[seq]!, "utf8").digest("hex");
+                const vector = storableVector(result.embedding, { context: `${hash}_${seq}` });
                 // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws to the
                 // batch catch (fragment failure); FatalVectorError passes through untouched.
                 await retryOnBusy(() => {
                   s.ensureVecTable(result.embedding.length, leaseGuard);
                   s.insertEmbedding(
-                    hash, seq, frag.startLine, new Float32Array(result.embedding),
+                    hash, seq, frag.startLine, vector,
                     result.model, isoNow(), frag.type, frag.label ?? undefined, canId,
                     leaseGuard, embedInputFp
                   );
@@ -1085,19 +1178,20 @@ async function cmdEmbed(args: string[]) {
 
           try {
             const fragStart = monoNow();
-            const result = await llm.embed(text);
+            const result = await llm.embed(text, { context: `${hash}_${seq}` });
             const fragMs = evidenceMs(elapsed(fragStart));
             if (result) {
               bindAndValidate(result);
               // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
               // the exact formatted embed input, written in the same atomic transaction.
               const embedInputFp = createHash("sha256").update(text, "utf8").digest("hex");
+              const vector = storableVector(result.embedding, { context: `${hash}_${seq}` });
               // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws to the
               // per-fragment catch (fragment failure); FatalVectorError passes through.
               await retryOnBusy(() => {
                 s.ensureVecTable(result.embedding.length, leaseGuard);
                 s.insertEmbedding(
-                  hash, seq, frag.startLine, new Float32Array(result.embedding),
+                  hash, seq, frag.startLine, vector,
                   result.model, isoNow(), frag.type, frag.label ?? undefined, canId,
                   leaseGuard, embedInputFp
                 );
@@ -1134,6 +1228,7 @@ async function cmdEmbed(args: string[]) {
       } else {
         await markSafe("markEmbedFailed", () => s.markEmbedFailed(hash, `${docFragsFail} fragment(s) failed`, leaseGuard));
       }
+      docInHand = null; // this document's attempt is settled
 
       embedded++;
       const docMs = evidenceMs(elapsed(docStart));
@@ -1146,18 +1241,20 @@ async function cmdEmbed(args: string[]) {
     console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
 
     // End-of-run verification — shared finalization (T9-H1 + T10-M1); see finalizeCanary.
-    await finalizeCanary(failedFragments, hashes.length);
+    await finaliseRun({ kind: "completed", end: await finalizeCanary(failedFragments, hashes.length) });
   } catch (err) {
     // Fatal aborts must NOT exit 0 — otherwise the embed timer / `update --embed`
     // cannot tell the run was incomplete. Set a nonzero exit code (cleanup still
     // runs in finally). Non-fatal errors propagate unchanged.
+    // v0.43.7 (BACKLOG 82.2, D2): ONE finaliser states what the stopped run leaves — the refund of a document
+    // charged for the endpoint's failure, the unverified mark, or (lease lost) that nothing was written.
     if (err instanceof EmbedLeaseLostError) {
       // Checked before FatalVectorError because EmbedLeaseLostError extends it.
       console.error(`${c.red}Embed aborted: lost the embedding lease (another embed process took over). Re-run 'clawmem embed'.${c.reset}`);
-      process.exitCode = 1;
+      await finaliseRun({ kind: "aborted", err, leaseLost: true });
     } else if (err instanceof FatalVectorError) {
       console.error(`${c.red}Embed aborted: ${(err as Error).message}${c.reset}`);
-      process.exitCode = 1;
+      await finaliseRun({ kind: "aborted", err, leaseLost });
     } else {
       throw err;
     }
@@ -1229,7 +1326,7 @@ async function cmdList(args: string[]) {
   if (isNaN(limit) || limit < 1) die("--num must be a positive integer");
 
   const s = getStore();
-  const col = values.collection || null;
+  const col = values.collection ? refuseLeadingMark(values.collection, "collection") : null;   // 82.3 D7: an identifier
 
   const rows = s.db.prepare(`
     SELECT
@@ -1300,7 +1397,7 @@ async function cmdSearch(args: string[]) {
     allowPositionals: true,
   });
 
-  const query = positionals.join(" ");
+  const query = stripLeadingMarks(positionals.join(" "));                // 82.3 D7: free text is a normalised field
   if (!query) die("Usage: clawmem search <query>");
 
   const s = getStore();
@@ -1339,28 +1436,37 @@ async function cmdVsearch(args: string[]) {
     allowPositionals: true,
   });
 
-  const query = positionals.join(" ");
+  const query = stripLeadingMarks(positionals.join(" "));                // 82.3 D7: free text is a normalised field
   if (!query) die("Usage: clawmem vsearch <query>");
 
   const s = getStore();
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
-  const results = await s.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2);
-  const enriched = enrichResults(s, results, query);
+  // v0.43.7 (BACKLOG 82.2, D4): `vsearch` promises a cosine ranking. A refused query vector is an explicit error —
+  // never lexical scores under a cosine label; stored vectors the scan skipped are counted and reported.
+  const leg = await cliVectorLeg(s, query, limit * 2);
+  if (leg.refused) {
+    await disposeDefaultLlamaCpp();
+    die(VECTOR_SEARCH_UNAVAILABLE);
+  }
+  const report = cliVectorReport([leg]);
+  const enriched = enrichResults(s, leg.results, query);
   const scored = applyCompositeScoring(enriched, query)
     .filter(r => r.compositeScore >= minScore)
     .slice(0, limit);
 
+  if (report.warning) console.error(report.warning);
   if (values.json) {
-    console.log(JSON.stringify(scored.map(r => ({
+    const rows = scored.map(r => ({
       file: r.displayPath,
       title: r.title,
       score: r.compositeScore,
       searchScore: r.score,
       recencyScore: r.recencyScore,
       contentType: r.contentType,
-    })), null, 2));
+    }));
+    console.log(JSON.stringify(report.degraded ? { ...report.degraded, results: rows } : rows, null, 2));
   } else {
     printResults(scored, query);
   }
@@ -1380,7 +1486,7 @@ async function cmdQuery(args: string[]) {
     allowPositionals: true,
   });
 
-  const query = positionals.join(" ");
+  const query = stripLeadingMarks(positionals.join(" "));                // 82.3 D7: free text is a normalised field
   if (!query) die("Usage: clawmem query <query>");
 
   const s = getStore();
@@ -1412,7 +1518,12 @@ async function cmdQuery(args: string[]) {
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
   candidateResults.push(...ftsResults);
-  const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, 20);
+  // v0.43.7 (BACKLOG 82.2, D4): each vector leg embeds its own text. A leg whose query vector was refused is
+  // dropped alone; the other legs and the lexical results answer, and the command says what happened.
+  const vectorLegs: CliVectorLeg[] = [];
+  const originalLeg = await cliVectorLeg(s, query, 20);
+  vectorLegs.push(originalLeg);
+  const vecResults = originalLeg.results;
   allRanked.push({ results: vecResults.map(toRanked), weight: 2 });
   candidateResults.push(...vecResults);
 
@@ -1423,7 +1534,9 @@ async function cmdQuery(args: string[]) {
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     } else {
-      const r = await s.searchVec(eq.query, DEFAULT_EMBED_MODEL, 20);
+      const expandedLeg = await cliVectorLeg(s, eq.query, 20);
+      vectorLegs.push(expandedLeg);
+      const r = expandedLeg.results;
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     }
@@ -1477,15 +1590,19 @@ async function cmdQuery(args: string[]) {
     .filter(r => r.compositeScore >= minScore)
     .slice(0, limit);
 
+  // One warning line on stderr; `--json` stays a bare array when nothing was degraded (operator ruling 25 A).
+  const report = cliVectorReport(vectorLegs);
+  if (report.warning) console.error(report.warning);
   if (values.json) {
-    console.log(JSON.stringify(scored.map(r => ({
+    const rows = scored.map(r => ({
       file: r.displayPath,
       title: r.title,
       score: r.compositeScore,
       searchScore: r.score,
       recencyScore: r.recencyScore,
       contentType: r.contentType,
-    })), null, 2));
+    }));
+    console.log(JSON.stringify(report.degraded ? { ...report.degraded, results: rows } : rows, null, 2));
   } else {
     printResults(scored, query);
   }
@@ -2286,6 +2403,8 @@ async function cmdSpoolIngest() {
   if (!raw) return;
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return; }
+  const marked = markedJobReport(parsed);                 // 82.3 D7 (68 A): never spooled, reported
+  if (marked !== null) { console.error(marked); return; }
   if (!validateSurfacingBookkeepingJob(parsed)) return;
   const s = getStore();
   writeSurfacingBookkeepingSpoolJob(s.dbPath, parsed);
@@ -2379,6 +2498,7 @@ async function cmdBudget(args: string[]) {
 
   const s = getStore();
 
+  if (values.session) refuseLeadingMark(values.session, "session id");   // 82.3 D7: an identifier (beside Codex T1 P3)
   if (values.session) {
     const usages = s.getUsageForSession(values.session);
     if (usages.length === 0) {
@@ -3715,8 +3835,10 @@ async function cmdWatch() {
       for (const target of watchTargets(collections, fullPath)) {
         console.log(`${c.dim}[${event}]${c.reset} ${target.col.name}/${target.relativePath}`);
         const stats = await indexCollection(s, target.col.name, target.col.path, target.col.pattern);
+        // A refused file alone prints no line here: under the watcher a pass runs on every change, and the file was
+        // named once in the indexer's own warning (ruling 44 A). It is in the line whenever something else changed.
         if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
-          console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}${enrichSummaryNote(stats)}`);
+          console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}${enrichSummaryNote(stats)}${refusedSummaryNote(stats)}`);
         }
       }
     },
@@ -3779,7 +3901,7 @@ async function cmdReindex(args: string[]) {
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force });
-    console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed${enrichSummaryNote(stats)}`);
+    console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed${enrichSummaryNote(stats)}${refusedSummaryNote(stats)}`);
   }
 }
 
@@ -3870,7 +3992,9 @@ async function doctorLlmContext(): Promise<void> {
   }
 }
 
-async function cmdDoctor() {
+async function cmdDoctor(args: string[] = []) {
+  // 82.2 (D5): `--full` examines every stored vector instead of a sample.
+  const doctorFull = args.includes("--full");
   console.log(`${c.bold}ClawMem Doctor${c.reset}\n`);
   let issues = 0;
 
@@ -4107,6 +4231,81 @@ async function cmdDoctor() {
     }
   } catch (err) {
     console.log(`${c.yellow}!${c.reset} Vector index: could not check (${(err as Error).message})`);
+  }
+
+  // 3b. v0.43.7 (82.2 D5): stored vectors that are not usable — a vector the strict reader refuses, or one sqlite-vec
+  // cannot compute. A bounded sample by default ("among N examined of M", never a statement about the whole vault);
+  // `--full` examines every one and finds vector rows that have no metadata row. One read transaction on a
+  // read-only handle: the report describes one state of the database. An error while examining is "could not
+  // examine" — never a finding, never a reason to delete.
+  try {
+    const s = getStore();
+    const { scanVectorHealth, describeVectorScan, damagedCanaryBaselines } = await import("./vector-health.ts");
+    for (const d of damagedCanaryBaselines(s)) {
+      console.log(`${c.red}✗${c.reset} Canary baseline: damaged (profile ${d.profileKey}: ${d.reason}) — an embed run stops at it. Run 'clawmem embed --force --recalibrate-canary' against a healthy embedding server.`);
+      issues++;
+      process.exitCode = 1;
+    }
+    const reader = createStore(s.dbPath, { readonly: true });
+    try {
+      const said = describeVectorScan(scanVectorHealth(reader.db, { full: doctorFull }));
+      console.log(`${said.ok ? `${c.green}✓` : `${c.red}✗`}${c.reset} Stored vectors: ${said.lines[0]}`);
+      for (const line of said.lines.slice(1)) console.log(`   ${c.dim}${line}${c.reset}`);
+      if (!said.ok) {
+        issues++;
+        process.exitCode = 1;
+      }
+    } finally {
+      reader.close();
+    }
+  } catch (err) {
+    console.log(`${c.red}✗${c.reset} Stored vectors: could not examine (${(err as Error).message}) — nothing is known about them, and this is not a reason to delete any`);
+    issues++;
+    process.exitCode = 1;
+  }
+
+  // BACKLOG 82.3, D7 — stored identifiers that start with a byte-order mark: listed (table, rowid, column, hex), never
+  // repaired. Read-only, on its own read-only handle. Best effort — the guard, not this list, is the guarantee.
+  try {
+    const { scanMarkedIdentifiers, describeMarkedIdentifiers } = await import("./identifier-columns.ts");
+    const reader = createStore(getStore().dbPath, { readonly: true });
+    try {
+      const said = describeMarkedIdentifiers(scanMarkedIdentifiers(reader.db));
+      console.log(`${said.ok ? `${c.green}✓` : `${c.red}✗`}${c.reset} Stored identifiers: ${said.lines[0]}`);
+      for (const line of said.lines.slice(1)) console.log(`   ${c.dim}${line}${c.reset}`);
+      if (!said.ok) {
+        issues++;
+        process.exitCode = 1;
+      }
+    } finally {
+      reader.close();
+    }
+  } catch (err) {
+    console.log(`${c.red}✗${c.reset} Stored identifiers: could not examine (${(err as Error).message})`);
+    issues++;
+    process.exitCode = 1;
+  }
+
+  // BACKLOG 82.3, rulings 74 A / 76 A / 77 A — stored bodies the old string binding altered: a row whose hash is not the
+  // hash of its text. Every body, every run; read-only, on its own read-only handle. Fails while an active document holds one.
+  try {
+    const { scanBodyHashes, describeBodyHashes } = await import("./body-hash-check.ts");
+    const reader = createStore(getStore().dbPath, { readonly: true });
+    try {
+      const said = describeBodyHashes(scanBodyHashes(reader.db));
+      console.log(`${said.ok ? `${c.green}✓` : `${c.red}✗`}${c.reset} Stored bodies: ${said.lines[0]}`);
+      for (const line of said.lines.slice(1)) console.log(`   ${c.dim}${line}${c.reset}`);
+      if (!said.ok) {
+        issues++;
+        process.exitCode = 1;
+      }
+    } finally {
+      reader.close();
+    }
+  } catch (err) {
+    console.log(`${c.red}✗${c.reset} Stored bodies: could not examine (${(err as Error).message})`);
+    issues++;
+    process.exitCode = 1;
   }
 
   // 4. Content types
@@ -4673,6 +4872,7 @@ async function cmdBootstrap(args: string[]) {
   const absPath = pathResolve(vaultPath);
   if (!existsSync(absPath)) die(`Directory not found: ${absPath}`);
 
+  if (values.name) refuseLeadingMark(values.name, "collection");     // 82.3 D7: before the collection is added (beside Codex T1 P3)
   const name = values.name || basename(absPath).toLowerCase().replace(/[^a-z0-9_-]/g, "-");
 
   // 1. Init (skip if already initialized)
@@ -4994,7 +5194,7 @@ async function main() {
         await cmdReindex(subArgs);
         break;
       case "doctor":
-        await cmdDoctor();
+        await cmdDoctor(subArgs);
         break;
       case "vec-daemon-health":
         await cmdVecDaemonHealth(subArgs);
@@ -5213,6 +5413,12 @@ async function cmdMigrate(args: string[]) {
     die(`Cannot read manifest ${manifestPath}: ${err}`);
   }
   const note = flagValue("--note");
+  // BACKLOG 82.3, D7 (ruling 62 A): a note led by a byte-order mark is refused HERE, naming the flag, before any run
+  // row — not by the storage guard inside the retire transaction. The mark is not printed.
+  if (note && startsWithMark(note)) {   // exit 2, like every refused mark-led input (64 A)
+    console.error(`${c.red}Error:${c.reset} --note starts with a byte-order mark (U+${note.charCodeAt(0).toString(16).toUpperCase()}); type the note without it. Nothing was changed.`);
+    process.exit(2);
+  }
 
   if (!apply) {
     for (const edge of edgeArgs) {
@@ -5446,6 +5652,7 @@ async function cmdLifecycle(args: string[]) {
           console.log(`  - ${r.collection}/${r.path} (archived ${r.archived_at?.slice(0, 10)})`);
         }
       } else if (values.collection) {
+        refuseLeadingMark(values.collection, "collection");               // 82.3 D7: an identifier — refused, never stripped
         const restored = store.restoreArchivedDocuments({ collection: values.collection });
         console.log(`Restored ${restored} documents from collection "${values.collection}"`);
       } else if (values.all) {
@@ -5511,7 +5718,9 @@ async function cmdReflect(args: string[]) {
   const stopWords = new Set(["the", "that", "this", "with", "from", "have", "will", "been", "were", "they", "their", "what", "when", "which", "about", "into", "more", "some", "than", "them", "then", "very", "also", "just", "should", "would", "could", "does", "make", "like", "using", "used"]);
 
   for (const d of recentDocs) {
-    const doc = store.findDocument(d.path);
+    // 82.3 D7: the full display name, not the bare stored path — a bare `folder/<mark>x.md` reads as a selector whose
+    // path starts with a mark and is refused (ruling 46 A); `collection/folder/<mark>x.md` names the row exactly.
+    const doc = store.findDocument(`${d.collection}/${d.path}`);
     if ("error" in doc) continue;
     const body = store.getDocumentBody(doc) || "";
     const words = body.toLowerCase()
@@ -5951,6 +6160,7 @@ async function cmdRepair(args: string[]) {
   const sub = args[0];
   const rest = args.slice(1);
   if (sub === "entities") return cmdRepairEntities(rest);
+  if (sub === "vectors") return cmdRepairVectors(rest);
   if (sub === "counters") {
     const { values } = parseArgs({
       args: rest,
@@ -6061,21 +6271,10 @@ async function cmdRepair(args: string[]) {
   die("Usage: clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]\n       clawmem repair stop-queue [--retry-now <id[,id…]|held> [--limit N]] [--run] [--dismiss <id>] [--dismiss-causal]\n       clawmem repair entities [--vault <name>] [--apply [--expect <digest>]] [--restore <op>] [--json]");
 }
 
-// 76.3: `clawmem repair entities` — entity links written before the v0.43.2 resolver fix. Every vault is opened as a raw
-// SQLite handle (no store init: no schema work, no backfill); the dry run opens each one readonly.
-async function cmdRepairEntities(args: string[]) {
-  const { values } = parseArgs({
-    args,
-    options: { vault: { type: "string" }, apply: { type: "boolean" }, expect: { type: "string" }, restore: { type: "string" }, json: { type: "boolean" } },
-    allowPositionals: false,
-  });
-  if ((values.apply || values.restore) && !values.vault) die("--apply and --restore act on one vault: add --vault <name> (the dry run lists each vault's name)");
-  if (values.apply && values.restore) die("--apply and --restore cannot be combined");
-  if (values.expect !== undefined && !values.apply) die("--expect goes with --apply");
-  const { Database } = await import("bun:sqlite");
+/** The vaults a `repair` command can name: the default index first, then each configured vault on another file. */
+async function repairVaultList(): Promise<{ name: string; aliases: string[]; path: string }[]> {
   const { realpathSync } = await import("fs");
   const { listVaults, getVaultPath } = await import("./config.ts");
-  const repair = await import("./entity-repair.ts");
   // One entry per database file: a configured name for a file already listed is an alias of that entry. A configured
   // name always reaches its own file, as resolveStore does: the default index is "general" unless a configured vault on
   // another file has that name, and then "default-index" (or the first such name no configured vault takes).
@@ -6106,6 +6305,137 @@ async function cmdRepairEntities(args: string[]) {
     }
     vaults.push({ name, aliases: [], path });
   }
+  return vaults;
+}
+
+// 82.2 (D5): `clawmem repair vectors` — stored vectors that are not usable, and similarity relations whose weight is
+// no cosine similarity. Dry run by default. Exits: 0 nothing to do / both phases completed; 1 something to do (dry
+// run), a run stopped by --limit, or a failed run; 2 usage.
+async function cmdRepairVectors(args: string[]) {
+  const usage = (msg: string): never => {
+    console.error(`${c.red}Error:${c.reset} ${msg}\nUsage: clawmem repair vectors [--vault <name>] [--run] [--limit N] [--json]`);
+    process.exit(2);
+  };
+  let values: { vault?: string; run?: boolean; limit?: string; json?: boolean };
+  try {
+    ({ values } = parseArgs({
+      args,
+      options: { vault: { type: "string" }, run: { type: "boolean" }, limit: { type: "string" }, json: { type: "boolean" } },
+      allowPositionals: false,
+    }));
+  } catch (err) {
+    return usage((err as Error).message);
+  }
+  let limit: number | undefined;
+  if (values.limit !== undefined) {
+    if (!/^[0-9]+$/.test(values.limit) || Number(values.limit) < 1) usage("--limit takes a whole number above zero");
+    if (!values.run) usage("--limit goes with --run: it bounds the vector rows a run deletes");
+    limit = Number(values.limit);
+  }
+  if (values.vault !== undefined) refuseLeadingMark(values.vault, "vault");   // 82.3 D7 (Codex T1 P3): before the lookup
+  const vaults = await repairVaultList();
+  const v = values.vault === undefined ? vaults[0]! : vaults.find(x => x.name === values.vault || x.aliases.includes(values.vault!));
+  if (!v) return usage(`Unknown vault: "${values.vault}" (known: ${vaults.flatMap(x => [x.name, ...x.aliases]).join(", ")})`);
+  if (!existsSync(v.path)) die(`vault ${v.name}: no database at ${v.path}`);
+  const { repairVectors } = await import("./vector-health.ts");
+  type Report = ReturnType<typeof repairVectors>;
+  let report: Report;
+  if (!values.run) {
+    const store = createStore(v.path, { readonly: true });
+    try {
+      report = repairVectors(store.db, { run: false });
+    } catch (err) {
+      console.error(`${c.red}Error:${c.reset} ${v.name}: could not examine the stored vectors (${(err as Error).message}). Nothing was changed, and this is not a reason to delete any.`);
+      process.exitCode = 1;
+      return;
+    } finally {
+      store.close();
+    }
+  } else {
+    const store = createStore(v.path);
+    const LEASE_NAME = "embedding";
+    const LEASE_TTL_MS = 60_000;
+    try {
+      // The lease `clawmem embed` holds: a repair and an embed never write the vector tables at the same time.
+      const lease = acquireWorkerLease(store, LEASE_NAME, LEASE_TTL_MS);
+      if (!lease.acquired || !lease.token) {
+        const msg = "an embed or another repair holds the embedding lease; nothing was changed. Run it again when that has ended.";
+        if (values.json) console.log(JSON.stringify({ vault: v.name, refused: msg }));
+        else console.log(`${c.yellow}${v.name}: ${msg}${c.reset}`);
+        process.exitCode = 1;
+        return;
+      }
+      const token = lease.token;
+      try {
+        report = repairVectors(store.db, {
+          run: true, limit,
+          leaseGuard: { workerName: LEASE_NAME, token },
+          renew: () => renewWorkerLease(store, LEASE_NAME, token, LEASE_TTL_MS),
+        });
+      } finally {
+        releaseWorkerLease(store, LEASE_NAME, token);
+      }
+    } finally {
+      store.close();
+    }
+  }
+  if (values.json) console.log(JSON.stringify({ vault: v.name, ...report }));
+  else printVectorRepair(v.name, report, limit);
+  process.exitCode = report.exit;
+}
+
+function printVectorRepair(vault: string, report: { run: boolean; exit: number; vectors: any; relations: any }, limit: number | undefined): void {
+  const { vectors: vec, relations: rel } = report;
+  const kinds = Object.entries(vec.byKind as Record<string, number>).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(", ");
+  console.log(`${c.bold}repair vectors${c.reset} — vault ${vault}${report.run ? "" : " (dry run)"}`);
+  console.log(`${c.bold}VECTORS${c.reset}`);
+  console.log(`  ${vec.bad} stored vector(s) not usable${kinds ? ` (${kinds})` : ""}`);
+  for (const f of vec.list) console.log(`    ${f.hashSeq}  ${f.kind}${f.orphan ? "  (no metadata row)" : ""}`);
+  if (vec.bad > vec.list.length) console.log(`    … and ${vec.bad - vec.list.length} more`);
+  if (!report.run) {
+    console.log(`  ${vec.documentsReset} document row(s) would be set to be embedded again`);
+  } else {
+    console.log(`  deleted ${vec.deleted}; kept ${vec.kept} that were healthy when examined again; ${vec.documentsReset} document row(s) set to be embedded again`);
+    if (vec.status === "stopped-by-limit") console.log(`  ${c.yellow}stopped by --limit ${limit}: vectors that are not usable remain${c.reset}`);
+    if (vec.status === "failed") console.log(`  ${c.red}failed: ${vec.error}. The pages before the failing one stay committed; the failing page was rolled back.${c.reset}`);
+  }
+  console.log(`${c.bold}RELATIONS${c.reset}`);
+  if (rel.status === "not-run") {
+    console.log(`  relations: not run — vector phase incomplete`);
+  } else {
+    console.log(`  ${rel.invalid} similarity relation(s) whose weight is no cosine similarity${report.run ? ` — deleted ${rel.deleted}` : ""}`);
+    for (const r of rel.list) console.log(`    ${r.sourceId} -> ${r.targetId}  weight ${r.weight}`);
+    if (rel.invalid > rel.list.length) console.log(`    … and ${rel.invalid - rel.list.length} more`);
+    if (rel.negativeKept > 0) console.log(`  negative similarity relations: ${rel.negativeKept} — kept`);
+    if (rel.otherOriginOutOfRange > 0) console.log(`  relations of type semantic that the link builder did not write, weight out of range: ${rel.otherOriginOutOfRange} — kept`);
+    if (rel.unresolved > 0) {
+      console.log(`  ${rel.unresolved} in-range similarity relation(s) of the ${report.run ? "repaired" : "affected"} documents stay as they are: they cannot be told from any other, and build_graphs does not replace an existing relation`);
+      for (const d of rel.unresolvedByDocument) console.log(`    document ${d.id}: ${d.relations}`);
+    }
+    if (rel.status === "failed") console.log(`  ${c.red}failed: ${rel.error}. The pages before the failing one stay committed; the failing page was rolled back.${c.reset}`);
+  }
+  if (!report.run) {
+    console.log(report.exit === 0 ? `Nothing to do.` : `Dry run: nothing was changed. 'clawmem repair vectors --run' makes these changes.`);
+  } else if (report.exit === 0) {
+    console.log(vec.deleted > 0 ? `Done. Next: 'clawmem embed' embeds the affected documents again, then build_graphs.` : `Done.`);
+  }
+}
+
+// 76.3: `clawmem repair entities` — entity links written before the v0.43.2 resolver fix. Every vault is opened as a raw
+// SQLite handle (no store init: no schema work, no backfill); the dry run opens each one readonly.
+async function cmdRepairEntities(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: { vault: { type: "string" }, apply: { type: "boolean" }, expect: { type: "string" }, restore: { type: "string" }, json: { type: "boolean" } },
+    allowPositionals: false,
+  });
+  if ((values.apply || values.restore) && !values.vault) die("--apply and --restore act on one vault: add --vault <name> (the dry run lists each vault's name)");
+  if (values.apply && values.restore) die("--apply and --restore cannot be combined");
+  if (values.expect !== undefined && !values.apply) die("--expect goes with --apply");
+  if (values.vault !== undefined) refuseLeadingMark(values.vault, "vault");   // 82.3 D7 (Codex T1 P3): before the lookup
+  const { openDatabase } = await import("./sqlite-guard.ts");
+  const repair = await import("./entity-repair.ts");
+  const vaults = await repairVaultList();
   const chosen = values.vault === undefined ? vaults : vaults.filter(v => v.name === values.vault || v.aliases.includes(values.vault!));
   if (chosen.length === 0) die(`Unknown vault: "${values.vault}" (known: ${vaults.flatMap(v => [v.name, ...v.aliases]).join(", ")})`);
   const refused = (name: string, err: unknown) => {
@@ -6118,7 +6448,7 @@ async function cmdRepairEntities(args: string[]) {
   if (values.restore !== undefined || values.apply) {
     const v = chosen[0]!;
     if (!existsSync(v.path)) die(`vault ${v.name}: no database at ${v.path}`);
-    const db = new Database(v.path, { readwrite: true, create: false });
+    const db = openDatabase(v.path, { readwrite: true, create: false });
     try {
       if (values.restore !== undefined) {
         const r = repair.restoreEntityRepair(db, values.restore);
@@ -6304,6 +6634,9 @@ ${c.bold}Repair:${c.reset}
   clawmem repair entities [--vault <name>] [--apply [--expect <digest>]] [--restore <op>] [--json]
                                        Fix entity links written before v0.43.2's resolver fix (dry run without --apply)
 
+  clawmem repair vectors [--vault <name>] [--run] [--limit N] [--json]
+                                       Remove stored vectors that are not usable; their documents are embedded again (dry run without --run)
+
 ${c.bold}Stop pipeline:${c.reset}
   clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]
                                        Recompute feedback counters from verified references (dry run without --apply)
@@ -6350,6 +6683,18 @@ ${c.bold}Options:${c.reset}
 }
 
 main().catch(err => {
+  // 82.3 D7: an identifier or a selector that starts with a byte-order mark is USER INPUT — its own message, exit 2.
+  // Never for `clawmem hook …`: a hook's exit 2 tells the host to BLOCK the action; a hook keeps its exit 1.
+  if (err instanceof BomLeadingIdentifierError && process.argv[2] !== "hook") {
+    console.error(`${c.red}Error:${c.reset} ${err.message}`);
+    process.exit(2);
+  }
+  // 82.3 D7 (ruling 67 A): a statement the guard refused is reported as its message — it names the statement and the
+  // doctor — never as a stack trace with source lines. Exit 1, as before.
+  if (err instanceof BomLeadingTextError) {
+    console.error(`${c.red}Error:${c.reset} ${err.message}`);
+    process.exit(1);
+  }
   console.error(err);
   process.exit(1);
 });

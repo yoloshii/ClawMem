@@ -16,6 +16,7 @@
  *    -> the junk IS injected (banded last) — proving the pool genuinely
  *    carries it to the guard, so its absence at w=0 is the guard's doing.
  */
+import { stubSearchVec } from "./vec-stub.ts";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { newSurfacingTrace } from "../../src/eval/hook-trace.ts";
 import { createTestStore, seedDocuments } from "./test-store.ts";
@@ -37,7 +38,7 @@ seedDocuments(store, [
   // reachable only through the expansion lane below.
   { path: "m/w0-junk.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows and frost dates", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
 ]);
-store.searchVec = async () => [];
+stubSearchVec(store, async () => []);
 store.expandQuery = async () => [{ type: "lex", query: "gardening almanac planting" }] as Awaited<ReturnType<Store["expandQuery"]>>;
 // Full coverage: the reranker ANSWERS for every doc it is sent, top-ranking
 // the junk — coverage is complete whatever the lane weight. endsWith: the

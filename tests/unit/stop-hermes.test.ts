@@ -35,6 +35,7 @@ import { promptSha, transcriptKey } from "../../src/stop-pairing.ts";
 import { STOP_SCHEMA_MARKER } from "../../src/stop-schema.ts";
 import { T0, iso } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const dirs: string[] = [];
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), "clawmem-621-hermes-"));
@@ -185,7 +186,7 @@ describe("Hermes: a transcript begun after the upgrade is read from its first li
 // ─── Feedback: a prefetch is credited only through the plugin's delivery mark ──────────────────────────────────────
 function seedDoc(store: Store, collection: string, path: string, title: string): number {
   const hash = `h-${collection}-${path}`;
-  store.insertContent(hash, `# ${title}\n\nbody`, iso(0));
+  seedContent(store.db, hash, `# ${title}\n\nbody`, iso(0));
   store.insertDocument(collection, path, title, hash, iso(0), iso(0));
   return store.findActiveDocument(collection, path)!.id;
 }
@@ -490,7 +491,7 @@ describe("context-surfacing returns its usage row's id to the Hermes plugin only
     setDefaultLlamaCpp({ embed: async () => ({ embedding: new Float32Array([0, 0, 1, 0]), model: "f" }), query: async () => null, expandQuery: async () => [] } as any);
     const store = createTestStore();
     const hash = "h-vortalcrest";
-    store.insertContent(hash, `Notes on the vortalcrest configuration and its setup steps. ${"Filler prose about unrelated chores. ".repeat(3)}`, iso(0));
+    seedContent(store.db, hash, `Notes on the vortalcrest configuration and its setup steps. ${"Filler prose about unrelated chores. ".repeat(3)}`, iso(0));
     store.insertDocument("notes", "vortalcrest.md", "Vortalcrest setup notes", hash, iso(0), iso(0));
     return store;
   }

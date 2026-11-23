@@ -7,6 +7,7 @@
  * wiring — searchVecBounded fallback, lane collection, membership, guard —
  * runs for real on a GPU-less host.
  */
+import { stubSearchVec } from "../helpers/vec-stub.ts";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { join, dirname } from "path";
@@ -72,7 +73,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       { path: "m/vector-hit.md", title: "Deployment pipeline rollback design", body: "How we roll back a bad deployment of the pipeline service safely.", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
       { path: "m/keyword-hit.md", title: "deployment pipeline rollback checklist", body: "deployment pipeline rollback checklist for the release train operators", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [vecResult(store, "test/m/vector-hit.md", 0.55)];
+    stubSearchVec(store, async () => [vecResult(store, "test/m/vector-hit.md", 0.55)]);
 
     process.env.CLAWMEM_PROFILE = "balanced";
     const trace = newSurfacingTrace();
@@ -98,11 +99,11 @@ describe("BUILD-1 lanes through the real handler", () => {
       turnIndex: 0, queryText: "the oauth refresh token rotation decision rationale",
     });
     let priorVecQueries = 0;
-    store.searchVec = async (query: string) => {
+    stubSearchVec(store, async (query: string) => {
       priorVecQueries++;
       // Return the doc only for the joined-priors query, not the current prompt.
       return query.includes("oauth") ? [vecResult(store, "test/m/prior-doc.md", 0.5)] : [];
-    };
+    });
 
     process.env.CLAWMEM_PROFILE = "balanced";
     process.env.CLAWMEM_PRIOR_VECTOR_INPROC = "1";
@@ -138,7 +139,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       turnIndex: 0, queryText: "oauth refresh token rotation decision rationale",
     });
     const vecQueries: string[] = [];
-    store.searchVec = async (query: string) => { vecQueries.push(query); return []; };
+    stubSearchVec(store, async (query: string) => { vecQueries.push(query); return []; });
 
     process.env.CLAWMEM_PROFILE = "balanced";
     delete process.env.CLAWMEM_PRIOR_VECTOR_INPROC;
@@ -159,7 +160,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       { path: "m/req-doc.md", title: "oauth refresh rotation", body: "oauth refresh token rotation decision for the auth service", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
     ]);
     let inprocScans = 0;
-    store.searchVec = async () => { inprocScans++; return []; };
+    stubSearchVec(store, async () => { inprocScans++; return []; });
 
     const savedXdg = process.env.XDG_RUNTIME_DIR;
     const fakeRuntime = mkdtempSync(join(tmpdir(), "clawmem-req-sock-"));
@@ -204,7 +205,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       turnIndex: 0, queryText: "oauth refresh token rotation decision rationale",
     });
     const vecQueries: string[] = [];
-    store.searchVec = async (query: string) => { vecQueries.push(query); return []; };
+    stubSearchVec(store, async (query: string) => { vecQueries.push(query); return []; });
 
     const savedXdg = process.env.XDG_RUNTIME_DIR;
     const fakeRuntime = mkdtempSync(join(tmpdir(), "clawmem-stale-sock-"));
@@ -251,7 +252,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       hookName: "context-surfacing", injectedPaths: [], estimatedTokens: 0, wasReferenced: 0,
       turnIndex: 0, queryText: "clawmem ranking defect composite scoring diagnosis",
     });
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     // The prior's FTS list returns BOTH docs (simulating a polluted lane);
     // the current prompt's own FTS finds nothing (all stopwords).
     const realSearchFTS = store.searchFTS.bind(store);
@@ -289,7 +290,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       { path: "m/base2.md", title: "release train ownership", body: "release train cadence ownership and the platform stage gates responsibilities", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
       { path: "m/exp-only.md", title: "cadence retrospective summary", body: "retrospective summary of cadence changes across quarters", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "cadence retrospective" } as { type: string; query: string }] as Awaited<ReturnType<Store["expandQuery"]>>;
     store.rerank = async (_q, docs) => docs.map((d, i) => ({ file: d.file, score: 0.9 - i * 0.1 }));
 
@@ -318,7 +319,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       { path: "m/raw3.md", title: "cadence checklist", body: "release train cadence checklist for platform stage gates operators", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
     const RAW_VEC_SCORE = 0.5;
-    store.searchVec = async () => [vecResult(store, "test/m/raw1.md", RAW_VEC_SCORE)];
+    stubSearchVec(store, async () => [vecResult(store, "test/m/raw1.md", RAW_VEC_SCORE)]);
     store.expandQuery = async () => [] as Awaited<ReturnType<Store["expandQuery"]>>;
     // The reranker inverts the FTS preference: raw3 (weakest by fusion) gets
     // the TOP rerank score — its effect must appear in the ORDER, not in any
@@ -366,7 +367,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       // Shares ZERO content vocabulary with the current prompt → gate fails.
       { path: "m/pc-junk.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "gardening almanac" } as { type: string; query: string }] as Awaited<ReturnType<Store["expandQuery"]>>;
     // The reranker ANSWERS but covers only a strict subset of what it was
     // sent — a partially-covered pool must never be partially reordered.
@@ -394,7 +395,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       // Shares ZERO content vocabulary with the current prompt → gate fails.
       { path: "m/exp-junk.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "gardening almanac" } as { type: string; query: string }] as Awaited<ReturnType<Store["expandQuery"]>>;
     store.rerank = async () => { throw new Error("reranker down"); };
 
@@ -415,7 +416,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       { path: "m/zf2.md", title: "billing invoice retries", body: "billing invoice retries enterprise and the export dead letter queue", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
       { path: "m/zf-junk.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "gardening almanac" } as { type: string; query: string }] as Awaited<ReturnType<Store["expandQuery"]>>;
     // store.rerank is NOT stubbed: the request goes through the store's real
     // remote path, whose default contract ZERO-FILLS omitted documents and
@@ -467,7 +468,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       // current rank-0 contribution (codex turn-14 finding 4 arithmetic).
       { path: "m/cb-exp.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows for enterprise gardens", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [
       { type: "lex", query: "gardening almanac" },
       { type: "lex", query: "almanac planting" },
@@ -518,7 +519,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       confidence: 0.9,
       qualityScore: 0.8,
     })));
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "quarterly retrospective summary" } as { type: string; query: string }] as Awaited<ReturnType<Store["expandQuery"]>>;
     store.rerank = async (_q, docs) => docs.map((d, i) => ({ file: d.file, score: 0.9 - i * 0.01 }));
 
@@ -579,7 +580,7 @@ describe("BUILD-1 lanes through the real handler", () => {
     seedDocuments(skillStore as Store, [
       { path: "obs/scraper-observation.md", title: "scraper skill observation", body: "observation about the scraper skill routing decision toolchain outcomes", collection: "skillobs", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
 
     process.env.CLAWMEM_PROFILE = "speed";
     process.env.CLAWMEM_SURFACE_SECONDARY_VAULTS = "true";
@@ -604,7 +605,7 @@ describe("BUILD-1 lanes through the real handler", () => {
       // Expansion-only, gate-passing junk (shares only "enterprise").
       { path: "m/ib-exp.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows for enterprise gardens", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "gardening almanac planting" }] as Awaited<ReturnType<Store["expandQuery"]>>;
     // The reranker ANSWERS for the whole pool (full coverage → applied) but is
     // DEGENERATE: it top-ranks the expansion-only junk. Coverage is not
@@ -650,7 +651,7 @@ describe("BUILD-1 lanes through the real handler", () => {
     seedDocuments(skillStore as Store, [
       { path: "m/twin.md", collection: "test", title: "scraper skill routing", body: "scraper skill routing decision for the toolchain in the skill vault at length", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     process.env.CLAWMEM_PROFILE = "speed";
     process.env.CLAWMEM_SURFACE_SECONDARY_VAULTS = "true";
     process.env.CLAWMEM_VAULTS = JSON.stringify({ skill: skillPath });
@@ -964,7 +965,7 @@ describe("BUILD-3d: per-request degeneracy gate at the real handler", () => {
       // Expansion-only, gate-FAILING junk (no prompt vocabulary).
       { path: "m/dg-junk.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows and frost dates", contentType: "note", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [{ type: "lex", query: "gardening almanac planting" }] as Awaited<ReturnType<Store["expandQuery"]>>;
     // The inert regime: full coverage, every score identical — spread 0.
     store.rerank = async (_q, docs) => docs.map(d => ({ file: d.file, score: 0.5 }));
@@ -994,7 +995,7 @@ describe("BUILD-3d: per-request degeneracy gate at the real handler", () => {
       { path: "m/dc2.md", title: "billing invoice retries", body: "billing invoice retries enterprise and the export dead letter queue", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
       { path: "m/dc3.md", title: "billing invoice dunning", body: "billing invoice dunning retries cadence for enterprise export accounts", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [] as Awaited<ReturnType<Store["expandQuery"]>>;
     // The documented broken-GGUF regime: every score <= 8.03e-7, tiny but
     // NON-constant differences — spread alone would also catch it, the max
@@ -1021,7 +1022,7 @@ describe("BUILD-3d: per-request degeneracy gate at the real handler", () => {
       { path: "m/dh2.md", title: "billing invoice retries", body: "billing invoice retries enterprise and the export dead letter queue", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
       { path: "m/dh3.md", title: "billing invoice dunning", body: "billing invoice dunning retries cadence for enterprise export accounts", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [];
+    stubSearchVec(store, async () => []);
     store.expandQuery = async () => [] as Awaited<ReturnType<Store["expandQuery"]>>;
     store.rerank = async (_q, docs) => docs.map((d, i) => ({ file: d.file, score: 0.9 - i * 0.1 }));
 
@@ -1117,11 +1118,11 @@ describe("BUILD-4 relevance admission at the real handler (codex t52-F1 locks)",
       { path: "m/vj2.md", title: "sourdough hydration", body: "sourdough hydration ratios and proofing schedule notes", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
       { path: "m/vj3.md", title: "marathon taper", body: "marathon taper week mileage and carb loading", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [
+    stubSearchVec(store, async () => [
       vecResult(store, "test/m/vj1.md", 0.69),
       vecResult(store, "test/m/vj2.md", 0.67),
       vecResult(store, "test/m/vj3.md", 0.66),
-    ];
+    ]);
     process.env.CLAWMEM_PROFILE = "balanced";
     const trace = newSurfacingTrace();
     const out = await contextSurfacing(store, { prompt: "billing invoice export retries enterprise", sessionId: "lanes-b4-degenerate" }, { trace });
@@ -1148,7 +1149,7 @@ describe("BUILD-4 relevance admission at the real handler (codex t52-F1 locks)",
       // FTS-only, rank 2 — mass ≈ 0.27 of the two-lane top → below the 0.5 floor.
       { path: "m/fb.md", title: "billing invoice retries", body: "billing invoice retries enterprise and the export dead letter queue", contentType: "decision", confidence: 0.9, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [vecResult(store, "test/m/fa.md", 0.8)];
+    stubSearchVec(store, async () => [vecResult(store, "test/m/fa.md", 0.8)]);
     process.env.CLAWMEM_PROFILE = "balanced";
     const trace = newSurfacingTrace();
     await contextSurfacing(store, { prompt: "billing invoice export retries enterprise", sessionId: "lanes-b4-floor" }, { trace });
@@ -1178,7 +1179,7 @@ describe("BUILD-4 relevance admission at the real handler (codex t52-F1 locks)",
       // Vector-only junk: shares no vocabulary with the prompt.
       { path: "m/vsnooze.md", title: "gardening almanac", body: "seasonal gardening almanac with planting windows and frost dates", contentType: "note", confidence: 0.8, qualityScore: 0.8 },
     ]);
-    store.searchVec = async () => [vecResult(store, "test/m/vsnooze.md", 0.7)];
+    stubSearchVec(store, async () => [vecResult(store, "test/m/vsnooze.md", 0.7)]);
     store.snoozeDocument("test", "m/vsnooze.md", new Date(Date.now() + 86_400_000).toISOString());
     process.env.CLAWMEM_PROFILE = "balanced";
     const trace = newSurfacingTrace();
@@ -1202,7 +1203,7 @@ describe("BUILD-4 relevance admission at the real handler (codex t52-F1 locks)",
       seedDocuments(store, [
         { path: "m/fa.md", title: "billing invoice export", body: "billing invoice export retries flow for enterprise tenants", contentType: "note", qualityScore: 0.8, modifiedAt: "2026-08-01T00:00:00.000Z" },
       ]);
-      store.searchVec = async () => [vecResult(store, "test/m/fa.md", 0.8)];
+      stubSearchVec(store, async () => [vecResult(store, "test/m/fa.md", 0.8)]);
       process.env.CLAWMEM_PROFILE = "balanced";
       const trace = newSurfacingTrace();
       await contextSurfacing(store, { prompt: "billing invoice export retries enterprise", sessionId }, { trace });
@@ -1256,12 +1257,12 @@ describe("BUILD-4 relevance admission at the real handler (codex t52-F1 locks)",
     // Vector lane in REVERSE fts order: two-lane masses even out, so all
     // four clear the BUILD-4 relative floor (a single lane's rank-4 sits at
     // ~0.235 of top and would be floor-cut, leaving only 3 admitted).
-    store.searchVec = async () => [
+    stubSearchVec(store, async () => [
       vecResult(store, "test/m/howto-export.md", 0.8),
       vecResult(store, "test/m/d3.md", 0.7),
       vecResult(store, "test/m/d2.md", 0.6),
       vecResult(store, "test/m/d1.md", 0.5),
-    ];
+    ]);
     process.env.CLAWMEM_PROFILE = "balanced";
     const trace = newSurfacingTrace();
     await contextSurfacing(store, { prompt: "billing invoice export retries enterprise", sessionId: "lanes-b5-locks" }, { trace });

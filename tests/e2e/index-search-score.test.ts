@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import {
   createStore,
-  insertContent,
   insertDocument,
   searchFTS,
   extractSnippet,
@@ -10,6 +9,7 @@ import {
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "../../src/memory.ts";
 import { enrichResults } from "../../src/search-utils.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 
 beforeEach(() => {
@@ -19,7 +19,7 @@ beforeEach(() => {
 function addDoc(collection: string, path: string, title: string, body: string, opts?: { modifiedAt?: string; pinned?: boolean; qualityScore?: number }) {
   const hash = `hash_${path}_${Math.random().toString(36).slice(2)}`;
   const now = opts?.modifiedAt || new Date().toISOString();
-  insertContent(store.db, hash, body, now);
+  seedContent(store.db, hash, body, now);
   insertDocument(store.db, collection, path, title, hash, now, now);
 
   if (opts?.pinned || opts?.qualityScore !== undefined) {

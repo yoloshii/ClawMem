@@ -18,6 +18,7 @@ import { replayDueRetries } from "../../src/stop-extract.ts";
 import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { T0, iso, human, assistant, writeTranscriptFile, appendEntries } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let failTurns = new Set<string>();
 let observerPrompts: string[] = [];
 let judgeHits = 0;
@@ -148,7 +149,7 @@ describe("D3 a replay keeps its source time (tests 23, 30)", () => {
     const path = "decisions/2026-09-30-othersess.md";
     const body = "The team adopted node as the build runtime.";
     const hash = createHash("sha256").update(body).digest("hex");
-    store.insertContent(hash, body, created);
+    seedContent(store.db, hash, body, created);
     store.insertDocument("_clawmem", path, "Decisions", hash, created, modified);
     const id = store.findActiveDocument("_clawmem", path)!.id;
     store.db.prepare(`UPDATE documents SET content_type = 'decision', confidence = 0.8, created_at = ?, modified_at = ? WHERE id = ?`).run(created, modified, id);

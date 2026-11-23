@@ -1,0 +1,965 @@
+{
+ "$comment": "BACKLOG 82.3 D7 binding census (ruling 49 A): every vault column a ClawMem statement writes with a string, and how its text is handled. Compared by scripts/check-binding-census.ts with a whole-suite recording; checked against the schema by tests/unit/binding-census.test.ts.",
+ "columns": {
+  "causal_due.claim_token": {
+   "class": "constant/generated"
+  },
+  "causal_due.created_at": {
+   "class": "constant/generated"
+  },
+  "causal_due.lease_expires_at": {
+   "class": "constant/generated"
+  },
+  "causal_due.mode": {
+   "class": "constant/generated"
+  },
+  "causal_due.obs_doc_ids": {
+   "class": "json-list"
+  },
+  "causal_due.range_key": {
+   "class": "identifier"
+  },
+  "causal_due.run_key": {
+   "class": "identifier"
+  },
+  "causal_due.session_id": {
+   "class": "identifier"
+  },
+  "causal_due.source_time": {
+   "class": "constant/generated"
+  },
+  "causal_due.transcript_key": {
+   "class": "identifier"
+  },
+  "causal_due.window_at": {
+   "class": "constant/generated"
+  },
+  "causal_run_events.created_at": {
+   "class": "constant/generated"
+  },
+  "causal_run_events.detail": {
+   "class": "normalised",
+   "row": "model text stored as evidence (ruling 61 A: a run event's detail, often the model's own words)"
+  },
+  "causal_run_events.event_type": {
+   "class": "constant/generated"
+  },
+  "causal_run_events.scope": {
+   "class": "constant/generated"
+  },
+  "causal_runs.finished_at": {
+   "class": "constant/generated"
+  },
+  "causal_runs.mode": {
+   "class": "constant/generated"
+  },
+  "causal_runs.model": {
+   "class": "identifier"
+  },
+  "causal_runs.outcome": {
+   "class": "constant/generated"
+  },
+  "causal_runs.prompt_sha256": {
+   "class": "constant/generated"
+  },
+  "causal_runs.prompt_version": {
+   "class": "constant/generated"
+  },
+  "causal_runs.response_sha256": {
+   "class": "constant/generated"
+  },
+  "causal_runs.run_key": {
+   "class": "identifier"
+  },
+  "causal_runs.session_id": {
+   "class": "identifier"
+  },
+  "causal_runs.source": {
+   "class": "constant/generated"
+  },
+  "causal_runs.started_at": {
+   "class": "constant/generated"
+  },
+  "causal_witness_sightings.created_at": {
+   "class": "constant/generated"
+  },
+  "causal_witness_sightings.model_identity": {
+   "class": "identifier"
+  },
+  "causal_witness_sightings.prompt_version": {
+   "class": "constant/generated"
+  },
+  "causal_witness_sightings.reasoning": {
+   "class": "normalised",
+   "row": "model text stored as evidence (ruling 55 A, 57 A)"
+  },
+  "causal_witness_sightings.run_key": {
+   "class": "identifier"
+  },
+  "causal_witness_sightings.source_fact": {
+   "class": "normalised",
+   "row": "model text stored as evidence (ruling 55 A, 57 A)"
+  },
+  "causal_witness_sightings.target_fact": {
+   "class": "normalised",
+   "row": "model text stored as evidence (ruling 55 A, 57 A)"
+  },
+  "co_activations.doc_a": {
+   "class": "identifier"
+  },
+  "co_activations.doc_b": {
+   "class": "identifier"
+  },
+  "co_activations.last_seen": {
+   "class": "constant/generated"
+  },
+  "co_activations.stamp": {
+   "class": "constant/generated"
+  },
+  "compaction_state.attempt": {
+   "class": "constant/generated"
+  },
+  "compaction_state.created_at": {
+   "class": "constant/generated"
+  },
+  "compaction_state.payload": {
+   "class": "json-list"
+  },
+  "compaction_state.session_id": {
+   "class": "identifier"
+  },
+  "compaction_state.started_at": {
+   "class": "constant/generated"
+  },
+  "consolidated_observations.collection": {
+   "class": "identifier"
+  },
+  "consolidated_observations.observation": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "consolidated_observations.source_doc_ids": {
+   "class": "json-list"
+  },
+  "consolidated_observations.trend": {
+   "class": "constant/generated"
+  },
+  "content.created_at": {
+   "class": "constant/generated"
+  },
+  "content.doc": {
+   "class": "normalised",
+   "row": "file body / API-born body (hash contract: normalizedContent \u2192 insertContent)"
+  },
+  "content.hash": {
+   "class": "constant/generated"
+  },
+  "content_vectors.canonical_id": {
+   "class": "constant/generated"
+  },
+  "content_vectors.embed_input_fp": {
+   "class": "constant/generated"
+  },
+  "content_vectors.embedded_at": {
+   "class": "constant/generated"
+  },
+  "content_vectors.fragment_label": {
+   "class": "normalised",
+   "row": "fragment label"
+  },
+  "content_vectors.fragment_type": {
+   "class": "constant/generated"
+  },
+  "content_vectors.hash": {
+   "class": "constant/generated"
+  },
+  "content_vectors.model": {
+   "class": "identifier"
+  },
+  "context_usage.dedupe_key": {
+   "class": "identifier"
+  },
+  "context_usage.hook_name": {
+   "class": "constant/generated"
+  },
+  "context_usage.host": {
+   "class": "constant/generated"
+  },
+  "context_usage.injected_paths": {
+   "class": "json-list"
+  },
+  "context_usage.prompt_sha": {
+   "class": "constant/generated"
+  },
+  "context_usage.query_text": {
+   "class": "normalised",
+   "row": "free-text input (query, usage log, intent cache)"
+  },
+  "context_usage.session_id": {
+   "class": "identifier"
+  },
+  "context_usage.session_key": {
+   "class": "identifier"
+  },
+  "context_usage.timestamp": {
+   "class": "constant/generated"
+  },
+  "context_usage.transcript_key": {
+   "class": "identifier"
+  },
+  "context_usage.writer_stamp": {
+   "class": "constant/generated"
+  },
+  "counter_repair_log.col": {
+   "class": "constant/generated"
+  },
+  "counter_repair_log.created_at": {
+   "class": "constant/generated"
+  },
+  "counter_repair_log.new_value": {
+   "class": "constant/generated"
+  },
+  "counter_repair_log.old_value": {
+   "class": "constant/generated"
+  },
+  "counter_repair_log.op_id": {
+   "class": "constant/generated"
+  },
+  "counter_repair_log.row_key": {
+   "class": "identifier"
+  },
+  "counter_repair_log.tbl": {
+   "class": "constant/generated"
+  },
+  "documents.access_grace_until": {
+   "class": "constant/generated"
+  },
+  "documents.amem_context": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "documents.amem_keywords": {
+   "class": "json-list"
+  },
+  "documents.amem_tags": {
+   "class": "json-list"
+  },
+  "documents.archived_at": {
+   "class": "constant/generated"
+  },
+  "documents.authored_at": {
+   "class": "constant/generated"
+  },
+  "documents.collection": {
+   "class": "identifier"
+  },
+  "documents.concepts": {
+   "class": "json-list"
+  },
+  "documents.content_hash": {
+   "class": "constant/generated"
+  },
+  "documents.content_type": {
+   "class": "normalised",
+   "row": "frontmatter scalars"
+  },
+  "documents.counter_stamp": {
+   "class": "constant/generated"
+  },
+  "documents.created_at": {
+   "class": "constant/generated"
+  },
+  "documents.deactivated_reason": {
+   "class": "constant/generated"
+  },
+  "documents.doc_stamp": {
+   "class": "constant/generated"
+  },
+  "documents.domain": {
+   "class": "normalised",
+   "row": "frontmatter scalars"
+  },
+  "documents.embed_error": {
+   "class": "guarded",
+   "note": "error text; a mark-led one is refused (ruling 55 A)"
+  },
+  "documents.embed_state": {
+   "class": "constant/generated"
+  },
+  "documents.facts": {
+   "class": "json-list"
+  },
+  "documents.failure_reason": {
+   "class": "normalised",
+   "row": "observation fields (updateObservationFields)"
+  },
+  "documents.files_modified": {
+   "class": "json-list"
+  },
+  "documents.files_read": {
+   "class": "json-list"
+  },
+  "documents.hash": {
+   "class": "constant/generated"
+  },
+  "documents.last_accessed_at": {
+   "class": "constant/generated"
+  },
+  "documents.last_seen_at": {
+   "class": "constant/generated"
+  },
+  "documents.memory_type": {
+   "class": "constant/generated"
+  },
+  "documents.modified_at": {
+   "class": "constant/generated"
+  },
+  "documents.narrative": {
+   "class": "normalised",
+   "row": "observation fields (updateObservationFields)"
+  },
+  "documents.normalized_hash": {
+   "class": "constant/generated"
+  },
+  "documents.obs_quality_score": {
+   "class": "normalised",
+   "row": "observation fields (updateObservationFields)"
+  },
+  "documents.observation_type": {
+   "class": "normalised",
+   "row": "observation fields (updateObservationFields)"
+  },
+  "documents.origin": {
+   "class": "constant/generated"
+  },
+  "documents.path": {
+   "class": "identifier"
+  },
+  "documents.skill_name": {
+   "class": "normalised",
+   "row": "observation fields (updateObservationFields)"
+  },
+  "documents.snoozed_until": {
+   "class": "constant/generated"
+  },
+  "documents.source_doc_ids": {
+   "class": "json-list"
+  },
+  "documents.tags": {
+   "class": "json-list"
+  },
+  "documents.title": {
+   "class": "normalised",
+   "row": "title"
+  },
+  "embed_canary.embedded_at": {
+   "class": "constant/generated"
+  },
+  "embed_canary.pair_margins": {
+   "class": "json-list"
+  },
+  "embed_canary.probe_id": {
+   "class": "constant/generated"
+  },
+  "embed_canary.profile_key": {
+   "class": "constant/generated"
+  },
+  "entities_fts.entity_id": {
+   "class": "identifier"
+  },
+  "entities_fts.entity_type": {
+   "class": "normalised",
+   "row": "entity names, types, mentions"
+  },
+  "entities_fts.name": {
+   "class": "normalised",
+   "row": "entity names, types, mentions"
+  },
+  "entity_cooccurrences.entity_a": {
+   "class": "identifier"
+  },
+  "entity_cooccurrences.entity_b": {
+   "class": "identifier"
+  },
+  "entity_cooccurrences.last_cooccurred": {
+   "class": "stored-copy",
+   "note": "bound only by the entity repair's exact copies (apply's pair moves, restore; ruling 53 A); every other writer sets datetime('now') in SQL"
+  },
+  "entity_enrichment_state.input_hash": {
+   "class": "constant/generated"
+  },
+  "entity_mentions.created_at": {
+   "class": "constant/generated"
+  },
+  "entity_mentions.entity_id": {
+   "class": "identifier"
+  },
+  "entity_mentions.mention_text": {
+   "class": "normalised",
+   "row": "entity names, types, mentions"
+  },
+  "entity_nodes.created_at": {
+   "class": "constant/generated"
+  },
+  "documents_fts.body": {"class": "stored-copy", "note": "ruling 84 A: insertContent refreshes the search rows of the active documents on a rewritten hash; the body is copied in SQL from content.doc (never bound as a string) — the bound value is the hash, an identifier; the FTS triggers copy it the same way"},
+  "entity_nodes.description": {
+   "class": "stored-copy",
+   "note": "bound only by the entity repair's exact copies (copyTables, restore; ruling 53 A); every other writer inserts NULL in SQL"
+  },
+  "entity_nodes.entity_id": {
+   "class": "identifier"
+  },
+  "entity_nodes.entity_type": {
+   "class": "normalised",
+   "row": "entity names, types, mentions"
+  },
+  "entity_nodes.last_seen": {
+   "class": "constant/generated"
+  },
+  "entity_nodes.name": {
+   "class": "normalised",
+   "row": "entity names, types, mentions"
+  },
+  "entity_nodes.vault": {
+   "class": "identifier"
+  },
+  "entity_repair_log.action": {
+   "class": "constant/generated"
+  },
+  "entity_repair_log.comp": {
+   "class": "constant/generated"
+  },
+  "entity_repair_log.created_at": {
+   "class": "constant/generated"
+  },
+  "entity_repair_log.new_row": {
+   "class": "json-list"
+  },
+  "entity_repair_log.old_row": {
+   "class": "json-list"
+  },
+  "entity_repair_log.op_id": {
+   "class": "constant/generated"
+  },
+  "entity_repair_log.row_key": {
+   "class": "identifier"
+  },
+  "entity_repair_log.tbl": {
+   "class": "constant/generated"
+  },
+  "entity_triple_provenance.created_at": {
+   "class": "constant/generated"
+  },
+  "entity_triple_provenance.source_fact": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "entity_triples.created_at": {
+   "class": "constant/generated"
+  },
+  "entity_triples.object_entity_id": {
+   "class": "identifier"
+  },
+  "entity_triples.object_literal": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "entity_triples.predicate": {
+   "class": "normalised",
+   "row": "a triple's predicate"
+  },
+  "entity_triples.source_fact": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "entity_triples.subject_entity_id": {
+   "class": "identifier"
+  },
+  "entity_triples.valid_from": {
+   "class": "guarded",
+   "note": "a validity date from the caller or model (ruling 55 A)"
+  },
+  "entity_triples.valid_to": {
+   "class": "guarded",
+   "note": "a validity date from the caller or model (ruling 55 A)"
+  },
+  "feedback_ledger.created_at": {
+   "class": "constant/generated"
+  },
+  "feedback_ledger.display_path": {
+   "class": "identifier"
+  },
+  "feedback_ledger.displayed_title": {
+   "class": "stored-copy",
+   "note": "a stored title copied as bytes (ruling 56 A)"
+  },
+  "feedback_ledger.referenced_at": {
+   "class": "constant/generated"
+  },
+  "feedback_ledger.vault": {
+   "class": "identifier"
+  },
+  "feedback_turns.reason": {
+   "class": "constant/generated"
+  },
+  "feedback_turns.state": {
+   "class": "constant/generated"
+  },
+  "feedback_turns.updated_at": {
+   "class": "constant/generated"
+  },
+  "guard_check.v": {
+   "class": "constant/generated"
+  },
+  "hermes_marks.session_id": {
+   "class": "identifier"
+  },
+  "hermes_marks.transcript_key": {
+   "class": "identifier"
+  },
+  "hermes_scan.first_line_sha": {
+   "class": "constant/generated"
+  },
+  "hermes_scan.session_id": {
+   "class": "identifier"
+  },
+  "hermes_scan.tail_sha": {
+   "class": "constant/generated"
+  },
+  "hermes_scan.transcript_key": {
+   "class": "identifier"
+  },
+  "hermes_scan.updated_at": {
+   "class": "constant/generated"
+  },
+  "hook_dedupe.hook_name": {
+   "class": "constant/generated"
+  },
+  "hook_dedupe.last_seen_at": {
+   "class": "constant/generated"
+  },
+  "hook_dedupe.prompt_hash": {
+   "class": "constant/generated"
+  },
+  "hook_dedupe.prompt_preview": {
+   "class": "normalised",
+   "row": "hook prompt (ruling 45 A)"
+  },
+  "intent_classifications.cached_at": {
+   "class": "constant/generated"
+  },
+  "intent_classifications.intent": {
+   "class": "constant/generated"
+  },
+  "intent_classifications.query_hash": {
+   "class": "constant/generated"
+  },
+  "intent_classifications.query_text": {
+   "class": "normalised",
+   "row": "free-text input (query, usage log, intent cache)"
+  },
+  "intent_classifications.temporal_end": {
+   "class": "constant/generated"
+  },
+  "intent_classifications.temporal_start": {
+   "class": "constant/generated"
+  },
+  "judge_deferred.fact_fp": {
+   "class": "constant/generated"
+  },
+  "judge_deferred.fact_payload": {
+   "class": "json-list"
+  },
+  "judge_deferred.next_retry_at": {
+   "class": "constant/generated"
+  },
+  "judge_deferred.queued_at": {
+   "class": "constant/generated"
+  },
+  "judge_deferred.session_id": {
+   "class": "identifier"
+  },
+  "judge_events.action": {
+   "class": "constant/generated"
+  },
+  "judge_events.event_type": {
+   "class": "constant/generated"
+  },
+  "judge_events.evidence_head": {
+   "class": "normalised",
+   "row": "model text stored as evidence (ruling 55 A, 57 A)"
+  },
+  "judge_events.new_ref": {
+   "class": "constant/generated"
+  },
+  "judge_events.old_ref": {
+   "class": "constant/generated"
+  },
+  "judge_events.reason_code": {
+   "class": "constant/generated"
+  },
+  "judge_events.reasoning_head": {
+   "class": "normalised",
+   "row": "model text stored as evidence (ruling 55 A, 57 A)"
+  },
+  "judge_events.relation": {
+   "class": "constant/generated"
+  },
+  "judge_pair_verdicts.contract_version": {
+   "class": "constant/generated"
+  },
+  "judge_pair_verdicts.decided_at": {
+   "class": "constant/generated"
+  },
+  "judge_pair_verdicts.fact_fp": {
+   "class": "constant/generated"
+  },
+  "judge_pair_verdicts.old_doc_hash": {
+   "class": "constant/generated"
+  },
+  "judge_pair_verdicts.verdict": {
+   "class": "constant/generated"
+  },
+  "judge_runs.consumer": {
+   "class": "constant/generated"
+  },
+  "judge_runs.endpoint": {
+   "class": "constant/generated"
+  },
+  "judge_runs.lane": {
+   "class": "constant/generated"
+  },
+  "judge_runs.model": {
+   "class": "identifier"
+  },
+  "judge_runs.outcome": {
+   "class": "constant/generated"
+  },
+  "judge_runs.prompt_version": {
+   "class": "constant/generated"
+  },
+  "judge_runs.response_sha256": {
+   "class": "constant/generated"
+  },
+  "judge_runs.session_id": {
+   "class": "identifier"
+  },
+  "llm_cache.created_at": {
+   "class": "constant/generated"
+  },
+  "llm_cache.hash": {
+   "class": "constant/generated"
+  },
+  "llm_cache.result": {
+   "class": "guarded",
+   "note": "a model reply cached as returned; a mark-led reply is refused and not cached (ruling 55 A)"
+  },
+  "maintenance_runs.finished_at": {
+   "class": "constant/generated"
+  },
+  "maintenance_runs.lane": {
+   "class": "constant/generated"
+  },
+  "maintenance_runs.metrics_json": {
+   "class": "json-list"
+  },
+  "maintenance_runs.phase": {
+   "class": "constant/generated"
+  },
+  "maintenance_runs.reason": {
+   "class": "guarded",
+   "note": "a run reason / error text (ruling 55 A)"
+  },
+  "maintenance_runs.started_at": {
+   "class": "constant/generated"
+  },
+  "maintenance_runs.status": {
+   "class": "constant/generated"
+  },
+  "memory_evolution.new_context": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "memory_evolution.new_keywords": {
+   "class": "json-list"
+  },
+  "memory_evolution.previous_context": {
+   "class": "stored-copy",
+   "note": "the stored context copied as bytes (ruling 56 A)"
+  },
+  "memory_evolution.previous_keywords": {
+   "class": "json-list"
+  },
+  "memory_evolution.reasoning": {
+   "class": "normalised",
+   "row": "A-MEM context and evolution; consolidated observation text; triple literal; provenance fact"
+  },
+  "memory_relations.created_at": {
+   "class": "constant/generated",
+   "note": "copied as a plain guarded string by retire-edge / restore (ruling 63 A): every writer builds it in code, so no mark can be there, and a surprise is a clean refusal, never an altered store"
+  },
+  "memory_relations.metadata": {
+   "class": "json-list",
+   "note": "copied as a plain guarded string by retire-edge / restore (ruling 63 A): every writer builds it in code, so no mark can be there, and a surprise is a clean refusal, never an altered store"
+  },
+  "memory_relations.relation_type": {
+   "class": "constant/generated"
+  },
+  "memory_relations.stamp": {
+   "class": "constant/generated"
+  },
+  "recall_events.dedupe_key": {
+   "class": "identifier"
+  },
+  "recall_events.query_hash": {
+   "class": "constant/generated"
+  },
+  "recall_events.session_id": {
+   "class": "identifier"
+  },
+  "recall_events.surfaced_at": {
+   "class": "constant/generated"
+  },
+  "recall_stats.first_recalled_at": {
+   "class": "constant/generated"
+  },
+  "recall_stats.last_recalled_at": {
+   "class": "constant/generated"
+  },
+  "recall_stats.updated_at": {
+   "class": "constant/generated"
+  },
+  "recovered_antipattern_bodies.body": {
+   "class": "stored-copy",
+   "note": "a stored body copied as bytes (ruling 56 A)"
+  },
+  "recovered_antipattern_bodies.created_at": {
+   "class": "constant/generated"
+  },
+  "recovered_antipattern_bodies.hash": {
+   "class": "constant/generated"
+  },
+  "registration.attempt": {
+   "class": "constant/generated"
+  },
+  "registration.registered_at": {
+   "class": "constant/generated"
+  },
+  "registration.session_id": {
+   "class": "identifier"
+  },
+  "retired_causal_edges.created_at": {
+   "class": "constant/generated",
+   "note": "copied as a plain guarded string by retire-edge / restore (ruling 63 A): every writer builds it in code, so no mark can be there, and a surprise is a clean refusal, never an altered store"
+  },
+  "retired_causal_edges.fingerprint": {
+   "class": "constant/generated"
+  },
+  "retired_causal_edges.metadata": {
+   "class": "json-list",
+   "note": "copied as a plain guarded string by retire-edge / restore (ruling 63 A): every writer builds it in code, so no mark can be there, and a surprise is a clean refusal, never an altered store"
+  },
+  "retired_causal_edges.operator_note": {
+   "class": "guarded",
+   "note": "the operator note of a CLI call (ruling 55 A)"
+  },
+  "retired_causal_edges.relation_type": {
+   "class": "constant/generated"
+  },
+  "retired_causal_edges.retired_at": {
+   "class": "constant/generated"
+  },
+  "retired_causal_edges.retired_run_key": {
+   "class": "identifier"
+  },
+  "session_docs.created_at": {
+   "class": "constant/generated"
+  },
+  "session_docs.ended_at": {
+   "class": "constant/generated"
+  },
+  "session_docs.kind": {
+   "class": "constant/generated"
+  },
+  "session_docs.path": {
+   "class": "identifier"
+  },
+  "session_docs.rendered_fp": {
+   "class": "constant/generated"
+  },
+  "session_docs.session_id": {
+   "class": "identifier"
+  },
+  "session_docs.transcript_key": {
+   "class": "identifier"
+  },
+  "session_log.ended_at": {
+   "class": "constant/generated"
+  },
+  "session_log.files_changed": {
+   "class": "json-list"
+  },
+  "session_log.handoff_path": {
+   "class": "identifier"
+  },
+  "session_log.machine": {
+   "class": "constant/generated"
+  },
+  "session_log.session_id": {
+   "class": "identifier"
+  },
+  "session_log.started_at": {
+   "class": "constant/generated"
+  },
+  "session_log.summary": {
+   "class": "normalised",
+   "row": "session summaries (API-born summaries row)"
+  },
+  "session_transcripts.ended_at": {
+   "class": "constant/generated"
+  },
+  "session_transcripts.host": {
+   "class": "constant/generated"
+  },
+  "session_transcripts.session_id": {
+   "class": "identifier"
+  },
+  "session_transcripts.session_key": {
+   "class": "identifier"
+  },
+  "session_transcripts.transcript_key": {
+   "class": "identifier"
+  },
+  "session_transcripts.transcript_path": {
+   "class": "identifier"
+  },
+  "session_transcripts.updated_at": {
+   "class": "constant/generated"
+  },
+  "stop_cursors.first_failed_at": {
+   "class": "constant/generated"
+  },
+  "stop_cursors.first_line_sha": {
+   "class": "constant/generated"
+  },
+  "stop_cursors.hook": {
+   "class": "constant/generated"
+  },
+  "stop_cursors.last_error": {
+   "class": "guarded",
+   "note": "error text (ruling 55 A)"
+  },
+  "stop_cursors.last_output_at": {
+   "class": "constant/generated"
+  },
+  "stop_cursors.session_id": {
+   "class": "identifier"
+  },
+  "stop_cursors.tail_sha": {
+   "class": "constant/generated"
+  },
+  "stop_cursors.transcript_key": {
+   "class": "identifier"
+  },
+  "stop_cursors.transcript_path": {
+   "class": "identifier"
+  },
+  "stop_items.created_at": {
+   "class": "constant/generated"
+  },
+  "stop_items.fp": {
+   "class": "constant/generated"
+  },
+  "stop_items.kind": {
+   "class": "constant/generated"
+  },
+  "stop_items.payload": {
+   "class": "json-list"
+  },
+  "stop_items.range_sha": {
+   "class": "constant/generated"
+  },
+  "stop_items.session_id": {
+   "class": "identifier"
+  },
+  "stop_items.transcript_key": {
+   "class": "identifier"
+  },
+  "stop_retries.claim_token": {
+   "class": "constant/generated"
+  },
+  "stop_retries.first_failed_at": {
+   "class": "constant/generated"
+  },
+  "stop_retries.first_line_sha": {
+   "class": "constant/generated"
+  },
+  "stop_retries.hook": {
+   "class": "constant/generated"
+  },
+  "stop_retries.last_error": {
+   "class": "guarded",
+   "note": "error text (ruling 55 A)"
+  },
+  "stop_retries.lease_expires_at": {
+   "class": "constant/generated"
+  },
+  "stop_retries.next_retry_at": {
+   "class": "constant/generated"
+  },
+  "stop_retries.range_key": {
+   "class": "identifier"
+  },
+  "stop_retries.range_sha": {
+   "class": "constant/generated"
+  },
+  "stop_retries.session_id": {
+   "class": "identifier"
+  },
+  "stop_retries.source_time": {
+   "class": "constant/generated"
+  },
+  "stop_retries.transcript_key": {
+   "class": "identifier"
+  },
+  "stop_retries.transcript_path": {
+   "class": "identifier"
+  },
+  "utility_signals.last_referenced": {
+   "class": "constant/generated"
+  },
+  "utility_signals.last_surfaced": {
+   "class": "constant/generated"
+  },
+  "utility_signals.path": {
+   "class": "identifier"
+  },
+  "utility_signals.stamp": {
+   "class": "constant/generated"
+  },
+  "vault_flags.flag": {
+   "class": "constant/generated"
+  },
+  "vault_flags.updated_at": {
+   "class": "constant/generated"
+  },
+  "vault_flags.value": {
+   "class": "constant/generated"
+  },
+  "vectors_vec.hash_seq": {
+   "class": "constant/generated"
+  },
+  "worker_leases.acquired_at": {
+   "class": "constant/generated"
+  },
+  "worker_leases.expires_at": {
+   "class": "constant/generated"
+  },
+  "worker_leases.lease_token": {
+   "class": "constant/generated"
+  },
+  "worker_leases.worker_name": {
+   "class": "constant/generated"
+  }
+ }
+}

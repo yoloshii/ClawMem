@@ -29,6 +29,7 @@ import { buildMcpServer } from "../../src/mcp.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const ROOT = "/tmp/clawmem-indexer-boundary-test";
 const CONTENT = `${ROOT}/content`;
 const DB = `${ROOT}/vault.sqlite`;
@@ -56,7 +57,7 @@ function seedDbOnlyMemory(path: string): void {
   const body = `# ${path}\n\nDatabase-created memory with no file behind it.\n`;
   const hash = hashContent(body + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument("_clawmem", path, path, hash, now, now);
 }
 
@@ -277,7 +278,7 @@ describe("D9: a reindex must not undo forget or archival", () => {
     const body = "# L\n\nbody\n";
     const hash = hashContent(body);
     const now = new Date().toISOString();
-    store.insertContent(hash, body, now);
+    seedContent(store.db, hash, body, now);
     store.insertDocument("docs", "legacy.md", "Legacy", hash, now, now);
     // A row archived by a PRE-migration version: inactive, archived_at set, no provenance.
     store.db.prepare("UPDATE documents SET active = 0, archived_at = ?, deactivated_reason = NULL WHERE collection = 'docs' AND path = 'legacy.md'")
@@ -299,7 +300,7 @@ describe("D9: a reindex must not undo forget or archival", () => {
     const body = "# Repaired\n\nbody\n";
     const hash = hashContent(body);
     const now = new Date().toISOString();
-    store.insertContent(hash, body, now);
+    seedContent(store.db, hash, body, now);
     store.insertDocument("docs", "repair.md", "Repaired", hash, now, now);
     // The exact inconsistent state released versions could produce: active AND archived.
     store.db.prepare("UPDATE documents SET active = 1, archived_at = ? WHERE collection = 'docs' AND path = 'repair.md'")

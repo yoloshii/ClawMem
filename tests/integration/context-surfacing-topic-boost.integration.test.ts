@@ -49,13 +49,13 @@ import { join } from "node:path";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { createTestStore } from "../helpers/test-store.ts";
 import {
-  insertContent,
   insertDocument,
   type Store,
 } from "../../src/store.ts";
 import { clearConfigCache } from "../../src/config.ts";
 import { newSurfacingTrace } from "../../src/eval/hook-trace.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // =============================================================================
 // Hermetic env setup
 // =============================================================================
@@ -138,7 +138,7 @@ function seedDoc(
   opts: { confidence?: number; qualityScore?: number; contentType?: string } = {},
 ): void {
   const hash = `hash_${path}`;
-  insertContent(store.db, hash, body, SEED_TS);
+  seedContent(store.db, hash, body, SEED_TS);
   insertDocument(store.db, "test", path, title, hash, SEED_TS, SEED_TS);
   const row = store.db
     .prepare(

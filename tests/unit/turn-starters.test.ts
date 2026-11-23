@@ -38,6 +38,7 @@ import { precompactExtract } from "../../src/hooks/precompact-extract.ts";
 import { promptSha, transcriptKey } from "../../src/stop-pairing.ts";
 import { iso, human, assistant, command, localStdout, meta, writeTranscriptFile, appendEntries, lineStarts, type Entry } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const dirs: string[] = [];
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), "clawmem-724-"));
@@ -477,7 +478,7 @@ function cursorFirstLineSha(path: string): string {
 describe("72.4 F6/F7 feedback attribution closes at openings and pairs notices by identity", () => {
   function seedDoc(store: Store, path: string, title: string): number {
     const hash = `h-${path}-${Math.random().toString(36).slice(2, 8)}`;
-    store.insertContent(hash, `# ${title}\n\nbody`, iso(0));
+    seedContent(store.db, hash, `# ${title}\n\nbody`, iso(0));
     store.insertDocument("notes", path, title, hash, iso(0), iso(0));
     return store.findActiveDocument("notes", path)!.id;
   }

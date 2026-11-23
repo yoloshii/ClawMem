@@ -784,9 +784,12 @@ describe("repository state", () => {
     expect(at("searchVecMatch", "deadline")).toEqual(["MonoDeadline"]);
     expect(r.closure.every((c) => !c.brands.includes("LegacyWallDeadline"))).toBe(true);
   });
-  it("ZERO debt entries after the migration (activation precondition, O1 §6 step 4) and the three baselined diagnostics", () => {
+  it("ZERO debt entries after the migration (activation precondition, O1 §6 step 4) and the two baselined diagnostics", () => {
     expect(r.entries).toEqual([]);
-    expect(r.diagnostics).toHaveLength(3);
-    expect(r.diagnostics.find((d) => d.file === "src/consolidation.ts")?.context).toBe("for(const doc of docs)>try");
+    // v0.43.7 (82.2 D4): the third baselined diagnostic — `src/consolidation.ts`, the untyped MATCH seed of the
+    // surprisal scan — is RETIRED: the seed is now read through `storedVector` (a Float32Array). Two remain.
+    expect(r.diagnostics).toHaveLength(2);
+    expect(r.diagnostics.find((d) => d.file === "src/consolidation.ts")).toBeUndefined();
+    expect(r.diagnostics.map((d) => d.file)).toEqual(["src/conversation-synthesis.ts", "src/conversation-synthesis.ts"]);
   });
 });

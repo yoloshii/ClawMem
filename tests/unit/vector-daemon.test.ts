@@ -8,6 +8,7 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Socket } from "bun";
+import { stubSearchVec } from "../helpers/vec-stub.ts";
 import {
   startVectorDaemon,
   vecDaemonSocketPath,
@@ -121,10 +122,10 @@ describe("vector daemon server", () => {
     expect(handle).not.toBeNull();
     // A raw request WITHOUT remainingBudgetMs ran under no advisory deadline — nothing is attested.
     const resp = await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ query: "q", model: "m", limit: 5 }) + "\n");
-    expect(JSON.parse(resp)).toEqual({ results: [{ hash_seq: "h1_0", distance: 0.1 }] });
+    expect(JSON.parse(resp)).toEqual({ results: [{ hash_seq: "h1_0", distance: 0.1 }], vectorFaultProtocol: "vf1" });
     // The same request WITH a budget ran under the advisory deadline — attested.
     const budgeted = await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ query: "q", model: "m", limit: 5, remainingBudgetMs: 2000 }) + "\n");
-    expect(JSON.parse(budgeted)).toEqual({ results: [{ hash_seq: "h1_0", distance: 0.1 }], deadlineProtocol: DEADLINE_PROTOCOL });
+    expect(JSON.parse(budgeted)).toEqual({ results: [{ hash_seq: "h1_0", distance: 0.1 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
   });
 
   test("single-flight: a second request during an in-flight scan gets {error:'busy'}", async () => {
@@ -140,7 +141,7 @@ describe("vector daemon server", () => {
     const second = await rawRequest(sock, JSON.stringify({ query: "b", model: "m", limit: 5 }) + "\n");
     expect(JSON.parse(second)).toEqual({ error: "busy" });
     release();
-    expect(JSON.parse(await first)).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }] }); // no budget sent → unattested (P2)
+    expect(JSON.parse(await first)).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], vectorFaultProtocol: "vf1" }); // no budget sent → unattested (P2)
   });
 
   test("O1 §4 version skew by FIELD PRESENCE: a pre-O1 absolute `deadlineMs` request is refused WITHOUT scanning and without decoding it", async () => {
@@ -171,7 +172,7 @@ describe("vector daemon server", () => {
     expect(skewLines(logs)[0]).toContain(sock); // names the socket — a multi-vault host has one watcher per vault
     expect(skewLines(logs)[0]).toContain("pre-v0.38");
     await rawRequest(sock, JSON.stringify({ ping: true }) + "\n");
-    expect(JSON.parse(await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5 }) + "\n"))).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }] });
+    expect(JSON.parse(await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5 }) + "\n"))).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], vectorFaultProtocol: "vf1" });
     expect(skewLines(logs)).toHaveLength(1);
     // Once per DAEMON, not per module: a restarted daemon reports its own first refusal.
     handle!.close();
@@ -218,7 +219,7 @@ describe("vector daemon server", () => {
     expect(scanned).toBe(0);
     for (const remainingBudgetMs of [1, MAX_LEG_BUDGET_MS]) {
       const resp = await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5, remainingBudgetMs }) + "\n");
-      expect(JSON.parse(resp)).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL });
+      expect(JSON.parse(resp)).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
     }
     expect(scanned).toBe(2);
   });
@@ -251,7 +252,7 @@ describe("vector daemon server", () => {
     const late = await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5, remainingBudgetMs: 20 }) + "\n");
     expect(JSON.parse(late)).toEqual({ error: "expired" });
     const ok = await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5, remainingBudgetMs: 2000 }) + "\n");
-    expect(JSON.parse(ok)).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL });
+    expect(JSON.parse(ok)).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
   });
 
   test("malformed JSON → {error:'malformed'}", async () => {
@@ -275,10 +276,10 @@ describe("vector daemon server", () => {
     let scans = 0;
     handle = await startVectorDaemon(store, () => {}, async () => { scans++; return []; });
     const line = await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ ping: true }) + "\n");
-    expect(JSON.parse(line)).toEqual({ pong: true, db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1", "deadline-rel-v1"] }); // capability attestation (codex t84; O1 §4 activation)
+    expect(JSON.parse(line)).toEqual({ pong: true, db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1", "deadline-rel-v1", "vf1"] }); // capability attestation (codex t84; O1 §4 activation)
     expect(scans).toBe(0);
     const pong = await daemonPing(store.dbPath, 1000);
-    expect(pong).toEqual({ status: "ok", db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1", "deadline-rel-v1"] });
+    expect(pong).toEqual({ status: "ok", db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1", "deadline-rel-v1", "vf1"] });
     // A ping-shaped frame that is NOT a ping is a normal (malformed) request.
     const notPing = await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ ping: "yes" }) + "\n");
     expect(JSON.parse(notPing)).toEqual({ error: "malformed" });
@@ -319,7 +320,7 @@ describe("vector daemon server", () => {
     // returned null — the daemon silently never bound after any stale socket.
     expect(handle).not.toBeNull();
     expect(logs.join("\n")).not.toContain("socket dir prep failed");
-    expect(await daemonVecMatch(store.dbPath, { query: "q", model: "m", limit: 5 }, dl(1000))).toEqual({ status: "ok", results: [{ hash_seq: "h:0", distance: 0.1 }] });
+    expect(await daemonVecMatch(store.dbPath, { query: "q", model: "m", limit: 5 }, dl(1000))).toEqual({ status: "ok", results: [{ hash_seq: "h:0", distance: 0.1 }], vectorFaults: 0 });
   });
 
   test("close() unlinks the socket → the file is gone", async () => {
@@ -392,7 +393,7 @@ describe("daemonVecMatch (hook client fail-open classification)", () => {
     expect(scans).toBe(0);
     // The same request WITH a budget is served, and its header attests.
     const served = JSON.parse(await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ ...hydratedNoBudget, remainingBudgetMs: 2000 }) + "\n"));
-    expect(served).toEqual({ protocol: "hydrated-v1", count: 0, deadlineProtocol: DEADLINE_PROTOCOL });
+    expect(served).toEqual({ protocol: "hydrated-v1", count: 0, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
     expect(scans).toBe(1);
   });
 
@@ -410,7 +411,7 @@ describe("daemonVecMatch (hook client fail-open classification)", () => {
       expect(scans).toBe(0);
       // A budget that covers the decode delay is served (the delay is spent, not fatal).
       expect(JSON.parse(await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5, remainingBudgetMs: 2000 }) + "\n", 3000)))
-        .toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL });
+        .toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
       expect(scans).toBe(1);
     } finally {
       delete process.env.CLAWMEM_TEST_VEC_REQUEST_DECODE_SYNC_DELAY_MS;
@@ -426,7 +427,7 @@ describe("searchVecBounded routing + client failure modes", () => {
     const store = fakeStore();
     let inproc = 0;
     (store as unknown as { db: unknown }).db = {};
-    (store as unknown as { searchVec: unknown }).searchVec = async () => { inproc++; return []; };
+    stubSearchVec(store, async () => { inproc++; return []; });
     const seen: string[] = [];
     await searchVecBounded(store, "q", "m", 5, undefined, undefined, undefined, undefined, s => seen.push(s));
     expect(seen).toEqual(["absent"]);
@@ -442,10 +443,8 @@ describe("searchVecBounded routing + client failure modes", () => {
   test("no daemon → routes to the in-process store.searchVec", async () => {
     const sentinel = [{ filepath: "clawmem://c/x.md", score: 0.9 }] as unknown as Awaited<ReturnType<typeof searchVecBounded>>;
     let called = false;
-    const store = {
-      dbPath: `/tmp/vd-test-${process.pid}-${seq++}.sqlite`,
-      searchVec: async () => { called = true; return sentinel; },
-    } as unknown as Store;
+    const store = { dbPath: `/tmp/vd-test-${process.pid}-${seq++}.sqlite` } as unknown as Store;
+    stubSearchVec(store, async () => { called = true; return sentinel as never; });
     const out = await searchVecBounded(store, "q", "m", 5);
     expect(called).toBe(true);       // absent socket → in-process path
     expect(out).toBe(sentinel);
@@ -551,7 +550,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
     const lines = await rawRequestAll(vecDaemonSocketPath(store.dbPath), hydratedReqLine());
     expect(lines.length).toBe(3);
     const header = JSON.parse(lines[0]!);
-    expect(header).toEqual({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL });
+    expect(header).toEqual({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
     const entry = JSON.parse(lines[1]!).entry;
     expect(entry.projected).toBe(true);
     expect(entry.bodyLength).toBe(body.length);                       // UTF-16 code units (t87 F3)
@@ -600,13 +599,13 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
     // a deadline attestation does not establish projection capability, and accepting it would hydrate
     // synchronously on the hook's event loop. Capability skew — named — never ok.
     const sock2 = vecDaemonSocketPath(`/tmp/vd-legacy2-${process.pid}.sqlite`);
-    const srv2 = fakeServer(sock2, (s) => { s.write(JSON.stringify({ results: [{ hash_seq: "h_0", distance: 0.5 }], deadlineProtocol: DEADLINE_PROTOCOL }) + "\n"); s.end(); });
+    const srv2 = fakeServer(sock2, (s) => { s.write(JSON.stringify({ results: [{ hash_seq: "h_0", distance: 0.5 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n"); s.end(); });
     cleanups.push(() => srv2.stop());
     const oc2 = await dvm(`/tmp/vd-legacy2-${process.pid}.sqlite`, JSON.parse(hydratedReqLine()), dl(2000));
     expect(oc2).toEqual({ status: "skew", missing: HYDRATED_PROTOCOL });
     // …whereas an attested raw answer to a RAW request is the legitimate raw-hit path: ok + hits.
     const sock3 = vecDaemonSocketPath(`/tmp/vd-legacy3-${process.pid}.sqlite`);
-    const srv3 = fakeServer(sock3, (s) => { s.write(JSON.stringify({ results: [{ hash_seq: "h_0", distance: 0.5 }], deadlineProtocol: DEADLINE_PROTOCOL }) + "\n"); s.end(); });
+    const srv3 = fakeServer(sock3, (s) => { s.write(JSON.stringify({ results: [{ hash_seq: "h_0", distance: 0.5 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n"); s.end(); });
     cleanups.push(() => srv3.stop());
     const oc3 = await dvm(`/tmp/vd-legacy3-${process.pid}.sqlite`, { query: "q", model: "m", limit: 5 } as never, dl(2000));
     expect(oc3.status).toBe("ok");
@@ -615,7 +614,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
 
   test("codex migration r2 #1 at the PRODUCTION search path: a hydrated leg answered with attested RAW hits returns [] as `skew` — client-side hydration never runs", async () => {
     const dbPath = `/tmp/vd-r2p1-${process.pid}.sqlite`;
-    const srv = fakeServer(vecDaemonSocketPath(dbPath), (s) => { s.write(JSON.stringify({ results: [{ hash_seq: "h_0", distance: 0.5 }], deadlineProtocol: DEADLINE_PROTOCOL }) + "\n"); s.end(); });
+    const srv = fakeServer(vecDaemonSocketPath(dbPath), (s) => { s.write(JSON.stringify({ results: [{ hash_seq: "h_0", distance: 0.5 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n"); s.end(); });
     cleanups.push(() => srv.stop());
     let dbTouched = 0;
     const store = { dbPath, get db() { dbTouched++; throw new Error("client-side hydration must not touch the store"); } } as unknown as Store;
@@ -655,7 +654,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
           const nl = s.data.buf.indexOf("\n");
           if (nl < 0) return;
           seen = JSON.parse(s.data.buf.slice(0, nl)) as Record<string, unknown>;
-          s.write(JSON.stringify({ results: [], deadlineProtocol: DEADLINE_PROTOCOL }) + "\n"); s.end();
+          s.write(JSON.stringify({ results: [], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n"); s.end();
         },
       },
     });
@@ -676,7 +675,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
     const sock = vecDaemonSocketPath(dbPath);
     const enc = new TextEncoder();
     const entryLine = JSON.stringify({ entry: makeEntry({ title: "žluťoučký kůň 認証" }) });
-    const full = enc.encode(JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" + entryLine + "\n" + JSON.stringify({ end: true }) + "\n");
+    const full = enc.encode(JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" + entryLine + "\n" + JSON.stringify({ end: true }) + "\n");
     // Split INSIDE the multibyte title (find a byte >= 0x80 and cut mid-sequence).
     let cut = -1;
     for (let i = 0; i < full.length - 1; i++) { if (full[i]! >= 0xc0 && full[i + 1]! >= 0x80) { cut = i + 1; break; } }
@@ -695,7 +694,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
     const dbPath = `/tmp/vd-badutf-${process.pid}.sqlite`;
     const sock = vecDaemonSocketPath(dbPath);
     const enc = new TextEncoder();
-    const head = enc.encode(JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" + '{"entry":{"title":"');
+    const head = enc.encode(JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" + '{"entry":{"title":"');
     const tail = enc.encode('"}}\n' + JSON.stringify({ end: true }) + "\n");
     const payload = new Uint8Array(head.length + 1 + tail.length);
     payload.set(head, 0); payload[head.length] = 0xff; payload.set(tail, head.length + 1);
@@ -707,7 +706,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
 
   test("byte cap, not char cap (t87 F3): a line under the cap in UTF-16 units but over it in UTF-8 bytes is rejected pre-parse; the same char count in ASCII passes", async () => {
     const mkLines = (fat: string): string =>
-      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 1, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: makeEntry({ rerankText: fat }) }) + "\n" +
       JSON.stringify({ end: true }) + "\n";
     // ~30k CJK chars ≈ 90 KB UTF-8 (> 64 KiB entry cap) but only ~30k UTF-16 units.
@@ -734,7 +733,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
   test("t88 lock (a): an inter-entry (async) stall lets the deadline WIN — later entries are never parsed", async () => {
     const dbPath = `/tmp/vd-inter-${process.pid}.sqlite`;
     const lines =
-      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 3, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 3, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: makeEntry({ docid: "e1" }) }) + "\n" +
       JSON.stringify({ entry: makeEntry({ docid: "e2" }) }) + "\n" +
       JSON.stringify({ entry: makeEntry({ docid: "e3" }) }) + "\n" +
@@ -763,7 +762,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
     const dbPath = `/tmp/vd-max-${process.pid}.sqlite`;
     const fat = "a".repeat(60_000); // entry line ≈ 60 KB < 64 KiB cap
     const lines =
-      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 3, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 3, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: makeEntry({ docid: "m1", rerankText: fat }) }) + "\n" +
       JSON.stringify({ entry: makeEntry({ docid: "m2", rerankText: fat }) }) + "\n" +
       JSON.stringify({ entry: makeEntry({ docid: "m3", rerankText: fat }) }) + "\n" +
@@ -780,7 +779,7 @@ describe("hydrated-v1 wire protocol (codex #28 t86–t88)", () => {
   test("hydrated state machine fails closed on a count mismatch (end before all entries)", async () => {
     const dbPath = `/tmp/vd-count-${process.pid}.sqlite`;
     const lines =
-      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 2, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: 2, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: makeEntry() }) + "\n" +
       JSON.stringify({ end: true }) + "\n";
     const srv = fakeServer(vecDaemonSocketPath(dbPath), (s) => { s.write(lines); s.end(); });
@@ -819,7 +818,7 @@ describe("t89 remedies", () => {
 
   test("S1: a malformed RAW hit list is never ok — degrades to error/FTS", async () => {
     const dbPath = `/tmp/vd-s1raw-${process.pid}.sqlite`;
-    serveLines(dbPath, JSON.stringify({ results: [{ hash_seq: 7, distance: "x" }], deadlineProtocol: DEADLINE_PROTOCOL }) + "\n");
+    serveLines(dbPath, JSON.stringify({ results: [{ hash_seq: 7, distance: "x" }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n");
     // A RAW request: the hit-list validation guards the raw-hit path. (To a HYDRATED request any raw answer is
     // refused earlier, as capability skew — codex migration r2 #1.)
     expect((await daemonVecMatch(dbPath, { query: "q", model: "m", limit: 5 } as never, dl(2000))).status).toBe("error");
@@ -829,7 +828,7 @@ describe("t89 remedies", () => {
     const dbPath = `/tmp/vd-s1ent-${process.pid}.sqlite`;
     const bad = entryOk(); delete bad.rerankText;
     serveLines(dbPath,
-      JSON.stringify({ protocol: "hydrated-v1", count: 1, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: "hydrated-v1", count: 1, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: bad }) + "\n" +
       JSON.stringify({ end: true }) + "\n");
     expect((await daemonVecMatch(dbPath, req() as never, dl(2000))).status).toBe("error");
@@ -838,7 +837,7 @@ describe("t89 remedies", () => {
   test("S1: a hydrated entry with a wrong-typed field (bodyLength string) is never ok-hydrated", async () => {
     const dbPath = `/tmp/vd-s1typ-${process.pid}.sqlite`;
     serveLines(dbPath,
-      JSON.stringify({ protocol: "hydrated-v1", count: 1, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: "hydrated-v1", count: 1, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: entryOk({ bodyLength: "10" }) }) + "\n" +
       JSON.stringify({ end: true }) + "\n");
     expect((await daemonVecMatch(dbPath, req() as never, dl(2000))).status).toBe("error");
@@ -847,7 +846,7 @@ describe("t89 remedies", () => {
   test("S1: a fractional header count is a malformed peer — error", async () => {
     const dbPath = `/tmp/vd-s1cnt-${process.pid}.sqlite`;
     serveLines(dbPath,
-      JSON.stringify({ protocol: "hydrated-v1", count: 1.5, deadlineProtocol: DEADLINE_PROTOCOL }) + "\n" +
+      JSON.stringify({ protocol: "hydrated-v1", count: 1.5, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }) + "\n" +
       JSON.stringify({ entry: entryOk() }) + "\n" +
       JSON.stringify({ end: true }) + "\n");
     expect((await daemonVecMatch(dbPath, req() as never, dl(2000))).status).toBe("error");
@@ -876,7 +875,7 @@ describe("t89 remedies", () => {
     }
     expect(scans).toBe(0);
     const okLine = await rawRequest(sock, JSON.stringify(req({ limit: 16 })) + "\n");
-    expect(JSON.parse(okLine)).toEqual({ protocol: "hydrated-v1", count: 0, deadlineProtocol: DEADLINE_PROTOCOL });
+    expect(JSON.parse(okLine)).toEqual({ protocol: "hydrated-v1", count: 0, deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" });
     expect(scans).toBe(1);
   });
 
@@ -893,7 +892,7 @@ describe("t89 remedies", () => {
     // Immediately after: NOT busy — the expired answer released single-flight; a raw
     // request (no projection, no budget) is served normally — and UNATTESTED (codex migration r1 P2).
     const second = JSON.parse(await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5 }) + "\n", 3000));
-    expect(second).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }] });
+    expect(second).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }], vectorFaultProtocol: "vf1" });
   });
 
   test("t90 S1 (O1): a malformed remainingBudgetMs (string) is refused as malformed on BOTH raw and hydrated requests — it never reaches the scan; a `deadlineMs` of any shape is version_skew", async () => {
@@ -965,7 +964,7 @@ describe("t89 remedies", () => {
     const hHydrated = await vdHealth(dbPath, 2000);
     hydratedOnly.stop();
     expect(hHydrated.status).toBe("live-raw"); // a daemon that ignores the relative budget is not the certified contract
-    const full = fakeServer(sock, (s) => { s.write(JSON.stringify({ pong: true, db: dbPath, pid: 77, protocols: ["hydrated-v1", "deadline-rel-v1"] }) + "\n"); s.end(); });
+    const full = fakeServer(sock, (s) => { s.write(JSON.stringify({ pong: true, db: dbPath, pid: 77, protocols: ["hydrated-v1", "deadline-rel-v1", "vf1"] }) + "\n"); s.end(); });
     cleanups2.push(() => full.stop());
     expect((await vdHealth(dbPath, 2000)).status).toBe("live");
   });

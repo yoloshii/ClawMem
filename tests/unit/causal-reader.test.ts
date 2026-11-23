@@ -24,6 +24,7 @@ import { capCausalWire, CAUSAL_READER_MAX_BYTES } from "../../src/causal-reader.
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { createHash, randomUUID } from "node:crypto";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 let dir: string;
 let client: Client;
@@ -40,7 +41,7 @@ function hashOf(path: string): string {
 function mkDoc(path: string, opts?: { active?: boolean; invalidated?: boolean }): number {
   const hash = hashOf(path);
   const ts = "2026-08-01T00:00:00.000Z";
-  (store as any).insertContent(hash, `body of ${path}`, ts);
+  seedContent(store.db, hash, `body of ${path}`, ts);
   (store as any).insertDocument("_clawmem", path, path, hash, ts, ts);
   const id = ((store.db.prepare(`SELECT id FROM documents WHERE collection = '_clawmem' AND path = ?`).get(path)) as { id: number }).id;
   if (opts?.active === false) store.db.prepare(`UPDATE documents SET active = 0 WHERE id = ?`).run(id);

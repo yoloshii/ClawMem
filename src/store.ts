@@ -14,10 +14,15 @@
 
 import { monoNow, deadlineAfter, earliest, isExpired, timeoutSignal, type DurationMs, type MonoDeadline, isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { COMPACTION_STATE_DDL, fenceEvolutionWriters, notLegacyArtifactSql, notLegacyTaintedEvolutionSql, resetLegacyDerivedNotes } from "./compaction-state.ts";
-import { clampRelationWeight } from "./relation-weight.ts";
+import { clampRelationWeight, assertSemanticThreshold } from "./relation-weight.ts";
 import { freshStamp, hasStopStamps, installStopPipelineSchema, stampAssign, stampInsert } from "./stop-schema.ts";
 import { reconcileRestoredSessionDocs } from "./stop-session-docs.ts";
 import { Database } from "bun:sqlite";
+import { openDatabase } from "./sqlite-guard.ts";
+import { normalizedContent, refuseLeadingMark, stripLeadingMarks } from "./text-policy.ts";
+import { parseSelectorList, refuseMarkedSelector, trimAsciiSpace } from "./selector.ts";
+import { insertContent } from "./content-insert.ts";
+export { insertContent, ContentContractError } from "./content-insert.ts";
 import { Glob } from "bun";
 import { realpathSync, existsSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
@@ -181,7 +186,9 @@ export type VirtualPath = {
  * - :linenum suffix (should be parsed separately before calling this)
  */
 export function normalizeVirtualPath(input: string): string {
-  let path = input.trim();
+  // 82.3 D7: identity-preserving — only ASCII padding is stripped. `String.trim()` also removes U+FEFF, which
+  // would read a mark-led name as the name without it.
+  let path = trimAsciiSpace(input);
 
   // Handle clawmem:// with extra slashes: clawmem:////collection/path -> clawmem://collection/path
   if (path.startsWith('clawmem:')) {
@@ -241,7 +248,7 @@ export function buildVirtualPath(collectionName: string, path: string): string {
  * handled separately by checking if the first component is a collection name.
  */
 export function isVirtualPath(path: string): boolean {
-  const trimmed = path.trim();
+  const trimmed = trimAsciiSpace(path);                                   // 82.3 D7: see normalizeVirtualPath
 
   // Explicit clawmem:// prefix (with any number of slashes)
   if (trimmed.startsWith('clawmem:')) return true;
@@ -1431,7 +1438,8 @@ const contextUsageHasDedupeKeyCache = new WeakMap<Database, boolean>();
  * explicit clearAllEmbeddings (gated behind `embed --force`). See
  * INCIDENT-2026-06-22 §12 + EMBED-LEASE-RENEWAL-DESIGN.md.
  */
-export class FatalVectorError extends Error {}
+import { FatalVectorError, VecPoisonError, EmbedEnvelopeError, assertStorableTyped, storedVector, storableVector, usableDistance } from "./vector-guard.ts";
+export { FatalVectorError, VecPoisonError, EmbedEnvelopeError };
 
 /**
  * Rethrow a fatal vector error (dimension / model / schema mismatch) so a searchVec() fallback
@@ -1513,7 +1521,7 @@ export type LeaseGuard = { workerName: string; token: string };
  * can interleave a reclaim between the check and the mutation. No-op when leaseGuard
  * is omitted (non-embed callers).
  */
-function assertLeaseHeld(db: Database, leaseGuard?: LeaseGuard): void {
+export function assertLeaseHeld(db: Database, leaseGuard?: LeaseGuard): void {
   if (!leaseGuard) return;
   const row = db.prepare(`SELECT lease_token FROM worker_leases WHERE worker_name = ?`).get(leaseGuard.workerName) as { lease_token: string } | null;
   if (!row || row.lease_token !== leaseGuard.token) {
@@ -1726,6 +1734,7 @@ export type Store = {
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => Promise<SearchResult[]>;
+  searchVecWithFaults: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => Promise<VecSearchResult>;
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
   // Query expansion & reranking
@@ -1792,7 +1801,14 @@ export type Store = {
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
   // Embed state tracking
-  markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => void;
+  /** v0.43.7 (BACKLOG 82.2): returns the ids of the document rows whose `embed_attempts` it incremented — the charge receipt. */
+  markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => number[];
+  /**
+   * v0.43.7 (BACKLOG 82.2): give back ONE attempt and record `error` on exactly the rows of a charge receipt that
+   * still have that hash, are active and are `pending`. One immediate transaction that asserts the lease. Returns
+   * the number of rows refunded.
+   */
+  refundEmbedAttempt: (hash: string, chargedIds: number[], error: string, leaseGuard?: LeaseGuard) => number;
   markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => void;
   markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => void;
   getEmbedStats: () => { pending: number; synced: number; failed: number };
@@ -1805,6 +1821,8 @@ export type Store = {
   buildTemporalBackbone: () => number;
   countActiveRelations: (relationType: string) => number;
   buildSemanticGraph: (threshold?: number) => Promise<number>;
+  /** As `buildSemanticGraph`, with the count of neighbour rows skipped for an unusable distance (82.2 D4, ruling 28 A). */
+  buildSemanticGraphDetailed: (threshold?: number) => Promise<SemanticGraphBuild>;
 
   // A-MEM: Self-Evolving Memory
   constructMemoryNote: (llm: LlamaCpp, docId: number) => Promise<any>;
@@ -1865,8 +1883,8 @@ export type Store = {
 export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTimeout?: number }): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
   const db = opts?.readonly
-    ? new Database(resolvedPath, { readonly: true })
-    : new Database(resolvedPath);
+    ? openDatabase(resolvedPath, { readonly: true })
+    : openDatabase(resolvedPath);
   if (!opts?.readonly) {
     initializeDatabase(db, opts?.busyTimeout ?? 15000);
   } else {
@@ -1927,6 +1945,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
     searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadline),
+    searchVecWithFaults: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => searchVecWithFaults(db, query, model, limit, collectionId, collections, dateRange, deadline),
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
     // Query expansion & reranking
@@ -1967,6 +1986,14 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       const now = isoNow();
       db.transaction(() => {
         assertLeaseHeld(db, leaseGuard);
+        // v0.43.7 (BACKLOG 82.2) backstop, BEFORE the DELETE: a refused save leaves the previous baseline as it was.
+        // (`JSON.stringify` stores a NaN margin as `null`, which the reader refuses.)
+        for (const p of probes) assertStorableTyped(p.embedding, { context: `canary probe ${p.probeId}` });
+        for (const [name, value] of Object.entries(pairMargins)) {
+          if (typeof value !== "number" || !Number.isFinite(value)) {
+            throw new VecPoisonError("non-finite", "endpoint", { context: `canary margin ${name}` });
+          }
+        }
         db.prepare(`DELETE FROM embed_canary WHERE profile_key = ?`).run(profileKey);
         const ins = db.prepare(`INSERT INTO embed_canary (probe_id, profile_key, embedding, pair_margins, embedded_at) VALUES (?, ?, ?, ?, ?)`);
         for (const p of probes) {
@@ -1978,12 +2005,19 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       const rows = db.prepare(`SELECT probe_id, embedding, pair_margins, embedded_at FROM embed_canary WHERE profile_key = ?`).all(profileKey) as { probe_id: string; embedding: Uint8Array; pair_margins: string; embedded_at: string }[];
       if (rows.length === 0) return null;
       const probes = new Map<string, Float32Array>();
+      // v0.43.7 (BACKLOG 82.2): a stored baseline is read strictly — a probe that is not a usable vector, or a
+      // margin that is not a finite number, is refused (source "stored"), never compared against.
       for (const r of rows) {
-        const buf = new Uint8Array(r.embedding);
-        probes.set(r.probe_id, new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4));
+        probes.set(r.probe_id, storedVector(r.embedding, undefined, { context: `canary baseline probe ${r.probe_id}` }));
       }
       let pairMargins: Record<string, number> = {};
       try { pairMargins = JSON.parse(rows[0]!.pair_margins); } catch { /* malformed → empty */ }
+      if (!pairMargins || typeof pairMargins !== "object" || Array.isArray(pairMargins)) pairMargins = {};
+      for (const [name, value] of Object.entries(pairMargins)) {
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          throw new VecPoisonError("non-finite", "stored", { context: `canary baseline margin ${name}` });
+        }
+      }
       return { probes, pairMargins, embeddedAt: rows[0]!.embedded_at };
     },
     // Lease-fenced (T9-M4): a holder reclaimed during an async end probe must not set or
@@ -2037,10 +2071,22 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       // getHashesNeedingFragments). The completion setters below are state-only — no
       // further increment — so a start + a failure for the same attempt cannot
       // double-count the retry budget.
+      let charged: number[] = [];
       db.transaction(() => {
         assertLeaseHeld(db, leaseGuard);
-        db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(hash);
+        charged = (db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1 RETURNING id`).all(hash) as { id: number }[]).map(r => r.id);
       }).immediate();
+      return charged;
+    },
+    refundEmbedAttempt: (hash: string, chargedIds: number[], error: string, leaseGuard?: LeaseGuard) => {
+      let refunded = 0;
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        // RETURNING, not `changes`: the documents triggers add their own row changes to that count.
+        const stmt = db.prepare(`UPDATE documents SET embed_attempts = MAX(COALESCE(embed_attempts, 0) - 1, 0), embed_error = ? WHERE id = ? AND hash = ? AND active = 1 AND embed_state = 'pending' RETURNING id`);
+        for (const id of chargedIds) refunded += stmt.all(error, id, hash).length;
+      }).immediate();
+      return refunded;
     },
     markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => {
       // Success resets the retry budget: embed_attempts counts CONSECUTIVE failures
@@ -2077,6 +2123,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     buildTemporalBackbone: () => buildTemporalBackbone(db),
     countActiveRelations: (relationType: string) => countActiveRelations(db, relationType),
     buildSemanticGraph: (threshold?: number) => buildSemanticGraph(db, threshold),
+    buildSemanticGraphDetailed: (threshold?: number) => buildSemanticGraphDetailed(db, threshold),
 
     // A-MEM: Self-Evolving Memory
     constructMemoryNote: (llm: LlamaCpp, docId: number) => constructMemoryNote({ db, dbPath: resolvedPath } as Store, llm, docId),
@@ -2094,7 +2141,12 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // SPO knowledge graph
     addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => {
-      const pred = predicate.toLowerCase().replace(/\s+/g, "_");
+      // 82.3 D7: the predicate, the object literal and the provenance fact are normalised fields — every leading
+      // byte-order mark is removed BEFORE the canonical form and the dedup lookup are built (`\s` matches U+FEFF,
+      // so an unstripped one would become a leading underscore of the predicate).
+      const pred = stripLeadingMarks(predicate).toLowerCase().replace(/\s+/g, "_");
+      if (objectLiteral !== null) objectLiteral = stripLeadingMarks(objectLiteral);
+      const sourceFact = options?.sourceFact == null ? null : stripLeadingMarks(options.sourceFact);
       const now = isoNow();
       const objClause = objectEntityId
         ? "object_entity_id = ? AND object_literal IS NULL"
@@ -2108,7 +2160,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         db.prepare(`
           INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
           VALUES (?, ?, ?, ?)
-        `).run(tripleId, options?.sourceDocId ?? null, options?.sourceFact ?? null, now);
+        `).run(tripleId, options?.sourceDocId ?? null, sourceFact, now);
       };
       const txn = db.transaction(() => {
         const existing = db.prepare(
@@ -2126,7 +2178,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           subjectEntityId, pred, objectEntityId, objectLiteral,
           options?.validFrom ?? null, options?.validTo ?? null,
           options?.confidence ?? 1.0, options?.sourceDocId ?? null,
-          options?.sourceFact ?? null, now
+          sourceFact, now
         );
         const tripleId = Number(result.lastInsertRowid);
         insertEvidence(tripleId);
@@ -2136,7 +2188,8 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     },
 
     invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => {
-      const pred = predicate.toLowerCase().replace(/\s+/g, "_");
+      const pred = stripLeadingMarks(predicate).toLowerCase().replace(/\s+/g, "_");   // 82.3 D7: the same key as addTriple
+      if (objectLiteral !== null) objectLiteral = stripLeadingMarks(objectLiteral);
       const ended = endedDate || isoNow().slice(0, 10);
       const objClause = objectEntityId
         ? "object_entity_id = ? AND object_literal IS NULL"
@@ -2925,15 +2978,6 @@ export function extractTitle(content: string, filename: string): string {
 // =============================================================================
 
 /**
- * Insert content into the content table (content-addressable storage).
- * Uses INSERT OR IGNORE so duplicate hashes are skipped.
- */
-export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(hash, content, createdAt);
-}
-
-/**
  * Insert a new document into the documents table.
  */
 /**
@@ -2957,7 +3001,7 @@ export function insertDocument(
   origin: DocumentOrigin = "api"
 ): void {
   // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
-  const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  const safeTitle = stripLeadingMarks((typeof title === "string") ? title : String(title ?? "Untitled"));   // 82.3 D7: normalised
   // origin defaults to 'api': a caller this parameter has not reached yet becomes exempt
   // from filesystem reconciliation — stale-active at worst, never a destroyed DB-born row.
   // 62.1 D9: every document this version writes carries a doc stamp (the fence checks it on the Stop hooks' paths).
@@ -3036,11 +3080,12 @@ const DEDUP_WINDOW_MINUTES = 30;
 export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryResult {
   const now = isoNow();
   const authoredAt = normalizeIsoTimestamp(params.authoredAt);
-  const payload = params.semanticPayload || params.body;
+  // BACKLOG 82.3, D7 — the body, the title and the dedup payload are normalised fields: every leading byte-order
+  // mark is removed BEFORE a hash or a dedup key is built, so the hash is the hash of what is stored.
+  const { body, hash: bodyHash } = normalizedContent(params.body);
+  const title = stripLeadingMarks(params.title);
+  const payload = stripLeadingMarks(params.semanticPayload ?? "") || body;
   const normHash = hashNormalized(payload);
-  const bodyHasher = new Bun.CryptoHasher("sha256");
-  bodyHasher.update(params.body);
-  const bodyHash = bodyHasher.digest("hex");
 
   // --- Ownership + lifecycle preflight (before ANY write, including dedup's counters) ---
   // Rejecting later would leak writes: an orphaned content row on a rejected insert, or a
@@ -3081,7 +3126,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   // target (it also never carries a normalized_hash today — belt and suspenders), and a
   // NULL-origin candidate is adopted 'api' by the counter update (touch-adoption).
   const dedupRow = db.prepare(`
-    SELECT id, duplicate_count
+    SELECT id, duplicate_count, hash
     FROM documents
     WHERE active = 1
       AND collection = ?
@@ -3096,7 +3141,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     params.contentType,
     normHash,
     `-${DEDUP_WINDOW_MINUTES} minutes`
-  ) as { id: number; duplicate_count: number } | null;
+  ) as { id: number; duplicate_count: number; hash: string } | null;
 
   if (dedupRow) {
     // Increment duplicate_count and update last_seen_at. §51.1: a validated
@@ -3131,6 +3176,9 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     }
 
     if (dedupChanges > 0) {
+      // 84 A (Codex T2 S1): a memory whose body row an older version stored with other bytes under this very hash is
+      // repaired here too — insertContent rewrites it (and its search rows) only when its bytes differ.
+      if (dedupRow.hash === bodyHash) insertContent(db, bodyHash, body, now);
       return {
         action: 'deduplicated',
         docId: dedupRow.id,
@@ -3147,8 +3195,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   // so a caller-held transaction is safe.
   const writePhase = db.transaction((): SaveMemoryResult => {
     // Store content
-    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-      .run(bodyHash, params.body, now);
+    insertContent(db, bodyHash, body, now);
 
     // Insert document row (62.1 D9: doc-stamped, like every document write of this version)
     const st = stampInsert(db, "doc_stamp");
@@ -3162,7 +3209,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       `).run(
         params.collection,
         params.path,
-        params.title,
+        title,
         bodyHash,
         now,
         now,
@@ -3202,7 +3249,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
             : "";
           const stu = stampAssign(db, "doc_stamp");
           const updateVals: (string | number | null)[] = [
-            bodyHash, params.title, now, params.contentType,
+            bodyHash, title, now, params.contentType,
             params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
             now,
           ];
@@ -3404,7 +3451,7 @@ export function reactivateDocument(
   hash: string,
   modifiedAt: string
 ): boolean {
-  const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  const safeTitle = stripLeadingMarks((typeof title === "string") ? title : String(title ?? "Untitled"));   // 82.3 D7: normalised
   // The reset_embed_on_hash_change trigger resets embed_state/attempts/error iff the
   // hash actually changes, so re-adding unchanged content preserves its valid vectors.
   //
@@ -3432,7 +3479,7 @@ export function updateDocumentTitle(
   modifiedAt: string
 ): void {
   db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
-    .run(title, modifiedAt, documentId);
+    .run(stripLeadingMarks(title), modifiedAt, documentId);   // 82.3 D7: a title is a normalised field
 }
 
 /**
@@ -3446,7 +3493,7 @@ export function updateDocument(
   hash: string,
   modifiedAt: string
 ): void {
-  const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  const safeTitle = stripLeadingMarks((typeof title === "string") ? title : String(title ?? "Untitled"));   // 82.3 D7: normalised
   // The reset_embed_on_hash_change trigger resets embed_state/attempts/error when the
   // hash actually changes, so this only needs to set the content fields.
   const st = stampAssign(db, "doc_stamp");   // 62.1 D9
@@ -3699,6 +3746,7 @@ function levenshtein(a: string, b: string): number {
  * If multiple documents match the same short hash (collision), returns the first one.
  */
 export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
+  refuseLeadingMark(docid, "docid");                                      // 82.3 D7: a selector — refused, never stripped
   // Normalize: remove leading # if present
   const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
 
@@ -4282,6 +4330,60 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
   verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
 }
 
+/** One row of a vector scan whose distance `usableDistance` accepted (already clamped into [0, 2]). */
+export type VecHit = { hash_seq: string; distance: number };
+
+/**
+ * What a vector scan returns (v0.43.7, BACKLOG 82.2 D4): the usable hits AND the count of rows whose returned
+ * distance was not usable (NULL, an infinity, outside [0, 2]) — carried in the value, so no adapter can lose it.
+ * `scanned` is the UNFILTERED row count the MATCH returned (what exhaustion is decided on).
+ */
+export type VecScan = { hits: VecHit[]; vectorFaults: number; firstFault?: string; scanned: number };
+
+export const emptyVecScan = (): VecScan => ({ hits: [], vectorFaults: 0, scanned: 0 });
+
+let vectorFaultWarned = false;
+
+/** The one place a returned distance is judged: unusable rows are dropped and counted; one warning per process. */
+export function screenVecHits(rows: readonly { hash_seq: string; distance: unknown }[]): VecScan {
+  const hits: VecHit[] = [];
+  let vectorFaults = 0;
+  let firstFault: string | undefined;
+  for (const row of rows) {
+    const distance = usableDistance(row.distance);
+    if (distance === null) {
+      if (vectorFaults++ === 0) firstFault = row.hash_seq;
+      continue;
+    }
+    hits.push({ hash_seq: row.hash_seq, distance });
+  }
+  if (firstFault === undefined) return { hits, vectorFaults, scanned: rows.length };
+  if (!vectorFaultWarned) {
+    vectorFaultWarned = true;
+    console.warn(`[clawmem] vector search skipped ${vectorFaults} stored vector(s) whose distance is not usable (first: ${firstFault}); \`clawmem doctor\` lists them`);
+  }
+  return { hits, vectorFaults, firstFault, scanned: rows.length };
+}
+
+/** The distances a hydrate path may use. A hit that was not screened is a programming fault: it throws, it is
+ *  never published as a score. */
+function screenedDistances(vecResults: readonly { hash_seq: string; distance: number }[]): Map<string, number> {
+  const distances = new Map<string, number>();
+  for (const hit of vecResults) {
+    const distance = usableDistance(hit.distance);
+    if (distance === null) throw new Error(`vector hydrate: unusable distance for ${hit.hash_seq} (a hit that was not screened)`);
+    distances.set(hit.hash_seq, distance);
+  }
+  return distances;
+}
+
+/** The hydrate queries are restricted to the keys they were given, so a missing key is a programming fault. */
+function distanceOf(distances: Map<string, number>, hashSeq: string): number {
+  const distance = distances.get(hashSeq);
+  if (distance === undefined) throw new Error(`vector hydrate: no distance for ${hashSeq} (a row outside the keys the query was given)`);
+  return distance;
+}
+
 // Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the monotonic
 // deadline (O1), then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
 // collection/date filtering is a Step-2 concern. Split out (BACKLOG Source 46) so the vector-query
@@ -4291,12 +4393,12 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
 // request answered by an attesting daemon — a legacy daemon's raw answer is `skew` since O1 §4) and
 // in the in-process fallback. In-process searchVec() below composes the two halves, so its public
 // contract is unchanged.
-export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadline?: MonoDeadline): Promise<{ hash_seq: string; distance: number }[]> {
+export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadline?: MonoDeadline): Promise<VecScan> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) return [];
+  if (!tableExists) return emptyVecScan();
 
   const embedResult = await getEmbedding(query, model, true, deadline);
-  if (!embedResult) return [];
+  if (!embedResult) return emptyVecScan();
 
   // W1: read-path embedding-model consistency gate + dimension check via the SHARED guard
   // (same guard the eval-only precomputed-vector entry runs — the two paths cannot diverge).
@@ -4311,7 +4413,7 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
   // If the budget already elapsed during the async embed above, bail here so a timed-out
   // vector leg cannot resume and re-block the hook after it fell back to FTS.
-  if (deadline !== undefined && isExpired(deadline)) return [];
+  if (deadline !== undefined && isExpired(deadline)) return emptyVecScan();
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -4319,11 +4421,29 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  return db.prepare(`
+  const matchStmt = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `);
+  const wanted = limit * 3;
+  let k = wanted;
+  let scan = screenVecHits(matchStmt.all(embedding, k) as { hash_seq: string; distance: unknown }[]);
+  // v0.43.7 (82.2 D4, operator ruling 18 A): rows whose distance is not usable can take the FIRST places of a scan
+  // (a -Infinity distance sorts first). A scan that met one rescans deeper until it holds what a healthy scan would
+  // give — inside the escalation cap and the caller's deadline. A healthy vault is scanned once, as before.
+  // The fault count and the first fault are STICKY across rounds (Codex T1 P2), as in the detailed path: a later round
+  // can return other rows (a concurrent repair between two statements) and must not erase what an earlier one met.
+  let vectorFaults = scan.vectorFaults;
+  let firstFault = scan.firstFault;
+  while (vectorFaults > 0 && scan.hits.length < wanted && scan.scanned >= k && k < VEC_ESCALATION_HARD_CAP
+    && !(deadline !== undefined && isExpired(deadline))) {
+    k = Math.min(k * 3, VEC_ESCALATION_HARD_CAP);
+    scan = screenVecHits(matchStmt.all(embedding, k) as { hash_seq: string; distance: unknown }[]);
+    vectorFaults = Math.max(vectorFaults, scan.vectorFaults);
+    firstFault ??= scan.firstFault;
+  }
+  return firstFault === undefined ? { ...scan, vectorFaults } : { ...scan, vectorFaults, firstFault };
 }
 
 // Step 2 of vector search: hydrate raw {hash_seq, distance} hits into SearchResult[] via indexed
@@ -4337,7 +4457,7 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
 
   // Step 2: Get chunk info and document data
   const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+  const distanceMap = screenedDistances(vecResults);
 
   // Build query for document lookup (includes fragment metadata)
   const placeholders = hashSeqs.map(() => '?').join(',');
@@ -4386,7 +4506,7 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
   // Combine with distances and dedupe by filepath (keep best-scoring fragment per doc)
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
   for (const row of docRows) {
-    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const distance = distanceOf(distanceMap, row.hash_seq);
     const existing = seen.get(row.filepath);
     if (!existing || distance < existing.bestDist) {
       seen.set(row.filepath, { row, bestDist: distance });
@@ -4508,7 +4628,7 @@ export function projectVecResults(
   if (vecResults.length === 0) return [];
 
   const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+  const distanceMap = screenedDistances(vecResults);
 
   const run = db.transaction(() => {
     // PHASE 1 — metadata + byte length only; content.doc is NEVER selected here.
@@ -4554,7 +4674,7 @@ export function projectVecResults(
     // Dedup by filepath keeping the best-scoring fragment — hydrateVecResults' exact rule.
     const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
     for (const row of docRows) {
-      const distance = distanceMap.get(row.hash_seq) ?? 1;
+      const distance = distanceOf(distanceMap, row.hash_seq);
       const existing = seen.get(row.filepath);
       if (!existing || distance < existing.bestDist) {
         seen.set(row.filepath, { row, bestDist: distance });
@@ -4615,9 +4735,26 @@ export function projectVecResults(
 // (hydrated-v1: the scan AND a hydrateVecResults-equivalent projection both run in the daemon),
 // falling back to client-side hydrateVecResults only on the raw-hit path — so neither the
 // blocking MATCH nor, under hydrated-v1, the hydration ever runs on the hook's event loop.
+//
+// v0.43.7 (82.2 D4, operator ruling 16 B): `searchVecWithFaults` is the form every route under `src/` calls — it
+// returns the results WITH the count of stored vectors the scan skipped as unusable, so the route can say so.
+// `searchVec` keeps its list return for callers outside this tree; it drops the count (the once-per-process warning
+// still prints), and the call-site census refuses a caller of it under `src/`.
+export interface VecSearchResult {
+  results: SearchResult[];
+  /** Stored vectors this scan met whose returned distance was not usable — dropped, never scored. */
+  vectorFaults: number;
+  firstFault?: string;
+}
+
+export async function searchVecWithFaults(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline): Promise<VecSearchResult> {
+  const scan = await searchVecMatch(db, query, model, limit, deadline);
+  const results = hydrateVecResults(db, scan.hits, limit, collectionId, collections, dateRange);
+  return scan.firstFault === undefined ? { results, vectorFaults: scan.vectorFaults } : { results, vectorFaults: scan.vectorFaults, firstFault: scan.firstFault };
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline): Promise<SearchResult[]> {
-  const vecResults = await searchVecMatch(db, query, model, limit, deadline);
-  return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
+  return (await searchVecWithFaults(db, query, model, limit, collectionId, collections, dateRange, deadline)).results;
 }
 
 // =============================================================================
@@ -4653,9 +4790,13 @@ export interface VecSearchDetailedOpts {
 export interface VecSearchDetailedResult {
   results: SearchResult[];
   degraded: boolean;
-  degradedReason?: "excluded-dominant" | "cap-truncation";
+  degradedReason?: "excluded-dominant" | "cap-truncation" | "vector-fault";
   scannedFragments: number;
   excludedDocsSeen: number;
+  /** v0.43.7 (82.2 D4): stored vectors this scan met whose returned distance was not usable — dropped, never scored. */
+  vectorFaults: number;
+  /** The `hash_seq` of the first of them (for the warning and the doctor). */
+  firstFault?: string;
 }
 
 // Hard MATCH-depth cap for exclusion escalation. Exhausting a 60k+ table per query is a
@@ -4675,7 +4816,7 @@ function hydrateVecResultsClassified(
   if (vecResults.length === 0) return { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
 
   const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+  const distanceMap = screenedDistances(vecResults);
   const placeholders = hashSeqs.map(() => '?').join(',');
   let docSql = `
     SELECT
@@ -4728,7 +4869,7 @@ function hydrateVecResultsClassified(
       excludedDocs.add(row.filepath);
       continue;
     }
-    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const distance = distanceOf(distanceMap, row.hash_seq);
     const existing = seen.get(row.filepath);
     if (!existing || distance < existing.bestDist) {
       seen.set(row.filepath, { row, bestDist: distance });
@@ -4771,7 +4912,7 @@ export function searchVecDetailedWithVector(
   limit: number = 20,
   opts: VecSearchDetailedOpts = {}
 ): VecSearchDetailedResult {
-  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0 };
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0, vectorFaults: 0 };
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return empty;
 
@@ -4786,7 +4927,9 @@ export function searchVecDetailedWithVector(
   const matchStmt = db.prepare(`SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ? AND k = ?`);
 
   let k = Math.min(limit * 3, effectiveCap);
-  let raw: { hash_seq: string; distance: number }[] = [];
+  let scan = emptyVecScan();
+  let vectorFaults = 0;
+  let firstFault: string | undefined;
   let classified: ReturnType<typeof hydrateVecResultsClassified> = { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
 
   // Escalation loop (filtering callers only): grow MATCH depth x3 until `limit` allowed
@@ -4795,15 +4938,22 @@ export function searchVecDetailedWithVector(
   // so it engages the same escalation — otherwise nearer non-observation internals could
   // starve the observation lane out of its first limit*3 raw candidates. Without any
   // filtering this runs exactly once at limit*3 — today's semantics.
+  //
+  // v0.43.7 (82.2 D4): a row whose returned distance is not usable is dropped by the screen and counted. Such rows
+  // can take the FIRST places of a scan (a -Infinity distance sorts first), so a scan that met one refills like a
+  // filtering one — inside the same cap and deadline. The count is sticky across rounds; exhaustion is decided on
+  // the UNFILTERED row count.
   const filteringActive = exclude.size > 0 || !!opts.observationsOnly;
   for (;;) {
-    raw = matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: number }[];
-    classified = hydrateVecResultsClassified(db, raw, limit, opts, exclude);
+    scan = screenVecHits(matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: unknown }[]);
+    vectorFaults = Math.max(vectorFaults, scan.vectorFaults);
+    firstFault ??= scan.firstFault;
+    classified = hydrateVecResultsClassified(db, scan.hits, limit, opts, exclude);
     const done =
-      !filteringActive ||
+      !(filteringActive || vectorFaults > 0) ||
       classified.allowedDocs >= limit ||
       k >= effectiveCap ||
-      raw.length < k || // MATCH returned fewer than requested: table exhausted below k
+      scan.scanned < k || // MATCH returned fewer than requested: table exhausted below k
       (opts.deadline !== undefined && isExpired(opts.deadline));
     if (done) break;
     k = Math.min(k * 3, effectiveCap);
@@ -4811,7 +4961,7 @@ export function searchVecDetailedWithVector(
 
   // Degraded contract (T4-M1 + T5-M2): only the HARD cap preventing an exhaustive scan
   // counts — scanning the whole (sub-cap) table is ordinary corpus exhaustion, no marker.
-  const scannedFragments = raw.length;
+  const scannedFragments = scan.scanned;
   let degraded = false;
   let degradedReason: VecSearchDetailedResult["degradedReason"];
   const underfilled = classified.allowedDocs < limit;
@@ -4822,6 +4972,10 @@ export function searchVecDetailedWithVector(
       ? "excluded-dominant"
       : "cap-truncation";
   }
+  if (vectorFaults > 0) {
+    degraded = true;
+    degradedReason ??= "vector-fault";
+  }
 
   return {
     results: classified.results,
@@ -4829,6 +4983,8 @@ export function searchVecDetailedWithVector(
     degradedReason,
     scannedFragments,
     excludedDocsSeen: classified.excludedDocsSeen,
+    vectorFaults,
+    ...(firstFault === undefined ? {} : { firstFault }),
   };
 }
 
@@ -4845,7 +5001,7 @@ export async function searchVecDetailed(
   limit: number = 20,
   opts: VecSearchDetailedOpts = {}
 ): Promise<VecSearchDetailedResult> {
-  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0 };
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0, vectorFaults: 0 };
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return empty;
 
@@ -4855,7 +5011,7 @@ export async function searchVecDetailed(
 
   return searchVecDetailedWithVector(
     db,
-    { embedding: new Float32Array(embedResult.embedding), endpointModel: embedResult.model },
+    { embedding: embedResult.embedding, endpointModel: embedResult.model },
     limit,
     opts
   );
@@ -4865,7 +5021,7 @@ export async function searchVecDetailed(
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, deadline?: MonoDeadline): Promise<{ embedding: number[]; model: string } | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadline?: MonoDeadline): Promise<{ embedding: Float32Array; model: string } | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
@@ -4881,9 +5037,11 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, deadl
     if (bounded === null) return null; // deadline already elapsed — skip the embed entirely
     signal = bounded;
   }
-  const result = await llm.embed(formattedText, { model, isQuery, signal });
+  const result = await llm.embed(formattedText, { model, isQuery, signal, context: isQuery ? "query" : "document" });
   if (!result?.embedding) return null;
-  return { embedding: result.embedding, model: result.model };
+  // v0.43.7 (BACKLOG 82.2): `llm.ts` validated this at the response boundary. Judged again here so an LLM that is
+  // not `LlamaCpp` (an injected one) cannot hand the MATCH an array nobody looked at; a validated array passes as it is.
+  return { embedding: storableVector(result.embedding, { context: isQuery ? "query" : "document" }), model: result.model };
 }
 
 /**
@@ -5025,6 +5183,9 @@ export function insertEmbedding(
   // no other holder can interleave a reclaim between the check and the INSERTs.
   db.transaction(() => {
     assertLeaseHeld(db, leaseGuard);
+    // v0.43.7 (BACKLOG 82.2) backstop, BEFORE the DELETE: a caller that did not come through `llm.ts` cannot store
+    // poison, and a refused write leaves the row it would have replaced.
+    assertStorableTyped(embedding, { context: hashSeq });
     db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
     db.prepare(
@@ -5795,6 +5956,9 @@ function findByDisplayPath(db: Database, selectCols: string, displayPath: string
 }
 
 export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
+  // 82.3 D7: a selector follows the identifier policy — refused (BomLeadingIdentifierError), never stripped, when the
+  // whole text, its collection or its path starts with a byte-order mark. Nothing below changes a code point of it.
+  refuseMarkedSelector(filename);
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
   if (colonMatch) {
@@ -5870,6 +6034,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
       }
 
       if (relativePath) {
+        refuseLeadingMark(relativePath, "path");                          // 82.3 D7: the component this reader binds
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
@@ -5997,7 +6162,9 @@ export function findDocuments(
   let fileRows: DbDocRow[];
 
   if (isCommaSeparated) {
-    const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
+    // 82.3 D7: identity-preserving parsing — ASCII padding only is stripped, and EVERY element is checked before
+    // the first lookup, so a list with one marked element returns nothing at all.
+    const names = parseSelectorList(pattern).map(refuseMarkedSelector);
     fileRows = [];
     for (const name of names) {
       let doc = db.prepare(`
@@ -6031,6 +6198,7 @@ export function findDocuments(
     }
   } else {
     // Glob pattern match
+    refuseMarkedSelector(pattern);                                        // 82.3 D7: a glob is a selector too
     const matched = matchFilesByGlob(db, pattern);
     if (matched.length === 0) {
       errors.push(`No files matched pattern: ${pattern}`);
@@ -6249,7 +6417,7 @@ function updateSessionFn(db: Database, sessionId: string, updates: { endedAt?: s
   if (updates.endedAt !== undefined) { sets.push("ended_at = ?"); vals.push(updates.endedAt); }
   if (updates.handoffPath !== undefined) { sets.push("handoff_path = ?"); vals.push(updates.handoffPath); }
   if (updates.filesChanged !== undefined) { sets.push("files_changed = ?"); vals.push(JSON.stringify(updates.filesChanged)); }
-  if (updates.summary !== undefined) { sets.push("summary = ?"); vals.push(updates.summary); }
+  if (updates.summary !== undefined) { sets.push("summary = ?"); vals.push(stripLeadingMarks(updates.summary)); }   // 82.3 D7: a session summary is normalised
   if (sets.length === 0) return;
   vals.push(sessionId);
   db.prepare(`UPDATE session_log SET ${sets.join(", ")} WHERE session_id = ?`).run(...vals);
@@ -6304,7 +6472,8 @@ function insertUsageFn(db: Database, usage: UsageRecord): number {
     usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths),
     usage.estimatedTokens, usage.wasReferenced, usage.turnIndex ?? 0,
   ];
-  if (hasQueryText || keyed) { cols.push("query_text"); vals.push(usage.queryText ?? null); }
+  // 82.3 D7: the query text is a normalised field — no leading byte-order mark is stored.
+  if (hasQueryText || keyed) { cols.push("query_text"); vals.push(usage.queryText == null ? null : stripLeadingMarks(usage.queryText)); }
   if (keyed) { cols.push("dedupe_key"); vals.push(usage.dedupeKey!); }
   // 62.1 D9 (rev 21/22): every row this version writes carries a writer stamp — on a fenced vault an unstamped insert
   // (an older ClawMem's) fails — and D1's identity columns, which arrive in the same migration.
@@ -6432,15 +6601,17 @@ function updateObservationFieldsFn(
 ): void {
   const sets: string[] = [];
   const vals: (string | null)[] = [];
-  if (fields.observation_type !== undefined) { sets.push("observation_type = ?"); vals.push(fields.observation_type); }
+  // 82.3 D7: the scalars are normalised fields — every leading byte-order mark is removed HERE, so every caller is
+  // covered and no refusal can follow the insert of the document. The JSON lists start with `[` and need nothing.
+  if (fields.observation_type !== undefined) { sets.push("observation_type = ?"); vals.push(stripLeadingMarks(fields.observation_type)); }
   if (fields.facts !== undefined) { sets.push("facts = ?"); vals.push(fields.facts); }
-  if (fields.narrative !== undefined) { sets.push("narrative = ?"); vals.push(fields.narrative); }
+  if (fields.narrative !== undefined) { sets.push("narrative = ?"); vals.push(stripLeadingMarks(fields.narrative)); }
   if (fields.concepts !== undefined) { sets.push("concepts = ?"); vals.push(fields.concepts); }
   if (fields.files_read !== undefined) { sets.push("files_read = ?"); vals.push(fields.files_read); }
   if (fields.files_modified !== undefined) { sets.push("files_modified = ?"); vals.push(fields.files_modified); }
-  if (fields.skill_name !== undefined) { sets.push("skill_name = ?"); vals.push(fields.skill_name); }
-  if (fields.quality_score !== undefined) { sets.push("obs_quality_score = ?"); vals.push(fields.quality_score); }
-  if (fields.failure_reason !== undefined) { sets.push("failure_reason = ?"); vals.push(fields.failure_reason); }
+  if (fields.skill_name !== undefined) { sets.push("skill_name = ?"); vals.push(stripLeadingMarks(fields.skill_name)); }
+  if (fields.quality_score !== undefined) { sets.push("obs_quality_score = ?"); vals.push(stripLeadingMarks(fields.quality_score)); }
+  if (fields.failure_reason !== undefined) { sets.push("failure_reason = ?"); vals.push(stripLeadingMarks(fields.failure_reason)); }
   if (sets.length === 0) return;
   vals.push(collectionName, docPath);
   db.prepare(`UPDATE documents SET ${sets.join(", ")} WHERE collection = ? AND path = ? AND active = 1`).run(...vals);
@@ -6488,8 +6659,7 @@ export async function syncBeadsIssues(
 
   for (const issue of issues) {
     const docPath = `_clawmem/beads/${issue.id}.md`;
-    const docBody = formatBeadsIssueAsMarkdown(issue);
-    const hash = await hashContent(docBody);
+    const { body: docBody, hash } = normalizedContent(formatBeadsIssueAsMarkdown(issue));
 
     const existingDoc = findActiveDocument(db, 'beads', docPath);
 
@@ -6668,10 +6838,27 @@ export function buildTemporalBackbone(db: Database): number {
  * Connects documents with similarity > threshold.
  * Returns number of edges created.
  */
-export async function buildSemanticGraph(
+/**
+ * What a build of the similarity links did (v0.43.7, 82.2 D4): the edges written, and the neighbour rows whose
+ * distance was not usable — skipped and counted (a row SQL itself excluded, a NULL distance, is not counted).
+ */
+export interface SemanticGraphBuild { edges: number; vectorFaults: number }
+
+export async function buildSemanticGraph(db: Database, threshold: number = 0.7): Promise<number> {
+  const built = await buildSemanticGraphDetailed(db, threshold);
+  if (built.vectorFaults > 0) {
+    console.warn(`[clawmem] the similarity-link build skipped ${built.vectorFaults} neighbour row(s) whose distance is not usable; \`clawmem doctor\` lists the stored vectors`);
+  }
+  return built.edges;
+}
+
+export async function buildSemanticGraphDetailed(
   db: Database,
   threshold: number = 0.7
-): Promise<number> {
+): Promise<SemanticGraphBuild> {
+  // v0.43.7 (82.2 D5): the threshold has its documented domain [0, 1]. Outside it nothing is built — a negative
+  // threshold is the only way a negative similarity was ever stored as a relation weight.
+  assertSemanticThreshold(threshold);
   // Query all documents with embeddings. The legacy pre-compaction snapshot is never a graph node,
   // as a source or as a neighbour (62.2).
   const docs = db.prepare(`
@@ -6682,6 +6869,7 @@ export async function buildSemanticGraph(
   `).all() as { id: number; hash: string }[];
 
   let edges = 0;
+  let vectorFaults = 0;
 
   // For each document, find similar neighbors
   for (let i = 0; i < docs.length; i++) {
@@ -6698,13 +6886,18 @@ export async function buildSemanticGraph(
         AND d2.id != ?
         AND d2.active = 1
         AND ${notLegacyArtifactSql("d2")}
+        AND vec_distance_cosine(v1.embedding, v2.embedding) IS NOT NULL
         AND vec_distance_cosine(v1.embedding, v2.embedding) < ?
       ORDER BY distance
       LIMIT 10
-    `).all(doc1.hash, doc1.id, 1 - threshold) as { target_id: number; distance: number }[];
+    `).all(doc1.hash, doc1.id, 1 - threshold) as { target_id: number; distance: unknown }[];
 
     for (const sim of similar) {
-      const similarity = 1 - sim.distance;
+      // v0.43.7 (82.2 D4): the one distance predicate. What it refuses (an infinity, a value outside [0, 2]) is
+      // skipped and counted; what it accepts is clamped, so the stored weight is a similarity in [-1, 1].
+      const distance = usableDistance(sim.distance);
+      if (distance === null) { vectorFaults++; continue; }
+      const similarity = 1 - distance;
       // Count rows SQLite actually wrote, matching buildTemporalBackbone — the two
       // counters feed one `build_graphs` response and must report the same unit.
       edges += db.prepare(`
@@ -6714,7 +6907,7 @@ export async function buildSemanticGraph(
     }
   }
 
-  return edges;
+  return { edges, vectorFaults };
 }
 
 // =============================================================================

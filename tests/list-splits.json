@@ -1,0 +1,77 @@
+{
+  "_about": "BACKLOG 82.3, D7 — every comma split under src/. A list of SELECTORS or COLLECTION NAMES supplied by a caller is split in ONE place, src/selector.ts, which strips ASCII padding only and refuses an element that starts with a byte-order mark. Every other split is listed here with what it splits. tests/unit/list-splits-census.test.ts fails on a split this file does not list, and on a listed one that is gone.",
+  "splits": [
+    {
+      "file": "src/clawmem.ts",
+      "code": "? values[\"accept-unmeasured\"].split(\",\").map(s => s.trim()).filter(Boolean)",
+      "kind": "evaluation flag",
+      "why": "--accept-unmeasured: names of evaluation strata"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "code": "const dirs = values.runs.split(\",\").map(s => s.trim()).filter(Boolean).map(d => pathResolve(d));",
+      "kind": "evaluation flag",
+      "why": "--runs: directories of evaluation runs, resolved as filesystem paths"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "code": "const ids = raw === \"held\" ? null : raw.split(\",\").map(x => Number(x.trim()));",
+      "kind": "numeric ids",
+      "why": "--retry-now: range ids, each parsed as an integer and checked"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "code": "const names = values[\"pair-treatment\"].split(\",\").map(x => x.trim()).filter(Boolean);",
+      "kind": "evaluation flag",
+      "why": "--pair-treatment: names of evaluation arms"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "code": "for (const entry of values[\"pair-min-basis-stratum\"].split(\",\").map(x => x.trim()).filter(Boolean)) {",
+      "kind": "evaluation flag",
+      "why": "--pair-min-basis-stratum: name=number pairs"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "code": "for (const pair of raw.split(\",\").map(x => x.trim()).filter(Boolean)) {",
+      "kind": "evaluation flag",
+      "why": "strata given as name=number pairs"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "code": "pairRequireIds = values[\"pair-require-ids\"].split(\",\").map(x => x.trim()).filter(Boolean);",
+      "kind": "evaluation flag",
+      "why": "--pair-require-ids: case ids of an evaluation set"
+    },
+    {
+      "file": "src/hooks.ts",
+      "code": "? raw.split(\",\").map(s => s.trim().toLowerCase()).filter(Boolean)",
+      "kind": "environment",
+      "why": "CLAWMEM_HEARTBEAT_PATTERNS: substrings to match in a prompt, lower-cased — not names of stored things"
+    },
+    {
+      "file": "src/indexer.ts",
+      "code": "return match[1]!.split(\",\").map(s => s.trim());",
+      "kind": "configuration",
+      "why": "the brace list of a collection PATTERN from the config file — a glob, not a stored name"
+    },
+    {
+      "file": "src/selector.ts",
+      "code": "for (const piece of text.split(\",\")) {",
+      "kind": "identity-preserving parser",
+      "why": "THE parser of caller-supplied selector and collection lists (trimAsciiSpace, then the refusal)"
+    },
+    {
+      "file": "src/server-guard.ts",
+      "code": "const items = v.split(\",\").map(x => x.trim());",
+      "kind": "environment",
+      "why": "a serve allowlist from the environment (hosts, origins); an empty entry is refused"
+    },
+    {
+      "file": "src/store.ts",
+      "code": "const days = row.day_list.split(\",\").sort();",
+      "kind": "stored value",
+      "why": "a day list that SQLite's group_concat built from stored dates — not caller input"
+    }
+  ]
+}

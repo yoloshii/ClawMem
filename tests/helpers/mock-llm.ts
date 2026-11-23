@@ -45,7 +45,7 @@ export interface MockLLM extends LLM {
 export function createMockLLM(): MockLLM {
   const llm: MockLLM = {
     embed: mock(async (text: string, _opts?: EmbedOptions): Promise<EmbeddingResult | null> => {
-      return { embedding: hashEmbed(text), model: "mock-embed" };
+      return { embedding: new Float32Array(hashEmbed(text)), model: "mock-embed" }; // a typed array, as LlamaCpp returns since v0.43.7
     }),
 
     generate: mock(async (_prompt: string, _opts?: GenerateOptions): Promise<GenerateResult | null> => {

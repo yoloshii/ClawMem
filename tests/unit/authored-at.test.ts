@@ -42,6 +42,7 @@ import { generateDirectoryBlock, getDecisionsForDirectory } from "../../src/dire
 import { createEvalSession } from "../../src/eval/replay.ts";
 import type { DocumentRow } from "../../src/store.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const TEST_DB = "/tmp/clawmem-authored-at-test.sqlite";
 const TMP = `/tmp/clawmem-authored-at-fixtures-${Date.now()}`;
 const MODEL = "authored-fake";
@@ -71,7 +72,7 @@ function seedDoc(
 ): number {
   const hash = hashContent(body + col + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, opts?.modifiedAt ?? now);
   const row = store.db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1`)
     .get(col, path) as { id: number };

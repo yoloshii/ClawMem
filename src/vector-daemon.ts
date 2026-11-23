@@ -28,9 +28,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import type { Socket } from "bun";
-import { searchVecMatch, hydrateVecResults, projectVecResults, HydratedBodyOversizedError, VecReadModelMismatchError, type Store, type SearchResult, type ProjectedVecResult } from "./store.ts";
+import { searchVecMatch, hydrateVecResults, projectVecResults, screenVecHits, HydratedBodyOversizedError, VecReadModelMismatchError, type Store, type SearchResult, type ProjectedVecResult, type VecHit, type VecScan } from "./store.ts";
+import { VecPoisonError, EmbedEnvelopeError, isRefusedEmbedResponse, type VecPoisonReason, type VectorSource } from "./vector-guard.ts";
 import { monoNow, deadlineAfter, duration, isExpired, remainingForTimeout, wireBudget, deadlineTimer, elapsed, evidenceMs, type MonoDeadline, type MonoInstant } from "./clock.ts";
-import { HYDRATED_PROTOCOL, HYDRATED_MAX_RESULTS, HYDRATED_MAX_ENTRY_BYTES, HYDRATED_MAX_FRAME_BYTES, HYDRATED_MAX_SOURCE_BODY_BYTES, HYDRATED_SNIPPET_LENS, HYDRATED_RERANK_TEXT_LEN, HYDRATED_GATE_TEXT_LEN, DEADLINE_PROTOCOL, MAX_LEG_BUDGET_MS } from "./vector-protocol.ts";
+import { HYDRATED_PROTOCOL, HYDRATED_MAX_RESULTS, HYDRATED_MAX_ENTRY_BYTES, HYDRATED_MAX_FRAME_BYTES, HYDRATED_MAX_SOURCE_BODY_BYTES, HYDRATED_SNIPPET_LENS, HYDRATED_RERANK_TEXT_LEN, HYDRATED_GATE_TEXT_LEN, DEADLINE_PROTOCOL, MAX_LEG_BUDGET_MS, VECTOR_FAULT_PROTOCOL } from "./vector-protocol.ts";
 
 // Newline-delimited JSON, one request/response per connection. A query string and a list of
 // {hash_seq, distance} are both small; anything over this cap is a protocol violation, so both sides
@@ -67,7 +68,6 @@ function warnOnceOnDaemonSkew(dbPath: string, missing: string): void {
   console.error(`[clawmem] vector daemon on ${vecDaemonSocketPath(dbPath)} does not implement ${missing} (a watcher on an older build) — vector legs degrade to FTS until 'clawmem watch' is restarted on this build`);
 }
 
-type VecHit = { hash_seq: string; distance: number };
 type VecReq = {
   query: string; model: string; limit: number;
   /** O1 (deadline-rel-v1): whole milliseconds still available to the leg, filled in by
@@ -109,8 +109,11 @@ type VecResp =
   // relative budget the request carried. A response WITHOUT it came from a pre-O1 daemon that
   // silently ignored the field, or answers a raw request that carried no budget (nothing was
   // enforced, so nothing is attested) — an O1 client classifies the leg `skew` (FTS), never `ok`.
-  | { results: VecHit[]; deadlineProtocol?: string }
-  | { error: string; storedModels?: string[]; activeModel?: string }
+  // `vectorFaultProtocol` + `vectorFaults` (82.2 D4): the daemon screened every returned distance and counted
+  // what it dropped. Present on every scan answer of a `vf1` daemon; the count is omitted when it is zero.
+  | { results: VecHit[]; deadlineProtocol?: string; vectorFaultProtocol?: string; vectorFaults?: number }
+  // `vec_poison` (82.2 D4): the daemon's own embedding refused the QUERY vector — typed, as the model mismatch is.
+  | { error: string; storedModels?: string[]; activeModel?: string; kind?: string; reason?: string; source?: string; context?: string; elementIndex?: number; norm?: number; index?: number }
   // Readiness/identity probe answer (eval daemon child, codex t76 constraint 3): the exact DB path
   // this daemon serves and the pid that owns the socket — a parent verifies both before trusting.
   // `protocols` (v0.38 hydrated daemon) advertises the response protocols this daemon can serve —
@@ -118,7 +121,7 @@ type VecResp =
   // makes a daemon-required run authoritative; old clients ignore the extra field).
   | { pong: true; db: string; pid: number; protocols?: string[] }
   // Hydrated response lines (each is its own newline-delimited frame):
-  | { protocol: typeof HYDRATED_PROTOCOL; count: number; deadlineProtocol?: string }
+  | { protocol: typeof HYDRATED_PROTOCOL; count: number; deadlineProtocol?: string; vectorFaultProtocol?: string; vectorFaults?: number }
   | { entry: ProjectedVecResult }
   | { end: true };
 
@@ -132,8 +135,11 @@ type VecResp =
  * `deadline` (codex migration r1 S1): the CLIENT's authoritative deadline ended the leg — its timer
  * fired, the window closed before a connection or before a whole transmissible millisecond, or a
  * monotonic check around a response-line parse found it crossed. Distinct from `error` (a daemon
- * that misbehaved): the surfacing trace records it with terminal kind `abandonment`. */
-export type VecExecStatus = "ok" | "busy" | "error" | "absent" | "model_mismatch" | "oversized" | "skew" | "deadline";
+ * that misbehaved): the surfacing trace records it with terminal kind `abandonment`.
+ * `vector-fault` (82.2 D4): the embedding endpoint answered the QUERY with a vector that must not be
+ * used (`VecPoisonError` / `EmbedEnvelopeError`) — in the daemon (a typed `vec_poison` frame) or in
+ * the in-process path. The leg is lexical only. */
+export type VecExecStatus = "ok" | "busy" | "error" | "absent" | "model_mismatch" | "oversized" | "skew" | "deadline" | "vector-fault";
 
 /** Which response protocol actually served an `ok` leg (run-identity input, t84 CR-5/t85):
  * "hydrated-v1" = daemon-side projection; "raw-hit" = raw VecHit list + client-side hydration (a
@@ -173,6 +179,40 @@ export function isValidVecHit(h: unknown): h is VecHit {
   if (!h || typeof h !== "object") return false;
   const r = h as Record<string, unknown>;
   return typeof r.hash_seq === "string" && typeof r.distance === "number" && Number.isFinite(r.distance);
+}
+
+const POISON_REASONS: readonly VecPoisonReason[] = ["not-an-array", "empty", "non-number", "non-finite", "float32-overflow", "norm", "blob-length"];
+const optionalInt = (v: unknown): v is number | undefined => v === undefined || (typeof v === "number" && Number.isInteger(v) && v >= 0);
+
+/** The `vec_poison` frame for a refused query vector (82.2 D4). */
+export function vecPoisonFrame(e: VecPoisonError | EmbedEnvelopeError): Record<string, unknown> {
+  return e instanceof VecPoisonError
+    ? { error: "vec_poison", kind: "vector", reason: e.reason, source: e.source, context: e.context,
+        ...(e.elementIndex !== undefined ? { elementIndex: e.elementIndex } : {}),
+        ...(e.norm !== undefined && Number.isFinite(e.norm) ? { norm: e.norm } : {}),
+        ...(e.index !== undefined ? { index: e.index } : {}) }
+    : { error: "vec_poison", kind: "envelope", reason: e.reason, context: e.context, ...(e.index !== undefined ? { index: e.index } : {}) };
+}
+
+/** Rebuild the typed error from a `vec_poison` frame; null for a frame that is not one (the leg is then `error`). */
+export function vecPoisonFromFrame(frame: Record<string, unknown>): VecPoisonError | EmbedEnvelopeError | null {
+  if (frame.error !== "vec_poison" || typeof frame.reason !== "string" || typeof frame.context !== "string" || !optionalInt(frame.index)) return null;
+  const ctx = { context: frame.context, ...(frame.index !== undefined ? { index: frame.index } : {}) };
+  if (frame.kind === "envelope") return new EmbedEnvelopeError(frame.reason, ctx);
+  if (frame.kind !== "vector" || !POISON_REASONS.includes(frame.reason as VecPoisonReason)) return null;
+  if (frame.source !== "endpoint" && frame.source !== "stored") return null;
+  if (!optionalInt(frame.elementIndex) || !(frame.norm === undefined || (typeof frame.norm === "number" && Number.isFinite(frame.norm)))) return null;
+  return new VecPoisonError(frame.reason as VecPoisonReason, frame.source as VectorSource, ctx, {
+    ...(frame.elementIndex !== undefined ? { elementIndex: frame.elementIndex } : {}),
+    ...(frame.norm !== undefined ? { norm: frame.norm as number } : {}),
+  });
+}
+
+/** The fault count of a scan answer: absent = zero (the attestation was checked first); anything but a
+ *  non-negative integer is a protocol error (`null`). */
+function wireVectorFaults(v: unknown): number | null {
+  if (v === undefined) return 0;
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : null;
 }
 
 /**
@@ -342,7 +382,9 @@ export async function startVectorDaemon(
   log: (msg: string) => void = () => {},
   // The Step-1 scan is injectable so tests can exercise the socket/single-flight/framing logic without
   // a live embedding server. Production omits it → the real searchVecMatch on the watcher's warm store.
-  scan: (query: string, model: string, limit: number, deadline?: MonoDeadline) => Promise<VecHit[]> =
+  // It returns the scan WITH its fault count (82.2 D4). A bare hit list (an older injected scan) is
+  // screened here, so nothing reaches the wire or the projection that the predicate did not judge.
+  scan: (query: string, model: string, limit: number, deadline?: MonoDeadline) => Promise<VecScan | VecHit[]> =
     (query, model, limit, deadline) => searchVecMatch(store.db, query, model, limit, deadline),
 ): Promise<VectorDaemonHandle | null> {
   const sockPath = vecDaemonSocketPath(store.dbPath);
@@ -389,9 +431,11 @@ export async function startVectorDaemon(
    * construction: a hydrated request without a relative budget is refused before any scan (codex
    * migration r1 P2), so every hydrated answer ran under an enforced advisory deadline.
    */
-  const respondHydrated = (socket: Socket<DaemonSocketData>, results: ProjectedVecResult[]) => {
+  const faultFields = (vectorFaults: number) => ({ vectorFaultProtocol: VECTOR_FAULT_PROTOCOL, ...(vectorFaults > 0 ? { vectorFaults } : {}) });
+
+  const respondHydrated = (socket: Socket<DaemonSocketData>, results: ProjectedVecResult[], vectorFaults: number) => {
     const enc = new TextEncoder();
-    const header = JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: results.length, deadlineProtocol: DEADLINE_PROTOCOL });
+    const header = JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: results.length, deadlineProtocol: DEADLINE_PROTOCOL, ...faultFields(vectorFaults) });
     const endLine = JSON.stringify({ end: true });
     let total = enc.encode(header).length + 1 + enc.encode(endLine).length + 1;
     const entryLines: string[] = [];
@@ -422,7 +466,7 @@ export async function startVectorDaemon(
       // O1 activation, the relative-budget deadline protocol (§4: NEVER advertised while any
       // deadline path read wall time — both O1 ratchets are at zero in this build).
       if (parsed && typeof parsed === "object" && parsed.ping === true) {
-        respond(socket, { pong: true, db: store.dbPath, pid: process.pid, protocols: [HYDRATED_PROTOCOL, DEADLINE_PROTOCOL] });
+        respond(socket, { pong: true, db: store.dbPath, pid: process.pid, protocols: [HYDRATED_PROTOCOL, DEADLINE_PROTOCOL, VECTOR_FAULT_PROTOCOL] });
         return;
       }
       // O1 §4 version skew, detected by FIELD PRESENCE before anything is decoded: a pre-O1
@@ -513,7 +557,8 @@ export async function startVectorDaemon(
     const safeLimit = hydrated ? req.limit : Math.min(Math.max(1, Math.trunc(req.limit)), MAX_VEC_LIMIT);
     scanInFlight = true;
     try {
-      const results = await scan(req.query, req.model, safeLimit, advisoryDeadline);
+      const scanned = await scan(req.query, req.model, safeLimit, advisoryDeadline);
+      const { hits: results, vectorFaults } = Array.isArray(scanned) ? screenVecHits(scanned) : scanned;
       // t89 P4: a scan that finished past the advisory deadline must not proceed into projection —
       // the hook has already fallen back to FTS; answering `expired` releases single-flight for the
       // next request without touching a single body.
@@ -538,12 +583,12 @@ export async function startVectorDaemon(
           collections: req.collections,
           dateRange: req.dateRange,
         });
-        respondHydrated(socket, projected);
+        respondHydrated(socket, projected, vectorFaults);
       } else {
         // Codex migration r1 P2: attest ONLY a budget this daemon enforced. A raw request without
         // `remainingBudgetMs` (a compatibility caller) ran under no deadline, so its answer carries
         // no attestation — an O1 client would (correctly) classify it `skew`.
-        respond(socket, advisoryDeadline !== undefined ? { results, deadlineProtocol: DEADLINE_PROTOCOL } : { results });
+        respond(socket, advisoryDeadline !== undefined ? { results, deadlineProtocol: DEADLINE_PROTOCOL, ...faultFields(vectorFaults) } : { results, ...faultFields(vectorFaults) });
       }
     } catch (e) {
       // Preserve the v0.18 read-model-mismatch "warn loudly once" contract across the wire: return a
@@ -551,6 +596,10 @@ export async function startVectorDaemon(
       // warnOnceOnVectorModelMismatch (an instanceof check) still fires. Other errors stay generic.
       if (e instanceof VecReadModelMismatchError) {
         respond(socket, { error: "read_model_mismatch", storedModels: e.storedModels, activeModel: e.activeModel });
+      } else if (isRefusedEmbedResponse(e)) {
+        // 82.2 D4: the embedding endpoint answered the QUERY with a vector that must not be used. Typed, so
+        // the client rebuilds the same error the in-process path throws and one route table covers both.
+        respond(socket, vecPoisonFrame(e) as VecResp);
       } else if (e instanceof HydratedBodyOversizedError) {
         // t87 F1: a selected result's stored body exceeded the source ceiling — refused BEFORE
         // its body was fetched. Distinct outcome so the hook traces the candidate loss.
@@ -614,8 +663,9 @@ export async function startVectorDaemon(
 // ─────────────────────────────────────────────────────────────────────────────
 
 type DaemonOutcome =
-  | { status: "ok"; results: VecHit[] }                      // attested raw hits for a raw request → client hydrates ("raw-hit" path)
-  | { status: "ok-hydrated"; results: ProjectedVecResult[] } // daemon-side projection (hydrated-v1) → zero client-side sqlite on the timed path
+  | { status: "ok"; results: VecHit[]; vectorFaults: number }                      // attested raw hits for a raw request → client hydrates ("raw-hit" path)
+  | { status: "ok-hydrated"; results: ProjectedVecResult[]; vectorFaults: number } // daemon-side projection (hydrated-v1) → zero client-side sqlite on the timed path
+  | { status: "vector-fault"; error: VecPoisonError | EmbedEnvelopeError }          // 82.2 D4: the daemon's embedding refused the QUERY vector (typed `vec_poison` frame)
   | { status: "oversized" }                                  // daemon refused on a size cap → FTS with vector-candidate LOSS (traced distinctly)
   | { status: "busy" }    // daemon busy/expired → hook falls to FTS (do NOT re-run in-process)
   | { status: "error" }   // daemon present but timed out/misbehaving → fall to FTS
@@ -660,6 +710,7 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, deadline: Mono
     let mode: "unknown" | "hydrated" = "unknown";
     let expected = 0;
     const entries: ProjectedVecResult[] = [];
+    let hydratedFaults = 0;
     let pumping = false;
 
     let cancelTimer: () => void = () => {};
@@ -673,7 +724,14 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, deadline: Mono
     // The authoritative leg timer: the client decides the leg outcome (O1 §2).
     cancelTimer = deadlineTimer(deadline, () => finish({ status: "deadline" }));
 
-    const mapError = (resp: { error: string; storedModels?: string[]; activeModel?: string }): DaemonOutcome =>
+    const mapError = (resp: { error: string; storedModels?: string[]; activeModel?: string }): DaemonOutcome => {
+      if (resp.error === "vec_poison") {
+        const rebuilt = vecPoisonFromFrame(resp as Record<string, unknown>);
+        return rebuilt ? { status: "vector-fault", error: rebuilt } : { status: "error" };
+      }
+      return mapPlainError(resp);
+    };
+    const mapPlainError = (resp: { error: string; storedModels?: string[]; activeModel?: string }): DaemonOutcome =>
       resp.error === "busy" || resp.error === "expired" ? { status: "busy" }
         : resp.error === "read_model_mismatch" ? { status: "model_mismatch", storedModels: resp.storedModels ?? [], activeModel: resp.activeModel ?? "" }
         : resp.error === "oversized" ? { status: "oversized" }
@@ -703,6 +761,12 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, deadline: Mono
               // O1 §4: a header without the deadline attestation is a pre-O1 daemon — it ran the
               // scan with NO deadline of its own. The leg is `skew` (FTS), never ok.
               if (obj.deadlineProtocol !== DEADLINE_PROTOCOL) { finish({ status: "skew", missing: DEADLINE_PROTOCOL }); return; }
+              // 82.2 D4: a header without the fault attestation is a daemon that never screened a distance —
+              // its count is unknown, never zero. Capability skew, checked on the answer consumed.
+              if (obj.vectorFaultProtocol !== VECTOR_FAULT_PROTOCOL) { finish({ status: "skew", missing: VECTOR_FAULT_PROTOCOL }); return; }
+              const headerFaults = wireVectorFaults(obj.vectorFaults);
+              if (headerFaults === null) { finish({ status: "error" }); return; }
+              hydratedFaults = headerFaults;
               mode = "hydrated";
               expected = obj.count;
               // t89 S1: integer counts only — a fractional/NaN count is a malformed peer.
@@ -719,9 +783,16 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, deadline: Mono
               // pre-v0.38 blocking shape hydrated-v1 exists to remove) — refused as capability skew before any
               // client-side hydration, never `ok`.
               if (hydratedReq) { finish({ status: "skew", missing: HYDRATED_PROTOCOL }); return; }
+              // 82.2 D4: raw hits without the fault attestation were never screened — skew, as above.
+              if (obj.vectorFaultProtocol !== VECTOR_FAULT_PROTOCOL) { finish({ status: "skew", missing: VECTOR_FAULT_PROTOCOL }); return; }
+              const rawFaults = wireVectorFaults(obj.vectorFaults);
               // t89 S1: validate every hit; a malformed/mixed list degrades to FTS, never ok.
-              if (!Array.isArray(obj.results) || !obj.results.every(isValidVecHit)) { finish({ status: "error" }); return; }
-              finish({ status: "ok", results: obj.results }); return;
+              if (rawFaults === null || !Array.isArray(obj.results) || !obj.results.every(isValidVecHit)) { finish({ status: "error" }); return; }
+              // The daemon's hit check, again on this side: a `vf1` daemon never sends an unusable distance, so one
+              // on the wire is a protocol error — it is not silently dropped and it is never hydrated.
+              const screened = screenVecHits(obj.results);
+              if (screened.vectorFaults > 0) { finish({ status: "error" }); return; }
+              finish({ status: "ok", results: screened.hits, vectorFaults: rawFaults }); return;
             } else if (obj && "error" in obj) { finish(mapError(obj)); return; }
             else { finish({ status: "error" }); return; } // a pong (or anything else) is not a scan answer
           } else {
@@ -733,7 +804,7 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, deadline: Mono
               if (entries.length > expected) { finish({ status: "error" }); return; }
             } else if (obj && "end" in obj) {
               if (entries.length !== expected) { finish({ status: "error" }); return; }
-              finish({ status: "ok-hydrated", results: entries }); return;
+              finish({ status: "ok-hydrated", results: entries, vectorFaults: hydratedFaults }); return;
             } else if (obj && "error" in obj) { finish(mapError(obj)); return; }
             else { finish({ status: "error" }); return; }
           }
@@ -876,7 +947,7 @@ export async function daemonPing(dbPath: string, timeoutMs: number): Promise<Dae
 /** Operational liveness/ownership state of a vault's vector daemon (codex t77 F5). */
 export type VectorDaemonHealth =
   | { status: "live"; socket: string; db: string; pid: number; protocols: string[] }
-  /** Attested (exact DB + pid) but WITHOUT hydrated-v1 or deadline-rel-v1 (t84/t89 P1, O1 §4): live, NOT Path-A authoritative — the v0.38 hook classifies its answers `skew` and falls back to FTS. */
+  /** Attested (exact DB + pid) but WITHOUT hydrated-v1, deadline-rel-v1 or (since v0.43.7) vf1 (t84/t89 P1, O1 §4, 82.2 D4): live, NOT Path-A authoritative — the v0.38 hook classifies its answers `skew` and falls back to FTS. */
   | { status: "live-raw"; socket: string; db: string; pid: number; protocols: string[] }
   /** A live clawmem daemon predating the ping protocol (pre-v0.38 watcher): serves this vault's path-keyed socket, cannot attest DB/pid — liveness is established, attestation is not. */
   | { status: "live-legacy"; socket: string }
@@ -912,7 +983,9 @@ export async function vectorDaemonHealth(dbPath: string, timeoutMs = 2000): Prom
   // requests (its raw hits are `skew` → FTS); one without deadline-rel-v1 ignores the relative
   // budget and runs under no deadline of its own: live, but NOT what the deadline contract
   // certifies.
-  return pong.protocols.includes(HYDRATED_PROTOCOL) && pong.protocols.includes(DEADLINE_PROTOCOL)
+  // 82.2 D4: and the vector-fault protocol — a daemon without `vf1` answers scans the new clients class as
+  // `skew`, so certifying it `live` would say the opposite of what every reply does.
+  return pong.protocols.includes(HYDRATED_PROTOCOL) && pong.protocols.includes(DEADLINE_PROTOCOL) && pong.protocols.includes(VECTOR_FAULT_PROTOCOL)
     ? { status: "live", socket, db: pong.db, pid: pong.pid, protocols: pong.protocols }
     : { status: "live-raw", socket, db: pong.db, pid: pong.pid, protocols: pong.protocols };
 }
@@ -941,7 +1014,7 @@ export async function searchVecBounded(
   /** Optional per-leg outcome recorder (the surfacing trace's vectorLegs) — called before any
    * fallback runs. `protocol` names which response protocol served an ok leg (t84 CR-5):
    * "hydrated-v1" = daemon-side projection; "raw-hit" = raw hits + client-side hydration. */
-  onOutcome?: (status: VecExecStatus, protocol?: VecResponseProtocol) => void,
+  onOutcome?: (status: VecExecStatus, protocol?: VecResponseProtocol, vectorFaults?: number) => void,
   /** Hydrated-v1 request inputs (t87 F4): the RAW CURRENT PROMPT (snippet construction on every
    * leg) + the resolved session topic. Present → the leg requests daemon-side projection (a legacy
    * daemon's unattested raw answer is `skew` → FTS, since O1 §4). Absent → a raw request, answered
@@ -958,7 +1031,8 @@ export async function searchVecBounded(
   const traceStatus: VecExecStatus = outcome.status === "ok-hydrated" ? "ok" : outcome.status;
   const protocol: VecResponseProtocol | undefined = outcome.status === "ok-hydrated" ? HYDRATED_PROTOCOL : outcome.status === "ok" ? "raw-hit" : undefined;
   if (outcome.status === "skew") warnOnceOnDaemonSkew(store.dbPath, outcome.missing);
-  if (onOutcome) { try { onOutcome(traceStatus, protocol); } catch { /* recorder must never break the leg */ } }
+  const legFaults = outcome.status === "ok" || outcome.status === "ok-hydrated" ? outcome.vectorFaults : undefined;
+  if (onOutcome) { try { onOutcome(traceStatus, protocol, legFaults); } catch { /* recorder must never break the leg */ } }
   let results: (SearchResult | ProjectedVecResult)[];
   switch (outcome.status) {
     case "ok-hydrated":
@@ -977,12 +1051,20 @@ export async function searchVecBounded(
       // In-process path: the synchronous MATCH runs on THIS event loop (the caller's race timer
       // cannot fire during it). The test seam models that scan's duration deterministically.
       testSyncScanDelay();
-      results = await store.searchVec(query, model, limit, collectionId, collections, dateRange, deadline);
+      {
+        // 82.2 D4 (operator ruling 16 B): the fault-carrying form — the count reaches the leg recorder here too.
+        const found = await store.searchVecWithFaults(query, model, limit, collectionId, collections, dateRange, deadline);
+        results = found.results;
+        if (found.vectorFaults > 0 && onOutcome) { try { onOutcome(traceStatus, protocol, found.vectorFaults); } catch { /* recorder must never break the leg */ } }
+      }
       break;
     case "model_mismatch":
       // Mirror the in-process path: throw the typed error so the leg's catch fires
       // warnOnceOnVectorModelMismatch (a persistent config error, warned loudly once), then FTS.
       throw new VecReadModelMismatchError(outcome.storedModels, outcome.activeModel);
+    case "vector-fault":
+      // 82.2 D4: the same typed error the in-process path throws, so the caller's route row applies to both.
+      throw outcome.error;
     default: // "busy" | "error" | "oversized" | "skew" | "deadline" → let the caller's FTS fallback take over
       results = [];
       break;
@@ -1017,7 +1099,7 @@ export async function searchVecDaemonRequired(
   deadline?: MonoDeadline,
   /** Optional per-leg outcome recorder (the surfacing trace's vectorLegs). `protocol` names which
    * response protocol served an ok leg (t84 CR-5). */
-  onOutcome?: (status: VecExecStatus, protocol?: VecResponseProtocol) => void,
+  onOutcome?: (status: VecExecStatus, protocol?: VecResponseProtocol, vectorFaults?: number) => void,
   /** Hydrated-v1 request inputs (t87 F4) — see searchVecBounded. */
   hydration?: { presentationQuery: string; intent?: string },
 ): Promise<(SearchResult | ProjectedVecResult)[]> {
@@ -1031,7 +1113,8 @@ export async function searchVecDaemonRequired(
   const traceStatus: VecExecStatus = outcome.status === "ok-hydrated" ? "ok" : outcome.status;
   const protocol: VecResponseProtocol | undefined = outcome.status === "ok-hydrated" ? HYDRATED_PROTOCOL : outcome.status === "ok" ? "raw-hit" : undefined;
   if (outcome.status === "skew") warnOnceOnDaemonSkew(store.dbPath, outcome.missing);
-  if (onOutcome) { try { onOutcome(traceStatus, protocol); } catch { /* recorder must never break the leg */ } }
+  const legFaults = outcome.status === "ok" || outcome.status === "ok-hydrated" ? outcome.vectorFaults : undefined;
+  if (onOutcome) { try { onOutcome(traceStatus, protocol, legFaults); } catch { /* recorder must never break the leg */ } }
   let results: (SearchResult | ProjectedVecResult)[] = [];
   if (outcome.status === "ok-hydrated") {
     // Projection-complete daemon hydration — zero synchronous sqlite on this event loop.
@@ -1043,6 +1126,8 @@ export async function searchVecDaemonRequired(
     results = hydrateVecResults(store.db, outcome.results, limit, collectionId, collections, dateRange);
   } else if (outcome.status === "model_mismatch") {
     throw new VecReadModelMismatchError(outcome.storedModels, outcome.activeModel);
+  } else if (outcome.status === "vector-fault") {
+    throw outcome.error; // 82.2 D4: typed, as in searchVecBounded
   }
   if (VEC_TIMING) {
     console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : ""} (daemon-required) elapsedMs=${evidenceMs(elapsed(startedAt))} results=${results.length}`);

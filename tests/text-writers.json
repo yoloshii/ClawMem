@@ -1,0 +1,405 @@
+{
+ "$comment": "BACKLOG 82.3 D7 writer inventory (ruling 58 A): one entry per producer of the free-text columns of tests/binding-census.json (normalised, guarded, stored-copy), with the tests that feed it a mark-led value. Identifier columns are covered as a class (identifierClass). Checked by tests/unit/text-writers.test.ts.",
+ "writers": [
+  {
+   "producer": "indexer: parseDocument + indexCollection",
+   "source": "src/indexer.ts",
+   "fields": [
+    "content.doc",
+    "documents.title",
+    "documents.domain",
+    "documents.content_type"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "mark-led files, with and without frontmatter"
+    },
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "frontmatter scalars led by %s are normalised"
+    },
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "the indexer: a heading led by %s, and a file name led by it inside a folder"
+    }
+   ]
+  },
+  {
+   "producer": "saveMemory",
+   "source": "src/store.ts",
+   "fields": [
+    "content.doc",
+    "documents.title"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "a body and a title led by %s"
+    }
+   ]
+  },
+  {
+   "producer": "insertDocument / updateDocument / updateDocumentTitle / reactivateDocument",
+   "source": "src/store.ts",
+   "fields": [
+    "documents.title"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "insertDocument, updateDocument, updateDocumentTitle and reactivateDocument given a title"
+    }
+   ]
+  },
+  {
+   "producer": "insertContent: the one body writer (decision-extractor, stop-session-docs, stop-recover, consolidation, profile, beads hash with normalizedContent)",
+   "source": "src/content-insert.ts",
+   "fields": [
+    "content.doc"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "a body led by %s is refused, with its own hash and with the hash of the rest"
+    },
+    {
+     "file": "tests/unit/hash-contract.test.ts",
+     "title": "the only INSERT or UPDATE of the `content` table under src/ is in content-insert.ts"
+    }
+   ]
+  },
+  {
+   "producer": "updateObservationFields",
+   "source": "src/store.ts",
+   "fields": [
+    "documents.narrative",
+    "documents.observation_type",
+    "documents.skill_name",
+    "documents.obs_quality_score",
+    "documents.failure_reason"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "every scalar led by %s is stored without it; the JSON lists are stored as given"
+    }
+   ]
+  },
+  {
+   "producer": "upsertEntity / ensureEntityCanonical / recordEntityMention",
+   "source": "src/entity.ts",
+   "fields": [
+    "entity_nodes.name",
+    "entity_nodes.entity_type",
+    "entities_fts.name",
+    "entities_fts.entity_type",
+    "entity_mentions.mention_text"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "upsertEntity given a name and a type led by %s"
+    },
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "ensureEntityCanonical with %s"
+    },
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "recordEntityMention with a mention text led by %s"
+    }
+   ]
+  },
+  {
+   "producer": "addTriple / invalidateTriple",
+   "source": "src/store.ts",
+   "fields": [
+    "entity_triples.predicate",
+    "entity_triples.object_literal",
+    "entity_triples.source_fact",
+    "entity_triple_provenance.source_fact"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "%s: stored alone, no part keeps the mark; the predicate has no underscore for it"
+    }
+   ]
+  },
+  {
+   "producer": "splitter: fragment labels",
+   "source": "src/splitter.ts",
+   "fields": [
+    "content_vectors.fragment_label"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "a section heading led by %s gives a label without it"
+    }
+   ]
+  },
+  {
+   "producer": "classifyIntent: the intent cache",
+   "source": "src/intent.ts",
+   "fields": [
+    "intent_classifications.query_text"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "the intent cache: a query led by %s is cached as the query without it"
+    }
+   ]
+  },
+  {
+   "producer": "insertUsage: the usage log",
+   "source": "src/store.ts",
+   "fields": [
+    "context_usage.query_text"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-writers.test.ts",
+     "title": "the usage log: a query text led by %s"
+    }
+   ]
+  },
+  {
+   "producer": "storeMemoryNote",
+   "source": "src/amem.ts",
+   "fields": [
+    "documents.amem_context"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-amem.test.ts",
+     "title": "storeMemoryNote: a context led by %s"
+    }
+   ]
+  },
+  {
+   "producer": "evolveMemories",
+   "source": "src/amem.ts",
+   "fields": [
+    "memory_evolution.new_context",
+    "memory_evolution.reasoning",
+    "memory_evolution.previous_context"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-amem.test.ts",
+     "title": "evolveMemories: a new context and a reasoning led by %s"
+    },
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "memory_evolution.previous_context copies a %s-led stored context"
+    }
+   ]
+  },
+  {
+   "producer": "consolidation: cluster pass, merge, contradiction",
+   "source": "src/consolidation.ts",
+   "fields": [
+    "consolidated_observations.observation"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-consolidation.test.ts",
+     "title": "%s (twice) before the text"
+    },
+    {
+     "file": "tests/unit/normalised-consolidation.test.ts",
+     "title": "-led copy merges the same way, instead of adding a second row"
+    }
+   ]
+  },
+  {
+   "producer": "updateSession",
+   "source": "src/store.ts",
+   "fields": [
+    "session_log.summary"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "session_log.summary through updateSession"
+    }
+   ]
+  },
+  {
+   "producer": "insertJudgeEvent",
+   "source": "src/judge-audit.ts",
+   "fields": [
+    "judge_events.reasoning_head",
+    "judge_events.evidence_head"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "judge reasoning_head and evidence_head"
+    }
+   ]
+  },
+  {
+   "producer": "causal writer: live sightings and legacy materialize",
+   "source": "src/causal-writer.ts",
+   "fields": [
+    "causal_witness_sightings.source_fact",
+    "causal_witness_sightings.target_fact",
+    "causal_witness_sightings.reasoning"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/causal-writer.test.ts",
+     "title": "a live sighting: facts and the model's reasoning led by %s are stored without it"
+    },
+    {
+     "file": "tests/unit/causal-writer.test.ts",
+     "title": "a legacy sighting materialized from stored metadata led by %s is stored without it"
+    }
+   ]
+  },
+  {
+   "producer": "wasPromptSeenRecently: hook dedupe",
+   "source": "src/hooks.ts",
+   "fields": [
+    "hook_dedupe.prompt_preview"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "-led prompt is the same prompt as the plain one"
+    }
+   ]
+  },
+  {
+   "producer": "writeGeneralMembership / writeMirrorMembership",
+   "source": "src/stop-feedback.ts",
+   "fields": [
+    "feedback_ledger.displayed_title"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "feedback_ledger.displayed_title copies a %s-led stored title"
+    },
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "feedback_ledger.displayed_title of a mirror row copies"
+    }
+   ]
+  },
+  {
+   "producer": "entity repair: copyTables, apply's mention-pair moves, restore (stored-copy, ruling 53 A)",
+   "source": "src/entity-repair.ts",
+   "fields": [
+    "entity_cooccurrences.last_cooccurred",
+    "entity_nodes.description"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/stored-copy.test.ts",
+     "title": "copyTables: a scratch copy of tables holding %s-led text is byte-identical"
+    },
+    {
+     "file": "tests/unit/stored-copy.test.ts",
+     "title": "a mention exchange with %s-led times: mention moves and pair inserts, then the restore"
+    }
+   ]
+  },
+  {
+   "producer": "preserveAntipatternBodies",
+   "source": "src/stop-recover.ts",
+   "fields": [
+    "recovered_antipattern_bodies.body"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "-led orphaned body is not selected"
+    }
+   ]
+  },
+  {
+   "producer": "causal run events: insertCausalEvent (ruling 61 A)",
+   "source": "src/causal-writer.ts",
+   "fields": [
+    "causal_run_events.detail"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "model text led by %s twice is stored without the marks"
+    },
+    {
+     "file": "tests/unit/normalised-evidence.test.ts",
+     "title": "a placeholder reasoning that is only %s keeps its event (detail empty)"
+    }
+   ]
+  },
+  {
+   "producer": "guarded free text (ruling 55 A): the guard refuses a mark-led value; one class-level test",
+   "source": "src/sqlite-guard.ts",
+   "fields": [
+    "llm_cache.result",
+    "documents.embed_error",
+    "stop_cursors.last_error",
+    "stop_retries.last_error",
+    "maintenance_runs.reason",
+    "retired_causal_edges.operator_note",
+    "entity_triples.valid_from",
+    "entity_triples.valid_to"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/sqlite-guard.test.ts",
+     "title": "the error names the mark, the statement and the parameter, and points at the doctor"
+    },
+    {
+     "file": "tests/unit/causal-migrate.test.ts",
+     "title": "%s: refused at the flag — exit 2, the message names --note, no run row, the edge untouched"
+    }
+   ]
+  },
+  {
+   "producer": "insertContent's 84 A rewrite: the search rows of the active documents on the rewritten hash (stored-copy, copied in SQL)",
+   "source": "src/content-insert.ts",
+   "fields": [
+    "documents_fts.body"
+   ],
+   "tests": [
+    {
+     "file": "tests/unit/well-formed-text.test.ts",
+     "title": "saveMemory of the same text: the row now holds the body (hash = hash of its bytes), the new memory reads it, and the OLD document's search row follows"
+    }
+   ]
+  }
+ ],
+ "identifierClass": {
+  "note": "identifier columns: refused at every input boundary (typed error), and the guard refuses a stored one bound again (D8 = C)",
+  "tests": [
+   {
+    "file": "tests/unit/identifier-refusal-boundary.test.ts",
+    "title": "get: %s"
+   },
+   {
+    "file": "tests/unit/selector-wiring.test.ts",
+    "title": "findDocument refuses a marked selector in every form"
+   },
+   {
+    "file": "tests/unit/identifier-refusal-indexer.test.ts",
+    "title": "a file whose path starts with a mark is skipped and counted"
+   },
+   {
+    "file": "tests/unit/identifier-refusal-cli.test.ts",
+    "title": "the CLI refuses a marked collection name with exit 2"
+   },
+   {
+    "file": "tests/unit/sqlite-guard.test.ts",
+    "title": "the error names the mark, the statement and the parameter, and points at the doctor"
+   }
+  ]
+ }
+}

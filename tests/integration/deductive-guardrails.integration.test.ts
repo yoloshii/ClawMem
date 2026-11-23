@@ -8,6 +8,7 @@ import { createMockLLM } from "../helpers/mock-llm.ts";
 import { hashContent } from "../../src/indexer.ts";
 import type { Store } from "../../src/store.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 /**
  * Integration tests for Ext 1 — Anti-contamination LLM synthesis
  * wrapper driven through the real `runDeductiveSynthesis` path.
@@ -47,7 +48,7 @@ function seedDeductiveSource(
   const body = `# ${opts.title}\n\n${opts.facts}\n\n${opts.narrative ?? ""}`;
   const hash = hashContent(body);
 
-  store.insertContent(hash, body, modifiedAt);
+  seedContent(store.db, hash, body, modifiedAt);
   store.insertDocument("test", opts.path, opts.title, hash, modifiedAt, modifiedAt);
 
   const row = store.db

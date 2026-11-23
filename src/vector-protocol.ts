@@ -86,6 +86,17 @@ export const HYDRATED_GATE_TEXT_LEN = 4000;
 export const DEADLINE_PROTOCOL = "deadline-rel-v1";
 
 /**
+ * The vector-fault protocol (v0.43.7, BACKLOG 82.2 D4). A daemon that implements it screens every
+ * returned distance, counts the rows it dropped, and says so on EVERY scan answer: the hydrated
+ * header and the raw reply carry `vectorFaultProtocol: "vf1"` and, when the count is not zero,
+ * `vectorFaults: n`. Attestation present and no count = zero faults. Attestation ABSENT = a daemon
+ * that never screened: the count is unknown, never zero, and the client classes the answer `skew`.
+ * A query vector the daemon's own embedding refused travels as the typed error frame
+ * `{ error: "vec_poison", ... }`. Advertised in the readiness pong's `protocols`; `live` requires it.
+ */
+export const VECTOR_FAULT_PROTOCOL = "vf1";
+
+/**
  * Contract ceiling on `remainingBudgetMs` (O1 §2, codex rev-6 F4): a
  * non-integer or out-of-range value is version/config skew, refused before
  * the scan, never clamped (the t89 P3 convention). EQUAL to the context-

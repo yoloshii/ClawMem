@@ -23,6 +23,7 @@ import { computeDocMetrics, mean, p95 } from "../../src/eval/metrics.ts";
 import { parseGoldFile, resolveGoldExamples, GoldFileError } from "../../src/eval/gold.ts";
 import { runEval, resolveRetrievedDocId, EvalIntegrityError } from "../../src/eval/run.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const TEST_DB = "/tmp/clawmem-eval-harness-test.sqlite";
 const OUT_DIR = "/tmp/clawmem-eval-harness-out";
 const MODEL = "eval-fake";
@@ -55,7 +56,7 @@ let store: Store;
 function seedDoc(col: string, path: string, body: string, opts?: { contentType?: string; noVector?: boolean }): string {
   const hash = hashContent(body + col + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
   if (opts?.contentType) {
     const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1`).get(hash) as { id: number };

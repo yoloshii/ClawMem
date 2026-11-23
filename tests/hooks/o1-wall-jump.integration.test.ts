@@ -30,6 +30,7 @@
  * RAW `performance.now()`, never `monoNow()`, so that mutation cannot stretch a stall to absorb the
  * step it is meant to expose.
  */
+import { stubSearchVec } from "../helpers/vec-stub.ts";
 import { describe, it, expect, afterEach, beforeEach } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -105,7 +106,7 @@ function seededStore(): Store {
 describe("O1 §5 (1): the CLIENT's monotonic control is unchanged by a wall step in the client", () => {
   it("a FORWARD +5 s step after the request is sent, before its answer is parsed: still `ok` — the pump's monotonic checks never see it", async () => {
     const dbPath = `/tmp/o1-jump-c1a-${process.pid}.sqlite`;
-    const fake = fakeDaemon(vecDaemonSocketPath(dbPath), () => ({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL }), 150);
+    const fake = fakeDaemon(vecDaemonSocketPath(dbPath), () => ({ results: [{ hash_seq: "h_0", distance: 0 }], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }), 150);
     try {
       const t0 = monoNow();
       setWallJumpForTest({ at: deadlineAfter(t0, duration(40)) as unknown as MonoInstant, deltaMs: +5000 });
@@ -118,7 +119,7 @@ describe("O1 §5 (1): the CLIENT's monotonic control is unchanged by a wall step
 
   it("a BACKWARD −5 s step before the connection opens: the TRANSMITTED budget is the true remainder — never inflated by the step", async () => {
     const dbPath = `/tmp/o1-jump-c1b-${process.pid}.sqlite`;
-    const fake = fakeDaemon(vecDaemonSocketPath(dbPath), () => ({ results: [], deadlineProtocol: DEADLINE_PROTOCOL }), 0);
+    const fake = fakeDaemon(vecDaemonSocketPath(dbPath), () => ({ results: [], deadlineProtocol: DEADLINE_PROTOCOL, vectorFaultProtocol: "vf1" }), 0);
     try {
       const t0 = monoNow();
       const deadline = deadlineAfter(t0, duration(300));
@@ -175,12 +176,12 @@ describe("O1 §5 (3): a BACKWARD step cannot convert a real monotonic overrun in
     process.env.CLAWMEM_PROFILE = "balanced"; // vectorTimeout 900
     process.env.CLAWMEM_HOOK_BUDGET_MS = "6000";
     const store = seededStore();
-    store.searchVec = async () => {
+    stubSearchVec(store, async () => {
       // The synchronous scan crosses the leg deadline; the wall clock steps BACK mid-scan.
       setWallJumpForTest({ at: deadlineAfter(monoNow(), duration(100)) as unknown as MonoInstant, deltaMs: -5000 });
       busyWaitMs(1200);
       return [];
-    };
+    });
     const trace = newSurfacingTrace();
     await contextSurfacing(store, { prompt: "billing invoice export retries enterprise", sessionId: "o1-jump-3" }, { trace });
     const primary = (trace.vectorLegDeadlines ?? []).find(d => d.leg === "primary");
@@ -206,11 +207,11 @@ describe("O1 §5 (4): handler-wide work/reserve decisions are unaffected by a wa
       if (query === "config.yaml" || query === "deploy.sh") fileSearches.push(query);
       return realFts(query, limit);
     }) as Store["searchFTS"];
-    store.searchVec = async () => {
+    stubSearchVec(store, async () => {
       setWallJumpForTest({ at: deadlineAfter(monoNow(), duration(100)) as unknown as MonoInstant, deltaMs: -5000 });
       busyWaitMs(1300); // crosses the work deadline (1000) and the vector deadline (min(900, 950))
       return [];
-    };
+    });
     const trace = newSurfacingTrace();
     const t0 = monoNow();
     await contextSurfacing(store, { prompt: "billing invoice export retries enterprise config.yaml deploy.sh", sessionId: "o1-jump-4" }, { trace });

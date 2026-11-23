@@ -16,6 +16,7 @@ import { splitDocument } from "../../src/splitter.ts";
 import { formatDocForEmbedding } from "../../src/llm.ts";
 import { runSampledVectorValidation } from "../../src/canary.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const ROOT = join(import.meta.dir, "../..");
 const CANARY = "CANARY-EMBED";
 const LEGACY = `# Pre-Compaction State\n\n_Extracted 2026-09-01T10:00:00 before auto-compaction. This is authoritative._\n\n## Last User Request\n\nzephyrinth gantry ${CANARY} from another session\n`;
@@ -69,7 +70,7 @@ function seed(st: Store): void {
   const now = new Date().toISOString();
   const put = (path: string, body: string, origin: string | null, title: string) => {
     const hash = hashContent(body + path);
-    st.insertContent(hash, body, now);
+    seedContent(st.db, hash, body, now);
     st.insertDocument("agent-memory", path, title, hash, now, now);
     st.db.prepare("UPDATE documents SET origin = ? WHERE collection = 'agent-memory' AND path = ?").run(origin, path);
     return hash;

@@ -30,6 +30,7 @@ import { formatDocForEmbedding } from "../../src/llm.ts";
 import { startEmbedFixture } from "../helpers/embed-readiness-fixture.ts";
 import { createHash } from "crypto";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // ---------------------------------------------------------------------------
 // Canary battery
 // ---------------------------------------------------------------------------
@@ -183,7 +184,7 @@ describe("baseline persistence — first-healthy calibration only (T8-M3)", () =
 function seedSyncedDoc(store: Store, col: string, path: string, body: string): string {
   const hash = hashContent(body + col + path);
   const now = new Date().toISOString();
-  store.insertContent(hash, body, now);
+  seedContent(store.db, hash, body, now);
   store.insertDocument(col, path, path, hash, now, now);
   store.markEmbedSynced(hash);
   return hash;

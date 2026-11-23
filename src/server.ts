@@ -13,6 +13,8 @@
  * it is not authority against a same-user process, which can read it.
  */
 
+import { BomLeadingIdentifierError, refuseLeadingMark, stripLeadingMarks } from "./text-policy.ts";
+import { parseCollectionList } from "./selector.ts";
 import type { Server } from "bun";
 import { isoNow, toDate, epochNow, epochAfter, duration } from "./clock.ts";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
@@ -45,6 +47,7 @@ import {
   extractSnippet,
   rethrowIfFatalVectorError,
 } from "./store.ts";
+import { isRefusedEmbedResponse } from "./vector-guard.ts";
 
 // =============================================================================
 // Types
@@ -140,6 +143,37 @@ function handleStats(_req: Request, _url: URL, store: Store): Response {
 
 // --- Unified Search ---
 
+type RestDegradedLeg = { leg: string; reason: "vector-fault"; vectorFaults?: number };
+
+/**
+ * The one vector leg of `POST /search` and `POST /retrieve` (v0.43.7, BACKLOG 82.2 D4 — rows `hybrid` and
+ * `rest-semantic`). `answered` is false when the leg produced nothing to use; the caller then relies on its lexical
+ * side (hybrid) or takes its lexical fallback (semantic).
+ *  - stored vectors the scan skipped as unusable: the results stand, and the count is reported;
+ *  - a QUERY vector the endpoint answered with a malformed vector (`VecPoisonError` / `EmbedEnvelopeError`): handled
+ *    HERE, before the fatal rethrow — no vector results, reported as `vector-fault`;
+ *  - a dimension / model / schema error: rethrown, as before;
+ *  - anything else (the endpoint is down): no vector results and nothing to report, as before.
+ */
+async function restVectorLeg(store: Store, query: string, limit: number, collections?: string[]): Promise<{ results: SearchResult[]; answered: boolean; degraded?: RestDegradedLeg }> {
+  try {
+    const found = await store.searchVecWithFaults(query, DEFAULT_EMBED_MODEL, limit, undefined, collections);
+    return found.vectorFaults > 0
+      ? { results: found.results, answered: true, degraded: { leg: "vector", reason: "vector-fault", vectorFaults: found.vectorFaults } }
+      : { results: found.results, answered: true };
+  } catch (e) {
+    if (isRefusedEmbedResponse(e)) return { results: [], answered: false, degraded: { leg: "vector", reason: "vector-fault" } };
+    rethrowIfFatalVectorError(e);
+    return { results: [], answered: false };
+  }
+}
+
+/** The degraded fields of a REST search reply (operator ruling 24 A): present only when something was degraded. */
+function restDegraded(...legs: (RestDegradedLeg | undefined)[]): { degraded?: true; degradedLegs?: RestDegradedLeg[] } {
+  const listed = legs.filter((leg): leg is RestDegradedLeg => leg !== undefined);
+  return listed.length > 0 ? { degraded: true, degradedLegs: listed } : {};
+}
+
 async function handleSearch(req: Request, _url: URL, store: Store): Promise<Response> {
   const body = await parseBody<{
     query: string;
@@ -152,30 +186,28 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
 
   if (!body?.query) return jsonError("query is required");
 
-  const query = body.query;
+  const query = stripLeadingMarks(body.query);            // 82.3 D7: free text is a normalised field
+  if (!query) return jsonError("query is required");
   const mode = body.mode ?? "auto";
   const limit = Math.min(body.limit ?? 10, 50);
   const compact = body.compact ?? true;
-  const collections = body.collection ? body.collection.split(",").map(c => c.trim()) : undefined;
+  const collections = body.collection ? parseCollectionList(body.collection) : undefined;   // 82.3 D7: a marked name is refused (400)
 
   let results: SearchResult[];
+  let vectorDegraded: RestDegradedLeg | undefined;
 
   if (mode === "keyword" || (mode === "auto" && query.split(/\s+/).length <= 3)) {
     results = store.searchFTS(query, limit * 2, undefined, collections);
   } else if (mode === "semantic") {
-    try {
-      results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) {
-      rethrowIfFatalVectorError(e);
-      results = store.searchFTS(query, limit * 2, undefined, collections);
-    }
+    const leg = await restVectorLeg(store, query, limit * 2, collections);
+    vectorDegraded = leg.degraded;
+    results = leg.answered ? leg.results : store.searchFTS(query, limit * 2, undefined, collections);
   } else {
     // hybrid — BM25 + vector
     const ftsResults = store.searchFTS(query, limit * 2, undefined, collections);
-    let vecResults: SearchResult[] = [];
-    try {
-      vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
+    const leg = await restVectorLeg(store, query, limit * 2, collections);
+    vectorDegraded = leg.degraded;
+    const vecResults = leg.results;
     // Simple merge — dedupe by filepath, take max score
     const merged = new Map<string, SearchResult>();
     for (const r of [...ftsResults, ...vecResults]) {
@@ -198,6 +230,7 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
       query,
       mode,
       count: final.length,
+      ...restDegraded(vectorDegraded),
       results: final.map(r => ({
         docid: r.docid,
         path: r.displayPath,
@@ -213,6 +246,7 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
     query,
     mode,
     count: final.length,
+    ...restDegraded(vectorDegraded),
     results: final.map(r => ({
       docid: r.docid,
       path: r.displayPath,
@@ -458,7 +492,7 @@ async function handleLifecycleRestore(req: Request, _url: URL, store: Store): Pr
   const body = await parseBody<{ query?: string; collection?: string }>(req);
 
   const filter: { ids?: number[]; collection?: string; sinceDate?: string } = {};
-  if (body?.collection) filter.collection = body.collection;
+  if (body?.collection) filter.collection = refuseLeadingMark(body.collection, "collection");   // 82.3 D7
 
   const restored = store.restoreArchivedDocuments(filter);
   return jsonResponse({ restored });
@@ -531,6 +565,7 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
 
   const { indexCollection } = await import("./indexer.ts");
   const collections = listCollections();
+  if (body?.collection) refuseLeadingMark(body.collection, "collection");   // 82.3 D7: an identifier (400)
   const targetCollections = body?.collection
     ? collections.filter(c => c.name === body.collection)
     : collections;
@@ -539,7 +574,7 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
     return jsonError(`Collection not found: ${body?.collection}`, 404);
   }
 
-  let totalAdded = 0, totalUpdated = 0, totalRemoved = 0;
+  let totalAdded = 0, totalUpdated = 0, totalRemoved = 0, totalRefused = 0;
   let enrichAttempted = 0, enrichStored = 0;
 
   for (const coll of targetCollections) {
@@ -547,6 +582,7 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
     totalAdded += stats.added;
     totalUpdated += stats.updated;
     totalRemoved += stats.removed;
+    totalRefused += stats.refused;                       // 82.3 D7: files whose path starts with a byte-order mark
     enrichAttempted += stats.enrichAttempted;
     enrichStored += stats.enrichStored;
   }
@@ -559,6 +595,7 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
     added: totalAdded,
     updated: totalUpdated,
     removed: totalRemoved,
+    refused: totalRefused,
     enrichAttempted,
     enrichStored,
   });
@@ -603,13 +640,16 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
   const doTemporal = body?.temporal ?? true;
   const doSemantic = body?.semantic ?? true;
 
-  let temporalEdges = 0, semanticEdges = 0;
+  let temporalEdges = 0, semanticEdges = 0, semanticSkipped = 0;
 
   if (doTemporal) {
     temporalEdges = store.buildTemporalBackbone();
   }
   if (doSemantic) {
-    semanticEdges = await store.buildSemanticGraph();
+    // v0.43.7 (82.2 D4, operator ruling 28 A): the count of skipped neighbour rows is carried in the reply.
+    const built = await store.buildSemanticGraphDetailed();
+    semanticEdges = built.edges;
+    semanticSkipped = built.vectorFaults;
   }
 
   // Same COUNTING semantics as the MCP `build_graphs` tool: the builders count rows actually
@@ -631,6 +671,7 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
     semantic: semanticEdges,
     temporalTotal: totalFor("temporal"),
     semanticTotal: totalFor("semantic"),
+    ...(semanticSkipped > 0 ? { semanticSkipped } : {}),
   });
 }
 
@@ -658,14 +699,17 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
 
   if (!body?.query) return jsonError("query is required");
 
-  const query = body.query;
+  const query = stripLeadingMarks(body.query);            // 82.3 D7: free text is a normalised field
+  if (!query) return jsonError("query is required");
   const requestedMode = body.mode ?? "auto";
   const mode = requestedMode === "auto" ? classifyRetrievalMode(query) : requestedMode;
   const limit = Math.min(body.limit ?? 10, 50);
   const compact = body.compact ?? true;
-  const collections = body.collection ? body.collection.split(",").map(c => c.trim()) : undefined;
+  const collections = body.collection ? parseCollectionList(body.collection) : undefined;   // 82.3 D7: a marked name is refused (400)
 
   let results: SearchResult[];
+  let vectorDegraded: RestDegradedLeg | undefined;
+  let causalDegraded: RestDegradedLeg[] = [];
 
   if (mode === "timeline") {
     // Delegate to session log
@@ -692,22 +736,22 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
       whyObservationLane: false,
     });
     results = causal.results;
+    // v0.43.7 (82.2 D4): the causal pipeline no longer rethrows a refused query vector — the reply says so.
+    // Only vector faults are reported here: REST reported none of the pipeline's older reasons, and still does not.
+    causalDegraded = causal.degraded.filter(d => d.reason === "vector-fault")
+      .map(d => ({ leg: d.leg, reason: "vector-fault" as const, ...(d.vectorFaults ? { vectorFaults: d.vectorFaults } : {}) }));
   } else if (mode === "keyword") {
     results = store.searchFTS(query, limit * 2, undefined, collections);
   } else if (mode === "semantic") {
-    try {
-      results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) {
-      rethrowIfFatalVectorError(e);
-      results = store.searchFTS(query, limit * 2, undefined, collections);
-    }
+    const leg = await restVectorLeg(store, query, limit * 2, collections);
+    vectorDegraded = leg.degraded;
+    results = leg.answered ? leg.results : store.searchFTS(query, limit * 2, undefined, collections);
   } else {
     // hybrid
     const fts = store.searchFTS(query, limit * 2, undefined, collections);
-    let vec: SearchResult[] = [];
-    try {
-      vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
+    const leg = await restVectorLeg(store, query, limit * 2, collections);
+    vectorDegraded = leg.degraded;
+    const vec = leg.results;
     const merged = new Map<string, SearchResult>();
     for (const r of [...fts, ...vec]) {
       const existing = merged.get(r.filepath);
@@ -723,7 +767,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
 
   if (compact) {
     return jsonResponse({
-      query, mode, count: final.length,
+      query, mode, count: final.length, ...restDegraded(vectorDegraded, ...causalDegraded),
       results: final.map(r => ({
         docid: r.docid, path: r.displayPath, title: r.title,
         score: Math.round(r.compositeScore * 1000) / 1000,
@@ -734,7 +778,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
   }
 
   return jsonResponse({
-    query, mode, count: final.length,
+    query, mode, count: final.length, ...restDegraded(vectorDegraded, ...causalDegraded),
     results: final.map(r => ({
       docid: r.docid, path: r.displayPath, title: r.title,
       score: Math.round(r.compositeScore * 1000) / 1000,
@@ -886,6 +930,8 @@ async function route(req: Request, store: Store, token: string | null): Promise<
   try {
     return await handler(req, url, store);
   } catch (err: any) {
+    // 82.3 D7: an identifier or a selector that starts with a byte-order mark is USER INPUT, not a server fault.
+    if (err instanceof BomLeadingIdentifierError) return jsonError(err.message, 400);
     console.error(`[clawmem-server] ${req.method} ${url.pathname} error:`, err);
     return jsonError(`Internal error: ${err.message}`, 500);
   }

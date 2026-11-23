@@ -10,9 +10,11 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { createHash } from "crypto";
 import { isoNow } from "./clock.ts";
 import { freshStamp, lastChanges, stopPipelineReady } from "./stop-schema.ts";
+import { insertContent } from "./content-insert.ts";
+import { normalizedContent } from "./text-policy.ts";
+import { runExact } from "./stored-copy.ts";
 
 const PRESERVE_FLAG = "stop-pipeline:antipattern-bodies-v1";
 const PRESERVE_PROGRESS = `${PRESERVE_FLAG}:after`;
@@ -47,13 +49,14 @@ export async function preserveAntipatternBodies(db: Database, opts?: { maxChunks
     `SELECT hash, doc, created_at FROM content WHERE rowid > ? AND rowid <= ? AND substr(doc, 1, 14) = '# Antipatterns'
        AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = content.hash)`
   );
-  const ins = db.prepare(`INSERT OR IGNORE INTO recovered_antipattern_bodies (hash, body, created_at) VALUES (?, ?, ?)`);
+  // 82.3 D7 (ruling 56 A): the body and its time are copies of stored text — bound as their bytes (`?T`)
+  const ins = `INSERT OR IGNORE INTO recovered_antipattern_bodies (hash, body, created_at) VALUES (?, ?T, ?T)`;
   while (after < max) {
     if (opts?.maxChunks !== undefined && chunks >= opts.maxChunks) return copied;
     const to = Math.min(after + CHUNK, max);
     db.transaction(() => {
       for (const r of read.all(after, to) as { hash: string; doc: string; created_at: string }[]) {
-        ins.run(r.hash, r.doc, r.created_at);
+        runExact(db, ins, [r.hash, r.doc, r.created_at]);
         copied += lastChanges(db);
       }
       setFlag(db, PRESERVE_PROGRESS, String(to));
@@ -113,15 +116,14 @@ export function applyRecoveredAntipatterns(db: Database, opts?: { minOccurrences
     `_Recovered from earlier antipattern documents that later ones overwrote (ClawMem ≤ v0.40)._`, ``,
     ...accepted.map(a => `- **Avoid:** ${a.text}\n  > Seen ${a.occurrences}× (${a.firstSeen.slice(0, 10)} … ${a.lastSeen.slice(0, 10)})`),
   ];
-  const body = lines.join("\n");
-  const hash = createHash("sha256").update(body, "utf8").digest("hex");
+  const { body, hash } = normalizedContent(lines.join("\n"));
   let action: RecoveryWrite["action"] = "unchanged";
   db.transaction(() => {
     const doc = db.prepare(`SELECT id, hash, active, origin FROM documents WHERE collection = '_clawmem' AND path = ?`).get(path) as
       { id: number; hash: string; active: number; origin: string | null } | null;
     if (doc && (doc.origin === "fs" || doc.active !== 1)) { action = "refused"; return; }
     if (doc && doc.hash === hash) return;
-    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`).run(hash, body, now);
+    insertContent(db, hash, body, now);
     if (doc) {
       db.prepare(`UPDATE documents SET hash = ?, modified_at = ?, revision_count = revision_count + 1, last_seen_at = ?, doc_stamp = ? WHERE id = ?`)
         .run(hash, now, now, freshStamp(), doc.id);

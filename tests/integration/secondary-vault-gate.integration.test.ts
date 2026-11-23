@@ -35,12 +35,12 @@ import { consumePendingSurfacingBookkeeping, applySurfacingBookkeeping } from ".
 import { createTestStore } from "../helpers/test-store.ts";
 import {
   createStore,
-  insertContent,
   insertDocument,
   type Store,
 } from "../../src/store.ts";
 import { clearConfigCache, surfaceSecondaryVaults } from "../../src/config.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let TMP_ROOT: string;
 let ORIG_CONFIG_DIR: string | undefined;
 let ORIG_VAULTS: string | undefined;
@@ -93,7 +93,7 @@ const SEED_TS = "2026-01-01T00:00:00.000Z";
 
 function seedDoc(store: Store, path: string, title: string, body: string): void {
   const hash = `hash_${path}`;
-  insertContent(store.db, hash, body, SEED_TS);
+  seedContent(store.db, hash, body, SEED_TS);
   insertDocument(store.db, "test", path, title, hash, SEED_TS, SEED_TS);
   store.db
     .prepare(

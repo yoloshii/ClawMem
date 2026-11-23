@@ -7,6 +7,7 @@
  * Pattern F from ENHANCEMENT-PLAN.md (source: Hindsight entity_resolver.py)
  */
 
+import { stripLeadingMarks } from "./text-policy.ts";
 import type { Database } from "bun:sqlite";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { createHash } from "crypto";
@@ -558,6 +559,7 @@ export function ensureEntityCanonical(
   type: string,
   vault: string = 'default'
 ): string {
+  name = stripLeadingMarks(name); type = stripLeadingMarks(type);        // 82.3 D7: normalised fields
   const canonicalId = resolveEntityCanonical(db, name, type, vault);
   if (canonicalId) return canonicalId;
 
@@ -589,6 +591,7 @@ export function upsertEntity(
   type: string,
   vault: string = 'default'
 ): string {
+  name = stripLeadingMarks(name); type = stripLeadingMarks(type);        // 82.3 D7: normalised fields
   // Check for canonical match first
   const canonicalId = resolveEntityCanonical(db, name, type, vault);
 
@@ -636,7 +639,7 @@ export function recordEntityMention(
   db.prepare(`
     INSERT OR IGNORE INTO entity_mentions (entity_id, doc_id, mention_text, created_at)
     VALUES (?, ?, ?, datetime('now'))
-  `).run(entityId, docId, mentionText || null);
+  `).run(entityId, docId, (mentionText && stripLeadingMarks(mentionText)) || null);   // 82.3 D7: a normalised field
 }
 
 /**
@@ -1144,6 +1147,23 @@ export function searchEntities(
 /** A canonical entity ID as `makeEntityId` writes it: `vault:type:slug`. */
 export const CANONICAL_ENTITY_ID_RE = /^[a-z][a-z0-9-]*:[a-z_]+:[a-z0-9_]+$/;
 
+/** Whitespace trimmed from both ends, but never a U+FEFF (JavaScript's `trim()` counts it as whitespace). */
+export const trimSpace = (s: string): string => s.replace(/^[^\S\uFEFF]+|[^\S\uFEFF]+$/g, "");
+
+/**
+ * Operator ruling 79 A: kg_query's `entity` is a name OR a canonical id. Before an id a leading byte-order mark is
+ * refused, never stripped — the argument is taken as an id when, without its leading whitespace and marks, it is
+ * id-shaped or equals a stored entity id. Returns that bare id, or null when the argument is not a marked id.
+ */
+export function markedEntityId(db: Database, query: string): string | null {
+  const given = trimSpace(query);
+  if (!/^[\uFEFF\uFFFE]/.test(given)) return null;
+  const bare = trimSpace(given.replace(/^[\s\uFFFE]+/, ""));
+  if (!bare) return null;
+  if (CANONICAL_ENTITY_ID_RE.test(bare)) return bare;
+  return db.prepare(`SELECT 1 FROM entity_nodes WHERE entity_id = ?`).get(bare) ? bare : null;
+}
+
 export interface EntityQueryMatch {
   entity_id: string;
   name: string;
@@ -1175,7 +1195,7 @@ export function resolveEntityQuery(
   type Row = { entity_id: string; name: string; entity_type: string; mention_count: number | null };
   const toMatch = (r: Row): EntityQueryMatch =>
     ({ entity_id: r.entity_id, name: r.name, type: r.entity_type, mention_count: r.mention_count ?? 0 });
-  const arg = query.trim();
+  const arg = trimSpace(query);   // 79 A: not trim() — it also removes U+FEFF, which would turn a marked id into another
   if (!arg) return { via: null, matches: [] };
 
   const byId = db.prepare(`

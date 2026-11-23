@@ -13,6 +13,7 @@
  * F59-3), whether a bookkeeping job was parked, plus the context_usage rows
  * and the prior-lookback view turn 2 actually gets.
  */
+import { stubSearchVec } from "./vec-stub.ts";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -41,14 +42,14 @@ seedDocuments(store, [
 ]);
 
 let vecCalls = 0;
-store.searchVec = async () => {
+stubSearchVec(store, async () => {
   vecCalls++;
   if (vecCalls === 1 && VECTOR_SYNC_DELAY_TURN1_MS > 0) {
     const until = Date.now() + VECTOR_SYNC_DELAY_TURN1_MS;
     while (Date.now() < until) { /* synchronous busy-wait — crosses the internal deadline */ }
   }
   return [];
-};
+});
 
 type TurnReport = {
   outcome: string | null;

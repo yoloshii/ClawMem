@@ -7,6 +7,8 @@
  * Documents are accessible via clawmem:// URIs.
  */
 
+import { refuseLeadingMark, stripLeadingMarks } from "./text-policy.ts";
+import { parseCollectionList } from "./selector.ts";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { isoNow, toDate, epochNow, epochMs } from "./clock.ts";
@@ -28,6 +30,7 @@ import {
   type CausalEdgeRecord,
   type EvolutionEntry,
 } from "./store.ts";
+import { isRefusedEmbedResponse } from "./vector-guard.ts";
 import { capCausalWire } from "./causal-reader.ts";
 import {
   applyCompositeScoring,
@@ -50,7 +53,7 @@ import {
   startHeavyMaintenanceWorker,
 } from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
-import { getEntityGraphNeighbors, searchEntities, resolveEntityQuery, CANONICAL_ENTITY_ID_RE } from "./entity.ts";
+import { getEntityGraphNeighbors, searchEntities, resolveEntityQuery, CANONICAL_ENTITY_ID_RE, markedEntityId, trimSpace } from "./entity.ts";
 
 // =============================================================================
 // Reranker fallback telemetry
@@ -103,6 +106,18 @@ type StatusResult = {
 // Helpers
 // =============================================================================
 
+/**
+ * 82.3 D7 — FREE TEXT at the tool boundary (a query, an entity name): a normalised field. Every leading byte-order
+ * mark is removed, so a query that starts with one searches for the rest. Operator ruling 45 A: every free-text
+ * input of this server goes through here, not only the five search tools.
+ */
+const freeText = (text: string): string => stripLeadingMarks(text);
+
+/** 82.3 D7: the files an index pass refused (a path that starts with a byte-order mark). Empty when there is none. */
+function refusedNote(refused: number): string {
+  return refused === 0 ? "" : `, !${refused} refused (path starts with a byte-order mark; rename the file)`;
+}
+
 function encodeClawmemPath(path: string): string {
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
 }
@@ -133,16 +148,48 @@ function resolveExcludedCollections(includeInternal: boolean | undefined, collec
   return INTERNAL_COLLECTIONS;
 }
 
-type DegradedLeg = { leg: string; reason: "excluded-dominant" | "cap-truncation" };
+type DegradedLeg = { leg: string; reason: "excluded-dominant" | "cap-truncation" | "vector-fault"; vectorFaults?: number };
 
 // Only excluded-dominant carries the includeInternal advice — cap-truncation must stay
-// truthful when the shortfall is dedup-driven (T5-M2).
+// truthful when the shortfall is dedup-driven (T5-M2). `vector-fault` (v0.43.7, 82.2 D4) has its
+// own line: stored vectors whose distance was not usable were skipped, or the query vector was refused.
 function degradedGuidanceText(legs: DegradedLeg[]): string {
-  const anyExcludedDominant = legs.some(l => l.reason === "excluded-dominant");
-  return anyExcludedDominant
-    ? "Note: nearest-neighbor region dominated by excluded internal docs — pass includeInternal:true or refine the query."
-    : "Note: vector results truncated at the scan cap.";
+  const notes: string[] = [];
+  if (legs.some(l => l.reason === "excluded-dominant")) notes.push("Note: nearest-neighbor region dominated by excluded internal docs — pass includeInternal:true or refine the query.");
+  else if (legs.some(l => l.reason === "cap-truncation")) notes.push("Note: vector results truncated at the scan cap.");
+  if (legs.some(l => l.reason === "vector-fault")) notes.push("Note: vector search was degraded by a malformed vector (a stored vector that could not be scored was skipped, or the embedding endpoint returned a malformed query vector) — run `clawmem doctor`.");
+  return notes.join("\n");
 }
+
+/** What a detailed vector search says about itself, as far as a reply reports it. */
+type VecLegDetail = { degraded: boolean; degradedReason?: DegradedLeg["reason"]; vectorFaults: number };
+
+/**
+ * The degraded entries of ONE vector leg (v0.43.7, 82.2 D4; operator ruling 17 A): the older reason stays as it
+ * is, and stored vectors the scan skipped as unusable are an entry of their own, with the count.
+ */
+export function vectorLegEntries(leg: string, det: VecLegDetail): DegradedLeg[] {
+  const entries: DegradedLeg[] = [];
+  if (det.degraded && det.degradedReason && det.degradedReason !== "vector-fault") entries.push({ leg, reason: det.degradedReason });
+  if (det.vectorFaults > 0) entries.push({ leg, reason: "vector-fault", vectorFaults: det.vectorFaults });
+  return entries;
+}
+
+/** The entry of a leg whose QUERY vector the embedding endpoint answered with a malformed vector. */
+const refusedLegEntry = (leg: string): DegradedLeg => ({ leg, reason: "vector-fault" });
+
+/**
+ * The degraded fields of a SINGLE-leg reply (it has one reason field, no list): the first — older — reason stays in
+ * the field, and the count of skipped stored vectors is carried beside it.
+ */
+export function flatDegraded(entries: DegradedLeg[]): { degraded?: true; degradedReason?: DegradedLeg["reason"]; vectorFaults?: number } {
+  if (entries.length === 0) return {};
+  const faults = entries.reduce((most, entry) => Math.max(most, entry.vectorFaults ?? 0), 0);
+  return { degraded: true, degradedReason: entries[0]!.reason, ...(faults > 0 ? { vectorFaults: faults } : {}) };
+}
+
+/** The explicit error of a route that promises a cosine ranking (MCP `vsearch`, `find_similar`). */
+const VECTOR_SEARCH_UNAVAILABLE = "vector search unavailable: the embedding endpoint returned a malformed vector";
 
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "discovery" | "complex" | "hybrid" {
   const q = query.toLowerCase();
@@ -205,6 +252,7 @@ export function buildMcpServer(): { server: McpServer; store: Store; closeAllSto
 
   function getStore(vault?: string): Store {
     if (!vault) return store;
+    refuseLeadingMark(vault, "vault");                               // 82.3 D7: an identifier — refused, never stripped
     const cached = vaultStoreCache.get(vault);
     if (cached) return cached;
     const s = resolveStore(vault, { busyTimeout: 5000 });
@@ -292,6 +340,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, mode, limit, compact, includeInternal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       const effectiveMode = mode === "auto" ? classifyRetrievalMode(query) : mode;
       const lim = limit || 10;
@@ -329,9 +378,9 @@ This is the recommended entry point for ALL memory queries.`,
         });
         // Causal mode reports the flat single-vector degraded shape per the documented
         // contract (T8-M5), not the multi-leg degradedLegs aggregate.
-        const causalDegraded: DegradedLeg | undefined = degraded.length > 0
-          ? { leg: degraded[0]!.leg, reason: degraded[0]!.reason }
-          : undefined;
+        // v0.43.7 (82.2 D4): the first — older — reason stays in the field; the count of skipped stored vectors
+        // is carried beside it; the note names every reason the pipeline recorded.
+        const causalDegraded: DegradedLeg[] = degraded;
 
         const enriched = enrichResults(store, causalResults, query);
         const scored = applyCompositeScoring(enriched, query).slice(0, lim);
@@ -344,8 +393,8 @@ This is the recommended entry point for ALL memory queries.`,
             ...(causal ? { causal } : {}),
           };
         });
-        const causalDegradedFields = causalDegraded ? { degraded: true as const, degradedReason: causalDegraded.reason } : {};
-        const degradedNote = causalDegraded ? `\n${degradedGuidanceText([causalDegraded])}` : "";
+        const causalDegradedFields = flatDegraded(causalDegraded);
+        const degradedNote = causalDegraded.length > 0 ? `\n${degradedGuidanceText(causalDegraded)}` : "";
         return {
           content: [{ type: "text", text: `[routed: causal, intent: ${intent.intent}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${degradedNote}` }],
           structuredContent: { mode: effectiveMode, intent, results: items, ...causalDegradedFields },
@@ -366,8 +415,12 @@ This is the recommended entry point for ALL memory queries.`,
             try {
               const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
               results = det.results;
-              if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `complex:clause${clauseIdx}:vector`, reason: det.degradedReason });
-            } catch (e) { rethrowIfFatalVectorError(e); /* */ }
+              degradedLegs.push(...vectorLegEntries(`complex:clause${clauseIdx}:vector`, det));
+            } catch (e) {
+              // A refused query vector is handled before the fatal rethrow: this clause is dropped alone and listed.
+              if (isRefusedEmbedResponse(e)) degradedLegs.push(refusedLegEntry(`complex:clause${clauseIdx}:vector`));
+              else rethrowIfFatalVectorError(e);
+            }
           }
           else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections, undefined, clauseExcl); }
           allResults.push(...results);
@@ -391,7 +444,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       // --- Keyword / Semantic / Discovery / Hybrid modes ---
       let results: SearchResult[] = [];
-      let singleLegDegraded: DegradedLeg | undefined;
+      let singleLegDegraded: DegradedLeg[] = [];
       // semantic/discovery: the raw regime applies ONLY to results the vector leg actually
       // served — the FTS fallback's scores are not cosine, so it keeps composite scoring.
       let vectorLegServed = false;
@@ -402,8 +455,14 @@ This is the recommended entry point for ALL memory queries.`,
           const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, lim, { excludeCollections: excl });
           results = det.results;
           vectorLegServed = true;
-          if (det.degraded && det.degradedReason) singleLegDegraded = { leg: `${effectiveMode}:vector`, reason: det.degradedReason };
-        } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim, undefined, undefined, undefined, excl); }
+          singleLegDegraded = vectorLegEntries(`${effectiveMode}:vector`, det);
+        } catch (e) {
+          // A refused query vector is handled before the fatal rethrow, then as any non-fatal vector error is
+          // here: the lexical fallback answers (its scores are not cosine) — and the reply says why.
+          if (isRefusedEmbedResponse(e)) singleLegDegraded = [refusedLegEntry(`${effectiveMode}:vector`)];
+          else rethrowIfFatalVectorError(e);
+          results = store.searchFTS(query, lim, undefined, undefined, undefined, excl);
+        }
       } else {
         // Hybrid: BM25 + vector + RRF
         const bm25 = store.searchFTS(query, 30, undefined, undefined, undefined, excl);
@@ -411,8 +470,11 @@ This is the recommended entry point for ALL memory queries.`,
         try {
           const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 30, { excludeCollections: excl });
           vec = det.results;
-          if (det.degraded && det.degradedReason) singleLegDegraded = { leg: "hybrid:vector", reason: det.degradedReason };
-        } catch (e) { rethrowIfFatalVectorError(e); /* */ }
+          singleLegDegraded = vectorLegEntries("hybrid:vector", det);
+        } catch (e) {
+          if (isRefusedEmbedResponse(e)) singleLegDegraded = [refusedLegEntry("hybrid:vector")];
+          else rethrowIfFatalVectorError(e);
+        }
         if (vec.length > 0) {
           const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
           results = attachRrfScores(fusedRanked, [...bm25, ...vec]);
@@ -433,8 +495,8 @@ This is the recommended entry point for ALL memory queries.`,
       const scored = rawRegime
         ? rankRawPrimary(enriched, query).slice(0, lim)
         : applyCompositeScoring(enriched, query).slice(0, lim);
-      const modeDegraded = singleLegDegraded ? { degraded: true as const, degradedReason: singleLegDegraded.reason } : {};
-      const modeDegradedNote = singleLegDegraded ? `\n${degradedGuidanceText([singleLegDegraded])}` : "";
+      const modeDegraded = flatDegraded(singleLegDegraded);
+      const modeDegradedNote = singleLegDegraded.length > 0 ? `\n${degradedGuidanceText(singleLegDegraded)}` : "";
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
@@ -478,8 +540,9 @@ This is the recommended entry point for ALL memory queries.`,
       const pathStr = Array.isArray(path) ? path.join('/') : (path || '');
       const decodedPath = decodeURIComponent(pathStr);
       const parts = decodedPath.split('/');
-      const collection = parts[0] || '';
-      const relativePath = parts.slice(1).join('/');
+      // 82.3 D7: the identifier policy runs on each component AFTER decoding (`%EF%BB%BFx.md` is refused here).
+      const collection = refuseLeadingMark(parts[0] || '', "collection");
+      const relativePath = refuseLeadingMark(parts.slice(1).join('/'), "path");
 
       let doc = store.db.prepare(`
         SELECT d.collection, d.path, d.title, c.doc as body
@@ -537,9 +600,10 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, limit, minScore, collection, compact, includeInternal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       const collections = collection
-        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        ? parseCollectionList(collection)                          // 82.3 D7: identity-preserving; a marked name is refused
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
       const results = store.searchFTS(query, limit || 10, undefined, collections, undefined, excl);
@@ -609,6 +673,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, limit, minScore, collection, compact, includeInternal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
@@ -616,13 +681,22 @@ This is the recommended entry point for ALL memory queries.`,
       }
 
       const collections = collection
-        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        ? parseCollectionList(collection)                          // 82.3 D7: identity-preserving; a marked name is refused
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
-      const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, limit || 10, { collections, excludeCollections: excl });
+      // v0.43.7 (82.2 D4): `vsearch` promises a cosine ranking. A refused query vector is an explicit error —
+      // never lexical scores under a cosine label. Every other error leaves this handler as it did before.
+      let det: Awaited<ReturnType<Store["searchVecDetailed"]>>;
+      try {
+        det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, limit || 10, { collections, excludeCollections: excl });
+      } catch (e) {
+        if (isRefusedEmbedResponse(e)) return { content: [{ type: "text", text: VECTOR_SEARCH_UNAVAILABLE }], isError: true };
+        throw e;
+      }
       const results = det.results;
-      const vsDegraded = det.degraded && det.degradedReason ? { degraded: true as const, degradedReason: det.degradedReason } : {};
-      const vsDegradedNote = det.degraded && det.degradedReason ? `\n${degradedGuidanceText([{ leg: "vsearch", reason: det.degradedReason }])}` : "";
+      const vsEntries = vectorLegEntries("vsearch", det);
+      const vsDegraded = flatDegraded(vsEntries);
+      const vsDegradedNote = vsEntries.length > 0 ? `\n${degradedGuidanceText(vsEntries)}` : "";
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
@@ -693,11 +767,24 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit, includeInternal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       const candLimit = candidateLimit || 30;
       const rankedLists: RankedResult[][] = [];
       const docidMap = new Map<string, string>();
       const degradedLegs: DegradedLeg[] = [];
+      /** One vector leg of this query: its results, or undefined when its query vector was refused. Both are listed. */
+      const vectorLeg = async (leg: string, search: () => ReturnType<Store["searchVecDetailed"]>) => {
+        try {
+          const det = await search();
+          degradedLegs.push(...vectorLegEntries(leg, det));
+          return det;
+        } catch (e) {
+          if (!isRefusedEmbedResponse(e)) throw e;
+          degradedLegs.push(refusedLegEntry(leg));
+          return undefined;
+        }
+      };
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
       // Step 0: Temporal constraint extraction (pure regex, ~0ms)
@@ -705,7 +792,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       // Step 1: BM25 probe — skip expensive LLM expansion if strong signal
       const collections = collection
-        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        ? parseCollectionList(collection)                          // 82.3 D7: identity-preserving; a marked name is refused
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
       const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl);
@@ -726,9 +813,10 @@ This is the recommended entry point for ALL memory queries.`,
         rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
       if (hasVectors) {
-        const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
-        if (det.degraded && det.degradedReason) degradedLegs.push({ leg: "vector:original", reason: det.degradedReason });
-        if (det.results.length > 0) {
+        // v0.43.7 (82.2 D4): each vector leg embeds its own text. A leg whose query vector was refused is dropped
+        // alone and listed; every other error leaves this handler as it did before.
+        const det = await vectorLeg("vector:original", () => store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl }));
+        if (det && det.results.length > 0) {
           for (const r of det.results) docidMap.set(r.filepath, r.docid);
           rankedLists.push(det.results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
@@ -746,9 +834,8 @@ This is the recommended entry point for ALL memory queries.`,
             rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         } else if (hasVectors) {
-          const det = await store.searchVecDetailed(eq.query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
-          if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `vector:expansion${expansionIdx}`, reason: det.degradedReason });
-          if (det.results.length > 0) {
+          const det = await vectorLeg(`vector:expansion${expansionIdx}`, () => store.searchVecDetailed(eq.query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl }));
+          if (det && det.results.length > 0) {
             for (const r of det.results) docidMap.set(r.filepath, r.docid);
             rankedLists.push(det.results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
@@ -960,6 +1047,13 @@ This is the recommended entry point for ALL memory queries.`,
     /** An exact path that names more than one document: the caller must choose (never auto-selected). */
     ambiguousPath?: boolean;
   };
+  /**
+   * v0.43.7 (BACKLOG 82.2, D4): the candidates of a discovery. `vectorUnavailable` is set when the cascade reached
+   * its vector source and the embedding endpoint answered the query with a malformed vector — "nothing found" is
+   * then not a statement about the vault.
+   */
+  type LifecycleCandidates = LifecycleCandidate[] & { vectorUnavailable?: true };
+  const LIFECYCLE_VECTOR_UNAVAILABLE = "No match — vector search was unavailable (the embedding endpoint returned a malformed vector)";
 
   const STOPWORDS = new Set([
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
@@ -976,7 +1070,7 @@ This is the recommended entry point for ALL memory queries.`,
     store: Store,
     query: string,
     limit: number = 5
-  ): Promise<LifecycleCandidate[]> {
+  ): Promise<LifecycleCandidates> {
     // 1. Path match (handles queries like "stack/research/foo.md"): an exact path first, then a
     //    substring. A path named exactly may target the legacy pre-compaction snapshot; a substring is
     //    discovery and never does (62.2). Exact means one document: the display path (`collection/path`)
@@ -1049,11 +1143,13 @@ This is the recommended entry point for ALL memory queries.`,
       }
     }
 
-    // 4. Vector search fallback (semantic similarity)
+    // 4. Vector search fallback (semantic similarity). Reached only when the three sources above found nothing.
     try {
       const llm = getDefaultLlamaCpp();
       if (llm) {
-        const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit);
+        // The count of skipped stored vectors is not carried here: a lifecycle reply has no degraded structure,
+        // and the scan writes its own line (once per process).
+        const vecResults = (await store.searchVecWithFaults(query, DEFAULT_EMBED_MODEL, limit)).results;
         if (vecResults.length > 0) {
           return vecResults.map(r => ({
             displayPath: r.displayPath,
@@ -1064,6 +1160,8 @@ This is the recommended entry point for ALL memory queries.`,
         }
       }
     } catch (e) {
+      // A refused QUERY vector is handled before the fatal rethrow: no candidate, and the reply says why.
+      if (isRefusedEmbedResponse(e)) return Object.assign([] as LifecycleCandidate[], { vectorUnavailable: true as const });
       rethrowIfFatalVectorError(e);
       // Vector search unavailable — degrade gracefully
     }
@@ -1076,11 +1174,12 @@ This is the recommended entry point for ALL memory queries.`,
    * Stricter confidence requirement for destructive ops (forget).
    */
   function selectLifecycleTarget(
-    candidates: LifecycleCandidate[],
+    candidates: LifecycleCandidates,
     query: string,
     destructive: boolean = false
-  ): { target: LifecycleCandidate } | { ambiguous: string } | { notFound: string } {
+  ): { target: LifecycleCandidate } | { ambiguous: string } | { notFound: string; unavailable?: true } {
     if (candidates.length === 0) {
+      if (candidates.vectorUnavailable) return { notFound: LIFECYCLE_VECTOR_UNAVAILABLE, unavailable: true };
       return { notFound: `No matching memory found for "${query}"` };
     }
 
@@ -1130,12 +1229,13 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, confirm, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const s = getStore(vault);
       const candidates = await findMemoryCandidates(s, query, 5);
       const selection = selectLifecycleTarget(candidates, query, true); // destructive = true
 
       if ("notFound" in selection) {
-        return { content: [{ type: "text", text: selection.notFound }] };
+        return { content: [{ type: "text", text: selection.notFound }], ...(selection.unavailable ? { isError: true } : {}) };
       }
       if ("ambiguous" in selection) {
         return { content: [{ type: "text", text: selection.ambiguous }] };
@@ -1407,14 +1507,22 @@ This is the recommended entry point for ALL memory queries.`,
 
       // Use the document's content as the search query
       const queryText = `${title}\n${body.slice(0, 1000)}`;
-      const det = await store.searchVecDetailed(queryText, DEFAULT_EMBED_MODEL, (limit || 5) + 1, { excludeCollections: excl });
+      // v0.43.7 (82.2 D4): as `vsearch` — a refused query vector is an explicit error, never another ranking.
+      let det: Awaited<ReturnType<Store["searchVecDetailed"]>>;
+      try {
+        det = await store.searchVecDetailed(queryText, DEFAULT_EMBED_MODEL, (limit || 5) + 1, { excludeCollections: excl });
+      } catch (e) {
+        if (isRefusedEmbedResponse(e)) return { content: [{ type: "text", text: VECTOR_SEARCH_UNAVAILABLE }], isError: true };
+        throw e;
+      }
 
       // Filter out the reference document itself
       const similar = det.results
         .filter(r => r.filepath !== result.filepath)
         .slice(0, limit || 5);
-      const fsDegraded = det.degraded && det.degradedReason ? { degraded: true as const, degradedReason: det.degradedReason } : {};
-      const fsDegradedNote = det.degraded && det.degradedReason ? `\n${degradedGuidanceText([{ leg: "find_similar", reason: det.degradedReason }])}` : "";
+      const fsEntries = vectorLegEntries("find_similar", det);
+      const fsDegraded = flatDegraded(fsEntries);
+      const fsDegradedNote = fsEntries.length > 0 ? `\n${degradedGuidanceText(fsEntries)}` : "";
 
       const items: SearchResultItem[] = similar.map(r => {
         const { line, snippet } = extractSnippet(r.body || "", title, 200);
@@ -1451,7 +1559,7 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ vault }) => {
       const store = getStore(vault);
       const collections = listCollections();
-      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, enrichAttempted: 0, enrichStored: 0 };
+      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, enrichAttempted: 0, enrichStored: 0, refused: 0 };
 
       for (const col of collections) {
         const stats = await indexCollection(store, col.name, col.path, col.pattern);
@@ -1462,6 +1570,7 @@ This is the recommended entry point for ALL memory queries.`,
         totalStats.dated += stats.dated;
         totalStats.enrichAttempted += stats.enrichAttempted;
         totalStats.enrichStored += stats.enrichStored;
+        totalStats.refused += stats.refused;
       }
 
       // Issue #24: surface enrichment productivity in the summary — a run where
@@ -1471,7 +1580,7 @@ This is the recommended entry point for ALL memory queries.`,
         : totalStats.enrichStored === totalStats.enrichAttempted
           ? `, ✎${totalStats.enrichStored}/${totalStats.enrichAttempted} notes`
           : `, ✎${totalStats.enrichStored}/${totalStats.enrichAttempted} notes (${totalStats.enrichAttempted - totalStats.enrichStored} produced nothing — LLM endpoint problem? run 'clawmem doctor')`;
-      const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed${enrichNote}`;
+      const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed${enrichNote}${refusedNote(totalStats.refused)}`;
       return {
         content: [{ type: "text" as const, text: summary }],
         structuredContent: { ...totalStats } as Record<string, unknown>,
@@ -1548,6 +1657,7 @@ This is the recommended entry point for ALL memory queries.`,
   // collection AND vault args). Returns null when the vault resolves.
   const unknownVaultError = (vault: string | undefined) => {
     if (vault === undefined) return null;
+    refuseLeadingMark(vault, "vault");                               // 82.3 D7: refused before the name is looked up or echoed
     const availableVaults = listVaults();
     if (availableVaults.includes(vault)) return null;
     return {
@@ -1568,6 +1678,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ collection, vault }) => {
+      if (collection !== undefined) refuseLeadingMark(collection, "collection");   // 82.3 D7: an identifier
       const vaultErr = unknownVaultError(vault);
       if (vaultErr) return vaultErr;
       const store = getStore(vault);
@@ -1747,12 +1858,13 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, limit, collection, weightProfile, includeInternal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const vaultErr = unknownVaultError(vault);
       if (vaultErr) return vaultErr;
       const store = getStore(vault);
       const lim = limit ?? 10;
       const collections = collection
-        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        ? parseCollectionList(collection)                          // 82.3 D7: identity-preserving; a marked name is refused
         : undefined;
       const excl = resolveExcludedCollections(includeInternal, collections);
       // Wider candidate pool than `limit` so raw-vs-composite rank shifts stay visible
@@ -1947,7 +2059,8 @@ This is the recommended entry point for ALL memory queries.`,
       description: "Build temporal and semantic graphs for MAGMA multi-graph memory. Run after indexing documents.",
       inputSchema: {
         graph_types: z.array(z.enum(['temporal', 'semantic', 'all'])).optional().default(['all']),
-        semantic_threshold: z.number().optional().default(0.7).describe("Similarity threshold for semantic edges (0.0-1.0)"),
+        // v0.43.7 (82.2 D5): the threshold has its documented domain — a value outside [0, 1] is refused, nothing is built.
+        semantic_threshold: z.number().min(0).max(1).optional().default(0.7).describe("Similarity threshold for semantic edges (0.0-1.0)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
@@ -1957,14 +2070,18 @@ This is the recommended entry point for ALL memory queries.`,
       const shouldBuildTemporal = types.includes('temporal') || types.includes('all');
       const shouldBuildSemantic = types.includes('semantic') || types.includes('all');
 
-      const results: { temporal?: number; semantic?: number; temporalTotal?: number; semanticTotal?: number } = {};
+      const results: { temporal?: number; semantic?: number; temporalTotal?: number; semanticTotal?: number; semanticSkipped?: number } = {};
 
       if (shouldBuildTemporal) {
         results.temporal = store.buildTemporalBackbone();
       }
 
       if (shouldBuildSemantic) {
-        results.semantic = await store.buildSemanticGraph(semantic_threshold);
+        // v0.43.7 (82.2 D4, operator ruling 28 A): the reply carries the count of neighbour rows the builder
+        // skipped because their distance was not usable — only when there were any.
+        const built = await store.buildSemanticGraphDetailed(semantic_threshold);
+        results.semantic = built.edges;
+        if (built.vectorFaults > 0) results.semanticSkipped = built.vectorFaults;
       }
 
       // The builders count rows SQLite actually inserted, so a second idempotent build
@@ -1983,6 +2100,7 @@ This is the recommended entry point for ALL memory queries.`,
       if (results.semantic !== undefined) {
         results.semanticTotal = totalFor("semantic");
         lines.push(`Semantic graph: ${results.semantic} new edge(s), ${results.semanticTotal} total`);
+        if (results.semanticSkipped) lines.push(`Semantic graph: ${results.semanticSkipped} neighbour row(s) skipped — a stored vector whose distance is not usable; run \`clawmem doctor\``);
       }
 
       return {
@@ -2013,6 +2131,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, limit, force_intent, enable_graph_traversal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
@@ -2021,7 +2140,7 @@ This is the recommended entry point for ALL memory queries.`,
       // already reach _clawmem. enable_graph_traversal=false disables EVERY graph stage
       // (adaptive, MPFP, entity expansion, causal one-hop); anchor search + rerank remain.
       const graphOn = enable_graph_traversal !== false;
-      const { intent, results: pipelineResults, associations } = await runCausalRetrieval(store, llm, query, {
+      const { intent, results: pipelineResults, associations, degraded: pipelineDegraded } = await runCausalRetrieval(store, llm, query, {
         forceIntent: force_intent as IntentType | undefined,
         stages: { traversal: graphOn, mpfp: graphOn, entityExpansion: graphOn, rerank: true, causalOneHop: graphOn },
         baseEligibility: {},
@@ -2050,15 +2169,19 @@ This is the recommended entry point for ALL memory queries.`,
         };
       });
 
+      // v0.43.7 (82.2 D4): this tool reported no degradation before, and still reports none of the older
+      // reasons. A vector fault is reported: without it a refused query vector would read as a full answer.
+      const intentFaults: DegradedLeg[] = pipelineDegraded.filter(d => d.reason === "vector-fault");
       return {
         content: [{
           type: "text",
-          text: `Intent: ${intent.intent} (${Math.round(intent.confidence * 100)}% confidence)\n\n${formatSearchSummary(results, query)}`,
+          text: `Intent: ${intent.intent} (${Math.round(intent.confidence * 100)}% confidence)\n\n${formatSearchSummary(results, query)}${intentFaults.length > 0 ? `\n${degradedGuidanceText(intentFaults)}` : ""}`,
         }],
         structuredContent: {
           intent: intent.intent,
           confidence: intent.confidence,
           results,
+          ...(intentFaults.length > 0 ? { degraded: true as const, degradedLegs: intentFaults } : {}),
         },
       };
     }
@@ -2082,6 +2205,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, limit, compact, includeInternal, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
@@ -2102,9 +2226,15 @@ This is the recommended entry point for ALL memory queries.`,
         if (clause.type === 'bm25') {
           results = store.searchFTS(clause.query, 20, undefined, clause.collections, undefined, clauseExcl);
         } else if (clause.type === 'vector') {
-          const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
-          results = det.results;
-          if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:vector`, reason: det.degradedReason });
+          // v0.43.7 (82.2 D4): a clause whose query vector was refused is dropped alone and listed.
+          try {
+            const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
+            results = det.results;
+            degradedLegs.push(...vectorLegEntries(`clause${clauseIdx}:vector`, det));
+          } catch (e) {
+            if (!isRefusedEmbedResponse(e)) throw e;
+            degradedLegs.push(refusedLegEntry(`clause${clauseIdx}:vector`));
+          }
         } else if (clause.type === 'graph') {
           // Graph clause → shared causal pipeline (v0.32.0), keeping this site's bounded
           // variant: traversal + one-hop only, smaller budgets, no MPFP/entity/rerank
@@ -2116,7 +2246,7 @@ This is the recommended entry point for ALL memory queries.`,
             baseEligibility: { allowCollections: clause.collections, excludeCollections: clauseExcl },
             whyObservationLane: true,
           });
-          for (const d of graphDegraded) degradedLegs.push({ leg: `clause${clauseIdx}:graph:${d.leg.replace(/^causal:/, "")}`, reason: d.reason });
+          for (const d of graphDegraded) degradedLegs.push({ leg: `clause${clauseIdx}:graph:${d.leg.replace(/^causal:/, "")}`, reason: d.reason, ...(d.vectorFaults ? { vectorFaults: d.vectorFaults } : {}) });
           // One-hop associations survive clause merging and reach the final items (T6-F10).
           for (const [fp, assoc] of graphAssociations) {
             const existing = planAssociations.get(fp) ?? [];
@@ -2319,13 +2449,17 @@ This is the recommended entry point for ALL memory queries.`,
     },
     async ({ entity, as_of, direction, vault }) => {
       const store = getStore(vault);
+      // 79 A: a mark before a canonical id is refused (an identifier); before a name it is stripped (45 A, free text)
+      if (markedEntityId(store.db, entity) !== null) refuseLeadingMark(trimSpace(entity), "entity (a canonical entity id)");
+      // a name: every leading space and mark goes (a space can precede the mark), then the free-text policy (45 A)
+      entity = freeText(entity.replace(/^[\s\uFFFE]+/, ""));
 
       // 76.2: an existing canonical ID, then every entity with exactly this name, then the
       // name search (never for an ID-shaped argument, never onto a name whose numbers differ).
       // An ID-shaped argument that names no entity is used as given, so an ID known only from
       // triples still round-trips.
       const resolution = resolveEntityQuery(store.db, entity);
-      const asGiven = entity.trim();
+      const asGiven = trimSpace(entity);
       const targets: { entity_id: string; name: string; type: string }[] = resolution.matches.length > 0
         ? resolution.matches
         : CANONICAL_ENTITY_ID_RE.test(asGiven) ? [{ entity_id: asGiven, name: asGiven, type: "" }] : [];
@@ -2602,6 +2736,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, unpin, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const s = getStore(vault);
       const candidates = await findMemoryCandidates(s, query);
       const selection = selectLifecycleTarget(candidates, query);
@@ -2651,6 +2786,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, until, vault }) => {
+      query = freeText(query);                                        // 82.3 D7: free text is a normalised field
       const s = getStore(vault);
       const candidates = await findMemoryCandidates(s, query);
       const selection = selectLifecycleTarget(candidates, query);
@@ -2817,6 +2953,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ query, collection, all, vault }) => {
+      if (query !== undefined) query = freeText(query);              // 82.3 D7: free text is a normalised field
       const store = getStore(vault);
       if (query) {
         const results = store.searchArchived(query, 20);
@@ -2831,6 +2968,7 @@ This is the recommended entry point for ALL memory queries.`,
       }
 
       if (collection) {
+        refuseLeadingMark(collection, "collection");                   // 82.3 D7: an identifier — refused, never stripped
         const restored = store.restoreArchivedDocuments({ collection });
         return { content: [{ type: "text", text: `Restored ${restored} documents from collection "${collection}"` }] };
       }
@@ -2892,6 +3030,7 @@ This is the recommended entry point for ALL memory queries.`,
       },
     },
     async ({ vault, content_root, pattern, collection_name }) => {
+      if (collection_name) refuseLeadingMark(collection_name, "collection_name");   // 82.3 D7: an identifier — refused, never stripped
       const s = getStore(vault);
       const root = content_root.replace(/^~/, process.env.HOME || "/tmp");
       const collName = collection_name || vault;
@@ -2921,7 +3060,7 @@ This is the recommended entry point for ALL memory queries.`,
         return {
           content: [{
             type: "text",
-            text: `Synced to vault "${vault}":\n  Collection: ${collName}\n  Root: ${root}\n  Added: ${stats.added}\n  Updated: ${stats.updated}\n  Deleted: ${stats.removed}${noteLine}`,
+            text: `Synced to vault "${vault}":\n  Collection: ${collName}\n  Root: ${root}\n  Added: ${stats.added}\n  Updated: ${stats.updated}\n  Deleted: ${stats.removed}${noteLine}${stats.refused === 0 ? "" : `\n  Refused: ${stats.refused} (path starts with a byte-order mark; rename the file)`}`,
           }],
           structuredContent: { vault, collection: collName, ...stats },
         };

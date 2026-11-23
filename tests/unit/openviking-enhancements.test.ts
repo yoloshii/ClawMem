@@ -23,6 +23,7 @@ import {
   type EnrichedResult,
 } from "../../src/memory.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 
 beforeEach(() => {
@@ -73,7 +74,7 @@ describe("content_vectors canonical_id column", () => {
 describe("getHashesNeedingFragments", () => {
   it("returns collection field for each result", () => {
     // Insert a document
-    store.insertContent("hash1", "# Test Document\n\nContent here.", new Date().toISOString());
+    seedContent(store.db, "hash1", "# Test Document\n\nContent here.", new Date().toISOString());
     store.insertDocument("test-collection", "docs/test.md", "Test", "hash1", new Date().toISOString(), new Date().toISOString());
 
     const hashes = store.getHashesNeedingFragments();
@@ -130,7 +131,7 @@ describe("cleanStaleEmbeddings", () => {
     store.ensureVecTable(3);
 
     // Insert content + active document + embedding
-    store.insertContent("activeHash", "Active content", new Date().toISOString());
+    seedContent(store.db, "activeHash", "Active content", new Date().toISOString());
     store.insertDocument("col", "active.md", "Active", "activeHash", new Date().toISOString(), new Date().toISOString());
     store.insertEmbedding("activeHash", 0, 0, new Float32Array([0.1, 0.2, 0.3]), "m", new Date().toISOString());
 
@@ -165,13 +166,13 @@ describe("cleanStaleEmbeddings", () => {
 describe("collection-scoped searchFTS", () => {
   beforeEach(() => {
     // Insert docs across two collections
-    store.insertContent("h1", "# Architecture decisions for auth module", new Date().toISOString());
+    seedContent(store.db, "h1", "# Architecture decisions for auth module", new Date().toISOString());
     store.insertDocument("forge-stack", "decisions/auth.md", "Auth Decisions", "h1", new Date().toISOString(), new Date().toISOString());
 
-    store.insertContent("h2", "# Architecture decisions for API design", new Date().toISOString());
+    seedContent(store.db, "h2", "# Architecture decisions for API design", new Date().toISOString());
     store.insertDocument("tool-forge", "decisions/api.md", "API Decisions", "h2", new Date().toISOString(), new Date().toISOString());
 
-    store.insertContent("h3", "# Architecture overview of the system", new Date().toISOString());
+    seedContent(store.db, "h3", "# Architecture overview of the system", new Date().toISOString());
     store.insertDocument("forge-stack", "docs/arch.md", "Architecture", "h3", new Date().toISOString(), new Date().toISOString());
   });
 
@@ -322,9 +323,9 @@ describe("recordCoActivation and getCoActivated", () => {
 describe("insertRelation", () => {
   it("inserts a usage relation", () => {
     // Need two documents
-    store.insertContent("rh1", "doc1 content", new Date().toISOString());
+    seedContent(store.db, "rh1", "doc1 content", new Date().toISOString());
     store.insertDocument("col", "doc1.md", "Doc1", "rh1", new Date().toISOString(), new Date().toISOString());
-    store.insertContent("rh2", "doc2 content", new Date().toISOString());
+    seedContent(store.db, "rh2", "doc2 content", new Date().toISOString());
     store.insertDocument("col", "doc2.md", "Doc2", "rh2", new Date().toISOString(), new Date().toISOString());
 
     const doc1 = store.findActiveDocument("col", "doc1.md")!;
@@ -342,9 +343,9 @@ describe("insertRelation", () => {
   // 62.1 D7 (CM-19): a re-inserted pair keeps a bounded weight. This test asserted 3.0 — the unbounded sum that let
   // usage edges re-recorded on every Stop reach ~9,000 in a live vault.
   it("keeps a bounded weight on conflict (never a sum)", () => {
-    store.insertContent("rh3", "doc3", new Date().toISOString());
+    seedContent(store.db, "rh3", "doc3", new Date().toISOString());
     store.insertDocument("col", "doc3.md", "D3", "rh3", new Date().toISOString(), new Date().toISOString());
-    store.insertContent("rh4", "doc4", new Date().toISOString());
+    seedContent(store.db, "rh4", "doc4", new Date().toISOString());
     store.insertDocument("col", "doc4.md", "D4", "rh4", new Date().toISOString(), new Date().toISOString());
 
     const d3 = store.findActiveDocument("col", "doc3.md")!;
@@ -373,7 +374,7 @@ describe("insertRelation", () => {
   // review in task #170 verifies both sites by inspection.
 
   it("rejects self-loops (fromDoc === toDoc) — no row inserted", () => {
-    store.insertContent("rh_self1", "self doc", new Date().toISOString());
+    seedContent(store.db, "rh_self1", "self doc", new Date().toISOString());
     store.insertDocument("col", "self1.md", "Self1", "rh_self1", new Date().toISOString(), new Date().toISOString());
     const self = store.findActiveDocument("col", "self1.md")!;
 
@@ -390,9 +391,9 @@ describe("insertRelation", () => {
   });
 
   it("normal (non-self) relation still works after self-loop guard added — regression", () => {
-    store.insertContent("rh_norm1", "a", new Date().toISOString());
+    seedContent(store.db, "rh_norm1", "a", new Date().toISOString());
     store.insertDocument("col", "norm1.md", "N1", "rh_norm1", new Date().toISOString(), new Date().toISOString());
-    store.insertContent("rh_norm2", "b", new Date().toISOString());
+    seedContent(store.db, "rh_norm2", "b", new Date().toISOString());
     store.insertDocument("col", "norm2.md", "N2", "rh_norm2", new Date().toISOString(), new Date().toISOString());
 
     const n1 = store.findActiveDocument("col", "norm1.md")!;
@@ -415,9 +416,9 @@ describe("insertRelation", () => {
   });
 
   it("self-loop guard does not interfere with conflict upsert on valid pair", () => {
-    store.insertContent("rh_up1", "u1", new Date().toISOString());
+    seedContent(store.db, "rh_up1", "u1", new Date().toISOString());
     store.insertDocument("col", "up1.md", "U1", "rh_up1", new Date().toISOString(), new Date().toISOString());
-    store.insertContent("rh_up2", "u2", new Date().toISOString());
+    seedContent(store.db, "rh_up2", "u2", new Date().toISOString());
     store.insertDocument("col", "up2.md", "U2", "rh_up2", new Date().toISOString(), new Date().toISOString());
     const u1 = store.findActiveDocument("col", "up1.md")!;
     const u2 = store.findActiveDocument("col", "up2.md")!;

@@ -195,6 +195,10 @@ rebuild over an unchanged corpus correctly returns `0`. `temporalTotal` / `seman
 edges of that type **currently in the active graph** (both endpoints active). `0 new` does not
 mean the graph is empty; read the total.
 
+From v0.43.7 the response carries `semanticSkipped` when the semantic build skipped neighbour rows because a
+stored vector gave no usable distance — only when the count is above zero. `clawmem doctor --full` finds those
+vectors and `clawmem repair vectors` removes them.
+
 Unlike the MCP `build_graphs` tool, which returns only the graph types you requested, this
 endpoint always emits all four keys — that is its pre-existing shape, kept so existing callers
 do not break.
@@ -221,7 +225,7 @@ do not break.
 |--------|------|-------------|
 | GET | `/collections` | List all collections |
 | GET | `/profile` | Get user profile |
-| POST | `/reindex` | Trigger re-scan. Response includes `enrichAttempted`/`enrichStored` note counters (v0.37.0) — a run whose enrichment produced nothing is visible, not an unqualified success |
+| POST | `/reindex` | Trigger re-scan. Response includes `enrichAttempted`/`enrichStored` note counters (v0.37.0) — a run whose enrichment produced nothing is visible, not an unqualified success — and `refused` (v0.43.7): files skipped because their name starts with a byte-order mark |
 | POST | `/graphs/build` | Rebuild temporal + semantic graphs |
 | GET | `/export` | Vault export as JSON: every active document except copies of the `precompact-state.md` snapshot ClawMem ≤ v0.39.x left in Claude Code memory dirs, counted in `legacy_snapshots_excluded`. `?full=true` includes them: every active document. Inactive documents and the vault's other tables are not exported; back up the SQLite file itself for that |
 
@@ -248,6 +252,11 @@ All responses are JSON. Search/retrieve responses include:
 ```
 
 When `compact=false`, results include `modifiedAt`, `confidence`, and full `body` instead of `snippet`.
+
+**Byte-order marks (v0.43.7).** An identifier in a request — a collection name, a document path or selector — that
+starts with U+FEFF or U+FFFE gets `400` with a message naming the field; it is never stripped. The `query` of `/search` and `/retrieve` loses its leading marks. A request that meets a stored identifier
+written with such a mark by an older version can fail with `500` and the guard's message, or return incomplete
+results: see [troubleshooting](../troubleshooting.md#stored-identifiers-that-start-with-a-byte-order-mark).
 
 ## Running as a systemd service
 

@@ -15,6 +15,7 @@
  * Runs on the `speed` profile — FTS-only, no vector service, no escalation —
  * so the suite is hermetic on a GPU-less CI host.
  */
+import { stubSearchVec, realSearches } from "../helpers/vec-stub.ts";
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "fs";
 import { join } from "path";
@@ -1132,8 +1133,8 @@ describe("BUILD-3b/3c: draw binding v3 + in-run pair gate", () => {
   }, 240_000);
 
   it("codex migration r2 #6: a RETRIED case's leg records are keyed by ATTEMPT — both attempts persist under distinct (leg, case, attempt, rep) keys, and the worst names its attempt", async () => {
-    const realSearchVec = store.searchVec;
-    store.searchVec = (async () => []) as Store["searchVec"]; // hermetic in-process vector leg: no embedding, no network
+    const restoreSearches = realSearches(store);
+    stubSearchVec(store, (async () => []) as Store["searchVec"]); // hermetic in-process vector leg: no embedding, no network
     try {
       const goldPath = writeGold(PAIR_GOLD);
       const partner = newDir("pair-att-a");
@@ -1147,7 +1148,7 @@ describe("BUILD-3b/3c: draw binding v3 + in-run pair gate", () => {
       expect(recs.filter(r => r.case === "pg-miss" && r.leg === "primary").map(r => r.attempt).sort()).toEqual([0, 1]);
       const top = recs.reduce((a, b) => (b.over_ms > a.over_ms ? b : a));
       expect(res.report.vector_deadline.worst).toMatchObject({ leg: top.leg, case: top.case, attempt: top.attempt, rep: top.rep });
-    } finally { store.searchVec = realSearchVec; }
+    } finally { restoreSearches(); }
   }, 240_000);
 
   it("a retried attempt's enforced violation survives into the trust gate AND the artifacts (codex turn-30 F3 seam)", async () => {
@@ -1405,15 +1406,15 @@ describe("BUILD-3d: registered treatments at the runHookEval boundary (codex tur
 
   it("codex migration r2 #2: REAL per-rep collection — every rep's own leg record is persisted, and a breach in rep 1 (never rep 0) is the attributed worst", async () => {
     const goldPath = writeGold([{ id: "rt-reps", prompt: OAUTH_PROMPT, profile: "balanced", labels: { must_include: [OAUTH_DOC] }, split: "tuning", tags: ["reps"] }]);
-    const realSearchVec = store.searchVec;
+    const restoreSearches = realSearches(store);
     let calls = 0;
     // The in-process vector leg (no daemon serves this vault): the 2nd rep's synchronous scan overruns the
     // 900 ms leg deadline; the others answer at once. The stall spins on the RAW clock.
-    store.searchVec = (async () => {
+    stubSearchVec(store, (async () => {
       calls++;
       if (calls === 2) { const until = performance.now() + 1200; while (performance.now() < until) { /* stall */ } }
       return [];
-    }) as Store["searchVec"];
+    }) as Store["searchVec"]);
     try {
       const r = await runHookEval({ goldPath, store, minExamples: 1, audited: true, latencyReps: 3, outDir: newDir("vd-reps") });
       const recs = r.report.vector_leg_records.filter(x => x.leg === "primary");
@@ -1423,7 +1424,7 @@ describe("BUILD-3d: registered treatments at the runHookEval boundary (codex tur
       expect(recs[2]!.over_ms).toBeLessThanOrEqual(0);
       expect(r.report.vector_deadline.worst).toMatchObject({ leg: "primary", case: "rt-reps", attempt: 0, rep: 1 });
       expect(r.report.vector_deadline.adhered).toBe(false);
-    } finally { store.searchVec = realSearchVec; }
+    } finally { restoreSearches(); }
   }, 120_000);
 
   it("admission_policy pair on SPEED cases: the per-case ledger records base AND treatment exposure with no rerank lane (ship-draw aggregate refusal 2026-08-26)", async () => {

@@ -10,7 +10,7 @@
 
 import type { Store } from "./store.ts";
 import { isoNow, toDate, epochNow } from "./clock.ts";
-import { hashContent } from "./indexer.ts";
+import { normalizedContent } from "./text-policy.ts";
 import { smartTruncate } from "./hooks.ts";
 import { MAX_LEVENSHTEIN_LENGTH } from "./limits.ts";
 
@@ -170,8 +170,7 @@ export function updateProfile(store: Store): ProfileUpdateOutcome {
   const dynamicItems = buildDynamicProfile(store);
   const now = isoNow();
 
-  const body = formatProfileDocument(staticFacts, dynamicItems);
-  const hash = hashContent(body);
+  const { body, hash } = normalizedContent(formatProfileDocument(staticFacts, dynamicItems));
 
   // Store content
   store.insertContent(hash, body, now);

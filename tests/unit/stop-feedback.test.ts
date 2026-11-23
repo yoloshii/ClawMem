@@ -19,6 +19,7 @@ import { feedbackLoop } from "../../src/hooks/feedback-loop.ts";
 import { promptSha, transcriptKey } from "../../src/stop-pairing.ts";
 import { T0, iso, human, assistant, ocMessage, writeTranscriptFile, appendEntries } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const dirs: string[] = [];
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), "clawmem-621-feedback-"));
@@ -30,7 +31,7 @@ afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, for
 // ─── helpers ───────────────────────────────────────────────────────────────────────────────────────────────────────
 function seedDoc(store: Store, collection: string, path: string, title: string, body = `# ${title}\n\nbody`): number {
   const hash = `h-${collection}-${path}-${Math.random().toString(36).slice(2, 8)}`;
-  store.insertContent(hash, body, iso(0));
+  seedContent(store.db, hash, body, iso(0));
   store.insertDocument(collection, path, title, hash, iso(0), iso(0));
   return store.findActiveDocument(collection, path)!.id;
 }

@@ -7,6 +7,8 @@
  * buried in larger documents.
  */
 
+import { stripLeadingMarks } from "./text-policy.ts";
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -149,7 +151,7 @@ function extractSections(lines: string[]): Fragment[] {
         }
       }
 
-      currentHeading = headingMatch[2]!.trim();
+      currentHeading = stripLeadingMarks(headingMatch[2]!.trim());      // 82.3 D7: a fragment label is a normalised field
       currentLines = [line];
       currentStartLine = i + 1;
     } else {
@@ -288,7 +290,7 @@ function extractFrontmatter(fm: Record<string, any>): Fragment[] {
     if (text.length >= 10) {
       fragments.push({
         type: 'frontmatter',
-        label: key,
+        label: stripLeadingMarks(key),                                 // 82.3 D7: a normalised field
         content: text,
         startLine: 0,
       });

@@ -11,7 +11,6 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import {
   createStore,
-  insertContent,
   insertDocument,
   searchFTS,
   ftsScoreFromBm25,
@@ -21,6 +20,7 @@ import {
 import { applyCompositeScoring } from "../../src/memory.ts";
 import { enrichResults, hasStrongFtsSignal, attachRrfScores, type RankedResult } from "../../src/search-utils.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // ─── Pure transform ──────────────────────────────────────────────────────────
 
 describe("ftsScoreFromBm25", () => {
@@ -137,7 +137,7 @@ let store: Store;
 function addDoc(collection: string, path: string, title: string, body: string, opts?: { modifiedAt?: string; qualityScore?: number }) {
   const hash = `hash_${path}_${Math.random().toString(36).slice(2)}`;
   const now = opts?.modifiedAt || new Date().toISOString();
-  insertContent(store.db, hash, body, now);
+  seedContent(store.db, hash, body, now);
   insertDocument(store.db, collection, path, title, hash, now, now);
   if (opts?.qualityScore !== undefined) {
     const doc = store.findActiveDocument(collection, path);

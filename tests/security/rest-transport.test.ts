@@ -16,6 +16,7 @@ import { createStore, type Store } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { startServer } from "../../src/server.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 type Srv = ReturnType<typeof startServer>;
 const newToken = () => randomBytes(32).toString("base64url");
 const TOKEN = newToken();
@@ -65,7 +66,7 @@ function seedDoc(opts: { modified?: string } = {}): { id: number; docid: string 
   const body = `# Doc ${++seq}\n\nbody ${seq} ${randomBytes(4).toString("hex")}`;
   const hash = hashContent(body);
   const when = opts.modified ?? new Date().toISOString();
-  store.insertContent(hash, body, when);
+  seedContent(store.db, hash, body, when);
   store.insertDocument("sec", `doc-${seq}.md`, `Doc ${seq}`, hash, when, when);
   const row = store.db.prepare("SELECT id FROM documents WHERE collection = 'sec' AND path = ?").get(`doc-${seq}.md`) as { id: number };
   return { id: row.id, docid: hash.slice(0, 6) };

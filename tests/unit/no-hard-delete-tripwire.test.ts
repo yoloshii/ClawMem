@@ -30,10 +30,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { buildMcpServer } from "../../src/mcp.ts";
 import * as storeModule from "../../src/store.ts";
-import { createStore, insertContent, insertDocument, type Store } from "../../src/store.ts";
+import { createStore, insertDocument, type Store } from "../../src/store.ts";
 import { stalenessCheck } from "../../src/hooks/staleness-check.ts";
 import { clearConfigCache } from "../../src/config.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const AUDIT = "clawmem_delete_audit";
 const TRIPWIRE = "clawmem_record_document_delete";
 
@@ -102,7 +103,7 @@ function seedOldDocs(s: Store, n: number): void {
   const old = new Date(Date.now() - 400 * 86_400_000).toISOString();
   for (let i = 0; i < n; i++) {
     const hash = `h-${i}`;
-    insertContent(s.db, hash, `body ${i}`, old);
+    seedContent(s.db, hash, `body ${i}`, old);
     insertDocument(s.db, "test", `doc-${i}.md`, "T", hash, old, old);
   }
   s.db.prepare("UPDATE documents SET active = 0, archived_at = ? WHERE path = 'doc-0.md'").run(old);

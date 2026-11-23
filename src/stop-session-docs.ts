@@ -16,6 +16,8 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "crypto";
 import { isoNow } from "./clock.ts";
 import { freshStamp, lastChanges } from "./stop-schema.ts";
+import { insertContent } from "./content-insert.ts";
+import { normalizedContent, stripLeadingMarks } from "./text-policy.ts";
 
 export type SessionDocKind = "decisions" | "antipatterns" | "handoff";
 export type StopItemKind = "decision" | "antipattern" | "turn-digest" | "handoff-summary";
@@ -153,17 +155,19 @@ export function upsertSessionDoc(
     // re-renders (reconcileRestoredSessionDocs).
     return { action: "inactive", docId: doc.id, path };
   }
-  const fp = sha256(p.body);
+  // 82.3 D7: the render and its title are normalised fields; the fingerprint is the hash of what is stored.
+  const { body, hash } = normalizedContent(p.body);
+  const title = stripLeadingMarks(p.title);
+  const fp = hash;
   if (doc && row.renderedFp === fp && row.docId === doc.id) return { action: "unchanged", docId: doc.id, path };
-  const hash = sha256(p.body);
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`).run(hash, p.body, now);
+  insertContent(db, hash, body, now);
   let docId: number;
   let action: "inserted" | "updated";
   if (doc) {
     db.prepare(
       `UPDATE documents SET hash = ?, title = ?, modified_at = ?, revision_count = revision_count + 1, last_seen_at = ?,
          origin = 'api', doc_stamp = ? WHERE id = ? AND active = 1`
-    ).run(hash, p.title, now, now, freshStamp(), doc.id);
+    ).run(hash, title, now, now, freshStamp(), doc.id);
     docId = doc.id;
     action = "updated";
   } else {
@@ -171,7 +175,7 @@ export function upsertSessionDoc(
       `INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, content_type, confidence,
          duplicate_count, revision_count, last_seen_at, origin, doc_stamp)
        VALUES ('_clawmem', ?, ?, ?, ?, ?, 1, ?, ?, 1, 1, ?, 'api', ?)`
-    ).run(path, p.title, hash, now, now, CONTENT_TYPE[p.kind], p.confidence ?? DEFAULT_CONFIDENCE[p.kind], now, freshStamp());
+    ).run(path, title, hash, now, now, CONTENT_TYPE[p.kind], p.confidence ?? DEFAULT_CONFIDENCE[p.kind], now, freshStamp());
     docId = (db.prepare(`SELECT id FROM documents WHERE collection = '_clawmem' AND path = ?`).get(path) as { id: number }).id;
     action = "inserted";
   }

@@ -6,6 +6,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { storedVector, VecPoisonError } from "./vector-guard.ts";
 import type { IntentType } from "./intent.ts";
 import { getIntentWeights } from "./intent.ts";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
@@ -54,7 +55,7 @@ export interface TraversalOptions {
   beamWidth: number;          // 5-10 nodes per level
   budget: number;             // Max total nodes (20-50)
   intent: IntentType;
-  queryEmbedding: number[];
+  queryEmbedding: number[] | Float32Array;
   eligibility?: CandidateEligibility;
 }
 
@@ -93,6 +94,14 @@ function cosineSimilarity(a: number[] | Float32Array, b: number[] | Float32Array
 /**
  * Get document embedding from vectors_vec table.
  */
+let warnedUnusableStoredVector = false;
+
+/**
+ * v0.43.7 (BACKLOG 82.2): the blob is DECODED and validated (`storedVector`). Bun returns it as a `Uint8Array`;
+ * through v0.43.6 it was typed `Float32Array` without decoding, so its length never matched the query's and the
+ * affinity of every neighbour was 0. A vector that is not usable contributes affinity 0 (an empty array) and one
+ * warning per process — the traversal leg is not discarded.
+ */
 function getDocEmbedding(db: Database, docId: number): Float32Array {
   // Get the hash for this document
   const doc = db.prepare(`
@@ -104,9 +113,19 @@ function getDocEmbedding(db: Database, docId: number): Float32Array {
   // Get embedding for seq=0 (whole document)
   const row = db.prepare(`
     SELECT embedding FROM vectors_vec WHERE hash_seq = ?
-  `).get(`${doc.hash}_0`) as { embedding: Float32Array } | undefined;
+  `).get(`${doc.hash}_0`) as { embedding: Uint8Array } | undefined;
 
-  return row?.embedding || new Float32Array(0);
+  if (!row?.embedding) return new Float32Array(0);
+  try {
+    return storedVector(row.embedding, undefined, { context: `${doc.hash}_0` });
+  } catch (e) {
+    if (!(e instanceof VecPoisonError)) throw e;
+    if (!warnedUnusableStoredVector) {
+      warnedUnusableStoredVector = true;
+      console.warn(`[clawmem] graph traversal skipped a stored vector that is not usable (${e.message}) Run 'clawmem doctor', then 'clawmem repair vectors'.`);
+    }
+    return new Float32Array(0);
+  }
 }
 
 /**

@@ -40,6 +40,8 @@ import { extractJsonFromLLM } from "./amem.ts";
 import { isSchemaPlaceholder, CAUSAL_RESIDUE } from "./schema-placeholder.ts";
 import { parseLegacyEdgeWitness, CAUSAL_FACT_CHAR_CAP } from "./causal-reader.ts";
 import type { GenerateResult } from "./llm.ts";
+import { stripLeadingMarks, truncateText } from "./text-policy.ts";
+const nullableStrip = <T extends string | null | undefined>(v: T): T => (typeof v === "string" ? stripLeadingMarks(v) as T : v);
 
 // =============================================================================
 // Constants + configuration
@@ -200,7 +202,8 @@ export function insertCausalEvent(db: Database, runId: number, ev: CausalEventIn
     ev.sourceFactOrdinal ?? null,
     ev.targetFactOrdinal ?? null,
     ev.confidence ?? null,
-    ev.detail == null ? null : ev.detail.slice(0, EVENT_DETAIL_MAX),
+    // BACKLOG 82.3, D7 (ruling 61 A): detail is normalised — often the model's own words; a refused detail would lose the event.
+    ev.detail == null ? null : truncateText(stripLeadingMarks(ev.detail), EVENT_DETAIL_MAX),   // never half of a pair (T2 S3)
     isoNow(),
   );
 }
@@ -892,7 +895,8 @@ export async function runCausalStep(
         // weight re-derivation (the 0.9-metadata / 0.7-new-sighting case keeps 0.9).
         db.prepare(INSERT_LEGACY_SIGHTING_SQL).run(
           sourceDocId, targetDocId,
-          legacy.sourceFact, legacy.targetFact, legacy.reasoning, legacy.confidence,
+          // 82.3 D7 (ruling 57 A): copied evidence text is normalised like a live sighting's
+          nullableStrip(legacy.sourceFact), nullableStrip(legacy.targetFact), nullableStrip(legacy.reasoning), legacy.confidence,
           runKey, runId, edge!.created_at ?? nowIso,
         );
         insertCausalEvent(db, runId, {
@@ -929,8 +933,9 @@ export async function runCausalStep(
         const changes = insertSighting.run(
           cand.sourceDocId, cand.targetDocId,
           cand.sourceOrdinal, cand.targetOrdinal,
-          cand.sourceFact, cand.targetFact,
-          cand.reasoning, cand.confidence,
+          // 82.3 D7 (ruling 55 A): model text stored as evidence is normalised
+          stripLeadingMarks(cand.sourceFact), stripLeadingMarks(cand.targetFact),
+          stripLeadingMarks(cand.reasoning), cand.confidence,
           modelIdentity, CAUSAL_PROMPT_VERSION,
           runKey, runId, nowIso,
         ).changes;

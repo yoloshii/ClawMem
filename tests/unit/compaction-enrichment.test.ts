@@ -17,6 +17,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const MODEL = "enrichment-fake";
 /** Nearby but distinct vectors: every seeded document is every other's close neighbour. */
 const vec = (spread = 0) => new Float32Array([0.1, 0.1, 1, spread]);
@@ -56,7 +57,7 @@ const at = (min: number) => new Date(t0 + min * 60_000).toISOString();
 
 function seed(path: string, body: string, origin: string | null, createdAt: string, title = path, spread = 0): number {
   const hash = hashContent(body + path);
-  store.insertContent(hash, body, createdAt);
+  seedContent(store.db, hash, body, createdAt);
   store.insertDocument("agent-memory", path, title, hash, createdAt, createdAt);
   store.db.prepare("UPDATE documents SET origin = ? WHERE collection = 'agent-memory' AND path = ?").run(origin, path);
   store.markEmbedSynced(hash);
@@ -277,7 +278,7 @@ describe("62.2 (codex T9 #3; operator ruling: reset) — a note a copy shaped is
       const first = createStore(file);
       const put = (path: string, body: string) => {
         const hash = hashContent(body + path);
-        first.insertContent(hash, body, at(0));
+        seedContent(first.db, hash, body, at(0));
         first.insertDocument("agent-memory", path, path, hash, at(0), at(0));
         return (first.db.prepare("SELECT id FROM documents WHERE path = ?").get(path) as { id: number }).id;
       };
@@ -302,7 +303,7 @@ describe("62.2 (codex T9 #3; operator ruling: reset) — a note a copy shaped is
       try {
         const put = (path: string, body: string, spread: number) => {
           const hash = hashContent(body + path);
-          live.insertContent(hash, body, at(0));
+          seedContent(live.db, hash, body, at(0));
           live.insertDocument("agent-memory", path, path, hash, at(0), at(0));
           live.ensureVecTable(4);
           live.insertEmbedding(hash, 0, 0, vec(spread), MODEL, new Date().toISOString(), "full", undefined, canonicalDocId("agent-memory", path));
@@ -396,7 +397,7 @@ describe("62.2 (codex T9 #3; operator ruling: reset) — a note a copy shaped is
       const before = createStore(file);
       const put = (path: string) => {
         const hash = hashContent(path);
-        before.insertContent(hash, `body of ${path}`, at(0));
+        seedContent(before.db, hash, `body of ${path}`, at(0));
         before.insertDocument("agent-memory", path, path, hash, at(0), at(0));
         return (before.db.prepare("SELECT id FROM documents WHERE path = ?").get(path) as { id: number }).id;
       };
@@ -434,7 +435,7 @@ describe("62.2 (codex T9 #3; operator ruling: reset) — a note a copy shaped is
 describe("62.2 (codex T12 #1) — the writer column and the evolution-writer floor appear together", () => {
   const put = (st: Store, path: string) => {
     const hash = hashContent(path);
-    st.insertContent(hash, `body of ${path}`, at(0));
+    seedContent(st.db, hash, `body of ${path}`, at(0));
     st.insertDocument("agent-memory", path, path, hash, at(0), at(0));
     return (st.db.prepare("SELECT id FROM documents WHERE path = ?").get(path) as { id: number }).id;
   };

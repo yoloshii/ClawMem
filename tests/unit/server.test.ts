@@ -8,6 +8,7 @@ import { createStore, type Store } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { startServer } from "../../src/server.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // The REST server needs a token on every request and a JSON Content-Type on every POST (BACKLOG 62.4).
 const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
 const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
@@ -35,19 +36,19 @@ beforeAll(() => {
   const now = new Date().toISOString();
   const authBody = "# Auth Decision\n\nWe chose JWT for authentication.";
   authDocHash = hashContent(authBody);
-  store.insertContent(authDocHash, authBody, now);
+  seedContent(store.db, authDocHash, authBody, now);
   store.insertDocument("test", "decisions/auth.md", "Auth Decision", authDocHash, now, now);
   store.updateDocumentMeta(1, { content_type: "decision", confidence: 0.9 });
 
   const handoffBody = "# Handoff 2026-03-14\n\nWorked on auth module.";
   handoffDocHash = hashContent(handoffBody);
-  store.insertContent(handoffDocHash, handoffBody, now);
+  seedContent(store.db, handoffDocHash, handoffBody, now);
   store.insertDocument("test", "handoffs/2026-03-14.md", "Handoff", handoffDocHash, now, now);
   store.updateDocumentMeta(2, { content_type: "handoff", confidence: 0.6 });
 
   const apiBody = "# API Design Notes\n\nREST over GraphQL.";
   const apiHash = hashContent(apiBody);
-  store.insertContent(apiHash, apiBody, now);
+  seedContent(store.db, apiHash, apiBody, now);
   store.insertDocument("test", "notes/api.md", "API Design", apiHash, now, now);
 
   server = startServer(store, PORT, "127.0.0.1", { token: REST_TOKEN });

@@ -8,6 +8,7 @@ import { hashContent } from "../../src/indexer.ts";
 import { wasPromptSeenRecently } from "../../src/hooks.ts";
 import { clearConfigCache } from "../../src/config.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 /**
  * Regression tests for the context-surfacing UserPromptSubmit hook timing out
  * ("UserPromptSubmit hook timed out after 8s/15s — output discarded").
@@ -120,7 +121,7 @@ describe("prewarmVectors — embed-independent, honest success (Change 4 fix)", 
     store.ensureVecTable(4);
     const now = new Date().toISOString();
     const hash = hashContent("doc a" + "a.md");
-    store.insertContent(hash, "doc a", now);
+    seedContent(store.db, hash, "doc a", now);
     store.insertDocument("c", "a.md", "a.md", hash, now, now);
     store.insertEmbedding(hash, 0, 1, new Float32Array([1, 0, 0, 0]), "m1", now, "full", null, "c/a.md");
     // No CLAWMEM_EMBED_URL and no embed server running: the zero-vector MATCH must still scan and
@@ -161,7 +162,7 @@ describe("startPeriodicPrewarm — periodic re-warm keeps the OS cache hot (B5 O
     // One real vector so prewarmVectors performs an actual scan (ran === true).
     const now = new Date().toISOString();
     const hash = hashContent("doc a" + "a.md");
-    store.insertContent(hash, "doc a", now);
+    seedContent(store.db, hash, "doc a", now);
     store.insertDocument("c", "a.md", "a.md", hash, now, now);
     store.insertEmbedding(hash, 0, 1, new Float32Array([1, 0, 0, 0]), "m1", now, "full", null, "c/a.md");
 

@@ -21,6 +21,7 @@ import { runSampledVectorValidation } from "../../src/canary.ts";
 import ts from "typescript";
 import { bow, deadPort, startEmbedFixture, type EmbedFixture } from "../helpers/embed-readiness-fixture.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const { parseDocument, hashContent, indexCollection } = indexer;
 const ROOT = resolve(import.meta.dir, "../..");
 const SENTINEL = "__clawmem_82_1_sentinel";
@@ -31,8 +32,15 @@ const EXEC = `{ title: (globalThis.${SENTINEL} = (globalThis.${SENTINEL} || 0) +
 const ran = () => (g[SENTINEL] ?? 0) as number;
 const resetSentinel = () => { g[SENTINEL] = 0; };
 
-/** What parseDocument returns for text that is NOT frontmatter: the whole text as body, the inferred type only. */
-const plain = (content: string, path = "note.md") => ({ body: content, meta: { content_type: parseDocument("plain text\n", path).meta.content_type } });
+/**
+ * What parseDocument returns for text that is NOT frontmatter: the whole text as body, the inferred type only.
+ * Since 82.3 (D7) the body is the text WITHOUT a leading byte-order mark, and `leadingMarkRemoved` says one was removed.
+ */
+const BOM = String.fromCharCode(0xfeff);
+const plain = (content: string, path = "note.md") => {
+  const marked = content.startsWith(BOM);
+  return { body: marked ? content.slice(1) : content, leadingMarkRemoved: marked, meta: { content_type: parseDocument("plain text\n", path).meta.content_type } };
+};
 
 const expectPlainText = (content: string, path = "note.md") => {
   const r = parseDocument(content, path);
@@ -497,7 +505,7 @@ describe("T7 — every production parse site is protected", () => {
         const body = payload(marker);
         const now = new Date().toISOString();
         const hash = hashContent(body);
-        st.insertContent(hash, body, now);
+        seedContent(st.db, hash, body, now);
         st.insertDocument("notes", "exec.md", "exec", hash, now, now);
       } finally { st.close(); }
     });

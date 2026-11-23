@@ -30,6 +30,7 @@ import { decisionExtractor } from "../../src/hooks/decision-extractor.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { createHash } from "node:crypto";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 let dir: string;
 
@@ -51,7 +52,7 @@ function mkDoc(path: string, opts?: { collection?: string; observationType?: str
   const collection = opts?.collection ?? "_clawmem";
   const hash = createHash("sha256").update(collection + path).digest("hex");
   const ts = opts?.createdAt ?? "2026-08-01T00:00:00.000Z";
-  (store as any).insertContent(hash, opts?.body ?? `body of ${path}`, ts);
+  seedContent(store.db, hash, opts?.body ?? `body of ${path}`, ts);
   (store as any).insertDocument(collection, path, path, hash, ts, ts);
   const id = (store as any).findActiveDocument(collection, path)!.id;
   if (opts?.observationType) {
@@ -715,4 +716,32 @@ describe("decisionExtractor boundary (off / shadow / on)", () => {
     expect(embedTexts.length).toBeLessThanOrEqual(1);
   }, 20_000);
   // (62.1 D4: checkMergePolicy — the session-document dedup whose embedding this bounded — was deleted.)
+});
+
+// ─── 82.3 D7: witness text is a normalised field (operator rulings 55 A, 57 A) ─────────────────────────────────
+describe("82.3: causal witness text without a leading byte-order mark", () => {
+  const MARKS: [string, string][] = [["U+FEFF", String.fromCharCode(0xfeff)], ["U+FFFE", String.fromCharCode(0xfffe)]];
+
+  test.each(MARKS)("a live sighting: facts and the model's reasoning led by %s are stored without it", async (_name, mark) => {
+    const a = mkNewObs("observations/a.md", [mark + "config changed"]);
+    const b = mkNewObs("observations/b.md", [mark + mark + "service restarted"]);
+    const result = await step(stubLlm([
+      { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.8, reasoning: mark + "config change caused restart" },
+    ]), [a, b]);
+    expect(result.edgesWritten).toBe(1);
+    expect(sightingRows().map(s => [s.source_fact, s.target_fact, s.reasoning]))
+      .toEqual([["config changed", "service restarted", "config change caused restart"]]);
+  });
+
+  test.each(MARKS)("a legacy sighting materialized from stored metadata led by %s is stored without it", async (_name, mark) => {
+    const a = mkNewObs("observations/a.md", ["cause fact"]);
+    const b = mkNewObs("observations/b.md", ["effect fact"]);
+    store.db.prepare(
+      `INSERT INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at)
+       VALUES (?, ?, 'causal', 0.9, ?, '2026-07-01T00:00:00.000Z')`,
+    ).run(a.docId, b.docId, JSON.stringify({ reasoning: mark + "old writer reasoning", source_fact: mark + "old src", target_fact: mark + "old tgt" }));
+    await step(stubLlm([{ source_fact_idx: 0, target_fact_idx: 1, confidence: 0.7, reasoning: "weaker new evidence" }]), [a, b]);
+    const legacy = sightingRows().find(s => s.legacy === 1)!;
+    expect([legacy.source_fact, legacy.target_fact, legacy.reasoning]).toEqual(["old src", "old tgt", "old writer reasoning"]);
+  });
 });

@@ -19,6 +19,7 @@ import { createStore, canonicalDocId, type Store } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { bow, deadPort, startEmbedFixture, type EmbedFixture } from "../helpers/embed-readiness-fixture.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const ROOT = join(import.meta.dir, "../..");
 const MARK = "quillfeather";
 const BODY_A = `The ${MARK} ingest pipeline batches its writes in groups of five hundred to cut the fsync cost.`;
@@ -59,7 +60,7 @@ function withStore<T>(fn: (st: Store) => T): T {
 function putDoc(st: Store, path: string, body: string): string {
   const now = new Date().toISOString();
   const hash = hashContent(body);
-  st.insertContent(hash, body, now);
+  seedContent(st.db, hash, body, now);
   st.insertDocument("notes", path, path.replace(/\.md$/, ""), hash, now, now);
   return hash;
 }

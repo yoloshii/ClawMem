@@ -76,7 +76,7 @@ Full version history is in [RELEASE_NOTES.md](RELEASE_NOTES.md). Upgrade instruc
 
 **Required:**
 
-- [Bun](https://bun.sh) v1.0+ — runtime for ClawMem. On Linux, install via `curl -fsSL https://bun.sh/install | bash` (not snap — snap Bun cannot read stdin, which breaks hooks).
+- [Bun](https://bun.sh) v1.3.14+ — runtime for ClawMem (1.4.0 or later recommended; before 1.2.21 ClawMem refuses to open a vault). On Linux, install via `curl -fsSL https://bun.sh/install | bash` (not snap — snap Bun cannot read stdin, which breaks hooks).
 - SQLite with FTS5 — included with Bun. On macOS, install `brew install sqlite` for extension loading support (ClawMem detects and uses Homebrew SQLite automatically).
 
 **Optional (for better performance):**

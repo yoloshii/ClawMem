@@ -23,7 +23,9 @@
  * initializes a store.
  */
 
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
+import { openDatabase } from "./sqlite-guard.ts";
+import { insertExact, runExact, selectExact } from "./stored-copy.ts";
 import { createHash } from "crypto";
 import { isoNow } from "./clock.ts";
 import {
@@ -219,6 +221,63 @@ export function missingPrerequisite(db: Database): string | null {
   return null;
 }
 
+/**
+ * Operator rulings 82 A / 85 A (Codex T1 S1, T2). Bun reads a TEXT value whose bytes are not valid UTF-8 LOSSILY — a
+ * short value as the empty string, a longer one with U+FFFD in place of the bad bytes (measured). Older versions could store such bytes (their binding of a value that started with U+FFFE stored every
+ * later code unit byte-swapped, and a swapped code unit can be a lone surrogate). The repair copies, compares and
+ * restores rows through strings, so it cannot keep such a value: it refuses while one exists among the VALUES it reads
+ * or writes (85 A) — the entity tables it snapshots, the bodies it re-reads, and for a restore the log rows of its op.
+ * Each text value is read twice — as a string and as its bytes — and the string must give back the bytes.
+ */
+export const REPAIR_TEXT_TABLES: Record<string, string> = {
+  entity_nodes: "", entities_fts: "", entity_mentions: "", entity_cooccurrences: "", entity_triples: "",
+  entity_triple_provenance: "", memory_relations: "relation_type = 'entity'",
+};
+const utf8 = new TextEncoder();
+/** True when `text`, read by bun:sqlite, is exactly the stored `raw` bytes. */
+export function readsBackExactly(text: string, raw: Uint8Array): boolean {
+  const back = utf8.encode(text);
+  if (back.length !== raw.length) return false;
+  for (let i = 0; i < back.length; i++) if (back[i] !== raw[i]) return false;
+  return true;
+}
+const UNREADABLE_LIST = 5;
+/** Every text value in `tables` that does not read back as its own bytes: the count, and the first few named. */
+export function unreadableText(db: Database, tables: Record<string, string | [string, unknown[]]> = REPAIR_TEXT_TABLES): { count: number; first: string[] } {
+  let count = 0;
+  const first: string[] = [];
+  for (const [table, scope] of Object.entries(tables)) {
+    const [where, args] = typeof scope === "string" ? [scope, []] : scope;
+    const cols = (db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as { name: string }[]).map(c => c.name);
+    if (cols.length === 0) continue;
+    const list = cols.map(c => `CASE WHEN typeof(${c}) = 'text' THEN ${c} END, CASE WHEN typeof(${c}) = 'text' THEN CAST(${c} AS BLOB) END`).join(", ");
+    for (const r of db.prepare(`SELECT rowid, ${list} FROM ${table}${where ? ` WHERE ${where}` : ""}`).values(...(args as any[])) as unknown[][]) {
+      cols.forEach((c, k) => {
+        const text = r[1 + 2 * k], raw = r[2 + 2 * k];
+        if (typeof text !== "string" || !(raw instanceof Uint8Array) || readsBackExactly(text, raw)) return;
+        count++;
+        if (first.length < UNREADABLE_LIST) first.push(`${table}.${c} rowid ${r[0]}`);
+      });
+    }
+  }
+  return { count, first };
+}
+/** The refusal for `unreadableText`'s finding (or for one named value), with what to do. */
+function unreadableRefusal(found: { count: number; first: string[] }): EntityRepairRefusal {
+  const more = found.count > found.first.length ? `, and ${found.count - found.first.length} more` : "";
+  return new EntityRepairRefusal(
+    `${found.count} stored text value${found.count === 1 ? "" : "s"} in the tables the entity repair reads or writes ` +
+    `${found.count === 1 ? "does" : "do"} not read back as ${found.count === 1 ? "its" : "their"} own bytes (not valid UTF-8 — ` +
+    `older versions could store such bytes, and they read back changed — a short value as empty text): ${found.first.join(", ")}${more}. ` +
+    `The repair cannot copy, compare or restore them — nothing written. Fix or remove those rows by hand ` +
+    `(troubleshooting: "Stored text that is not valid UTF-8"), then run the dry run again`,
+  );
+}
+export function refuseUnreadableText(db: Database): void {
+  const found = unreadableText(db);
+  if (found.count > 0) throw unreadableRefusal(found);
+}
+
 /** The table's columns, and whether its rowid must be copied explicitly (it is not an INTEGER PRIMARY KEY alias). */
 function tableShape(db: Database, table: string): { cols: string[]; explicitRowid: boolean } {
   const info = db.prepare(`SELECT name, type, pk FROM pragma_table_info(?)`).all(table) as { name: string; type: string; pk: number }[];
@@ -232,7 +291,8 @@ function tableShape(db: Database, table: string): { cols: string[]; explicitRowi
  * row with its rowid. `where` narrows a table's rows (a SQL condition on the vault's table).
  */
 export function copyTables(src: Database, tables: string[], where: Record<string, string> = {}): Database {
-  const dst = new Database(":memory:");
+  // 82.3 D7: every value is copied as it is stored — text as its bytes (`src/stored-copy.ts`), never bound as a string
+  const dst = openDatabase(":memory:");
   for (const table of tables) {
     const ddl = src.prepare(`SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'`).get(table) as { sql: string } | null;
     if (!ddl) throw new EntityRepairRefusal(`table ${table} is missing`);
@@ -245,9 +305,7 @@ export function copyTables(src: Database, tables: string[], where: Record<string
   for (const table of tables) {
     const { cols, explicitRowid } = tableShape(src, table);
     const names = explicitRowid ? ["rowid", ...cols] : cols;
-    const ins = dst.prepare(`INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`);
-    const filter = where[table] ? ` WHERE ${where[table]}` : "";
-    for (const row of src.prepare(`SELECT ${names.join(", ")} FROM ${table}${filter}`).values()) ins.run(...(row as any[]));
+    for (const row of selectExact(src, table, names, where[table] ?? "")) insertExact(dst, table, names, row);
   }
   dst.exec("COMMIT");
   return dst;
@@ -327,7 +385,8 @@ function writeMentionMoves(
     onWrite?.(r, null);
   }
   for (const x of p.inserts) {
-    db.prepare(`INSERT INTO entity_mentions (entity_id, doc_id, mention_text, created_at) VALUES (?, ?, ?, ?)`).run(x.entity, p.doc, x.text, x.at);
+    // 82.3 D7 (ruling 53 A): the moved row's text and time are stored copies; the entity id keeps the guarded binding
+    runExact(db, `INSERT INTO entity_mentions (entity_id, doc_id, mention_text, created_at) VALUES (?, ?, ?T, ?T)`, [x.entity, p.doc, x.text, x.at]);
     onWrite?.(null, x);
   }
 }
@@ -428,6 +487,7 @@ export function planEntityRepair(
 ): EntityRepairPlan {
   const missing = missingPrerequisite(db);
   if (missing) throw new EntityRepairRefusal(`${missing} — open this vault with ClawMem once to finish its upgrade, then run the dry run again`);
+  refuseUnreadableText(db); // 82 A
   const stats = plannerStatisticsRows(db);
   if (stats > 0) {
     throw new EntityRepairRefusal(
@@ -800,7 +860,7 @@ export function planEntityRepair(
       if (list) list.push(m);
       else rowsByDoc.set(m.doc, [m]);
     }
-    const bodyOf = db.prepare(`SELECT c.doc AS body FROM documents d JOIN content c ON c.hash = d.hash WHERE d.id = ?`);
+    const bodyOf = db.prepare(`SELECT c.doc AS body, CAST(c.doc AS BLOB) AS raw FROM documents d JOIN content c ON c.hash = d.hash WHERE d.id = ?`);
     const mentionDocs: MentionDocPlan[] = docsWithMoves.map(doc => {
       const rows = rowsByDoc.get(doc) ?? [];
       const dest = (r: MentionRowSnap) => accepted.get(`M${doc}:${r.entity}`)?.to ?? r.entity;
@@ -817,7 +877,11 @@ export function planEntityRepair(
         winners.set(d, staying ?? [...list].sort((a, b) => cmpNum(sightingInstant(a.at), sightingInstant(b.at)) || a.rid - b.rid)[0]!);
       }
       const movers = rows.filter(r => dest(r) !== r.entity);
-      const body = ((bodyOf.get(doc) as { body: string | null } | null)?.body ?? "").toLowerCase();
+      const read = bodyOf.get(doc) as { body: string | null; raw: Uint8Array | null } | null;
+      if (typeof read?.body === "string" && read.raw instanceof Uint8Array && !readsBackExactly(read.body, read.raw)) {
+        throw unreadableRefusal({ count: 1, first: [`the body of document ${doc} (content.doc)`] }); // 82 A: the planner reads it
+      }
+      const body = (read?.body ?? "").toLowerCase();
       const moves = movers.map(r => {
         const a = accepted.get(`M${doc}:${r.entity}`)!;
         return { rid: r.rid, from: r.entity, to: a.to, toMint: mintIds.has(a.to), fuzzy: a.fuzzy };
@@ -964,7 +1028,7 @@ export function planDigest(plan: Omit<EntityRepairPlan, "digest">): string {
 
 /** Plan one vault file without writing: a readonly handle, one read transaction, then ROLLBACK. */
 export function dryRunEntityRepair(dbPath: string): EntityRepairPlan {
-  const db = new Database(dbPath, { readonly: true });
+  const db = openDatabase(dbPath, { readonly: true });
   try {
     db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     db.exec("BEGIN");
@@ -1025,10 +1089,17 @@ export interface EntityRepairApplyReport {
 
 type Row = Record<string, string | number | null>;
 
-/** Insert a whole logged row (every column it carries, its id included). */
+/** Entity-id columns: an identifier keeps the guarded binding, so a stored mark-led id is refused (D8 = C, ruling 53 A). */
+const ENTITY_ID_COLUMNS = new Set(["subject_entity_id", "object_entity_id", "entity_id", "entity_a", "entity_b", "canonical_id"]);
+
+/**
+ * Insert a whole logged row (every column it carries, its id included): each stored text value copied as its bytes
+ * (82.3 D7), each entity id bound as a string through the guard.
+ */
 function insertRow(db: Database, tbl: string, row: Row): void {
   const cols = Object.keys(row);
-  db.prepare(`INSERT INTO ${tbl} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`).run(...cols.map(c => row[c] ?? null));
+  runExact(db, `INSERT INTO ${tbl} (${cols.join(", ")}) VALUES (${cols.map(c => (ENTITY_ID_COLUMNS.has(c) ? "?" : "?T")).join(", ")})`,
+    cols.map(c => row[c] ?? null));
 }
 
 /**
@@ -1124,10 +1195,11 @@ export function applyEntityRepair(
         dest.push(g.survivor);
         return;
       }
-      const r = db.prepare(`
+      // 82.3 D7 (ruling 53 A): the copied text fields are stored copies; the entity ids keep the guarded binding
+      const r = runExact(db, `
         INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(g.key[0], g.key[1], g.key[2], g.key[3], g.key[4], g.key[5], g.confidence ?? 1.0, g.inline.doc, g.inline.fact, g.inline.at);
+        VALUES (?, ?T, ?, ?T, ?T, ?T, ?, ?, ?T, ?T)
+      `, [g.key[0], g.key[1], g.key[2], g.key[3], g.key[4], g.key[5], g.confidence ?? 1.0, g.inline.doc, g.inline.fact, g.inline.at]);
       const id = Number(r.lastInsertRowid);
       log(g.comp, "entity_triples", String(id), "triple-insert", null, tripleRow.get(id));
       written.triplesInserted++;
@@ -1161,10 +1233,10 @@ export function applyEntityRepair(
         created_at: g.inline.at,
       };
       if (Object.keys(old).some(c => next[c] !== old[c])) {
-        db.prepare(`
-          UPDATE entity_triples SET subject_entity_id = ?, object_entity_id = ?, confidence = ?, source_doc_id = ?, source_fact = ?, created_at = ?
+        runExact(db, `
+          UPDATE entity_triples SET subject_entity_id = ?, object_entity_id = ?, confidence = ?, source_doc_id = ?, source_fact = ?T, created_at = ?T
           WHERE id = ?
-        `).run(next.subject_entity_id ?? null, next.object_entity_id ?? null, next.confidence ?? null, next.source_doc_id ?? null, next.source_fact ?? null, next.created_at ?? null, g.survivor);
+        `, [next.subject_entity_id ?? null, next.object_entity_id ?? null, next.confidence ?? null, next.source_doc_id ?? null, next.source_fact ?? null, next.created_at ?? null, g.survivor]);
         log(g.comp, "entity_triples", String(g.survivor), "triple-update", old, tripleRow.get(g.survivor));
         written.triplesUpdated++;
       }
@@ -1213,7 +1285,7 @@ export function applyEntityRepair(
             // a pair an earlier document of this apply removed comes back with its own time, NULL included; only a pair
             // the vault never had gets the apply's
             const was = pairBefore.get(pair);
-            if (was) db.prepare(`INSERT INTO entity_cooccurrences (entity_a, entity_b, count, last_cooccurred) VALUES (?, ?, 1, ?)`).run(a, b, was.last_cooccurred ?? null);
+            if (was) runExact(db, `INSERT INTO entity_cooccurrences (entity_a, entity_b, count, last_cooccurred) VALUES (?, ?, 1, ?T)`, [a, b, was.last_cooccurred ?? null]);
             else db.prepare(`INSERT INTO entity_cooccurrences (entity_a, entity_b, count, last_cooccurred) VALUES (?, ?, 1, datetime('now'))`).run(a, b);
           }
         } else if (old) {
@@ -1291,6 +1363,10 @@ export function restoreEntityRepair(db: Database, opId: string): EntityRepairRes
     }
     const rows = db.prepare(`SELECT id, comp, tbl, row_key, action, old_row, new_row FROM entity_repair_log WHERE op_id = ? ORDER BY id`).all(opId) as LogRow[];
     if (rows.length === 0) throw new EntityRepairRefusal(`no repair op ${opId} in entity_repair_log`);
+    { // 82 A / 85 A: the restore compares and writes back through strings — the entity tables and THIS op's log rows
+      const found = unreadableText(db, { ...REPAIR_TEXT_TABLES, entity_repair_log: ["op_id = ?", [opId]] });
+      if (found.count > 0) throw unreadableRefusal(found);
+    }
     const done = new Set(rows.filter(r => r.action === "restored").map(r => r.comp));
     const parse = (s: string | null) => (s == null ? null : (JSON.parse(s) as Row));
     const out: EntityRepairRestoreReport = { opId, restored: [], kept: [], mintsDeleted: [], mintsKept: [], edgesKept: 0 };
@@ -1419,10 +1495,10 @@ export function restoreEntityRepair(db: Database, opId: string): EntityRepairRes
       for (const r of list) {
         if (r.action !== "triple-update") continue;
         const old = parse(r.old_row)!;
-        db.prepare(`
-          UPDATE entity_triples SET subject_entity_id = ?, object_entity_id = ?, confidence = ?, source_doc_id = ?, source_fact = ?, created_at = ?
+        runExact(db, `
+          UPDATE entity_triples SET subject_entity_id = ?, object_entity_id = ?, confidence = ?, source_doc_id = ?, source_fact = ?T, created_at = ?T
           WHERE id = ?
-        `).run(old.subject_entity_id ?? null, old.object_entity_id ?? null, old.confidence ?? null, old.source_doc_id ?? null, old.source_fact ?? null, old.created_at ?? null, Number(r.row_key));
+        `, [old.subject_entity_id ?? null, old.object_entity_id ?? null, old.confidence ?? null, old.source_doc_id ?? null, old.source_fact ?? null, old.created_at ?? null, Number(r.row_key)]);
       }
       for (const r of list) if (r.action === "triple-insert") db.prepare(`DELETE FROM entity_triples WHERE id = ?`).run(Number(r.row_key));
     }
@@ -1446,8 +1522,8 @@ export function restoreEntityRepair(db: Database, opId: string): EntityRepairRes
       for (const r of list) {
         if (r.action !== "mention-delete") continue;
         const row = parse(r.old_row)!;
-        db.prepare(`INSERT INTO entity_mentions (entity_id, doc_id, mention_text, created_at) VALUES (?, ?, ?, ?)`)
-          .run(row.entity_id ?? null, row.doc_id ?? null, row.mention_text ?? null, row.created_at ?? null);
+        runExact(db, `INSERT INTO entity_mentions (entity_id, doc_id, mention_text, created_at) VALUES (?, ?, ?T, ?T)`,
+          [row.entity_id ?? null, row.doc_id ?? null, row.mention_text ?? null, row.created_at ?? null]);
       }
       for (const r of list) {
         if (r.action === "count") {
@@ -1463,8 +1539,8 @@ export function restoreEntityRepair(db: Database, opId: string): EntityRepairRes
             if (cur.count - delta <= 0) db.prepare(`DELETE FROM entity_cooccurrences WHERE entity_a = ? AND entity_b = ?`).run(a, b);
             else db.prepare(`UPDATE entity_cooccurrences SET count = count - ? WHERE entity_a = ? AND entity_b = ?`).run(delta, a, b);
           } else if (-delta > 0) {
-            db.prepare(`INSERT INTO entity_cooccurrences (entity_a, entity_b, count, last_cooccurred) VALUES (?, ?, ?, ?)`)
-              .run(a, b, -delta, old?.last_cooccurred ?? null);
+            runExact(db, `INSERT INTO entity_cooccurrences (entity_a, entity_b, count, last_cooccurred) VALUES (?, ?, ?, ?T)`,
+              [a, b, -delta, old?.last_cooccurred ?? null]);
           }
         }
       }

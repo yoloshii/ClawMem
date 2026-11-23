@@ -20,13 +20,14 @@ import { missingStopSchema, STOP_USAGE_WATERMARK_FLAG } from "../../src/stop-sch
 import { promptSha, transcriptKey } from "../../src/stop-pairing.ts";
 import { iso, human, assistant, writeTranscriptFile } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), "clawmem-621-repair-")); dirs.push(d); return d; }
 
 function seedDoc(store: Store, collection: string, path: string, title: string, contentType = "note"): number {
   const hash = `h-${collection}-${path}`;
-  store.insertContent(hash, `# ${title}\n\nbody`, iso(0));
+  seedContent(store.db, hash, `# ${title}\n\nbody`, iso(0));
   store.insertDocument(collection, path, title, hash, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
   const id = store.findActiveDocument(collection, path)!.id;
   store.db.prepare(`UPDATE documents SET content_type = ? WHERE id = ?`).run(contentType, id);
@@ -182,12 +183,12 @@ describe("D9 antipattern recovery", () => {
   function withBodies() {
     const store = createTestStore();
     const body = (n: number, lines: string[]) => `# Antipatterns 2026-0${n}-01\n\n_Session: x_\n\n${lines.map(l => `- **Avoid:** ${l}\n  > Context: c`).join("\n")}`;
-    store.insertContent("ap1", body(1, ["pushing with --force", "editing the shared checkout"]), "2026-01-01T00:00:00.000Z");
-    store.insertContent("ap2", body(2, ["pushing with --force", "skipping the gate"]), "2026-02-01T00:00:00.000Z");
-    store.insertContent("ap3", body(3, ["pushing   with --force"]), "2026-03-01T00:00:00.000Z");
-    store.insertContent("live", body(4, ["the live doc's own line"]), "2026-04-01T00:00:00.000Z");
+    seedContent(store.db, "ap1", body(1, ["pushing with --force", "editing the shared checkout"]), "2026-01-01T00:00:00.000Z");
+    seedContent(store.db, "ap2", body(2, ["pushing with --force", "skipping the gate"]), "2026-02-01T00:00:00.000Z");
+    seedContent(store.db, "ap3", body(3, ["pushing   with --force"]), "2026-03-01T00:00:00.000Z");
+    seedContent(store.db, "live", body(4, ["the live doc's own line"]), "2026-04-01T00:00:00.000Z");
     store.insertDocument("_clawmem", "antipatterns/2026-04-01-live.md", "Antipatterns", "live", iso(0), iso(0));
-    store.insertContent("other", "# Decisions\n\n- **Avoid:** not an antipatterns body", "2026-01-01T00:00:00.000Z");
+    seedContent(store.db, "other", "# Decisions\n\n- **Avoid:** not an antipatterns body", "2026-01-01T00:00:00.000Z");
     return store;
   }
 

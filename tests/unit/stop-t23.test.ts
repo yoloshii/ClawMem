@@ -33,6 +33,7 @@ import { currentTurnStart, streamLines, readLines } from "../../src/stop-cursor.
 import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { writeFileSync } from "fs";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const dirs: string[] = [];
 let failSummary = false;
 let observerPrompts: string[] = [];
@@ -62,7 +63,7 @@ const MIN = 60_000;
 
 function seedDoc(store: Store, collection: string, path: string, title: string): number {
   const hash = `h-${collection}-${path}`;
-  store.insertContent(hash, `# ${title}\n\nbody`, iso(0));
+  seedContent(store.db, hash, `# ${title}\n\nbody`, iso(0));
   store.insertDocument(collection, path, title, hash, iso(0), iso(0));
   return store.findActiveDocument(collection, path)!.id;
 }

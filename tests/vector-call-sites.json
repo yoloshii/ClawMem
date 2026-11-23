@@ -1,0 +1,80 @@
+{
+  "note": "BACKLOG 82.2, D4. What each vector call site does when the QUERY vector is refused (VecPoisonError / EmbedEnvelopeError). Per file and callee, one route per call IN SOURCE ORDER. tests/unit/vector-call-site-census.test.ts fails on a call that is not listed. The first eleven routes are the rows of the design's route table; the rest are sites that table does not name (internal compositions, the embed run, and two sites recorded as such).",
+  "routes": {
+    "hybrid": "REST hybrid and MCP hybrid `query`: the vector leg is empty, the lexical leg answers, the reply is marked degraded (`vector-fault`).",
+    "multi-leg": "A leg of a multi-leg query (expanded and observation legs, a `query_plan` vector clause): the refused leg is dropped alone and counted, the other legs answer, the reply is degraded when any leg was refused.",
+    "rest-semantic": "REST `mode=semantic`: handled BEFORE the fatal rethrow; takes the lexical fallback, marked degraded. Dimension and model errors keep rethrowing.",
+    "memory-retrieve": "MCP `memory_retrieve` semantic, discovery and complex-clause paths: handled before the rethrow, then treated as each path treats a non-fatal vector error; the reply names the degraded leg (`<mode>:vector`, `vector-fault`) and scores are not labelled cosine.",
+    "causal-anchors": "Causal retrieval's two vector-anchor lookups: the anchors come from the lexical side only, the trace records `vector-fault`, no rethrow.",
+    "causal-graph-expansion": "Causal retrieval's graph expansion (it embeds the query itself): the graph legs are skipped, the fused anchors are returned, and the result is marked `graph:vector-fault`.",
+    "lifecycle-discovery": "The candidate search behind `memory_forget` / `memory_pin` / `memory_snooze`: reached only when path, lexical and title found nothing; a refused query vector gives the 'vector search was unavailable' error, distinct from not-found, and nothing is changed.",
+    "cli-query": "CLI `clawmem query`: the vector lists are empty, the lexical results print, one warning line on stderr, `--json` carries the degraded reason, exit 0.",
+    "explicit-vector": "MCP `vsearch`, CLI `vsearch`, MCP `find_similar`: an explicit 'vector search unavailable' error — never lexical scores under a cosine label.",
+    "hooks": "Context surfacing (bounded and daemon-required legs): lexical only, the hook trace records `vector-fault`; a reply without the `vf1` attestation is `skew`.",
+    "embed-run": "`clawmem embed` (canary probes, the dimension probe, fragments, batches): fatal — the run stops with exit 1 and its abort bookkeeping (D2, D3).",
+    "canary-check": "The canary and sampled-validation commands outside an embed run: a refused answer is a `malformed` / definitive-failure result of the check (D3), not a crash.",
+    "rest-vector-leg": "The one vector leg both REST rows call (`restVectorLeg` in `src/server.ts`): it returns the results with the count of skipped stored vectors, turns a refused query vector into a `vector-fault` report BEFORE the fatal rethrow, and rethrows dimension, model and schema errors. Its four callers are listed under their own rows.",
+    "cli-vector-leg": "The one vector leg the CLI search commands call (`cliVectorLeg` in `src/cli-vector-leg.ts`): it returns the results with the count of skipped stored vectors and reports a refused query vector as `refused` (no results); every other error is thrown, as before. `vsearch` turns `refused` into the explicit error, `query` into a warning and a degraded `--json` reply. Its three callers are listed under their own rows.",
+    "store-query-embedding": "`store.ts` query embedding (`getEmbedding` and its callers): the typed error is THROWN to the route, which applies its own row.",
+    "store-internal": "A composition inside `store.ts` (scan + hydrate): it passes the fault signal and any typed error on to its caller's route.",
+    "daemon-internal": "The scan inside the vector daemon: a refused query vector travels as a typed error frame (`error: \"vec_poison\"`), rebuilt by the client into `VecPoisonError`.",
+    "in-process-fallback": "The in-process search a bounded leg runs when no daemon is present: it inherits the row of the hook that called it (`hooks`).",
+    "eval-harness": "The evaluation harness's daemon child (`src/eval/`): test machinery, the daemon's own contract applies.",
+    "stop-judge": "NOT IN THE DESIGN'S ROUTE TABLE. The Stop-hook judge's duplicate search: any error there already falls back to the lexical search; a refused query vector takes that same fallback."
+  },
+  "search": {
+    "src/causal-retrieval.ts": {
+      "searchVecDetailed": ["causal-anchors", "causal-anchors"],
+      "rethrowIfFatalVectorError": ["causal-anchors", "causal-anchors"]
+    },
+    "src/cli-vector-leg.ts": {
+      "searchVecWithFaults": ["cli-vector-leg"]
+    },
+    "src/clawmem.ts": {
+      "cliVectorLeg": ["explicit-vector", "cli-query", "multi-leg"]
+    },
+    "src/eval/vec-daemon-child.ts": {
+      "searchVecMatch": ["eval-harness"]
+    },
+    "src/hooks/context-surfacing.ts": {
+      "searchVecBounded": ["hooks", "hooks", "hooks"],
+      "searchVecDaemonRequired": ["hooks", "hooks", "hooks"]
+    },
+    "src/mcp.ts": {
+      "searchVecWithFaults": ["lifecycle-discovery"],
+      "searchVecDetailed": ["memory-retrieve", "memory-retrieve", "memory-retrieve", "explicit-vector", "hybrid", "multi-leg", "explicit-vector", "multi-leg"],
+      "rethrowIfFatalVectorError": ["memory-retrieve", "memory-retrieve", "memory-retrieve", "lifecycle-discovery"]
+    },
+    "src/server.ts": {
+      "restVectorLeg": ["rest-semantic", "hybrid", "rest-semantic", "hybrid"],
+      "searchVecWithFaults": ["rest-vector-leg"],
+      "rethrowIfFatalVectorError": ["rest-vector-leg"]
+    },
+    "src/stop-judge.ts": {
+      "searchVecWithFaults": ["stop-judge"]
+    },
+    "src/store.ts": {
+      "searchVecWithFaults": ["store-internal"],
+      "searchVecDetailedWithVector": ["store-internal"],
+      "searchVecMatch": ["store-internal"]
+    },
+    "src/vector-daemon.ts": {
+      "searchVecWithFaults": ["in-process-fallback"],
+      "searchVecMatch": ["daemon-internal"],
+      "daemonVecMatch": ["hooks", "hooks"]
+    }
+  },
+  "embedding": {
+    "src/causal-retrieval.ts": {
+      "embed": ["causal-graph-expansion"]
+    },
+    "src/clawmem.ts": {
+      "embed": ["embed-run", "embed-run", "embed-run", "embed-run", "canary-check", "canary-check"],
+      "embedBatch": ["embed-run"]
+    },
+    "src/store.ts": {
+      "embed": ["store-query-embedding"],
+      "getEmbedding": ["store-query-embedding", "store-query-embedding"]
+    }
+  }
+}

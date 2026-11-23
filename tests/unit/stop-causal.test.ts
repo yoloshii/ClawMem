@@ -21,6 +21,7 @@ import { transcriptKey } from "../../src/stop-pairing.ts";
 import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { human, assistant, writeTranscriptFile } from "./stop-fixtures.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const dirs: string[] = [];
 let savedMode: string | undefined;
 beforeEach(() => {
@@ -119,7 +120,7 @@ describe("D3 the window as it stood at commit (test 39)", () => {
   it("windowAt excludes a late backfill (backdated authorship) and a document revised after it", async () => {
     const store = createTestStore();
     const obs = (path: string, created: string, modified: string, authored: string | null) => {
-      store.insertContent(`h-${path}`, `# ${path}`, created);
+      seedContent(store.db, `h-${path}`, `# ${path}`, created);
       store.insertDocument("_clawmem", path, path, `h-${path}`, created, modified);
       const id = store.findActiveDocument("_clawmem", path)!.id;
       store.db.prepare(`UPDATE documents SET observation_type = 'discovery', facts = ?, authored_at = ?, created_at = ?, modified_at = ? WHERE id = ?`)

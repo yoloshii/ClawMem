@@ -19,6 +19,7 @@ import {
   compactionRegistryPath, isLegacyPrecompactState, registerCompaction, takeCompactionState,
 } from "../../src/compaction-state.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let root: string;
 let projectDir: string;
 let store: Store;
@@ -567,7 +568,7 @@ describe("62.2 (codex T1 #1) — a legacy precompact-state.md is never indexed, 
     const rows: Record<string, { id: number; hash: string }> = {};
     const add = (path: string, body: string, origin: string | null, v033 = false) => {
       const hash = hashContent(body + path);
-      st.insertContent(hash, body, now);
+      seedContent(st.db, hash, body, now);
       if (v033) {
         st.db.prepare("INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)")
           .run("agent-memory", path, "t", hash, now, now);
@@ -644,7 +645,7 @@ describe("62.2 (codex T1 #1) — a legacy precompact-state.md is never indexed, 
     // inferContentType reads the whole path, so a project directory named for decisions types the copy 'decision'.
     for (const [path, body] of [["-u-decisions/memory/precompact-state.md", Q_LEGACY], ["-u-decisions/memory/adr-001.md", "a real decision"]] as const) {
       const hash = hashContent(body + path);
-      store.insertContent(hash, body, now);
+      seedContent(store.db, hash, body, now);
       store.insertDocument("agent-memory", path, "t", hash, now, now);
       store.db.prepare("UPDATE documents SET content_type = 'decision', origin = 'fs' WHERE collection = 'agent-memory' AND path = ?").run(path);
     }
@@ -677,7 +678,7 @@ describe("62.2 (codex T1 #1) — a legacy precompact-state.md is never indexed, 
     for (const body of bodies) {
       for (const path of paths) {
         const hash = `h${n++}`;
-        store.insertContent(hash, body, now);
+        seedContent(store.db, hash, body, now);
         store.insertDocument("eq", path, "t", hash, now, now);
         const row = store.db.prepare(`SELECT ${notLegacyArtifactSql("d")} AS keep FROM documents d WHERE d.hash = ?`).get(hash) as { keep: number };
         expect([body.slice(0, 40), path, row.keep === 1]).toEqual([body.slice(0, 40), path, !isLegacyPrecompactState(path, body)]);
@@ -734,7 +735,7 @@ describe("62.2 (codex T1 #1) — a legacy precompact-state.md is never indexed, 
       const onDisk = "# Pre-Compaction State\n\n_Extracted 2026-09-02T10:00:00 before auto-compaction. This is authoritative._\n\nCANARY-ONDISK\n";
       const now = new Date().toISOString();
       const seed = (path: string, body: string, origin: string | null) => {
-        store.insertContent(hashContent(body), body, now);
+        seedContent(store.db, hashContent(body), body, now);
         store.insertDocument("coll", path, "t", hashContent(body), now, now);
         store.db.prepare("UPDATE documents SET origin = ? WHERE collection = 'coll' AND path = ?").run(origin, path);
       };

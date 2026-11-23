@@ -347,7 +347,7 @@ export interface SurfacingTrace {
    * refuses the run as daemon loss), "model_mismatch". The replay harness
    * reads this to prove the daemon-required protocol was actually executed.
    */
-  vectorLegs?: { leg: "primary" | "prior" | "deep"; path: import("../vector-daemon.ts").VecExecStatus; protocol?: import("../vector-daemon.ts").VecResponseProtocol }[];
+  vectorLegs?: { leg: "primary" | "prior" | "deep"; path: import("../vector-daemon.ts").VecExecStatus; protocol?: import("../vector-daemon.ts").VecResponseProtocol; vectorFaults?: number }[];
   /**
    * Codex t80 P1 / t81 P1+P2, O1 §3: one record per COMPLETED vector
    * INVOCATION (primary once, prior once, deep once per expansion query) —

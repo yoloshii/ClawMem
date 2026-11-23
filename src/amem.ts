@@ -5,6 +5,7 @@
  * All operations are non-fatal and log errors with [amem] prefix.
  */
 
+import { stripLeadingMarks } from "./text-policy.ts";
 import type { Database } from "bun:sqlite";
 import { isoNow } from "./clock.ts";
 import type { LlamaCpp } from "./llm.ts";
@@ -13,6 +14,8 @@ import type { Store } from "./store.ts";
 import { enrichDocumentEntities } from "./entity.ts";
 import { EVOLUTION_WRITER, notLegacyArtifactSql, notLegacyTaintedNoteSql } from "./compaction-state.ts";
 import { relWeightSql } from "./relation-weight.ts";
+import { usableDistance } from "./vector-guard.ts";
+import { runExact } from "./stored-copy.ts";
 
 export interface MemoryNote {
   keywords: string[];
@@ -602,7 +605,7 @@ export function storeMemoryNote(
     `).run(
       JSON.stringify(note.keywords),
       JSON.stringify(note.tags),
-      note.context,
+      stripLeadingMarks(note.context),                                 // 82.3 D7: a normalised field (model output)
       docId
     );
     // `.changes` is inflated by the documents_fts triggers and is NOT a row count — but zero
@@ -703,6 +706,7 @@ export async function generateMemoryLinks(
           AND d2.id != ?
           AND d2.active = 1
           AND ${notLegacyArtifactSql("d2")}
+          AND vec_distance_cosine(v1.embedding, v2.embedding) IS NOT NULL
         ORDER BY distance
         LIMIT ?
       `).all(sourceDoc.hash, sourceDoc.id, kNeighbors) as {
@@ -711,6 +715,13 @@ export async function generateMemoryLinks(
         target_context: string | null;
         distance: number;
       }[];
+      // v0.43.7 (82.2 D4): a NULL distance takes no place (the query excludes it). A row SQL returned whose
+      // distance is not usable (an infinity, a value outside [0, 2]) is not a neighbour: skipped and counted.
+      const returned = neighbors.length;
+      neighbors = neighbors.filter(n => usableDistance(n.distance) !== null);
+      if (neighbors.length < returned) {
+        console.warn(`[amem] skipped ${returned - neighbors.length} neighbour row(s) of docId ${docId} whose distance is not usable; \`clawmem doctor\` lists the stored vectors`);
+      }
     } catch (error) {
       if (isVectorIndexUnavailable(error)) return 0;
       throw error;
@@ -1016,7 +1027,8 @@ If no evolution is needed:
     `);
 
     // Stamped with this version's writer (62.2): an unstamped entry after the upgrade marks an older writer.
-    const historyStmt = store.db.prepare(`
+    // 82.3 D7 (ruling 56 A): previous_context is a copy of the stored context — bound as its bytes (`?T`)
+    const historySql = `
       INSERT INTO memory_evolution (
         memory_id,
         triggered_by,
@@ -1027,29 +1039,31 @@ If no evolution is needed:
         new_context,
         reasoning,
         writer
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '${EVOLUTION_WRITER}')
-    `);
+      ) VALUES (?, ?, ?, ?, ?, ?T, ?, ?, '${EVOLUTION_WRITER}')
+    `;
 
+    // 82.3 D7: the context and the reasoning are normalised fields (model output): no leading byte-order mark.
+    const newContext = stripLeadingMarks(evolution.new_context);
     try {
       store.db.exec("BEGIN TRANSACTION");
 
       updateStmt.run(
         JSON.stringify(evolution.new_keywords),
         JSON.stringify(evolution.new_tags),
-        evolution.new_context,
+        newContext,
         memoryId
       );
 
-      historyStmt.run(
+      runExact(store.db, historySql, [
         memoryId,
         triggeredBy,
         nextVersion,
         memory.amem_keywords,
         JSON.stringify(evolution.new_keywords),
         memory.amem_context,
-        evolution.new_context,
-        evolution.reasoning
-      );
+        newContext,
+        stripLeadingMarks(evolution.reasoning),
+      ]);
 
       store.db.exec("COMMIT");
       console.log(`[amem] Evolved memory ${memoryId} to version ${nextVersion}`);

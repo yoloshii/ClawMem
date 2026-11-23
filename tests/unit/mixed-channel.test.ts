@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterAll } from "bun:test";
-import { createStore, insertContent, insertDocument, canonicalDocId, type Store } from "../../src/store.ts";
+import { createStore, insertDocument, canonicalDocId, type Store } from "../../src/store.ts";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { startServer } from "../../src/server.ts";
 
@@ -25,6 +25,7 @@ const REST_TOKEN = "rest-test-token-62-4-0000000000000000000000";
 const AUTH = { Authorization: `Bearer ${REST_TOKEN}` };
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const MODEL = "mixed-fake";
 const savedProfile = Bun.env.CLAWMEM_PROFILE;
 const savedRerankUrl = Bun.env.CLAWMEM_RERANK_URL;
@@ -53,7 +54,7 @@ let store: Store;
 function addDoc(path: string, body: string, vec?: Float32Array) {
   const hash = `hash_${path}_${Math.random().toString(36).slice(2)}`;
   const now = new Date().toISOString();
-  insertContent(store.db, hash, body, now);
+  seedContent(store.db, hash, body, now);
   insertDocument(store.db, "user", path, path, hash, now, now);
   if (vec) {
     store.ensureVecTable(4);

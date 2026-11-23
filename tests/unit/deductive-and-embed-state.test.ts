@@ -63,7 +63,7 @@ describe("embed state tracking", () => {
     store = createStore(":memory:");
     const hash = hashContent("test body");
     const now = new Date().toISOString();
-    store.insertContent(hash, "test body", now);
+    seedContent(store.db, hash, "test body", now);
     store.insertDocument("test", "doc1.md", "Test Doc", hash, now, now);
 
     const doc = store.findActiveDocument("test", "doc1.md");
@@ -74,7 +74,7 @@ describe("embed state tracking", () => {
   it("markEmbedSynced updates state to synced", () => {
     const hash = hashContent("synced body");
     const now = new Date().toISOString();
-    store.insertContent(hash, "synced body", now);
+    seedContent(store.db, hash, "synced body", now);
     store.insertDocument("test", "doc2.md", "Synced Doc", hash, now, now);
 
     store.markEmbedSynced(hash);
@@ -87,7 +87,7 @@ describe("embed state tracking", () => {
   it("markEmbedFailed records failed state + error (attempts owned by markEmbedStart)", () => {
     const hash = hashContent("failed body");
     const now = new Date().toISOString();
-    store.insertContent(hash, "failed body", now);
+    seedContent(store.db, hash, "failed body", now);
     store.insertDocument("test", "doc3.md", "Failed Doc", hash, now, now);
 
     store.markEmbedStart(hash);            // attempt begins → embed_attempts = 1
@@ -104,7 +104,7 @@ describe("embed state tracking", () => {
   it("embed_attempts increments once per attempt (markEmbedStart), not per markEmbedFailed", () => {
     const hash = hashContent("retry body");
     const now = new Date().toISOString();
-    store.insertContent(hash, "retry body", now);
+    seedContent(store.db, hash, "retry body", now);
     store.insertDocument("test", "doc4.md", "Retry Doc", hash, now, now);
 
     // Three attempts: each starts (the single increment) then fails (state-only).
@@ -146,7 +146,7 @@ describe("source_doc_ids column", () => {
     const store = createStore(":memory:");
     const hash = hashContent("deductive conclusion");
     const now = new Date().toISOString();
-    store.insertContent(hash, "deductive conclusion", now);
+    seedContent(store.db, hash, "deductive conclusion", now);
     store.insertDocument("_clawmem", "deductions/test.md", "Test Deduction", hash, now, now);
 
     const doc = store.findActiveDocument("_clawmem", "deductions/test.md");
@@ -168,6 +168,7 @@ describe("source_doc_ids column", () => {
 
 import { computeSurprisalScores } from "../../src/consolidation.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 describe("computeSurprisalScores", () => {
   it("returns empty array when not enough documents", () => {
     const store = createStore(":memory:");
@@ -181,7 +182,7 @@ describe("computeSurprisalScores", () => {
     const now = new Date().toISOString();
     for (let i = 0; i < 10; i++) {
       const hash = hashContent(`obs ${i}`);
-      store.insertContent(hash, `obs ${i}`, now);
+      seedContent(store.db, hash, `obs ${i}`, now);
       store.insertDocument("_clawmem", `obs${i}.md`, `Obs ${i}`, hash, now, now);
       store.updateObservationFields(`obs${i}.md`, "_clawmem", { observation_type: "decision" });
     }

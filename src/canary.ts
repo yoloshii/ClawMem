@@ -27,6 +27,7 @@ import { parseDocument } from "./indexer.ts";
 import { splitDocument } from "./splitter.ts";
 import { canonicalDocId, type Store } from "./store.ts";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
+import { storableVector, storedVector, isRefusedEmbedResponse, cosineSimilarityStrict, VecPoisonError } from "./vector-guard.ts";
 
 export const CANARY_PROBE_VERSION = 1;
 
@@ -54,12 +55,9 @@ export function canaryProbeInputs(): Map<string, string> {
   ]);
 }
 
+/** v0.43.7 (BACKLOG 82.2): throws on a length difference — through v0.43.6 it read only the shorter length. */
 export function cosineSim(a: Float32Array, b: Float32Array): number {
-  let dot = 0, na = 0, nb = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) { dot += a[i]! * b[i]!; na += a[i]! * a[i]!; nb += b[i]! * b[i]!; }
-  const denom = Math.sqrt(na) * Math.sqrt(nb);
-  return denom > 0 ? dot / denom : 0;
+  return cosineSimilarityStrict(a, b);
 }
 
 /** Pair-separation margins — each must clear the floor in a healthy geometry. */
@@ -94,6 +92,8 @@ export interface CanaryCheckResult {
   profileKey: string;
   /** Present only when a stored baseline existed for the profile. */
   driftChecked: boolean;
+  /** v0.43.7 (BACKLOG 82.2): the one (dimension, model) every probe of a complete battery answered with — the run binds to it. */
+  binding?: { dim: number; model: string };
 }
 
 export function canaryProfileKey(model: string, dim: number): string {
@@ -101,59 +101,45 @@ export function canaryProfileKey(model: string, dim: number): string {
 }
 
 /**
- * Run the full battery: embed every probe, compute margins, evaluate
- * sanity (pair separation vs baseline-calibrated or absolute floors) and
- * drift (vs stored baseline vectors, when available).
+ * v0.43.7 (BACKLOG 82.2): a probe did not answer. `answered` of `total` did, none of them malformed, and they agree
+ * on `binding` (null when none answered) — the run binds to it.
  */
-export async function runCanaryBattery(
-  embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string } | null>,
-  getBaseline: (profileKey: string) => { probes: Map<string, Float32Array>; pairMargins: Record<string, number> } | null,
-  opts?: {
-    /** Recalibration mode (T9-M3): evaluate INTRINSIC sanity only (absolute floors +
-     *  mixed-endpoint) — skip every baseline-relative check, since the point of
-     *  recalibrating is that the old baseline no longer applies. */
-    ignoreBaseline?: boolean;
-  }
-): Promise<CanaryCheckResult | { unavailable: true; reason: string }> {
-  const inputs = canaryProbeInputs();
-  const vectors = new Map<string, Float32Array>();
-  const modelsSeen = new Set<string>();
-  const dimsSeen = new Set<number>();
-  let model = "";
-  for (const [id, text] of inputs) {
-    let r: { embedding: number[] | Float32Array; model?: string } | null = null;
-    try { r = await embed(text); } catch { r = null; }
-    if (!r || !r.embedding || r.embedding.length === 0) {
-      return { unavailable: true, reason: `probe '${id}' could not be embedded (endpoint unreachable?)` };
-    }
-    vectors.set(id, r.embedding instanceof Float32Array ? r.embedding : new Float32Array(r.embedding));
-    dimsSeen.add(r.embedding.length);
-    if (r.model) modelsSeen.add(r.model);
-    if (!model && r.model) model = r.model;
-  }
-  const dim = vectors.get("rel_a")!.length;
-  const profileKey = canaryProfileKey(model, dim);
-  const baseline = opts?.ignoreBaseline ? null : getBaseline(profileKey);
-  const margins = canaryMargins(vectors);
+export type CanaryUnavailable = { unavailable: true; reason: string; answered: number; total: number; binding: { dim: number; model: string } | null };
+/**
+ * v0.43.7 (BACKLOG 82.2): an answered probe was refused by the vector validator, or the answered probes disagree on
+ * dimension or model. It keeps the shape of a failed battery (`pass: false`, `failures`), with no margins.
+ * No flag overrides it.
+ */
+export type CanaryMalformed = CanaryCheckResult & { malformed: true; pass: false; reason: string; answered: number; total: number };
+export type CanaryOutcome = CanaryCheckResult | CanaryUnavailable | CanaryMalformed;
 
+type EmbedFn = (text: string) => Promise<{ embedding: unknown; model?: string } | null>;
+type CanaryBaseline = { probes: Map<string, Float32Array>; pairMargins: Record<string, number> };
+
+/**
+ * The failure lines of a COMPLETE, single-geometry battery: pair separation against baseline-calibrated or absolute
+ * floors, and drift against the stored baseline probes. A margin or a drift similarity that is not finite is a
+ * failure that names it — `NaN < floor` is false, so a comparison alone would pass it.
+ */
+export function canaryFailures(
+  margins: Record<string, number>,
+  vectors: Map<string, Float32Array>,
+  baseline: CanaryBaseline | null,
+  similarity: (a: Float32Array, b: Float32Array) => number = cosineSim,
+): string[] {
   const failures: string[] = [];
-  // A flapping endpoint answering with mixed dimensions or models across ONE battery is a
-  // hard failure (T8-H1): such a server must never be allowed to feed a rebuild.
-  if (dimsSeen.size > 1) failures.push(`mixed dimensions across probes (${[...dimsSeen].join(", ")}) — flapping endpoint`);
-  if (modelsSeen.size > 1) failures.push(`mixed models across probes (${[...modelsSeen].join(", ")}) — flapping endpoint`);
   for (const [name, value] of Object.entries(margins)) {
+    if (!Number.isFinite(value)) { failures.push(`${name} = ${value} is not finite`); continue; }
     const baseMargin = baseline?.pairMargins?.[name];
-    const floor = baseMargin !== undefined && baseMargin > 0
+    const calibrated = typeof baseMargin === "number" && Number.isFinite(baseMargin) && baseMargin > 0;
+    const floor = calibrated
       ? Math.max(CANARY_ABSOLUTE_MARGIN_FLOOR, baseMargin * CANARY_BASELINE_RATIO_FLOOR)
       : CANARY_ABSOLUTE_MARGIN_FLOOR;
     if (value < floor) {
-      failures.push(`${name} = ${value.toFixed(3)} < floor ${floor.toFixed(3)}${baseMargin !== undefined ? ` (baseline ${baseMargin.toFixed(3)})` : ""}`);
+      failures.push(`${name} = ${value.toFixed(3)} < floor ${floor.toFixed(3)}${calibrated ? ` (baseline ${baseMargin.toFixed(3)})` : ""}`);
     }
   }
-
-  let driftChecked = false;
   if (baseline) {
-    driftChecked = true;
     for (const [id, storedVec] of baseline.probes) {
       const fresh = vectors.get(id);
       if (!fresh) continue; // probe set changed (version bump) — baseline is stale, sanity floors govern
@@ -161,19 +147,99 @@ export async function runCanaryBattery(
         failures.push(`drift:${id} dimension changed (${storedVec.length} → ${fresh.length})`);
         continue;
       }
-      const sim = cosineSim(storedVec, fresh);
-      if (sim < CANARY_DRIFT_FLOOR) {
+      const sim = similarity(storedVec, fresh);
+      if (!Number.isFinite(sim)) {
+        failures.push(`drift:${id} cos(stored, fresh) = ${sim} is not finite`);
+      } else if (sim < CANARY_DRIFT_FLOOR) {
         failures.push(`drift:${id} cos(stored, fresh) = ${sim.toFixed(4)} < ${CANARY_DRIFT_FLOOR} — server geometry changed since last embed`);
       }
     }
   }
+  return failures;
+}
 
-  return { pass: failures.length === 0, failures, margins, vectors, profileKey, driftChecked };
+/**
+ * Run the full battery: embed every probe, compute margins, evaluate
+ * sanity (pair separation vs baseline-calibrated or absolute floors) and
+ * drift (vs stored baseline vectors, when available).
+ *
+ * v0.43.7 (BACKLOG 82.2) — the order is fixed: every answer is VALIDATED as it arrives (`storableVector`, raw) →
+ * the dimension and model sets are compared → only then margins. The battery still stops at the first probe that
+ * does not answer, and then JUDGES WHAT WAS ANSWERED before it returns: `malformed` first (so a timeout after a
+ * malformed or mixed answer cannot hide it), else `unavailable`.
+ */
+export async function runCanaryBattery(
+  embed: EmbedFn,
+  getBaseline: (profileKey: string) => CanaryBaseline | null,
+  opts?: {
+    /** Recalibration mode (T9-M3): evaluate INTRINSIC sanity only (absolute floors +
+     *  mixed-endpoint) — skip every baseline-relative check, since the point of
+     *  recalibrating is that the old baseline no longer applies. */
+    ignoreBaseline?: boolean;
+  }
+): Promise<CanaryOutcome> {
+  const inputs = canaryProbeInputs();
+  const total = inputs.size;
+  const vectors = new Map<string, Float32Array>();
+  const modelsSeen = new Set<string>();
+  const dimsSeen = new Set<number>();
+  let model = "";
+  const malformed = (reason: string, failures: string[]): CanaryMalformed => ({
+    malformed: true, pass: false, reason, answered: vectors.size, total,
+    failures, margins: {}, vectors, profileKey: "", driftChecked: false,
+  });
+  // A flapping endpoint answering with mixed dimensions or models across ONE battery is a
+  // hard failure (T8-H1): such a server must never be allowed to feed a rebuild.
+  const mixed = (): string[] => {
+    const lines: string[] = [];
+    if (dimsSeen.size > 1) lines.push(`mixed dimensions across probes (${[...dimsSeen].join(", ")}) — flapping endpoint`);
+    if (modelsSeen.size > 1) lines.push(`mixed models across probes (${[...modelsSeen].join(", ")}) — flapping endpoint`);
+    return lines;
+  };
+  for (const [id, text] of inputs) {
+    let r: { embedding: unknown; model?: string } | null = null;
+    let refused: unknown = null;
+    try { r = await embed(text); } catch (e) { if (isRefusedEmbedResponse(e)) refused = e; else r = null; }
+    if (!refused && r && r.embedding !== undefined && r.embedding !== null) {
+      try { vectors.set(id, storableVector(r.embedding, { context: `canary probe ${id}` })); }
+      catch (e) { if (e instanceof VecPoisonError) refused = e; else throw e; }
+    }
+    if (refused) {
+      const why = `probe '${id}' returned a malformed answer: ${(refused as Error).message}`;
+      return malformed(why, [why, ...mixed()]);
+    }
+    if (!vectors.has(id)) {
+      // No answer. Judge what WAS answered: a mixed answer before the silence is `malformed`.
+      const lines = mixed();
+      if (lines.length > 0) return malformed(`the probes answered before '${id}' disagree: ${lines.join("; ")}`, lines);
+      const binding = vectors.size > 0 ? { dim: [...dimsSeen][0]!, model } : null;
+      return {
+        unavailable: true, answered: vectors.size, total, binding,
+        reason: `probe '${id}' could not be embedded (endpoint unreachable?) — ${vectors.size} of ${total} probes answered`,
+      };
+    }
+    dimsSeen.add(vectors.get(id)!.length);
+    if (r!.model) modelsSeen.add(r!.model);
+    if (!model && r!.model) model = r!.model;
+  }
+  // Every probe answered. Dimension and model sets BEFORE any margin: a mixed battery is the structured failure,
+  // and no margin is computed for it (`cosineSim` no longer accepts two lengths).
+  const lines = mixed();
+  if (lines.length > 0) return malformed(lines.join("; "), lines);
+
+  const dim = vectors.get("rel_a")!.length;
+  const profileKey = canaryProfileKey(model, dim);
+  const baseline = opts?.ignoreBaseline ? null : getBaseline(profileKey);
+  const margins = canaryMargins(vectors);
+  const failures = canaryFailures(margins, vectors, baseline);
+  return { pass: failures.length === 0, failures, margins, vectors, profileKey, driftChecked: !!baseline, binding: { dim, model } };
 }
 
 /**
  * Preflight gate decision (T8-H1: the gate must FAIL CLOSED before a destructive clear).
  *
+ *   malformed                     → abort, ALWAYS (v0.43.7, BACKLOG 82.2): neither --force-geometry nor
+ *                                   --recalibrate-canary overrides an endpoint that returned a malformed vector
  *   pass                          → proceed
  *   fail + !forceGeometry         → abort (any run — nothing is written against bad geometry)
  *   fail + forceGeometry          → warn (explicit operator override)
@@ -185,9 +251,12 @@ export async function runCanaryBattery(
  *                                   their embeds fail naturally if the endpoint is down)
  */
 export function canaryGate(
-  outcome: CanaryCheckResult | { unavailable: true; reason: string },
+  outcome: CanaryCheckResult | CanaryMalformed | { unavailable: true; reason: string },
   opts: { force: boolean; forceGeometry: boolean }
 ): { action: "proceed" | "warn" | "abort"; reason: string } {
+  if ("malformed" in outcome) {
+    return { action: "abort", reason: `geometry canary got a malformed answer (${outcome.reason}) — nothing was cleared or written, and no flag overrides this` };
+  }
   if ("unavailable" in outcome) {
     if (opts.force && !opts.forceGeometry) {
       return { action: "abort", reason: `geometry canary unavailable (${outcome.reason}) — refusing a destructive --force clear against an unvalidated endpoint (override: --force-geometry)` };
@@ -243,8 +312,10 @@ export const SAMPLE_REPLACEMENT_BUDGET = 8;
 
 export async function runSampledVectorValidation(
   s: Store,
-  embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string } | null>
+  embed: EmbedFn
 ): Promise<{
+  /** v0.43.7 (BACKLOG 82.2): fresh responses the validator refused — a failure of the ENDPOINT, not of a stored row. */
+  refusedFresh: number;
   eligible: number; target: number; nMin: number; validated: number;
   validatedSeq0: number; seq0Target: number;
   legacyTier: number; unreconstructable: number; inconclusiveLegacy: number; attempts: number;
@@ -270,7 +341,7 @@ export async function runSampledVectorValidation(
   const seq0Pool = eligibleRows.filter(r => r.seq === 0);
   const seq0Target = Math.min(4, seq0Pool.length);
   const result = {
-    eligible, target, nMin, validated: 0, validatedSeq0: 0, seq0Target,
+    refusedFresh: 0, eligible, target, nMin, validated: 0, validatedSeq0: 0, seq0Target,
     legacyTier: 0, unreconstructable: 0, inconclusiveLegacy: 0, attempts: 0,
     definitiveFailures: [] as string[],
   };
@@ -336,8 +407,32 @@ export async function runSampledVectorValidation(
 
     const stored = vecStmt.get(`${row.hash}_${row.seq}`) as { embedding: Uint8Array } | undefined;
     if (!stored?.embedding) { result.unreconstructable++; continue; }
-    const storedBuf = new Uint8Array(stored.embedding);
-    const storedVec = new Float32Array(storedBuf.buffer, storedBuf.byteOffset, storedBuf.byteLength / 4);
+    // v0.43.7 (BACKLOG 82.2): the stored row is decoded and judged first. One that is not a usable vector is a
+    // DEFINITIVE failure of the row — no embed call is spent on it.
+    let storedVec: Float32Array;
+    try { storedVec = storedVector(stored.embedding, undefined, { context: `${row.hash}_${row.seq}` }); }
+    catch (e) {
+      if (!(e instanceof VecPoisonError)) throw e;
+      result.definitiveFailures.push(`stored-vector: ${canonical.collection}/${canonical.path}#${row.seq} — ${e.message} Run 'clawmem repair vectors'.`);
+      return result;
+    }
+    // The fresh response is judged raw. A refused one is a DEFINITIVE failure of the ENDPOINT (counted apart, never
+    // `validated`, never blamed on the row); no answer stays "unreconstructable".
+    const freshVector = async (): Promise<Float32Array | null | "refused"> => {
+      let fresh: { embedding: unknown } | null;
+      try { fresh = await embed(fragText); }
+      catch (e) { if (!isRefusedEmbedResponse(e)) return null; fresh = { embedding: e }; }
+      if (!fresh || fresh.embedding === undefined || fresh.embedding === null) return null;
+      try {
+        if (fresh.embedding instanceof Error) throw fresh.embedding;
+        return storableVector(fresh.embedding, { context: `${row.hash}_${row.seq}` });
+      } catch (e) {
+        if (!isRefusedEmbedResponse(e)) throw e;
+        result.refusedFresh++;
+        result.definitiveFailures.push(`endpoint: the embedding endpoint returned a malformed answer while validating ${canonical.collection}/${canonical.path}#${row.seq} — ${e.message}`);
+        return "refused";
+      }
+    };
 
     if (row.embed_input_fp) {
       const fp = createHash("sha256").update(fragText, "utf8").digest("hex");
@@ -345,20 +440,22 @@ export async function runSampledVectorValidation(
         result.definitiveFailures.push(`stale-input: ${canonical.collection}/${canonical.path}#${row.seq} — embed input changed since embed (fingerprint mismatch); re-embed required`);
         return result; // definitive → nonzero regardless of coverage; stop spending embeds (T8-H2)
       }
-      const fresh = await embed(fragText).catch(() => null);
-      if (!fresh || fresh.embedding.length !== storedVec.length) { result.unreconstructable++; continue; }
-      const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
-      if (sim < 0.98) {
+      const fresh = await freshVector();
+      if (fresh === "refused") return result;
+      if (!fresh || fresh.length !== storedVec.length) { result.unreconstructable++; continue; }
+      const sim = cosineSim(storedVec, fresh);
+      if (!(sim >= 0.98)) {
         result.definitiveFailures.push(`corruption/drift: ${canonical.collection}/${canonical.path}#${row.seq} — fingerprint matches but cos(stored, fresh) = ${sim.toFixed(4)} < 0.98`);
         return result;
       }
       result.validated++;
       if (row.seq === 0) result.validatedSeq0++;
     } else {
-      const fresh = await embed(fragText).catch(() => null);
-      if (!fresh || fresh.embedding.length !== storedVec.length) { result.unreconstructable++; continue; }
-      const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
-      if (sim < 0.98) { result.inconclusiveLegacy++; continue; }
+      const fresh = await freshVector();
+      if (fresh === "refused") return result;
+      if (!fresh || fresh.length !== storedVec.length) { result.unreconstructable++; continue; }
+      const sim = cosineSim(storedVec, fresh);
+      if (!(sim >= 0.98)) { result.inconclusiveLegacy++; continue; }
       result.legacyTier++;
       result.validated++;
       if (row.seq === 0) result.validatedSeq0++;

@@ -8,6 +8,7 @@
  * - WHAT: General factual (balanced approach)
  */
 
+import { stripLeadingMarks } from "./text-policy.ts";
 import type { Database } from "bun:sqlite";
 import { isoNow, toDate, epochNow } from "./clock.ts";
 import { createHash } from "crypto";
@@ -183,6 +184,7 @@ export async function classifyIntent(
   llm: LLM,
   db: Database
 ): Promise<IntentResult> {
+  query = stripLeadingMarks(query);                      // 82.3 D7: free text — normalised BEFORE the cache key is built
   // Check cache first (1 hour TTL)
   const queryHash = createHash('sha256').update(query).digest('hex');
   const cached = db.prepare(`

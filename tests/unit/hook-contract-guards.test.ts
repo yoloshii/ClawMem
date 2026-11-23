@@ -33,6 +33,7 @@ import {
 } from "../../src/schema-placeholder.ts";
 import { createHash } from "node:crypto";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 let dir: string;
 
@@ -43,7 +44,7 @@ function stubLlm(payload: unknown): any {
 function mkDoc(path: string): number {
   const hash = createHash("sha256").update(path).digest("hex");
   const ts = "2026-07-19T00:00:00.000Z";
-  (store as any).insertContent(hash, `body of ${path}`, ts);
+  seedContent(store.db, hash, `body of ${path}`, ts);
   (store as any).insertDocument("_clawmem", path, path, hash, ts, ts);
   return (store as any).findActiveDocument("_clawmem", path)!.id;
 }

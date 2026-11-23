@@ -16,8 +16,9 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
 import { createTestStore } from "../helpers/test-store.ts";
 import type { Store } from "../../src/store.ts";
-import { insertContent, insertDocument } from "../../src/store.ts";
+import { insertDocument } from "../../src/store.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 // =============================================================================
 // Fixtures
 // =============================================================================
@@ -30,7 +31,7 @@ function seedDoc(
 ): number {
   const now = new Date().toISOString();
   const hash = `hash_${path}_${Math.random().toString(36).slice(2)}`;
-  insertContent(store.db, hash, body, now);
+  seedContent(store.db, hash, body, now);
   insertDocument(store.db, "test", path, title, hash, now, now);
   const row = store.db.prepare(
     `SELECT id FROM documents WHERE collection = 'test' AND path = ? AND active = 1`,

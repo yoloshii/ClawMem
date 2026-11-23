@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 
+import { seedContent } from "../helpers/seed-content.ts";
 const ROOT = join(import.meta.dir, "../..");
 let home: string;
 let deadPort: number;
@@ -90,7 +91,7 @@ describe("62.2 — clawmem doctor reports the v0.39 compaction leftovers", () =>
     try {
       const body = "# Pre-Compaction State\n\n_Extracted 2026-03-20T10:00:00 before auto-compaction. This is authoritative._\n\nx\n";
       const now = new Date().toISOString();
-      st.insertContent(hashContent(body), body, now);
+      seedContent(st.db, hashContent(body), body, now);
       st.insertDocument("agent-memory", "-gone/memory/precompact-state.md", "t", hashContent(body), now, now);
       st.db.prepare("UPDATE documents SET origin = NULL WHERE path = '-gone/memory/precompact-state.md'").run();
     } finally {

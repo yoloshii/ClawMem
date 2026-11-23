@@ -18,7 +18,7 @@ import { budgetLayerOf, type LlamaCpp, type BudgetLlm, type LlmBackendId, type L
 import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
-import { hashContent } from "./indexer.ts";
+import { normalizedContent, stripLeadingMarks } from "./text-policy.ts";
 import { passesMergeSafety } from "./text-similarity.ts";
 import { withWorkerLease } from "./worker-lease.ts";
 import { notLegacyArtifactSql, notLegacyTaintedNoteSql, resetLegacyDerivedNotes } from "./compaction-state.ts";
@@ -35,6 +35,7 @@ import {
 import { resolveJudge } from "./judge.ts";
 import { pruneJudgeRuns } from "./judge-audit.ts";
 import { insertJudgeEvent } from "./judge-audit.ts";
+import { storedVector, usableDistance } from "./vector-guard.ts";
 import {
   validateDeductiveDraft,
   type DeductiveDraft,
@@ -669,6 +670,9 @@ Return ONLY the JSON array. /no_think`;
   if (!Array.isArray(parsed)) return;
 
   for (const pattern of parsed) {
+    // 82.3 D7: the observation is a normalised field — a leading byte-order mark is removed HERE, before the
+    // similarity search builds its deduplication key from the text and before any writer stores it.
+    if (typeof pattern.observation === "string") pattern.observation = stripLeadingMarks(pattern.observation);
     if (!pattern.observation || !Array.isArray(pattern.source_indices) || pattern.source_indices.length < 2) continue;
 
     // Map source indices to doc IDs — over the sources the prompt showed (v0.41.4: an index past them is refused)
@@ -849,6 +853,7 @@ export function applyContradictoryConsolidationCore(
   collection: string,
   policy: ContradictionPolicy,
 ): { newId: number; policy: "link" | "supersede" } {
+  newObservation = stripLeadingMarks(newObservation);              // 82.3 D7: every caller is covered
   let newId = 0;
   {
     // Insert the new consolidation as a separate active row
@@ -1055,6 +1060,7 @@ export function mergeIntoExistingConsolidation(
   newSourceDocIds: number[],
   newObservation: string
 ): { mergedIds: number[] } {
+  newObservation = stripLeadingMarks(newObservation);              // 82.3 D7: every caller is covered
   const existingSourceIds = safeParseDocIds(existing.source_doc_ids);
   const mergedIds = [...new Set([...existingSourceIds, ...newSourceDocIds])];
 
@@ -1486,10 +1492,10 @@ Return ONLY the JSON array. /no_think`;
     ].join('\n');
 
     const dedPath = `deductions/${dateStr}-${sourceDocIds.join('-')}.md`;
-    const hash = hashContent(body);
+    const { body: dedBody, hash } = normalizedContent(body);
 
     try {
-      store.insertContent(hash, body, timestamp);
+      store.insertContent(hash, dedBody, timestamp);
       store.insertDocument("_clawmem", dedPath, deduction.conclusion.slice(0, 80), hash, timestamp, timestamp);
 
       const doc = store.findActiveDocument("_clawmem", dedPath);
@@ -1655,15 +1661,22 @@ export function computeSurprisalScores(
       ).get(doc.hash_seq) as { embedding: Float32Array | number[] } | null;
 
       if (!vecRow?.embedding) continue;
+      // v0.43.7 (82.2 D4): the seed is a STORED vector — decoded and validated before it is used as a query (a
+      // malformed blob throws, and this document is skipped by the catch below, as any failed lookup is).
+      const seedVector = storedVector(vecRow.embedding, undefined, { context: `surprisal seed ${doc.hash_seq}` });
 
       // Query k+1 nearest neighbors (first result is the doc itself)
-      const neighbors = store.db.prepare(`
+      const neighbors = (store.db.prepare(`
         SELECT distance
         FROM vectors_vec
         WHERE embedding MATCH ?
         ORDER BY distance
         LIMIT ?
-      `).all(vecRow.embedding, k + 1) as { distance: number }[];
+      `).all(seedVector, k + 1) as { distance: unknown }[])
+        // the one distance predicate: a row whose distance is not usable is not a neighbour
+        .map(n => usableDistance(n.distance))
+        .filter((d): d is number => d !== null)
+        .map(distance => ({ distance }));
 
       // Skip the first result (self, distance ≈ 0) and compute average
       const nonSelf = neighbors.filter(n => n.distance > 0.001);

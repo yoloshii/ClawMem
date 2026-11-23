@@ -46,7 +46,8 @@
 import * as fs from "fs";
 import * as path from "path";
 import { randomBytes } from "node:crypto";
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
+import { openDatabase } from "./sqlite-guard.ts";
 import { epochMs, epochNow, isoNow } from "./clock.ts";
 import { sanitizeSnippet } from "./promptguard.ts";
 import type { Store } from "./store.ts";
@@ -130,7 +131,7 @@ const REGISTRY_DDL = `
 
 /** Run `fn` on the vault's registration database, opened for this call and closed after it. */
 function withRegistry<T>(dbPath: string, fn: (db: Database) => T): T {
-  const db = new Database(compactionRegistryPath(dbPath));
+  const db = openDatabase(compactionRegistryPath(dbPath));
   try {
     db.exec(`PRAGMA busy_timeout = 2000`);
     db.exec(REGISTRY_DDL);

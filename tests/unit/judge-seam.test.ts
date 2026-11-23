@@ -21,6 +21,7 @@ import {
   type ContradictionAuditContext,
 } from "../../src/hooks/decision-extractor.ts";
 
+import { seedContent } from "../helpers/seed-content.ts";
 let store: Store;
 let dir: string;
 
@@ -37,7 +38,7 @@ afterEach(() => {
 function mkTypedDoc(path: string, contentType: string, confidence: number): number {
   const hash = createHash("sha256").update(path).digest("hex");
   const ts = "2026-08-01T00:00:00.000Z";
-  (store as any).insertContent(hash, `body of ${path}`, ts);
+  seedContent(store.db, hash, `body of ${path}`, ts);
   (store as any).insertDocument("_clawmem", path, path, hash, ts, ts);
   const id = (store as any).findActiveDocument("_clawmem", path)!.id as number;
   (store as any).updateDocumentMeta(id, { content_type: contentType, confidence });
