@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.43.7**.
+Guide for upgrading between released versions. Current: **v0.43.8**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,6 +59,12 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 **Already on the sidecar?** It stays correct, and nothing requires a change. The Q8_0 GGUF frees about 3 GB of VRAM, is somewhat slower per document, and ranked like the sidecar in a side-by-side comparison ([measurements](inference-services.md#zerank-2-reranker-the-q8_0-gguf-or-the-bf16-sidecar)). To switch, stop the sidecar (`docker compose stop reranker`; its `unless-stopped` policy keeps it down across reboots), start the GGUF on `:8090`, and run `clawmem rerank-health`.
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
+
+---
+
+## v0.43.8: documentation and source comments only
+
+No behaviour change and no step: from v0.43.7, install it. From an earlier version, follow v0.43.7 below.
 
 ---
 

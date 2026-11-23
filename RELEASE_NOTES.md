@@ -4,6 +4,15 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.8 — documentation and source comments only
+
+No behaviour change. The release notes, the troubleshooting guide, the query-pipeline guide and some source
+comments no longer cite internal tracking numbers, and one inaccurate troubleshooting line is removed. Every source
+file is unchanged once its comments are removed. Upgrading from v0.43.7 needs no step; from an
+earlier version, follow v0.43.7 below.
+
+---
+
 ## v0.43.7 — unusable vectors are refused and repaired; values that start with a byte-order mark are no longer altered
 
 Two integrity defects, one release. Neither runs code or reaches outside the vault; both could
