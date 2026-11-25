@@ -36,6 +36,18 @@ Given the local-first architecture, the primary security concerns are:
 
 6. **Indexed Markdown as code-execution or memory-exhaustion input** -- Every indexed file's frontmatter is parsed by the indexing process (`clawmem update`, the watcher, the MCP `reindex`/`vault_sync` tools, `clawmem embed`, the canary). Before v0.43.6 a file whose first line was `---js` ran its frontmatter as JavaScript in that process, and crafted YAML (aliases, merge keys, `!!omap`) could expand to an object many orders of magnitude larger than the file. **Fixed in v0.43.6:** the eval engine is refused, the language is allow-listed, the YAML engine is ClawMem's own bounded one (no anchors, no merge, no omap, depth 32, 4,096 nodes, 64 KiB, 1,024 lines) and it checks its own contracts at first use, failing closed. A way to run code or exhaust memory through frontmatter, or through any other field of an indexed file, is a vulnerability: report it.
 
+7. **Integrity of stored values: byte-order marks and embedding replies** -- Any text that reaches the database —
+   an indexed file's name or body, a query, a hook's session id, a REST or MCP argument — is bound through Bun's
+   SQLite driver, which changed a string that STARTS with U+FEFF or U+FFFE (the mark dropped, or every later character
+   byte-swapped), on writes and lookups alike. Before v0.43.7 that silently altered indexed content and could make two
+   identifiers address one row. **Fixed in v0.43.7:** every database handle refuses such a binding before it runs,
+   free text is normalised before it is stored, an identifier that starts with a mark is refused, and the doctor lists
+   values older versions stored altered (identifiers by their mark; bodies by a hash that is not the hash of their
+   text). Separately, an embedding reply was stored without a check, so a malformed vector could sort first in every
+   vector search; since v0.43.7 a reply that is not a vector of finite numbers of a usable length is refused, and
+   stored ones are found and removed (`clawmem repair vectors`). An embedding endpoint still controls semantic ranking
+   by design; a way to alter stored text or alias an identifier through any input is a vulnerability: report it.
+
 ## Reporting a Vulnerability
 
 **Do not open a public issue for security vulnerabilities.**
@@ -48,18 +60,6 @@ Email **sciros@lazyvibecoder.com** with:
 - Suggested fix if you have one
 
 You should receive an acknowledgment within 72 hours. For critical issues (data exfiltration, arbitrary code execution), expect a fix within 7 days. For lower severity issues, fixes will ship in the next release.
-
-7. **Integrity of stored values: byte-order marks and embedding replies** -- Any text that reaches the database —
-   an indexed file's name or body, a query, a hook's session id, a REST or MCP argument — is bound through Bun's
-   SQLite driver, which changed a string that STARTS with U+FEFF or U+FFFE (the mark dropped, or every later character
-   byte-swapped), on writes and lookups alike. Before v0.43.7 that silently altered indexed content and could make two
-   identifiers address one row. **Fixed in v0.43.7:** every database handle refuses such a binding before it runs,
-   free text is normalised before it is stored, an identifier that starts with a mark is refused, and the doctor lists
-   values older versions stored altered (identifiers by their mark; bodies by a hash that is not the hash of their
-   text). Separately, an embedding reply was stored without a check, so a malformed vector could sort first in every
-   vector search; since v0.43.7 a reply that is not a vector of finite numbers of a usable length is refused, and
-   stored ones are found and removed (`clawmem repair vectors`). An embedding endpoint still controls semantic ranking
-   by design; a way to alter stored text or alias an identifier through any input is a vulnerability: report it.
 
 ## Security Best Practices for Users
 
